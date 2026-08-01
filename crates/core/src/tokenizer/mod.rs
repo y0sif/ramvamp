@@ -40,6 +40,23 @@ pub use error::TokenizerError;
 
 use config::{GenerationConfigFile, TokenizerConfigFile};
 
+/// Install-relative subdirectory holding the tokenizer sidecar files.
+///
+/// Single source of truth for the install layout: `ramvamp-repack`
+/// consumes this when placing fetched files.
+pub const TOKENIZER_SUBDIR: &str = "tokenizer";
+
+/// The tokenizer sidecar file names inside [`TOKENIZER_SUBDIR`]: the HF
+/// tokenizer, its config (chat template), and the generation defaults.
+///
+/// Single source of truth for the file set: `ramvamp-repack` consumes
+/// this as its fetch list.
+pub const TOKENIZER_FILES: [&str; 3] = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "generation_config.json",
+];
+
 /// Install-relative path of the tokenizer definition.
 pub const TOKENIZER_FILE: &str = "tokenizer/tokenizer.json";
 
@@ -51,6 +68,8 @@ pub const GENERATION_CONFIG_FILE: &str = "tokenizer/generation_config.json";
 
 /// Read cap for any single tokenizer file. `tokenizer.json` is ~11 MiB;
 /// the cap keeps a hostile install from driving an unbounded allocation.
+/// `ramvamp-repack` consumes this as its fetch-side per-file cap, so
+/// install and load enforce the same bound.
 pub const MAX_TOKENIZER_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// `<|im_start|>` id in the pinned vocabulary.
@@ -208,6 +227,12 @@ impl RvmpTokenizer {
     /// Token-for-token identical to the reference
     /// `apply_chat_template(..., tokenize=True)` (snapshot-tested): ChatML
     /// markers encode to their single special-token ids.
+    ///
+    /// Reference-faithful: special-token literals in message content
+    /// encode to real control ids, matching transformers/llama.cpp.
+    /// Acceptable for v0 (local single-user CLI). A sanitization hook is
+    /// REQUIRED before any server/multi-tenant exposure — see
+    /// architecture.md.
     pub fn encode_chat(
         &self,
         messages: &[ChatMessage],
@@ -344,6 +369,20 @@ mod tests {
             fs::copy(fixtures_dir().join(file), dir.join(file)).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn path_constants_agree_with_subdir_and_file_list() {
+        // Repack builds paths as `TOKENIZER_SUBDIR/<name>`; the load-side
+        // path constants must be exactly those joins, in the same order.
+        let paths = [
+            TOKENIZER_FILE,
+            TOKENIZER_CONFIG_FILE,
+            GENERATION_CONFIG_FILE,
+        ];
+        for (path, name) in paths.iter().zip(TOKENIZER_FILES) {
+            assert_eq!(*path, format!("{TOKENIZER_SUBDIR}/{name}"));
+        }
     }
 
     #[test]

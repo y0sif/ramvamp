@@ -23,8 +23,10 @@
 //! schema's required set, so validation passes) and re-runs
 //! [`format::verify_files`] as a self-check. [`fetch_and_amend`] chains
 //! both behind an [`format::is_complete`] gate: partial installs are
-//! refused. Re-running is idempotent — files are overwritten and
-//! re-hashed, entries are overwritten in place.
+//! refused. After a successful amend it smoke-loads the result with
+//! `RvmpTokenizer::load`, so a wrong `--tokenizer-dir` fails at install
+//! time instead of at first run. Re-running is idempotent — files are
+//! overwritten and re-hashed, entries are overwritten in place.
 //!
 //! Transfers go through a fixed-size chunk buffer with a hard per-file cap
 //! ([`MAX_TOKENIZER_FILE_BYTES`]); even these small sidecar files are
@@ -36,6 +38,13 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use ramvamp_core::format::{self, FileEntry};
+use ramvamp_core::tokenizer::{RvmpTokenizer, TokenizerError};
+// ramvamp-core is the single source of truth for the tokenizer file facts:
+// the file name list, the install subdirectory, and the per-file size cap
+// (anything past the cap is rejected before a byte is transferred, so a
+// wrong URL or hostile server cannot drive an unbounded download).
+// Re-exported so fetch-side callers get them from this module.
+pub use ramvamp_core::tokenizer::{MAX_TOKENIZER_FILE_BYTES, TOKENIZER_FILES, TOKENIZER_SUBDIR};
 
 use crate::source::{LocalFile, RangeRead, RemoteFile, SourceError};
 
@@ -46,23 +55,6 @@ pub const TOKENIZER_REPO: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507";
 /// Pinned revision (commit hash) of [`TOKENIZER_REPO`]. Belongs to the
 /// tokenizer source only; it is unrelated to the GGUF pin's revision.
 pub const TOKENIZER_REVISION: &str = "0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe";
-
-/// Files fetched into the install's `tokenizer/` subdirectory: the HF
-/// tokenizer, its config (chat template), and the generation defaults.
-pub const TOKENIZER_FILES: [&str; 3] = [
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "generation_config.json",
-];
-
-/// Install-relative subdirectory the tokenizer files land in.
-pub const TOKENIZER_SUBDIR: &str = "tokenizer";
-
-/// Hard per-file size cap: 64 MiB. The largest real file
-/// (`tokenizer.json`) is ~11 MB; anything past the cap is rejected before
-/// a byte is transferred, so a wrong URL or hostile server cannot drive an
-/// unbounded download.
-pub const MAX_TOKENIZER_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Fixed transfer chunk: files stream through one reusable buffer of at
 /// most this size (never a whole-file allocation).
@@ -115,6 +107,18 @@ pub enum TokenizerFetchError {
         .0.display()
     )]
     NotComplete(PathBuf),
+    /// The fetched files are durable and recorded in the manifest, but do
+    /// not load as the pinned model's tokenizer (e.g. a wrong
+    /// `--tokenizer-dir`). Re-running with a correct source overwrites
+    /// them.
+    #[error("fetched tokenizer in {} failed to load: {source}", dir.display())]
+    InvalidTokenizer {
+        /// Install directory holding the durable-but-invalid files.
+        dir: PathBuf,
+        /// The validation that failed in [`RvmpTokenizer::load`].
+        #[source]
+        source: TokenizerError,
+    },
 }
 
 /// Attach path context to an I/O error.
@@ -201,8 +205,9 @@ pub fn amend_manifest(
 
 /// The full guarded flow: refuse anything that is not a complete install
 /// ([`format::is_complete`]), fetch the tokenizer files, amend the
-/// manifest, self-verify. Idempotent: re-running overwrites the files and
-/// their manifest entries with freshly hashed copies.
+/// manifest, self-verify, then smoke-load the result. Idempotent:
+/// re-running overwrites the files and their manifest entries with freshly
+/// hashed copies.
 pub fn fetch_and_amend(
     dir: &Path,
     source: TokenizerSource,
@@ -212,6 +217,16 @@ pub fn fetch_and_amend(
     }
     let entries = fetch_tokenizer(dir, source)?;
     amend_manifest(dir, &entries)?;
+    // Semantic smoke check: the bytes hash-verified above must also *load*
+    // as the pinned model's tokenizer, so a wrong --tokenizer-dir fails at
+    // install time rather than at first run. The files are already durable
+    // and recorded; a re-run with a correct source overwrites them.
+    if let Err(source) = RvmpTokenizer::load(dir) {
+        return Err(TokenizerFetchError::InvalidTokenizer {
+            dir: dir.to_path_buf(),
+            source,
+        });
+    }
     Ok(entries)
 }
 
@@ -371,7 +386,9 @@ mod tests {
         manifest
     }
 
-    /// A local tokenizer source directory holding all three files.
+    /// A local tokenizer source directory holding all three files with
+    /// well-formed JSON but wrong content: fetching and hashing succeed,
+    /// the [`RvmpTokenizer::load`] smoke check does not.
     fn tokenizer_src(dir: &Path) -> PathBuf {
         let src = dir.join("tok-src");
         fs::create_dir_all(&src).unwrap();
@@ -389,12 +406,32 @@ mod tests {
         src
     }
 
+    /// The real pinned tokenizer files, vendored in-repo as core's test
+    /// fixtures. Referenced by relative path from this crate's manifest
+    /// dir; read-only.
+    fn real_fixture_src() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/src/tokenizer/fixtures/tokenizer")
+    }
+
+    /// A writable copy of the real fixture tokenizer files, for tests that
+    /// mutate the source between runs.
+    fn writable_real_src(dir: &Path) -> PathBuf {
+        let src = dir.join("tok-src-real");
+        fs::create_dir_all(&src).unwrap();
+        for name in TOKENIZER_FILES {
+            fs::copy(real_fixture_src().join(name), src.join(name)).unwrap();
+        }
+        src
+    }
+
     #[test]
     fn local_dir_fetch_amends_manifest_and_verifies() {
+        // Happy path with the REAL vendored tokenizer files, so the
+        // post-amend RvmpTokenizer::load smoke check passes too.
         let tmp = TempDir::new("local-fetch");
         let install = tmp.path().join("model.rvmp");
         let before = fake_install(&install);
-        let src = tokenizer_src(tmp.path());
+        let src = real_fixture_src();
 
         let entries = fetch_and_amend(&install, TokenizerSource::LocalDir(src.clone())).unwrap();
         assert_eq!(entries.len(), 3);
@@ -432,6 +469,35 @@ mod tests {
     }
 
     #[test]
+    fn wrong_content_fails_load_smoke_check() {
+        let tmp = TempDir::new("wrong-content");
+        let install = tmp.path().join("model.rvmp");
+        fake_install(&install);
+        let src = tokenizer_src(tmp.path());
+
+        let err = fetch_and_amend(&install, TokenizerSource::LocalDir(src)).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to load"),
+            "message should say the fetched tokenizer failed to load: {err}"
+        );
+        match err {
+            TokenizerFetchError::InvalidTokenizer { dir, source } => {
+                assert_eq!(dir, install);
+                // The failing validation is named via the source error.
+                assert!(matches!(source, TokenizerError::Backend { .. }));
+            }
+            other => panic!("expected InvalidTokenizer, got {other:?}"),
+        }
+        // The smoke check runs after the amend: the files and their
+        // manifest entries are durable, so a corrected re-run overwrites
+        // them in place.
+        assert!(install.join("tokenizer/tokenizer.json").exists());
+        let manifest = format::load_manifest(&install).unwrap();
+        assert!(manifest.files.contains_key("tokenizer/tokenizer.json"));
+        format::verify_files(&install, &manifest).unwrap();
+    }
+
+    #[test]
     fn refuses_incomplete_install() {
         let tmp = TempDir::new("incomplete");
         let src = tokenizer_src(tmp.path());
@@ -456,33 +522,39 @@ mod tests {
         let tmp = TempDir::new("rerun");
         let install = tmp.path().join("model.rvmp");
         let before = fake_install(&install);
-        let src = tokenizer_src(tmp.path());
+        // Writable copy of the real fixtures: both runs must pass the
+        // post-amend load smoke check.
+        let src = writable_real_src(tmp.path());
 
         let first = fetch_and_amend(&install, TokenizerSource::LocalDir(src.clone())).unwrap();
 
-        // Change one source file and re-run: same entry count, new hash.
-        fs::write(src.join("tokenizer.json"), br#"{"model":{"type":"WP"}}"#).unwrap();
+        // Change one source file (trailing newline: new bytes, still a
+        // valid config) and re-run: same entry count, new hash.
+        let gen_path = src.join("generation_config.json");
+        let mut gen_bytes = fs::read(&gen_path).unwrap();
+        gen_bytes.push(b'\n');
+        fs::write(&gen_path, gen_bytes).unwrap();
         let second = fetch_and_amend(&install, TokenizerSource::LocalDir(src.clone())).unwrap();
         assert_eq!(second.len(), 3);
         assert_ne!(
-            first["tokenizer/tokenizer.json"].sha256,
-            second["tokenizer/tokenizer.json"].sha256
+            first["tokenizer/generation_config.json"].sha256,
+            second["tokenizer/generation_config.json"].sha256
         );
         assert_eq!(
-            first["tokenizer/generation_config.json"],
-            second["tokenizer/generation_config.json"]
+            first["tokenizer/tokenizer.json"],
+            second["tokenizer/tokenizer.json"]
         );
 
         let manifest = format::load_manifest(&install).unwrap();
         assert_eq!(manifest.files.len(), before.files.len() + 3);
         assert_eq!(
-            manifest.files["tokenizer/tokenizer.json"],
-            second["tokenizer/tokenizer.json"]
+            manifest.files["tokenizer/generation_config.json"],
+            second["tokenizer/generation_config.json"]
         );
         format::verify_files(&install, &manifest).unwrap();
         assert_eq!(
-            fs::read(install.join("tokenizer/tokenizer.json")).unwrap(),
-            fs::read(src.join("tokenizer.json")).unwrap()
+            fs::read(install.join("tokenizer/generation_config.json")).unwrap(),
+            fs::read(&gen_path).unwrap()
         );
     }
 
@@ -520,7 +592,9 @@ mod tests {
         let tmp = TempDir::new("scoped-verify");
         let install = tmp.path().join("model.rvmp");
         fake_install(&install);
-        let src = tokenizer_src(tmp.path());
+        // Real fixtures so the load smoke check passes; it reads only the
+        // tokenizer files, never the model data files.
+        let src = real_fixture_src();
 
         // Corrupt common.bin (same size, different bytes): a full-manifest
         // verify would fail on its hash, so a successful amend proves the

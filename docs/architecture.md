@@ -243,7 +243,9 @@ softcap, and (if we adopt their quant source) a second quant scheme decision.
 
 - `ramvamp-server`: loopback OpenAI-compatible Chat Completions (streaming
   SSE, tool calls parsed from Qwen's native `<tool_call>` tokens). This is
-  the integration path for OpenCode and anything OpenAI-speaking.
+  the integration path for OpenCode and anything OpenAI-speaking. Must add
+  special-token sanitization for untrusted content (recorded decision:
+  `encode_chat` is reference-faithful).
 - KV prefix caching (prefill the system prompt once, reuse across turns);
   prerequisite for agentic clients whose prompts dominate the context.
 - Larger context via Q8 KV + budget growth; unlocks the Thinking-2507
