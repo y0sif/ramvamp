@@ -3,18 +3,29 @@
 //! `inspect` parses a GGUF source — a local file or a Hugging Face repo
 //! over ranged HTTP (header only, never the data section) — builds the
 //! repack plan, and prints a human-readable report of what an install
-//! would look like.
+//! would look like. `install` executes the plan into a `.rvmp` directory
+//! (streaming, resumable, hash-verified); `verify-install` re-checks an
+//! installed directory; `discard-partial` deletes an abandoned staging
+//! directory.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+use ramvamp_core::format;
 use ramvamp_repack::gguf::GgufFile;
+use ramvamp_repack::install::{self, InstallOptions, SourcePin};
 use ramvamp_repack::plan::RepackPlan;
 use ramvamp_repack::source::{LocalFile, RangeRead, RemoteFile};
+
+/// Frozen v0 model pin (docs/architecture.md "Model pin", audited
+/// 2026-08-01): the exact revision `install` defaults to.
+const PIN_REPO: &str = "bartowski/Qwen_Qwen3-30B-A3B-Instruct-2507-GGUF";
+const PIN_REVISION: &str = "6c6e8692f43e4ca663f7ece8229a1361090d3a4c";
+const PIN_FILE: &str = "Qwen_Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf";
 
 /// Tensor types the audited Q4_K_M qwen3moe pin contains (see
 /// docs/architecture.md, audited 2026-08-01); anything else is flagged in
@@ -36,6 +47,12 @@ struct Cli {
 enum Command {
     /// Parse a GGUF header, build the repack plan, and print a report.
     Inspect(InspectArgs),
+    /// Stream a GGUF source into an installed .rvmp directory.
+    Install(InstallArgs),
+    /// Re-verify an installed .rvmp directory (sizes, hashes, layout).
+    VerifyInstall(VerifyInstallArgs),
+    /// Delete the .partial staging directory of an interrupted install.
+    DiscardPartial(DiscardPartialArgs),
 }
 
 #[derive(Args)]
@@ -60,6 +77,57 @@ struct InspectArgs {
     file: String,
 }
 
+#[derive(Args)]
+struct InstallArgs {
+    /// Destination install directory, e.g. /models/qwen3.rvmp.
+    #[arg(long, value_name = "DIR")]
+    output: PathBuf,
+    /// Install from a local GGUF file instead of the Hugging Face pin.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["repo", "revision", "file"]
+    )]
+    local: Option<PathBuf>,
+    /// Hugging Face repo (defaults to the frozen v0 pin).
+    #[arg(long, default_value = PIN_REPO)]
+    repo: String,
+    /// Repo revision: commit hash of the frozen pin by default.
+    #[arg(long, default_value = PIN_REVISION)]
+    revision: String,
+    /// File name within the repo.
+    #[arg(long, default_value = PIN_FILE)]
+    file: String,
+    /// Transfer window size in MiB (one HTTP range request per window).
+    #[arg(long, value_name = "N", default_value_t = 32,
+          value_parser = clap::value_parser!(u64).range(1..=1024))]
+    window_mib: u64,
+    /// Continue a matching interrupted install from its last durable
+    /// window.
+    #[arg(long, conflicts_with = "overwrite")]
+    resume: bool,
+    /// Replace an existing install or partial install from scratch.
+    #[arg(long)]
+    overwrite: bool,
+    /// Skip the post-promotion hash self-check.
+    #[arg(long)]
+    skip_verify: bool,
+}
+
+#[derive(Args)]
+struct VerifyInstallArgs {
+    /// Installed .rvmp directory to verify.
+    #[arg(long, value_name = "DIR")]
+    input: PathBuf,
+}
+
+#[derive(Args)]
+struct DiscardPartialArgs {
+    /// Install target whose .partial staging directory should be deleted.
+    #[arg(long, value_name = "DIR")]
+    output: PathBuf,
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -68,7 +136,158 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Inspect(args) => inspect(&args),
+        Command::Install(args) => install_cmd(&args),
+        Command::VerifyInstall(args) => verify_install_cmd(&args),
+        Command::DiscardPartial(args) => discard_partial_cmd(&args),
     }
+}
+
+/// Open the install source and derive its pin (identity + manifest
+/// `source` fields).
+fn open_install_source(args: &InstallArgs) -> anyhow::Result<(Box<dyn RangeRead>, SourcePin)> {
+    match &args.local {
+        Some(path) => {
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            let file = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "local.gguf".to_owned());
+            let source = LocalFile::open(path)
+                .with_context(|| format!("open local file {}", path.display()))?;
+            Ok((
+                Box::new(source),
+                SourcePin {
+                    url: canonical.display().to_string(),
+                    hf_repo: "(local)".to_owned(),
+                    revision: "(local)".to_owned(),
+                    file,
+                },
+            ))
+        }
+        None => {
+            let url = format!(
+                "https://huggingface.co/{}/resolve/{}/{}",
+                args.repo, args.revision, args.file
+            );
+            let source = RemoteFile::open(&url).with_context(|| format!("open remote {url}"))?;
+            Ok((
+                Box::new(source),
+                SourcePin {
+                    url,
+                    hf_repo: args.repo.clone(),
+                    revision: args.revision.clone(),
+                    file: args.file.clone(),
+                },
+            ))
+        }
+    }
+}
+
+fn install_cmd(args: &InstallArgs) -> anyhow::Result<()> {
+    let (source, pin) = open_install_source(args)?;
+    println!("source: {}", pin.url);
+    println!("source size: {}", human_bytes(source.len()));
+
+    let gguf = GgufFile::parse(source.as_ref()).context("parse GGUF header")?;
+    let plan = RepackPlan::from_gguf(&gguf).context("build repack plan")?;
+    println!(
+        "plan: {} layers, {} experts, {} copy ops",
+        plan.arch.n_layers,
+        plan.arch.n_experts,
+        plan.copy_ops.len()
+    );
+    println!(
+        "download (tensor bytes): {}",
+        human_bytes(plan.totals.download_bytes)
+    );
+    println!(
+        "installed (data files):  {}",
+        human_bytes(plan.totals.installed_bytes)
+    );
+    println!(
+        "window: {} MiB   target: {}",
+        args.window_mib,
+        args.output.display()
+    );
+
+    let opts = InstallOptions {
+        window_bytes: args.window_mib * 1024 * 1024,
+        resume: args.resume,
+        overwrite: args.overwrite,
+        skip_verify: args.skip_verify,
+        ..InstallOptions::default()
+    };
+    let report = install::install(source.as_ref(), &plan, &pin, &args.output, &opts)
+        .context("install failed")?;
+
+    println!();
+    println!("installed: {}", report.final_dir.display());
+    if report.windows_resumed > 0 {
+        println!(
+            "windows: {} total, {} resumed from a previous run",
+            report.windows_total, report.windows_resumed
+        );
+    } else {
+        println!("windows: {}", report.windows_total);
+    }
+    println!(
+        "bytes copied this run: {}",
+        human_bytes(report.bytes_copied)
+    );
+    println!(
+        "source sha256 (digest-of-digests over {} windows): {}",
+        report.windows_total, report.source_sha256
+    );
+    println!(
+        "note: source.sha256 is a per-window digest-of-digests, not the plain \
+         file hash (see the install module docs)"
+    );
+    println!(
+        "self-check: {}",
+        if report.verified {
+            "PASS"
+        } else {
+            "skipped (--skip-verify)"
+        }
+    );
+    Ok(())
+}
+
+fn verify_install_cmd(args: &VerifyInstallArgs) -> anyhow::Result<()> {
+    match check_install(&args.input) {
+        Ok((files, bytes)) => {
+            println!(
+                "PASS: {} ({files} files, {} verified)",
+                args.input.display(),
+                human_bytes(bytes)
+            );
+            Ok(())
+        }
+        Err(e) => {
+            println!("FAIL: {}: {e:#}", args.input.display());
+            bail!("verification failed");
+        }
+    }
+}
+
+/// Manifest validation, per-file size+hash verification, and layout
+/// cross-check. Returns (file count, verified bytes).
+fn check_install(dir: &Path) -> anyhow::Result<(usize, u64)> {
+    let manifest = format::load_manifest(dir).context("load manifest.json")?;
+    manifest.validate().context("validate manifest")?;
+    let layout = format::load_layout(dir).context("load experts/layout.json")?;
+    layout
+        .validate_against(&manifest)
+        .context("cross-check layout against manifest")?;
+    format::verify_files(dir, &manifest).context("verify file hashes")?;
+    let bytes = manifest.files.values().map(|f| f.size).sum();
+    Ok((manifest.files.len(), bytes))
+}
+
+fn discard_partial_cmd(args: &DiscardPartialArgs) -> anyhow::Result<()> {
+    let removed = install::discard_partial(&args.output).context("discard partial install")?;
+    println!("removed: {}", removed.display());
+    Ok(())
 }
 
 fn inspect(args: &InspectArgs) -> anyhow::Result<()> {

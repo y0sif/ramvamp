@@ -8,5 +8,6 @@
 //! validates.
 
 pub mod gguf;
+pub mod install;
 pub mod plan;
 pub mod source;
