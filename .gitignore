@@ -1,0 +1,16 @@
+# Rust
+/target/
+
+# Installed models (multi-GB; never committed)
+/models/
+*.rvmp/
+
+# Benchmark and experiment outputs
+/scratch/
+
+# Environment
+.env
+
+# Editors / OS
+*.swp
+.DS_Store

@@ -1,0 +1,24 @@
+[package]
+name = "ramvamp-core"
+description = "Runtime for streaming fine-grained MoE experts from NVMe: packed format, io_uring reads, LFU expert cache, CPU kernels, KV cache, generation loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["io-uring"]
+# io_uring + O_DIRECT expert streaming (Linux). Disable for the portable
+# pread fallback used by tests and non-Linux development.
+io-uring = ["dep:io-uring"]
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+memmap2 = { workspace = true }
+io-uring = { workspace = true, optional = true }

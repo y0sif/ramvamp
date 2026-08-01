@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/repack", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/y0sif/ramvamp"
+authors = ["y0sif"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal
+ramvamp-core = { path = "crates/core" }
+ramvamp-repack = { path = "crates/repack" }
+
+# Errors and logging
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization and integrity
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+# Model I/O
+memmap2 = "0.9"
+io-uring = "0.7"
+safetensors = "0.6"
+tokenizers = "0.21"
+
+# Repacker HTTP (ranged downloads; rustls, no OpenSSL)
+ureq = { version = "3", features = ["rustls"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Fast-ish debug builds for kernel iteration
+[profile.dev]
+opt-level = 1
+
+[profile.bench]
+debug = true

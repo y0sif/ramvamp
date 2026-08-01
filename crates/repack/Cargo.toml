@@ -1,0 +1,25 @@
+[package]
+name = "ramvamp-repack"
+description = "Streaming model installer: ranged Hugging Face downloads repacked directly into the ramvamp packed-expert layout, hash-verified and resumable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ramvamp-repack"
+path = "src/main.rs"
+
+[dependencies]
+ramvamp-core = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+safetensors = { workspace = true }
+ureq = { workspace = true }
+clap = { workspace = true }

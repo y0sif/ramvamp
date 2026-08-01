@@ -1,0 +1,21 @@
+[package]
+name = "ramvamp"
+description = "Run 26-30B fine-grained MoE models in about 2 GB of RAM by streaming experts from NVMe. No GPU required."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ramvamp"
+path = "src/main.rs"
+
+[dependencies]
+ramvamp-core = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokenizers = { workspace = true }
+clap = { workspace = true }
