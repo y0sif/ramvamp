@@ -532,9 +532,11 @@ const RECORD_LEN: u64 = 8 + 8 + 4 + 8 + MAX_STRING_LEN;
 /// A GGUF byte stream synthesized on read: a real header declaring
 /// `MAX_METADATA_KV` key-values, then an endless run of valid metadata
 /// records (unique 8-byte key, `MAX_STRING_LEN` string value). The declared
-/// length is ~100 GiB but the test materializes nothing; every field passes
-/// its own per-item check, so only the running header-region cap can stop
-/// the stream.
+/// length is ~100 GiB but the source materializes nothing; the parser's
+/// heap legitimately peaks at the cap (~256 MiB of retained strings) before
+/// `HeaderTooLarge` fires, since every field passes its own per-item check
+/// and only the running header-region cap can stop the stream. The test
+/// therefore needs ~300 MB of headroom.
 struct EndlessMetadataSource;
 
 impl EndlessMetadataSource {
