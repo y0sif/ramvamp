@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{InstallError, hex, io_err};
+use super::{InstallError, MAX_WINDOW_BYTES, hex, io_err};
 use crate::plan::CopyOp;
 
 /// Name of the resume-state file inside the partial directory.
@@ -35,6 +35,13 @@ const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 /// durable_windows`, and every window below `durable_windows` has been
 /// written to its destination files *and* fsync'd before the state file
 /// recording it was itself durably written.
+///
+/// Identity-check caveat: the identity is URL + source length + plan
+/// fingerprint. For a source addressed by a mutable revision (e.g.
+/// `--revision main`) all three can theoretically survive a same-size
+/// re-upload of the file, letting a resume splice windows from two
+/// different uploads. The default install pins an immutable commit hash,
+/// which is immune.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallState {
@@ -118,6 +125,15 @@ pub(crate) fn load_state(partial: &Path) -> Result<InstallState, InstallError> {
         return Err(InstallError::StateMismatch(
             "window_bytes is zero".to_owned(),
         ));
+    }
+    // Same 1 GiB ceiling the CLI enforces for fresh installs; the value
+    // sizes the scratch buffer, so a hostile state file must not be able
+    // to demand an unbounded allocation.
+    if state.window_bytes > MAX_WINDOW_BYTES {
+        return Err(InstallError::StateMismatch(format!(
+            "window_bytes {} exceeds the {MAX_WINDOW_BYTES}-byte cap",
+            state.window_bytes
+        )));
     }
     if state.window_digests.len() as u64 != state.durable_windows {
         return Err(InstallError::StateMismatch(format!(

@@ -424,6 +424,165 @@ fn lock_blocks_concurrent_install_and_stale_locks_break() {
     assert!(format::is_complete(&dir2));
 }
 
+/// A `RangeRead` over a slice that starts failing every read after the
+/// first `allowed_reads`, for exercising the window-transfer error path.
+struct FailingSource<'a> {
+    data: &'a [u8],
+    allowed_reads: u64,
+    reads: AtomicU64,
+}
+
+impl RangeRead for FailingSource<'_> {
+    fn len(&self) -> u64 {
+        self.data.len() as u64
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), SourceError> {
+        if self.reads.fetch_add(1, Ordering::Relaxed) >= self.allowed_reads {
+            return Err(SourceError::ShortRead {
+                offset,
+                wanted: buf.len(),
+            });
+        }
+        RangeRead::read_at(&self.data, offset, buf)
+    }
+}
+
+#[test]
+fn failing_source_reports_resume_hint_and_resumes() {
+    let tmp = TempDir::new("failing-source");
+    let bytes = fixture_bytes();
+    let slice: &[u8] = &bytes;
+    let (_, plan) = plan_for(&bytes);
+    let final_dir = tmp.path().join("model.rvmp");
+
+    // Windows 0..3 transfer; window 3's read fails like a dead link.
+    let failing = FailingSource {
+        data: slice,
+        allowed_reads: 3,
+        reads: AtomicU64::new(0),
+    };
+    let err = install(
+        &failing,
+        &plan,
+        &pin("mem://tiny"),
+        &final_dir,
+        &opts(4096, 1),
+    )
+    .unwrap_err();
+    match &err {
+        InstallError::SourceRead { window, .. } => assert_eq!(*window, 3),
+        other => panic!("expected SourceRead, got {other:?}"),
+    }
+    assert!(
+        err.to_string().contains("--resume"),
+        "error must tell the user progress is durable and to --resume: {err}"
+    );
+
+    // The hint is honest: progress was durable and a resume completes.
+    let partial = format::partial_dir(&final_dir);
+    assert_eq!(load_state(&partial).unwrap().durable_windows, 3);
+    let mut resuming = opts(4096, 1);
+    resuming.resume = true;
+    let report = install(&slice, &plan, &pin("mem://tiny"), &final_dir, &resuming).unwrap();
+    assert_eq!(report.windows_resumed, 3);
+    assert!(report.verified);
+    assert!(format::is_complete(&final_dir));
+}
+
+#[test]
+fn resume_rejects_oversized_state_window_bytes() {
+    let tmp = TempDir::new("hostile-window");
+    let bytes = fixture_bytes();
+    let slice: &[u8] = &bytes;
+    let (_, plan) = plan_for(&bytes);
+    let final_dir = tmp.path().join("model.rvmp");
+
+    let mut aborting = opts(4096, 1);
+    aborting.fail_after_windows = Some(2);
+    install(&slice, &plan, &pin("mem://tiny"), &final_dir, &aborting).unwrap_err();
+    let partial = format::partial_dir(&final_dir);
+
+    // A hostile window_bytes would size the scratch buffer; the load
+    // must reject anything past the CLI's 1 GiB ceiling.
+    let mut st = load_state(&partial).unwrap();
+    st.window_bytes = MAX_WINDOW_BYTES + 1;
+    write_state(&partial, &st).unwrap();
+    let mut resuming = opts(4096, 1);
+    resuming.resume = true;
+    let err = install(&slice, &plan, &pin("mem://tiny"), &final_dir, &resuming).unwrap_err();
+    match &err {
+        InstallError::StateMismatch(msg) => {
+            assert!(msg.contains("cap"), "unexpected message: {msg}");
+        }
+        other => panic!("expected StateMismatch, got {other:?}"),
+    }
+
+    // The exact cap is still accepted by the loader's bound check (it
+    // fails later on identity instead).
+    st.window_bytes = MAX_WINDOW_BYTES;
+    write_state(&partial, &st).unwrap();
+    let err = install(&slice, &plan, &pin("mem://tiny"), &final_dir, &resuming).unwrap_err();
+    match &err {
+        InstallError::StateMismatch(msg) => {
+            assert!(!msg.contains("cap"), "cap must not reject the bound: {msg}");
+        }
+        other => panic!("expected StateMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_ops_rejects_destination_overlap() {
+    let mut sizes = std::collections::BTreeMap::new();
+    sizes.insert("common.bin".to_owned(), 4096u64);
+    sizes.insert("experts/layer_000.bin".to_owned(), 4096u64);
+
+    // Disjoint source ranges, overlapping destination spans in one file.
+    let overlapping = vec![
+        crate::plan::CopyOp {
+            src: 0..100,
+            dst_file: "common.bin".to_owned(),
+            dst_offset: 0,
+        },
+        crate::plan::CopyOp {
+            src: 100..200,
+            dst_file: "common.bin".to_owned(),
+            dst_offset: 50,
+        },
+    ];
+    let err = validate_ops(&overlapping, 4096, &sizes).unwrap_err();
+    match &err {
+        InstallError::BadPlan(msg) => {
+            assert!(
+                msg.contains("overlapping destination"),
+                "unexpected message: {msg}"
+            );
+        }
+        other => panic!("expected BadPlan, got {other:?}"),
+    }
+
+    // Same offsets in *different* files are fine, as are touching
+    // (non-overlapping) spans in the same file.
+    let disjoint = vec![
+        crate::plan::CopyOp {
+            src: 0..100,
+            dst_file: "common.bin".to_owned(),
+            dst_offset: 0,
+        },
+        crate::plan::CopyOp {
+            src: 100..200,
+            dst_file: "experts/layer_000.bin".to_owned(),
+            dst_offset: 0,
+        },
+        crate::plan::CopyOp {
+            src: 200..300,
+            dst_file: "common.bin".to_owned(),
+            dst_offset: 100,
+        },
+    ];
+    validate_ops(&disjoint, 4096, &sizes).unwrap();
+}
+
 #[test]
 fn resume_rejects_identity_mismatches() {
     let tmp = TempDir::new("mismatch");

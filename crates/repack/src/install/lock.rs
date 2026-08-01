@@ -6,8 +6,11 @@
 //! containing the holder's pid, removed on drop. A leftover lock whose pid
 //! no longer exists in `/proc` is stale and gets broken. Limitations
 //! accepted for an advisory single-machine lock: a recycled pid can make a
-//! stale lock look live, and breaking a stale lock races other breakers
-//! (bounded retries; `create_new` guarantees a single winner).
+//! stale lock look live, and stale-breaking is best-effort — a breaker
+//! that read a dead pid can remove a *fresh* live lock created between
+//! its pid check and its unlink, briefly letting two installs proceed.
+//! `create_new` arbitrates each individual create attempt, but the
+//! check-then-unlink break sequence itself is not atomic.
 
 use std::fs;
 use std::io;
@@ -80,7 +83,9 @@ impl InstallLock {
                         }
                         other => {
                             // Stale (dead pid) or unreadable/garbage lock:
-                            // break it and retry create_new.
+                            // break it and retry create_new. Accepted race
+                            // (see the module docs): this unlink can remove
+                            // a fresh live lock created since the pid read.
                             last_pid = other.unwrap_or(0);
                             tracing::warn!(
                                 lock = %path.display(),

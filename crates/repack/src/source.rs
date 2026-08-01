@@ -185,9 +185,23 @@ impl RangeRead for &[u8] {
 /// User-Agent sent with every remote request.
 const HTTP_USER_AGENT: &str = "ramvamp-repack/0.1";
 /// Attempts per range request: one initial try plus retries.
-const HTTP_ATTEMPTS: u32 = 3;
-/// Backoff before the first retry; doubles per subsequent retry.
-const HTTP_BACKOFF: Duration = Duration::from_millis(500);
+const HTTP_ATTEMPTS: u32 = 5;
+/// Backoff before the first retry; doubles per subsequent retry. With
+/// [`HTTP_ATTEMPTS`] = 5 the sleeps are 1+2+4+8 s, so a read tolerates
+/// roughly 15 s of accumulated outage before giving up.
+const HTTP_BACKOFF: Duration = Duration::from_secs(1);
+/// Max duration for establishing a connection (socket + TLS handshake).
+/// A healthy CDN connects in well under a second; 15 s absorbs slow DNS
+/// or congested links without hanging forever on a dead host.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Max duration for the response headers to arrive once the request is
+/// sent. Header turnaround is size-independent, so 60 s is generous.
+const HTTP_RECV_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Max duration for receiving one response body. Bodies are at most one
+/// transfer window (32 MiB by default, 1 GiB cap), so 600 s still admits
+/// a slow-but-live ~56 KiB/s link on the default window while cutting a
+/// stalled connection instead of blocking `read_exact` indefinitely.
+const HTTP_RECV_BODY_TIMEOUT: Duration = Duration::from_secs(600);
 /// Redirect hops followed when resolving a URL. Hugging Face `resolve`
 /// URLs 302 once to a CDN; a few extra hops are tolerated.
 const MAX_REDIRECT_HOPS: usize = 5;
@@ -235,6 +249,13 @@ impl RemoteFile {
             // With 0, ureq returns redirect responses as-is (never errors),
             // letting `ranged_get` follow them with Range intact.
             .max_redirects(0)
+            // ureq 3.x defaults every timeout to None, so a stalled
+            // connection would hang `read_exact` forever without these.
+            // Per-phase timeouts only: a global or per-call deadline
+            // would also kill legitimately slow window-sized reads.
+            .timeout_connect(Some(HTTP_CONNECT_TIMEOUT))
+            .timeout_recv_response(Some(HTTP_RECV_RESPONSE_TIMEOUT))
+            .timeout_recv_body(Some(HTTP_RECV_BODY_TIMEOUT))
             .user_agent(HTTP_USER_AGENT)
             .build();
         let agent = ureq::Agent::new_with_config(config);

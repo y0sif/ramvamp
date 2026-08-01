@@ -129,8 +129,13 @@ struct DiscardPartialArgs {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Honor RUST_LOG when set, but default to `info` so progress lines
+    // are visible (`from_default_env` alone would default to ERROR and
+    // suppress them).
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();

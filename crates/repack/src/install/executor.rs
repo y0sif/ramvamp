@@ -272,7 +272,11 @@ impl Executor<'_> {
             let range = self.geom.range(k);
             let window_len = (range.end - range.start) as usize;
             let window = &mut buf[..window_len];
-            self.source.read_at(range.start, window)?;
+            // Wrap transfer failures with the resume hint: everything up
+            // to the last checkpoint is already durable on disk.
+            self.source
+                .read_at(range.start, window)
+                .map_err(|source| InstallError::SourceRead { window: k, source })?;
 
             let mut hasher = Sha256::new();
             for_each_overlap(self.ops, &range, |op, overlap_start, overlap_end| {

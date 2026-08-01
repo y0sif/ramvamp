@@ -58,6 +58,12 @@ use lock::InstallLock;
 /// Default transfer window: 32 MiB of source per range request.
 pub const DEFAULT_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Largest accepted transfer window: 1 GiB, the same ceiling the CLI's
+/// `--window-mib 1..=1024` enforces for fresh installs. Also applied to
+/// `window_bytes` loaded from a resume state file, so a hostile state
+/// file cannot drive an unbounded scratch allocation.
+pub const MAX_WINDOW_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Default checkpoint batch: fsync destinations and advance the durable
 /// state every this many windows.
 pub const DEFAULT_FSYNC_EVERY_WINDOWS: u64 = 8;
@@ -71,6 +77,21 @@ pub enum InstallError {
     /// Error reading the source.
     #[error(transparent)]
     Source(#[from] SourceError),
+    /// A window transfer from the source failed (after the source layer's
+    /// own retries). Progress up to the last checkpoint is durable, so the
+    /// hint mirrors [`InstallError::NoSpace`]: resume, don't restart.
+    #[error(
+        "source read failed at window {window}; downloaded progress up to \
+         the last checkpoint is saved — re-run with --resume to continue \
+         from there"
+    )]
+    SourceRead {
+        /// Index of the window whose transfer failed.
+        window: u64,
+        /// Underlying source error.
+        #[source]
+        source: SourceError,
+    },
     /// A filesystem operation failed.
     #[error("{}: {source}", path.display())]
     Io {
@@ -250,6 +271,12 @@ pub fn install(
     if opts.window_bytes == 0 {
         return Err(InstallError::BadOptions("window size is zero".to_owned()));
     }
+    if opts.window_bytes > MAX_WINDOW_BYTES {
+        return Err(InstallError::BadOptions(format!(
+            "window size {} exceeds the {MAX_WINDOW_BYTES}-byte cap",
+            opts.window_bytes
+        )));
+    }
     if opts.fsync_every_windows == 0 {
         return Err(InstallError::BadOptions(
             "fsync batch size is zero".to_owned(),
@@ -367,7 +394,8 @@ fn dest_sizes(plan: &RepackPlan) -> BTreeMap<String, u64> {
 
 /// Validate a sorted copy map against the source length and the planned
 /// destination sizes: non-empty ops, disjoint ascending source ranges,
-/// and every destination span inside its planned file.
+/// every destination span inside its planned file, and destination spans
+/// disjoint within each file.
 fn validate_ops(
     ops: &[CopyOp],
     source_len: u64,
@@ -408,6 +436,29 @@ fn validate_ops(
                 "op writes to {} past planned size {size} of {:?}",
                 dst_end, op.dst_file
             )));
+        }
+    }
+    // Destination disjointness: within each file, no two ops may write
+    // overlapping spans. A planner bug that double-writes a destination
+    // range would otherwise only surface later as a baffling
+    // WindowDigestMismatch "corruption" on resume.
+    let mut dst_spans: BTreeMap<&str, Vec<(u64, u64)>> = BTreeMap::new();
+    for op in ops {
+        // dst_offset + len cannot overflow: checked above.
+        dst_spans
+            .entry(op.dst_file.as_str())
+            .or_default()
+            .push((op.dst_offset, op.dst_offset + op.len()));
+    }
+    for (file, spans) in &mut dst_spans {
+        spans.sort_unstable();
+        for pair in spans.windows(2) {
+            if pair[1].0 < pair[0].1 {
+                return Err(InstallError::BadPlan(format!(
+                    "overlapping destination spans in {file:?} near offset {}",
+                    pair[1].0
+                )));
+            }
         }
     }
     Ok(())
