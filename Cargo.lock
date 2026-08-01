@@ -778,8 +778,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ramvamp-core",
- "tokenizers",
- "tracing",
+ "serde_json",
  "tracing-subscriber",
 ]
 
@@ -793,6 +792,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "tokenizers",
  "tracing",
 ]
 

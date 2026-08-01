@@ -15,7 +15,6 @@ path = "src/main.rs"
 [dependencies]
 ramvamp-core = { workspace = true }
 anyhow = { workspace = true }
-tracing = { workspace = true }
+serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
-tokenizers = { workspace = true }
 clap = { workspace = true }
