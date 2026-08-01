@@ -16,9 +16,10 @@ use ramvamp_repack::gguf::GgufFile;
 use ramvamp_repack::plan::RepackPlan;
 use ramvamp_repack::source::{LocalFile, RangeRead, RemoteFile};
 
-/// Tensor types a Q4_K_M-family qwen3moe source is expected to contain;
-/// anything else is flagged in the report.
-const EXPECTED_TYPES: &[&str] = &["q4_k", "q6_k", "f32"];
+/// Tensor types the audited Q4_K_M qwen3moe pin contains (see
+/// docs/architecture.md, audited 2026-08-01); anything else is flagged in
+/// the report.
+const EXPECTED_TYPES: &[&str] = &["q4_k", "q5_k", "q6_k", "q8_0", "f32"];
 
 #[derive(Parser)]
 #[command(
@@ -124,7 +125,9 @@ fn print_report(gguf: &GgufFile, plan: &RepackPlan) {
     );
     println!(
         "rope_theta: {}   rms_eps: {}   context_length: {}",
-        a.rope_theta, a.rms_eps, plan.context_length
+        a.rope_theta,
+        a.rms_eps,
+        plan.context_length()
     );
     println!(
         "norm_topk_prob: {}   tie_embeddings: {}",

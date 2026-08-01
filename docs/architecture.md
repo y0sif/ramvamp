@@ -23,9 +23,13 @@ read, `max_hw_sectors_kb=128`).
 ## Model pin (v0)
 
 `Qwen/Qwen3-30B-A3B-Instruct-2507`, consumed via a community GGUF Q4_K_M
-(bartowski or Qwen official; NOT unsloth UD variants, which use nonstandard
-per-layer types). The exact file revision and its per-tensor type map are
-frozen in the repacker after a `gguf_dump` audit; the manifest records both.
+(NOT unsloth UD variants, which use nonstandard per-layer types). Frozen
+pin, audited 2026-08-01: repo
+`bartowski/Qwen_Qwen3-30B-A3B-Instruct-2507-GGUF`, revision
+`6c6e8692f43e4ca663f7ece8229a1361090d3a4c`, file
+`Qwen_Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf`, size 18,632,183,808 B
+(17.35 GiB), install size 18,626,213,888 B. The manifest records the pin
+and the audited per-tensor type map.
 
 Verified architecture facts the runtime may rely on:
 
@@ -53,9 +57,16 @@ bring-up format; Q4_K_M is the shipping target.
 Consequences accepted:
 
 - Two expert dot kernels: Q4_K (144 B / 256 weights) and Q6_K (210 B / 256
-  weights). In a standard Q4_K_M file, `ffn_down_exps` is Q6_K on 24 of 48
-  layers (layers 0-5, 42-47, every 3rd in between); gate/up are Q4_K
-  everywhere. Router and norms are F32; lm_head is Q6_K.
+  weights). Audited per-tensor types (facts, 2026-08-01, bartowski file at
+  commit `6c6e8692f43e4ca663f7ece8229a1361090d3a4c`): `ffn_down_exps` is
+  Q6_K on 24 of 48 layers (0-5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38,
+  41-47); gate/up are Q4_K everywhere. In the common weights, `attn_k` is
+  Q8_0 (all 48 layers), `attn_output` is Q5_K (all 48), `attn_v` is Q6_K on
+  exactly the Q6_K-down layers and Q4_K elsewhere; `token_embd` is Q4_K,
+  `output.weight` (lm_head) is Q6_K, router and norms are F32. Consequence:
+  the expert-streaming kernels stay Q4_K+Q6_K, but the resident
+  common-weight matmuls need Q4_K, Q5_K, Q6_K, and Q8_0 dequant paths (all
+  with candle AVX2 references).
 - Activations quantize to Q8_K per 256-block with per-32 `bsums`, mirroring
   ggml's `vec_dot_q4_K_q8_K` structure. Candle's Rust AVX2 k-quant ports
   (MIT/Apache-2.0) are the reference implementation to crib from.
@@ -91,9 +102,10 @@ Q6_K down have a larger stride (~2.92 MiB) than pure-Q4_K layers
               "sha256": "..." },
   "arch": { "n_layers": 48, "n_experts": 128, "top_k": 8, "hidden": 2048,
             "moe_intermediate": 768, "n_heads": 32, "n_kv_heads": 4,
-            "head_dim": 128, "vocab": 151936, "rope_theta": 1e7,
-            "rms_eps": 1e-6, "norm_topk_prob": true, "tie_embeddings": false,
-            "shared_expert": false, "sliding_window": null },
+            "head_dim": 128, "vocab": 151936, "context_length": 262144,
+            "rope_theta": 1e7, "rms_eps": 1e-6, "norm_topk_prob": true,
+            "tie_embeddings": false, "shared_expert": false,
+            "sliding_window": null },
   "quant": { "scheme": "gguf", "tensor_types": { "...": "q4_k" } },
   "files": { "common.bin": { "size": 0, "sha256": "..." },
              "experts/layer_00.bin": { "size": 0, "sha256": "..." } }
@@ -114,7 +126,7 @@ models: Qwen3 (48 layers) gets 10 slots/layer; Gemma 4 (30 layers) will get
 
 | Tenant | Qwen3 v0 | Notes |
 | --- | ---: | --- |
-| Common core (mmap, read-only) | ~1.0 GiB | touched every token, page cache keeps it resident; counts toward cgroup |
+| Common core (mmap, read-only) | 1,023.34 MiB (audited) | touched every token, page cache keeps it resident; counts toward cgroup |
 | KV cache FP16 | 384 MiB @ 4K | 96 KiB/token; linear append, 48 layers |
 | Expert slot pool | ~1.28 GiB | 10 slots x 48 layers, page-aligned, allocated once |
 | Scratch + program + tokenizer | ~150 MiB | fixed, reused per layer/chunk |
@@ -144,6 +156,10 @@ Budget escape hatches, in the experiment backlog and not in v0: Q8 KV
 - Portable fallback behind the `io-uring` feature flag: positioned reads on a
   small thread pool, buffered; for tests and non-Linux dev only, never for
   published numbers.
+- Install-time I/O note: the HF Xet CDN signs each download URL for one
+  exact byte range (any other range 403s), so the installer downloads in
+  large sequential windows demuxed to destination files rather than issuing
+  per-tensor requests.
 
 ## Thread topology (v0)
 
@@ -250,7 +266,8 @@ softcap, and (if we adopt their quant source) a second quant scheme decision.
 
 ## Deferred to implementation (not design-blocking)
 
-- `gguf_dump` audit of the pinned file; freeze `tensor_types` map in manifest
+- `gguf_dump` audit of the pinned file (done 2026-08-01, see "Model pin" and
+  "Source quantization"); the manifest writer freezes the `tensor_types` map
 - Exact Q8_K activation quantization scheme (mirror ggml's)
 - Chat template rendering: vendor the 2507 template, snapshot-test against
   `transformers` reference renders

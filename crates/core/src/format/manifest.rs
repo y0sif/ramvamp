@@ -80,6 +80,8 @@ pub struct ArchInfo {
     pub head_dim: u32,
     /// Vocabulary size.
     pub vocab: u32,
+    /// Trained context length in tokens (the runtime may cap lower).
+    pub context_length: u64,
     /// RoPE base frequency.
     pub rope_theta: f64,
     /// RMSNorm epsilon.
@@ -271,6 +273,9 @@ impl ArchInfo {
                 return err(format!("{field} must be nonzero"));
             }
         }
+        if self.context_length == 0 {
+            return err("context_length must be nonzero".to_owned());
+        }
         if self.n_heads % self.n_kv_heads != 0 {
             return err(format!(
                 "n_heads {} not divisible by n_kv_heads {} (GQA needs whole groups)",
@@ -340,9 +345,10 @@ mod tests {
                           "sha256": "{ZERO_SHA}" }},
               "arch": {{ "n_layers": 48, "n_experts": 128, "top_k": 8, "hidden": 2048,
                         "moe_intermediate": 768, "n_heads": 32, "n_kv_heads": 4,
-                        "head_dim": 128, "vocab": 151936, "rope_theta": 1e7,
-                        "rms_eps": 1e-6, "norm_topk_prob": true, "tie_embeddings": false,
-                        "shared_expert": false, "sliding_window": null }},
+                        "head_dim": 128, "vocab": 151936, "context_length": 262144,
+                        "rope_theta": 1e7, "rms_eps": 1e-6, "norm_topk_prob": true,
+                        "tie_embeddings": false, "shared_expert": false,
+                        "sliding_window": null }},
               "quant": {{ "scheme": "gguf", "tensor_types": {{ "ffn_down_exps": "q6_k" }} }},
               "common_tensors": {{ "token_embd.weight": {{ "offset": 0, "len": 1024,
                                                           "dtype": "q4_k" }} }},
@@ -351,6 +357,7 @@ mod tests {
         );
         let manifest: Manifest = serde_json::from_str(&json).unwrap();
         assert_eq!(manifest.arch.n_layers, 48);
+        assert_eq!(manifest.arch.context_length, 262144);
         assert_eq!(manifest.arch.sliding_window, None);
         assert_eq!(manifest.common_tensors["token_embd.weight"].len, 1024);
     }
@@ -400,6 +407,16 @@ mod tests {
             FormatError::InvalidArch(_)
         ));
         manifest.arch.n_layers = MAX_LAYERS + 1;
+        assert!(matches!(
+            manifest.validate().unwrap_err(),
+            FormatError::InvalidArch(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_context_length() {
+        let mut manifest = sample_manifest();
+        manifest.arch.context_length = 0;
         assert!(matches!(
             manifest.validate().unwrap_err(),
             FormatError::InvalidArch(_)

@@ -138,9 +138,6 @@ pub struct Totals {
 pub struct RepackPlan {
     /// Architecture facts for `manifest.json`.
     pub arch: ArchInfo,
-    /// Trained context length (`qwen3moe.context_length`); display only,
-    /// not part of [`ArchInfo`].
-    pub context_length: u64,
     /// Quantization map for `manifest.json`: every tensor name to its
     /// lowercase ggml type name, scheme `"gguf"`.
     pub quant: QuantInfo,
@@ -163,6 +160,11 @@ pub struct RepackPlan {
 }
 
 impl RepackPlan {
+    /// Trained context length (`qwen3moe.context_length`), from the arch.
+    pub fn context_length(&self) -> u64 {
+        self.arch.context_length
+    }
+
     /// Build the full repack plan from a parsed GGUF header.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, PlanError> {
         let arch_name = gguf
@@ -231,6 +233,7 @@ impl RepackPlan {
             n_kv_heads,
             head_dim,
             vocab,
+            context_length,
             rope_theta,
             rms_eps,
             // Not stored in GGUF metadata. Qwen3-MoE renormalizes the
@@ -399,7 +402,6 @@ impl RepackPlan {
 
         Ok(RepackPlan {
             arch,
-            context_length,
             quant: QuantInfo {
                 scheme: "gguf".to_owned(),
                 tensor_types,
@@ -688,7 +690,8 @@ mod tests {
         assert!(!a.tie_embeddings);
         assert!(!a.shared_expert);
         assert_eq!(a.sliding_window, None);
-        assert_eq!(plan.context_length, 4096);
+        assert_eq!(a.context_length, 4096);
+        assert_eq!(plan.context_length(), 4096);
         assert_eq!(plan.quant.scheme, "gguf");
     }
 

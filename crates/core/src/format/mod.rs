@@ -178,6 +178,7 @@ pub(crate) mod testutil {
                 n_kv_heads: 2,
                 head_dim: 8,
                 vocab: 512,
+                context_length: 4096,
                 rope_theta: 1e7,
                 rms_eps: 1e-6,
                 norm_topk_prob: true,
