@@ -223,6 +223,20 @@ only, x86-64 with AVX2 required. Gemma 4 26B-A4B is model #2 and brings:
 shared-expert overlap, SWA KV rings, per-layer attention-type mix, logit
 softcap, and (if we adopt their quant source) a second quant scheme decision.
 
+## Post-v0 direction (recorded 2026-08-01, not commitments)
+
+- `ramvamp-server`: loopback OpenAI-compatible Chat Completions (streaming
+  SSE, tool calls parsed from Qwen's native `<tool_call>` tokens). This is
+  the integration path for OpenCode and anything OpenAI-speaking.
+- KV prefix caching (prefill the system prompt once, reuse across turns);
+  prerequisite for agentic clients whose prompts dominate the context.
+- Larger context via Q8 KV + budget growth; unlocks the Thinking-2507
+  variant (same architecture, different pin + template + think-span
+  handling) for quality-over-latency users.
+- Anthropic Messages API schema as a second endpoint (Claude Code path;
+  until then, a translation proxy works).
+- Gemma 4 26B-A4B as model #2; Vulkan backend behind the kernel trait.
+
 ## Experiment backlog (numbered entries when run)
 
 - E-cores in compute pool for non-barrier expert GEMVs
