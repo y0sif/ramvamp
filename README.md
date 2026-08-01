@@ -1,13 +1,13 @@
 <h1 align="center">ramvamp</h1>
 
 <p align="center">
-  <strong>Run 26-30B MoE models in about 2 GB of RAM. No GPU required.</strong><br>
+  <strong>Run 26-30B MoE models in about 3 GB of RAM. No GPU required.</strong><br>
   A Rust runtime that streams experts from NVMe instead of holding them hostage in memory.
 </p>
 
 > **Status: pre-v0.** Nothing runs yet. This repository goes public when the
 > first honest benchmark exists: coherent Qwen3-30B-A3B chat at 3+ tok/s
-> inside a 2.5 GB cgroup, token-validated against llama.cpp.
+> inside a 3 GB cgroup, KL-validated against llama.cpp on identical weights.
 
 ramvamp runs fine-grained Mixture-of-Experts models, Qwen3-30B-A3B first and
 Gemma 4 26B-A4B next, without loading the full checkpoint into memory. The
