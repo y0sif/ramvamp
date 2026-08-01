@@ -4,9 +4,10 @@
 //! over ranged HTTP (header only, never the data section) — builds the
 //! repack plan, and prints a human-readable report of what an install
 //! would look like. `install` executes the plan into a `.rvmp` directory
-//! (streaming, resumable, hash-verified); `verify-install` re-checks an
-//! installed directory; `discard-partial` deletes an abandoned staging
-//! directory.
+//! (streaming, resumable, hash-verified) and then fetches the pinned
+//! tokenizer files into it; `fetch-tokenizer` amends an existing completed
+//! install with those files; `verify-install` re-checks an installed
+//! directory; `discard-partial` deletes an abandoned staging directory.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ use ramvamp_repack::gguf::GgufFile;
 use ramvamp_repack::install::{self, InstallOptions, SourcePin};
 use ramvamp_repack::plan::RepackPlan;
 use ramvamp_repack::source::{LocalFile, RangeRead, RemoteFile};
+use ramvamp_repack::tokenizer_fetch::{self, TokenizerSource};
 
 /// Frozen v0 model pin (docs/architecture.md "Model pin", audited
 /// 2026-08-01): the exact revision `install` defaults to.
@@ -49,6 +51,9 @@ enum Command {
     Inspect(InspectArgs),
     /// Stream a GGUF source into an installed .rvmp directory.
     Install(InstallArgs),
+    /// Fetch the pinned tokenizer files into an existing completed
+    /// install and record them in its manifest.
+    FetchTokenizer(FetchTokenizerArgs),
     /// Re-verify an installed .rvmp directory (sizes, hashes, layout).
     VerifyInstall(VerifyInstallArgs),
     /// Delete the .partial staging directory of an interrupted install.
@@ -112,6 +117,26 @@ struct InstallArgs {
     /// Skip the post-promotion hash self-check.
     #[arg(long)]
     skip_verify: bool,
+    /// Skip fetching the tokenizer files after the model install (add
+    /// them later with `fetch-tokenizer`).
+    #[arg(long)]
+    skip_tokenizer: bool,
+    /// Copy the tokenizer files from a local directory instead of
+    /// downloading the pinned tokenizer revision (offline installs).
+    #[arg(long, value_name = "PATH", conflicts_with = "skip_tokenizer")]
+    tokenizer_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct FetchTokenizerArgs {
+    /// Installed .rvmp directory to amend (must be a complete install;
+    /// partials are refused).
+    #[arg(long, value_name = "DIR")]
+    output: PathBuf,
+    /// Copy the tokenizer files from a local directory instead of
+    /// downloading the pinned tokenizer revision.
+    #[arg(long, value_name = "PATH")]
+    tokenizer_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -142,6 +167,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Inspect(args) => inspect(&args),
         Command::Install(args) => install_cmd(&args),
+        Command::FetchTokenizer(args) => fetch_tokenizer_cmd(&args),
         Command::VerifyInstall(args) => verify_install_cmd(&args),
         Command::DiscardPartial(args) => discard_partial_cmd(&args),
     }
@@ -254,6 +280,74 @@ fn install_cmd(args: &InstallArgs) -> anyhow::Result<()> {
         } else {
             "skipped (--skip-verify)"
         }
+    );
+
+    if args.skip_tokenizer {
+        println!(
+            "tokenizer: skipped (--skip-tokenizer); add it later with \
+             `ramvamp-repack fetch-tokenizer --output {}`",
+            report.final_dir.display()
+        );
+    } else {
+        fetch_tokenizer_into(&report.final_dir, args.tokenizer_dir.as_deref());
+    }
+    Ok(())
+}
+
+/// Fetch the tokenizer into a just-promoted install. Never fails the
+/// caller: the model install is already complete and durable, so a
+/// tokenizer failure only prints a warning pointing at the
+/// `fetch-tokenizer` subcommand.
+fn fetch_tokenizer_into(dir: &Path, tokenizer_dir: Option<&Path>) {
+    match tokenizer_fetch::fetch_and_amend(dir, tokenizer_source(tokenizer_dir)) {
+        Ok(entries) => {
+            println!(
+                "tokenizer: {} files recorded in the manifest",
+                entries.len()
+            );
+            for (name, entry) in &entries {
+                println!("  {name}: {}", human_bytes(entry.size));
+            }
+        }
+        Err(e) => {
+            let e = anyhow::Error::from(e);
+            eprintln!("warning: tokenizer fetch failed: {e:#}");
+            eprintln!(
+                "warning: the model install itself succeeded; run \
+                 `ramvamp-repack fetch-tokenizer --output {}` to add the \
+                 tokenizer later",
+                dir.display()
+            );
+        }
+    }
+}
+
+/// Map the optional `--tokenizer-dir` flag to a tokenizer source.
+fn tokenizer_source(dir: Option<&Path>) -> TokenizerSource {
+    match dir {
+        Some(path) => TokenizerSource::LocalDir(path.to_path_buf()),
+        None => TokenizerSource::Pinned,
+    }
+}
+
+fn fetch_tokenizer_cmd(args: &FetchTokenizerArgs) -> anyhow::Result<()> {
+    let entries = tokenizer_fetch::fetch_and_amend(
+        &args.output,
+        tokenizer_source(args.tokenizer_dir.as_deref()),
+    )
+    .context("fetch tokenizer")?;
+    for (name, entry) in &entries {
+        println!(
+            "{name}: {}  sha256 {}",
+            human_bytes(entry.size),
+            entry.sha256
+        );
+    }
+    println!(
+        "amended: {} ({} tokenizer entries verified; run verify-install \
+         for a full re-check)",
+        args.output.display(),
+        entries.len()
     );
     Ok(())
 }
