@@ -21,3 +21,4 @@ pub mod io;
 pub mod kernels;
 pub mod kv;
 pub mod model;
+pub mod tokenizer;
