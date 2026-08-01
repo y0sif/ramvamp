@@ -28,10 +28,26 @@ pub const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The staging directory for an install: `<final_dir>.partial`, as a
 /// sibling of `final_dir` so promotion is a single same-filesystem rename.
+///
+/// Rebuilt from `parent()` + `file_name()` so a trailing separator still
+/// yields a sibling (`/x/model.rvmp/` -> `/x/model.rvmp.partial`), never a
+/// child that [`promote`] could not rename over. Pathological inputs with
+/// no `file_name` (e.g. `/`, `..`, or an empty path) keep the plain
+/// append-suffix behavior.
 pub fn partial_dir(final_dir: &Path) -> PathBuf {
-    let mut name = final_dir.as_os_str().to_os_string();
-    name.push(PARTIAL_SUFFIX);
-    PathBuf::from(name)
+    match final_dir.file_name() {
+        Some(file_name) => {
+            let mut name = file_name.to_os_string();
+            name.push(PARTIAL_SUFFIX);
+            // A path with a file_name always has a parent (possibly "").
+            final_dir.parent().unwrap_or(Path::new("")).join(name)
+        }
+        None => {
+            let mut name = final_dir.as_os_str().to_os_string();
+            name.push(PARTIAL_SUFFIX);
+            PathBuf::from(name)
+        }
+    }
 }
 
 /// Validate the manifest, then durably write it to `<dir>/manifest.json`
@@ -85,6 +101,10 @@ pub fn is_complete(dir: &Path) -> bool {
 pub fn promote(partial_dir: &Path, final_dir: &Path) -> Result<(), FormatError> {
     let manifest = load_manifest(partial_dir)?;
     manifest.validate()?;
+    // TOCTOU window: `final_dir` can appear between this existence check
+    // and the rename, which would silently replace an empty directory at
+    // the target. Single-writer CLI usage plus the advisory locking design
+    // accepts that window.
     if final_dir.symlink_metadata().is_ok() {
         return Err(FormatError::AlreadyExists(final_dir.to_path_buf()));
     }
@@ -171,6 +191,21 @@ mod tests {
     fn partial_dir_appends_suffix() {
         assert_eq!(
             partial_dir(Path::new("/models/qwen.rvmp")),
+            Path::new("/models/qwen.rvmp.partial")
+        );
+        assert_eq!(
+            partial_dir(Path::new("model.rvmp")),
+            Path::new("model.rvmp.partial")
+        );
+    }
+
+    #[test]
+    fn partial_dir_ignores_trailing_separator() {
+        // A trailing slash must still produce a sibling, not a child
+        // (`/models/qwen.rvmp/.partial` could never promote: the target
+        // would already exist).
+        assert_eq!(
+            partial_dir(Path::new("/models/qwen.rvmp/")),
             Path::new("/models/qwen.rvmp.partial")
         );
     }

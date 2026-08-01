@@ -46,9 +46,13 @@ pub const MAX_DIMS: u32 = 4;
 pub const MAX_ALIGNMENT: u64 = 1 << 20;
 /// Data-section alignment used when `general.alignment` is absent.
 pub const DEFAULT_ALIGNMENT: u64 = 32;
-/// Total metadata array elements accepted across the whole header. Bounds
-/// parser heap usage together with `MAX_HEADER_BYTES`.
-pub const MAX_META_ELEMENTS: u64 = 1 << 24;
+/// Total metadata array elements accepted across the whole header (1 Mi).
+/// Real tokenizer arrays are ~300K elements, so 1 Mi gives margin while
+/// capping heap amplification: each declared element becomes an in-memory
+/// [`MetaValue`] many times larger than its encoded byte, so a small
+/// crafted file must not be able to drive hundreds of MiB of parser heap.
+/// Bounds parser heap usage together with `MAX_HEADER_BYTES`.
+pub const MAX_META_ELEMENTS: u64 = 1 << 20;
 /// Maximum size of the header region (metadata + tensor index). Real
 /// GGUF headers, tokenizer included, are tens of MiB; 256 MiB is generous.
 pub const MAX_HEADER_BYTES: u64 = 256 << 20;
@@ -59,8 +63,9 @@ pub const MAX_HEADER_BYTES: u64 = 256 << 20;
 pub struct GgufFile {
     /// Metadata key-value pairs, sorted by key.
     pub metadata: BTreeMap<String, MetaValue>,
-    /// Tensor index entries in file order.
-    pub tensors: Vec<TensorInfo>,
+    // Private so it cannot be mutated out from under `by_name`, which
+    // indexes into it; read access goes through [`GgufFile::tensors`].
+    tensors: Vec<TensorInfo>,
     version: u32,
     alignment: u64,
     data_start: u64,
@@ -97,6 +102,11 @@ impl GgufFile {
     /// Size of the tensor-data section in bytes (through end of file).
     pub fn data_section_len(&self) -> u64 {
         self.data_len
+    }
+
+    /// Tensor index entries in file order.
+    pub fn tensors(&self) -> &[TensorInfo] {
+        &self.tensors
     }
 
     /// Look up a tensor index entry by name.

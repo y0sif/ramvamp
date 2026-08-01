@@ -5,8 +5,11 @@
 use super::testutil::{
     FixtureBuilder, TensorSpec, header, pattern_byte, put_str, put_u8, put_u32, put_u64,
 };
-use super::{GgmlType, GgufError, GgufFile, MetaValue, TensorInfo};
-use crate::source::{LocalFile, RangeRead};
+use super::{
+    GgmlType, GgufError, GgufFile, MAX_HEADER_BYTES, MAX_META_ELEMENTS, MAX_METADATA_KV,
+    MAX_STRING_LEN, MetaValue, TensorInfo,
+};
+use crate::source::{LocalFile, RangeRead, SourceError};
 
 fn parse_bytes(bytes: &[u8]) -> Result<GgufFile, GgufError> {
     GgufFile::parse(&bytes)
@@ -31,7 +34,7 @@ fn parses_moe_fixture() {
     let f = parse_bytes(&bytes).unwrap();
     assert_eq!(f.version(), 3);
     assert_eq!(f.alignment(), 32);
-    assert_eq!(f.tensors.len(), 8);
+    assert_eq!(f.tensors().len(), 8);
     assert_eq!(
         f.metadata
             .get("general.architecture")
@@ -51,7 +54,7 @@ fn parses_moe_fixture() {
 fn tensor_sizes_offsets_and_data_bytes() {
     let bytes = FixtureBuilder::moe().build();
     let f = parse_bytes(&bytes).unwrap();
-    for (idx, t) in f.tensors.iter().enumerate() {
+    for (idx, t) in f.tensors().iter().enumerate() {
         let (rel, size) = MOE_LAYOUT[idx];
         assert_eq!(t.rel_offset, rel, "rel_offset of {}", t.name);
         assert_eq!(t.size_bytes, size, "size_bytes of {}", t.name);
@@ -113,7 +116,7 @@ fn accepts_v2() {
     b.version = 2;
     let f = parse_bytes(&b.build()).unwrap();
     assert_eq!(f.version(), 2);
-    assert_eq!(f.tensors.len(), 8);
+    assert_eq!(f.tensors().len(), 8);
 }
 
 #[test]
@@ -131,7 +134,7 @@ fn custom_alignment_respected() {
     b.alignment = 64;
     let f = parse_bytes(&b.build()).unwrap();
     assert_eq!(f.alignment(), 64);
-    for t in &f.tensors {
+    for t in f.tensors() {
         assert_eq!(t.rel_offset % 64, 0);
         assert_eq!(f.data_offset(t) % 64, 0);
     }
@@ -145,7 +148,7 @@ fn local_file_source_round_trip() {
     let src = LocalFile::open(&path).unwrap();
     assert_eq!(RangeRead::len(&src), bytes.len() as u64);
     let f = GgufFile::parse(&src).unwrap();
-    assert_eq!(f.tensors.len(), 8);
+    assert_eq!(f.tensors().len(), 8);
     let gate = f.tensor("blk.0.ffn_gate_exps.weight").unwrap();
     assert_eq!(gate.size_bytes, 36864);
     // Slab bytes read through the LocalFile match the in-memory fixture.
@@ -500,4 +503,106 @@ fn rejects_size_overflow() {
     put_u64(&mut bytes, 0);
     let err = parse_bytes(&bytes).unwrap_err();
     assert!(matches!(err, GgufError::SizeOverflow { .. }));
+}
+
+#[test]
+fn rejects_metadata_element_budget_on_declared_count() {
+    // One array declaring just over the global element budget, plus one
+    // filler byte per declared element so the per-array remaining-bytes
+    // check passes and the global budget is what rejects. The parser must
+    // fail on the declared count alone, before materializing any element.
+    let count = MAX_META_ELEMENTS + 1;
+    let mut bytes = header(3, 0, 1);
+    put_str(&mut bytes, "k");
+    put_u32(&mut bytes, 9); // array
+    put_u32(&mut bytes, 0); // of u8
+    put_u64(&mut bytes, count);
+    bytes.resize(bytes.len() + count as usize, 0);
+    let err = parse_bytes(&bytes).unwrap_err();
+    assert!(matches!(
+        err,
+        GgufError::MetadataTooLarge { limit } if limit == MAX_META_ELEMENTS
+    ));
+}
+
+/// Encoded size of one [`EndlessMetadataSource`] record: key length + 8-byte
+/// key + value type + value length + `MAX_STRING_LEN` value bytes.
+const RECORD_LEN: u64 = 8 + 8 + 4 + 8 + MAX_STRING_LEN;
+
+/// A GGUF byte stream synthesized on read: a real header declaring
+/// `MAX_METADATA_KV` key-values, then an endless run of valid metadata
+/// records (unique 8-byte key, `MAX_STRING_LEN` string value). The declared
+/// length is ~100 GiB but the test materializes nothing; every field passes
+/// its own per-item check, so only the running header-region cap can stop
+/// the stream.
+struct EndlessMetadataSource;
+
+impl EndlessMetadataSource {
+    /// 28-byte encoded prefix of record `r`: key `k<r:07>` + string value
+    /// type + value length.
+    fn record_prefix(r: u64) -> [u8; 28] {
+        let mut p = [0u8; 28];
+        p[..8].copy_from_slice(&8u64.to_le_bytes());
+        p[8..16].copy_from_slice(format!("k{r:07}").as_bytes());
+        p[16..20].copy_from_slice(&8u32.to_le_bytes());
+        p[20..28].copy_from_slice(&MAX_STRING_LEN.to_le_bytes());
+        p
+    }
+}
+
+impl RangeRead for EndlessMetadataSource {
+    fn len(&self) -> u64 {
+        24 + MAX_METADATA_KV * RECORD_LEN
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), SourceError> {
+        let want = buf.len() as u64;
+        if offset.checked_add(want).is_none_or(|end| end > self.len()) {
+            return Err(SourceError::OutOfBounds {
+                offset,
+                len: want,
+                source_len: self.len(),
+            });
+        }
+        let head = header(3, 0, MAX_METADATA_KV);
+        let base = head.len() as u64;
+        let mut pos = offset;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = if pos < base {
+                let take = ((base - pos) as usize).min(buf.len() - done);
+                buf[done..done + take].copy_from_slice(&head[pos as usize..pos as usize + take]);
+                take
+            } else {
+                let rec_off = (pos - base) % RECORD_LEN;
+                if rec_off < 28 {
+                    let prefix = Self::record_prefix((pos - base) / RECORD_LEN);
+                    let take = ((28 - rec_off) as usize).min(buf.len() - done);
+                    buf[done..done + take]
+                        .copy_from_slice(&prefix[rec_off as usize..rec_off as usize + take]);
+                    take
+                } else {
+                    let take = ((RECORD_LEN - rec_off) as usize).min(buf.len() - done);
+                    buf[done..done + take].fill(b'x');
+                    take
+                }
+            };
+            pos += n as u64;
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn rejects_header_region_over_cap() {
+    // The declared header region (`MAX_METADATA_KV` records of ~1 MiB) is
+    // far beyond the cap while every individual count stays within its own
+    // limit. The cap must trip just past MAX_HEADER_BYTES instead of
+    // streaming the whole declaration.
+    let err = GgufFile::parse(&EndlessMetadataSource).unwrap_err();
+    assert!(matches!(
+        err,
+        GgufError::HeaderTooLarge { limit } if limit == MAX_HEADER_BYTES
+    ));
 }
