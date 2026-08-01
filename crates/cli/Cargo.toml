@@ -1,6 +1,6 @@
 [package]
 name = "ramvamp"
-description = "Run 26-30B fine-grained MoE models in about 2 GB of RAM by streaming experts from NVMe. No GPU required."
+description = "Run 26-30B fine-grained MoE models in about 3 GB of RAM by streaming experts from NVMe. No GPU required."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

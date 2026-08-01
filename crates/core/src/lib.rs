@@ -2,7 +2,7 @@
 //!
 //! The design target is a 26-30B-parameter fine-grained MoE model (128 experts
 //! per layer, top-8 routing, ~3-4B active parameters per token) running in a
-//! ~2 GB memory budget. The always-needed "common core" (embeddings, attention,
+//! ~3 GB memory budget. The always-needed "common core" (embeddings, attention,
 //! routers, norms, any shared expert) stays memory-mapped; routed experts live
 //! on disk in a page-aligned packed layout and are read on demand with
 //! explicit parallel I/O into a small per-layer LFU cache.

@@ -6,10 +6,10 @@ ramvamp exists given what already ships.
 ## Differentiation statement
 
 Given that **TurboFieldfare** (Swift/Metal, Apple-Silicon-only, single-model)
-and **MoE-Infinity** (Python/CUDA, server-class) exist, and **llama.cpp
-explicitly lacks managed SSD expert streaming** (open feature requests; its
-mmap fallback was measured ~8x slower than explicit reads by TurboFieldfare),
-ramvamp earns its existence because:
+and **MoE-Infinity** (Python/CUDA, server-class) exist, and **llama.cpp has
+no merged SSD expert streaming** (open feature requests plus one unmerged RFC
+prototype; its mmap fallback was measured ~8x slower than explicit reads by
+TurboFieldfare), ramvamp earns its existence because:
 
 1. It brings measured, not theoretical, SSD expert streaming to Linux on
    commodity x86 hardware, with no GPU required.
@@ -23,7 +23,7 @@ ramvamp earns its existence because:
 | Project | Type / language | Approach | Status (Aug 2026) | Gap ramvamp fills |
 | --- | --- | --- | --- | --- |
 | [TurboFieldfare](https://github.com/drumih/turbo-fieldfare) | OSS, Swift + Metal | Explicit pread + per-layer LFU expert cache + custom quantized kernels; 5.1-6.3 tok/s in ~2 GB on an 8 GB M2 Air | Active, ~3.2k stars | Apple-only by design (Swift, Metal, unified memory); one pinned model |
-| [llama.cpp](https://github.com/ggml-org/llama.cpp) | OSS, C++ | mmap demand paging when the model exceeds RAM; `--n-cpu-moe` offloads experts to RAM, not SSD | Very active | No managed SSD expert streaming; [discussion #19163](https://github.com/ggml-org/llama.cpp/discussions/19163), issues [#19825](https://github.com/ggml-org/llama.cpp/issues/19825) and [#20757](https://github.com/ggml-org/llama.cpp/issues/20757) request it |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) | OSS, C++ | mmap demand paging when the model exceeds RAM; `--n-cpu-moe` offloads experts to RAM, not SSD | Very active | No merged SSD expert streaming; [discussion #19163](https://github.com/ggml-org/llama.cpp/discussions/19163), issues [#19825](https://github.com/ggml-org/llama.cpp/issues/19825) and [#20757](https://github.com/ggml-org/llama.cpp/issues/20757) request it; closest work is the unmerged RFC [#23324](https://github.com/ggml-org/llama.cpp/discussions/23324) (pread expert-slot prototype, 13 tok/s Qwen3-30B-A3B on a 16 GB M1 Pro) |
 | [MoE-Infinity](https://github.com/EfficientMoE/MoE-Infinity) | OSS, Python/PyTorch | Activation-aware expert cache across GPU/host/SSD tiers, prefetching | Active, academic | Server-oriented; needs CUDA and large host RAM; not a 2 GB consumer play |
 | [Micro-Expert-Router](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER) | OSS, Rust | io_uring + O_DIRECT NVMe expert streaming, CPU kernels | Early-stage | Closest precedent, but its performance numbers are stated by the author to be theoretical projections, not measurements |
 | [mistral.rs](https://github.com/EricLBuehler/mistral.rs) / [candle](https://github.com/huggingface/candle) | OSS, Rust | Full inference engines with quantization and device offload | Active | No SSD expert streaming; useful as building blocks and kernel references |
@@ -35,7 +35,7 @@ ramvamp earns its existence because:
 | --- | --- | --- | --- | --- |
 | Dense 26B | none | n/a | ~13 GB | Unusable: multiple seconds per token at NVMe speeds |
 | Coarse MoE (Mixtral 8x7B) | 8, top-2 | ~90 MB | ~5.6 GB | Unusable: experts too large to stream or cache |
-| Fine-grained MoE (Gemma 4 26B-A4B, Qwen3-30B-A3B) | 128, top-8 | ~2.5-3.4 MB | ~0.8 GB worst case; ~70-85 MB/token after LFU caching | The regime this project targets |
+| Fine-grained MoE (Gemma 4 26B-A4B, Qwen3-30B-A3B) | 128, top-8 | ~2.5-3.4 MB | ~0.8-1.1 GB worst case depending on model; a small LFU cache absorbs roughly half | The regime this project targets |
 
 Fine-grained MoE is the direction the field converged on (DeepSeek-V3, Qwen3,
 Gemma 4, GLM-4.5-Air), so the class of runnable models grows over time.
