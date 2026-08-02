@@ -8,3 +8,15 @@
 //! Layout rule learned the hard way upstream: packed sub-tensor offsets may
 //! guarantee less alignment than a wide load assumes. Every vectorized path
 //! must state, and test, the alignment it relies on.
+
+pub mod backend;
+mod error;
+pub mod gemv;
+
+pub mod quants;
+
+pub mod primitives;
+
+pub use backend::{Backend, CpuBackend};
+pub use error::KernelError;
+pub use gemv::{gemv_q8_0, gemv_q8_k};

@@ -14,6 +14,10 @@ default = ["io-uring"]
 # pread fallback used by tests and non-Linux development.
 io-uring = ["dep:io-uring"]
 
+[[bench]]
+name = "kernels"
+harness = false
+
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
