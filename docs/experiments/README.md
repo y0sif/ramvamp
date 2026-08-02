@@ -35,4 +35,73 @@ which is the reason their claims are credible.
 
 ## Index
 
-(no entries yet)
+- [EXP-001: AVX2 K-quant dot kernels vs scalar reference](#exp-001-avx2-k-quant-dot-kernels-vs-scalar-reference) — KEEP
+- [EXP-002: AVX2 activation quantizers](#exp-002-avx2-activation-quantizers) — KEEP
+
+## EXP-001: AVX2 K-quant dot kernels vs scalar reference
+
+- Date / commit: 2026-08-02 / on top of 1663ea4 (`feat/cpu-kernels`, pre-commit)
+- Hypothesis: runtime-dispatched AVX2+FMA ports of the `vec_dot_*` kernels
+  (ggml's x86 recipes: `maddubs`/`madd` integer core, bsums-based min
+  folding, one `fmadd` per super-block) beat the scalar reference by >= 3x
+  per row at the audited GEMV shapes.
+- Method: `crates/core/benches/kernels.rs` (`cargo bench -p ramvamp-core`);
+  full row sweep over a 2048-row synthetic packed matrix per timed run,
+  same dispatch wrapper for both sides (`force_scalar` flag), median of 31
+  runs after 5 warmup. Machine: Core Ultra 9 185H, single thread,
+  **warm cache — diagnostic numbers per rule 2, not publishable end-to-end
+  results** (no cgroup, no cold page cache).
+- Baseline: the scalar reference kernels in `kernels/quants/dot.rs`
+  (same binary, forced via the dispatch escape hatch).
+- Result (ns per output row; GB/s = packed row bytes / ns per row):
+
+  | kernel      | shape (in x out) | scalar ns/row | scalar GB/s | avx2 ns/row | avx2 GB/s | speedup |
+  |-------------|------------------|---------------|-------------|-------------|-----------|---------|
+  | q4_k x q8_k | 2048x2048        | 456           | 2.53        | 120         | 9.61      | 3.80x   |
+  | q5_k x q8_k | 2048x2048        | 449           | 3.13        | 141         | 9.97      | 3.18x   |
+  | q6_k x q8_k | 2048x2048        | 533           | 3.15        | 156         | 10.79     | 3.43x   |
+  | q6_k x q8_k | 768x2048         | 202           | 3.12        | 61          | 10.29     | 3.30x   |
+  | q8_0 x q8_0 | 2048x2048        | 918           | 2.37        | 179         | 12.16     | 5.13x   |
+
+  Summary: 3.2-3.8x on the k-quants, 5.1x on q8_0; ~10-12 GB/s effective
+  weight bandwidth per core warm. A second run agreed within ~5% except
+  q4_k avx2 (120 vs 141 ns/row across runs — treat the speedup as ~3.2-3.8x).
+- Verdict: KEEP
+- Notes: integer parts are bit-identical to scalar (tested); only float
+  accumulation order differs (tolerance-tested at in-dims 2048/768/4096
+  plus the scalar suite's adversarial blocks). All loads are `loadu`
+  (1-byte alignment contract, misalignment-tested). Dispatch checks
+  AVX2+FMA per call via the cached `is_x86_feature_detected!`. End-to-end
+  decode impact must be re-measured cold inside the 3 GB cgroup once the
+  phase-4 forward pass exists.
+
+## EXP-002: AVX2 activation quantizers
+
+- Date / commit: 2026-08-02 / on top of 1663ea4 (`feat/cpu-kernels`, pre-commit)
+- Hypothesis: AVX2 ports of `quantize_row_q8_k` / `quantize_row_q8_0` are
+  worthwhile even though quantization is once-per-token-per-row (the q8_k
+  scalar path pays heavily for `round_ties_even` per element), while
+  producing byte-identical blocks to the scalar reference.
+- Method: same harness, machine, and caveats as EXP-001 (warm-cache,
+  single-thread diagnostic): one 2048-float row quantized per timed run,
+  median of 31 after 5 warmup. GB/s here is f32 *input* bytes (8 KiB/row).
+- Baseline: the scalar reference quantizers in `kernels/quants/quantize.rs`
+  (forced via the dispatch escape hatch).
+- Result:
+
+  | kernel        | row     | scalar ns/row | scalar GB/s | avx2 ns/row | avx2 GB/s | speedup |
+  |---------------|---------|---------------|-------------|-------------|-----------|---------|
+  | quantize q8_k | 2048 f32 | 11960        | 0.68        | 1065        | 7.69      | 11.23x  |
+  | quantize q8_0 | 2048 f32 | 8324         | 0.98        | 1875        | 4.37      | 4.44x   |
+
+- Verdict: KEEP
+- Notes: outputs are byte-identical to the scalar reference on random,
+  tie-heavy, flat, and zero rows (tested per rule 4 — this is an
+  identical-math change, not a reordering). Deliberate deviation from
+  ggml's own AVX2 quantizer, whose `_mm256_round_ps` ties-to-even rounding
+  and `127/amax` scale differ from its scalar reference: we match the
+  SCALAR reference (q8_0 rounds half away from zero via an exact tie
+  fix-up; q8_k's `cvtps` under default MXCSR *is* `round_ties_even`; scale
+  math stays in scalar f32). The q8_0 quantizer is slower than q8_k's
+  AVX2 path because of the per-32-value tie fix-up and f16 scale rounding;
+  still 4.4x over scalar.
