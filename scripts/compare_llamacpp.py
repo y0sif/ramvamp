@@ -155,6 +155,14 @@ def cmd_greedy(args: argparse.Namespace) -> int:
     # with less RAM than the model, it triggers OOM killers (earlyoom).
     if "--no-warmup" in helptext:
         cmd.append("--no-warmup")
+    # Force mmap loading: recent builds (b10217+) can auto-select DirectIO,
+    # which reads the whole model into anonymous RAM (observed kill:
+    # anon-rss 7 GB, file-rss 8 kB on a 16 GB host). mmap keeps weights
+    # file-backed and evictable.
+    if "--load-mode" in helptext:
+        cmd.extend(["--load-mode", "mmap"])
+    elif "--mmap" in helptext:
+        cmd.append("--mmap")
     if "--seed" in helptext:
         cmd += ["--seed", "42"]
     print(f"+ {' '.join(cmd)}", file=sys.stderr)
@@ -296,6 +304,9 @@ def cmd_logits(args: argparse.Namespace) -> int:
         str(args.ctx),
         # See the greedy path: full-weight warmup OOM-kills small-RAM hosts.
         "--no-warmup",
+        # See the greedy path: force file-backed loading, not DirectIO.
+        "--load-mode",
+        "mmap",
         "--port",
         str(port),
         "--host",
