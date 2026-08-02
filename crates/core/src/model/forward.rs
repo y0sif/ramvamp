@@ -1,8 +1,10 @@
 //! Single-token forward pass over a loaded model.
 //!
 //! [`forward_token`] runs one token through every layer against a
-//! [`ForwardState`] that owns the KV cache and every scratch buffer, so the
-//! decode path allocates nothing after [`ForwardState::new`]. This is the
+//! [`ForwardState`] that owns the KV cache and every scratch buffer; the
+//! layer loop itself allocates nothing after [`ForwardState::new`]
+//! (remaining small per-token allocations: [`Model::embed`]'s dequant `Vec`
+//! and the stream decoder's `String`). This is the
 //! single-threaded, buffered-`pread` baseline of the decode loop in
 //! `docs/architecture.md` ("Decode loop"): no LFU cache, no io_uring
 //! overlap yet — misses read synchronously through

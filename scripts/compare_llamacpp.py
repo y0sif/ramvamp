@@ -324,8 +324,17 @@ def cmd_logits(args: argparse.Namespace) -> int:
 
     their_top = extract_top_probs(payload)
 
-    # Keying: token ids when the server provides them, else token text.
+    # Keying: token ids when the server provides them. Text keying is NOT a
+    # sound fallback: ramvamp renders partial-UTF-8 byte tokens as U+FFFD
+    # while llama.cpp returns raw byte fragments, so text keys silently fail
+    # to match and inflate the reported KL. Fail loudly instead.
     have_ids = all(r.get("id") is not None for r in their_top)
+    if not have_ids:
+        sys.exit(
+            "error: llama-server response has no token ids in its logprobs; "
+            "text-keyed comparison is unsound (U+FFFD vs raw byte fragments "
+            "would inflate KL). Use a llama.cpp build that returns ids."
+        )
 
     def key_ours(row: dict):
         return row["token_id"] if have_ids else row["text"]

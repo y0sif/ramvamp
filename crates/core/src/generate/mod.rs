@@ -3,9 +3,9 @@
 //! Prefill processes the prompt in bounded chunks (so one fetched expert
 //! serves many rows and scratch memory stays fixed) and is layer-major.
 //! Decode repeats the routed layer loop one token at a time. Sampling
-//! supports greedy, temperature, top-k, top-p, and repetition penalty;
-//! greedy decode must be deterministic for validation against reference
-//! implementations.
+//! supports greedy, temperature, top-k, and top-p (repetition penalty is
+//! not implemented yet); greedy decode must be deterministic for
+//! validation against reference implementations.
 //!
 //! # What exists today
 //!
@@ -241,6 +241,10 @@ impl Sampler {
 /// excludes trailing U+FFFD replacement characters, which mark a Unicode
 /// character whose UTF-8 bytes are still split across future tokens
 /// (byte-level BPE decode is byte-prefix-stable except for that tail).
+/// DEFERRED (review 2026-08-02): re-decoding the full accumulated sequence
+/// is O(n^2) over a generation — fine at the v0 default `max_new` 128,
+/// must become a bounded-tail incremental decode before phase 6 raises
+/// generation lengths.
 #[derive(Debug, Default)]
 struct StreamDecoder {
     ids: Vec<u32>,
