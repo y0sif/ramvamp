@@ -151,6 +151,10 @@ def cmd_greedy(args: argparse.Namespace) -> int:
         cmd.append("--no-conversation")
     if "--no-display-prompt" in helptext:
         cmd.append("--no-display-prompt")
+    # Skip the load-time warmup that touches every weight byte: on hosts
+    # with less RAM than the model, it triggers OOM killers (earlyoom).
+    if "--no-warmup" in helptext:
+        cmd.append("--no-warmup")
     if "--seed" in helptext:
         cmd += ["--seed", "42"]
     print(f"+ {' '.join(cmd)}", file=sys.stderr)
@@ -290,6 +294,8 @@ def cmd_logits(args: argparse.Namespace) -> int:
         # -c bounds the KV cache; see the --ctx help text for why it is vital.
         "-c",
         str(args.ctx),
+        # See the greedy path: full-weight warmup OOM-kills small-RAM hosts.
+        "--no-warmup",
         "--port",
         str(port),
         "--host",
