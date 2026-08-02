@@ -32,7 +32,11 @@
 //! per-element term magnitudes.
 //!
 //! The two activation quantizers are byte-identical to the scalar reference
-//! by construction. This is a deliberate deviation from ggml's AVX2
+//! by construction for finite inputs. (NaN/Inf rows diverge: scalar
+//! `f32::max` ignores NaN while `_mm256_max_ps` propagates it, and
+//! `cvtps_epi32(NaN)` saturates; a non-finite activation means the pass
+//! already failed upstream, so the claim is scoped, not defended.)
+//! This is a deliberate deviation from ggml's AVX2
 //! quantizers where their rounding differs from the scalar reference:
 //! ggml's AVX2 `quantize_row_q8_0` rounds with `_mm256_round_ps` (ties to
 //! even) and scales by `127/amax`, while its scalar reference uses `roundf`
@@ -200,7 +204,8 @@ pub fn vec_dot_q8_0_q8_0(
 /// AVX2+FMA when available (else the scalar reference).
 ///
 /// Same contract as [`super::quantize_row_q8_0`], and byte-identical output
-/// on every input: the SIMD path reproduces the reference's
+/// on every finite input (see module docs for the NaN/Inf caveat): the
+/// SIMD path reproduces the reference's
 /// half-away-from-zero rounding and its exact `1/d` scale math (deviating
 /// from ggml's AVX2 quantizer, which ties to even — see the module docs).
 /// `force_scalar` pins the scalar path for A/B comparison.
@@ -225,7 +230,8 @@ pub fn quantize_row_q8_0(
 /// AVX2+FMA when available (else the scalar reference).
 ///
 /// Same contract as [`super::quantize_row_q8_k`], and byte-identical output
-/// on every input (`_mm256_cvtps_epi32` under default rounding is exactly
+/// on every finite input (see module docs for the NaN/Inf caveat;
+/// `_mm256_cvtps_epi32` under default rounding is exactly
 /// the reference's `round_ties_even`; `iscale`/`d` math stays in scalar f32
 /// identical to the reference). `force_scalar` pins the scalar path for A/B
 /// comparison.
