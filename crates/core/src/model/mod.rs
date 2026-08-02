@@ -29,11 +29,22 @@
 //!   row, or its dequantized `hidden`-vector.
 //! - [`Model::lm_head`] / [`Model::final_norm`]: the layer-48 tail.
 //! - [`Model::expert_reader`]: the streaming side's file access.
+//!
+//! # Forward pass
+//!
+//! [`forward_token`] runs one token through every layer against a
+//! [`ForwardState`] (KV cache + preallocated scratch); see `forward` for
+//! the reference-fidelity notes (HF `Qwen3MoeDecoderLayer` order,
+//! QK-RMSNorm before RoPE, router softmax-then-top-k).
 
 mod error;
+mod forward;
 mod shapes;
 mod weights;
 
 pub use crate::io::LoadOptions;
 pub use error::ModelError;
+#[cfg(test)]
+pub(crate) use forward::testsupport;
+pub use forward::{ForwardError, ForwardState, forward_token};
 pub use weights::{F32Tensor, LayerWeights, Model, QuantTensor};
