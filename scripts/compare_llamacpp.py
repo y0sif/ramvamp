@@ -142,7 +142,8 @@ def cmd_greedy(args: argparse.Namespace) -> int:
     ).rstrip("\n")
 
     helptext = probe_flags(llama_cli)
-    cmd = [llama_cli, "-m", args.gguf, "-p", args.prompt, "--temp", "0", "-n", str(args.max_new)]
+    # -c bounds the KV cache; see the --ctx help text for why it is vital.
+    cmd = [llama_cli, "-m", args.gguf, "-c", str(args.ctx), "-p", args.prompt, "--temp", "0", "-n", str(args.max_new)]
     # Flag spellings move between llama.cpp releases; probe --help.
     if "-no-cnv" in helptext:
         cmd.append("-no-cnv")
@@ -286,6 +287,9 @@ def cmd_logits(args: argparse.Namespace) -> int:
         llama_server,
         "-m",
         args.gguf,
+        # -c bounds the KV cache; see the --ctx help text for why it is vital.
+        "-c",
+        str(args.ctx),
         "--port",
         str(port),
         "--host",
@@ -402,6 +406,14 @@ def main() -> int:
     common.add_argument("--prompt", default="The capital of France is")
     common.add_argument(
         "--timeout", type=float, default=600.0, help="per-command timeout (s)"
+    )
+    common.add_argument(
+        "--ctx",
+        type=int,
+        default=4096,
+        help="llama.cpp context size; REQUIRED to be small — without -c, "
+        "llama.cpp defaults to the model's native 262144 context and "
+        "allocates a ~24 GB KV cache (OOM-kill on 16 GB hosts)",
     )
 
     g = sub.add_parser("greedy", parents=[common], help="greedy text comparison")
