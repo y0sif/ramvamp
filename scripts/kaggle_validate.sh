@@ -12,7 +12,9 @@
 set -euo pipefail
 
 WORK=/kaggle/working
-SRC_TAR=$(ls /kaggle/input/*/ramvamp-src.tar.gz | head -1)
+# Kaggle nests inputs at varying depths (/kaggle/input/datasets/<user>/<name>/
+# on current layouts); find is layout-proof.
+SRC_TAR=$(find /kaggle/input -name ramvamp-src.tar.gz | head -1)
 GGUF_URL="https://huggingface.co/bartowski/Qwen_Qwen3-30B-A3B-Instruct-2507-GGUF/resolve/6c6e8692f43e4ca663f7ece8229a1361090d3a4c/Qwen_Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"
 LLAMA_RELEASE_TAG="${LLAMA_RELEASE_TAG:-latest}"
 
