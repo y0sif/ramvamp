@@ -37,6 +37,7 @@ which is the reason their claims are credible.
 
 - [EXP-001: AVX2 K-quant dot kernels vs scalar reference](#exp-001-avx2-k-quant-dot-kernels-vs-scalar-reference) — KEEP
 - [EXP-002: AVX2 activation quantizers](#exp-002-avx2-activation-quantizers) — KEEP
+- [EXP-003: Forward-pass validation vs llama.cpp b10217 (same Q4_K_M bytes)](#exp-003-forward-pass-validation-vs-llamacpp-b10217-same-q4_k_m-bytes) — KEEP
 
 ## EXP-001: AVX2 K-quant dot kernels vs scalar reference
 
@@ -105,3 +106,30 @@ which is the reason their claims are credible.
   math stays in scalar f32). The q8_0 quantizer is slower than q8_k's
   AVX2 path because of the per-32-value tie fix-up and f16 scale rounding;
   still 4.4x over scalar.
+
+## EXP-003: Forward-pass validation vs llama.cpp b10217 (same Q4_K_M bytes)
+
+- Date / commit: 2026-08-03 / dd8b6ee..28c9a62 (`feat/forward-pass`)
+- Hypothesis: the phase-4 forward pass (loading, KV/attention, MoE routing,
+  generate/logits CLI) reproduces llama.cpp's outputs on identical Q4_K_M
+  GGUF bytes.
+- Method: Kaggle CPU runtime (30 GB RAM, AVX2). Model installed on-site by
+  `ramvamp-repack`; source GGUF fetched at the pinned revision; llama.cpp
+  prebuilt b10217. Single-position top-20 logprob comparison via
+  llama-server, plus greedy raw-completion comparison via the /completion
+  endpoint (`scripts/compare_llamacpp.py`).
+- Baseline: llama.cpp b10217 on the same GGUF bytes.
+- Result:
+  - Greedy: 16-token completions character-identical on 3/3 prompts
+    ("The capital of France is", "Water is composed of",
+    "In Rust, ownership means").
+  - Logits: top-1 agreement 2/2; top-20 overlap 20/20 and 19/20;
+    union-renormalized truncated KL 0.0218 and 0.1007. Metric caveat:
+    single-position, top-20-truncated, renormalized — NOT comparable to
+    the full-vocab mean-KL <= 1e-3 design target.
+  - ramvamp smoke on the Kaggle Xeon: 0.87 tok/s decode, single-thread,
+    uncached.
+- Verdict: KEEP (forward pass semantically validated)
+- Notes: the full-vocab mean-KL measurement (architecture gate 3's actual
+  target) remains deferred to the phase-7 benchmark rig; this entry records
+  the top-20 truncated proxy only.

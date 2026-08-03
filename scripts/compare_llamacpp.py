@@ -3,7 +3,8 @@
 
 Validation gates 3 and 4 of docs/architecture.md ("Validation protocol"):
 
-  greedy  -- run `ramvamp generate --greedy` and `llama-cli --temp 0` on the
+  greedy  -- run `ramvamp generate --greedy` and a temperature-0 raw
+             completion via llama-server's /completion endpoint on the
              same prompt and report how far the emitted texts agree
              (greedy streams are expected to diverge eventually from fp
              reordering; the match length is reported, not gated).
@@ -19,8 +20,15 @@ Validation gates 3 and 4 of docs/architecture.md ("Validation protocol"):
              full-vocabulary KL gate (mean KL <= 1e-3) needs a dump of all
              151936 logits on both sides and comes later.
 
-Python stdlib only. If the llama.cpp binaries are absent the script exits
-with a clear message instead of failing cryptically.
+Both modes talk to llama-server; it is the only llama.cpp binary needed.
+llama-cli is deliberately not used: b10217 ignores the deprecated -no-cnv
+flag and drops into an interactive chat TUI (applies the chat template and
+waits on stdin until timeout), whereas /completion with a plain "prompt"
+string is a raw completion with no template -- the same contract as
+`ramvamp generate`.
+
+Python stdlib only. If llama-server is absent the script exits with a
+clear message instead of failing cryptically.
 
 Examples:
   scripts/compare_llamacpp.py greedy \
@@ -95,119 +103,8 @@ def run_ramvamp(args: argparse.Namespace, subcommand: list[str]) -> str:
     return result.stdout
 
 
-def probe_flags(binary: str) -> str:
-    """The binary's --help text, for probing flag spellings across versions."""
-    try:
-        result = subprocess.run(
-            [binary, "--help"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        return result.stdout + result.stderr
-    except OSError:
-        return ""
-
-
 # ---------------------------------------------------------------------------
-# greedy mode
-# ---------------------------------------------------------------------------
-
-
-def cmd_greedy(args: argparse.Namespace) -> int:
-    llama_cli = resolve_binary(args.llama_cli, ["llama-cli", "main"], "llama-cli")
-    if llama_cli is None:
-        fail(
-            "llama-cli not found (looked at --llama-cli and PATH). "
-            "Install llama.cpp and re-run; the ramvamp side alone can be "
-            "exercised with `ramvamp generate --greedy`."
-        )
-    if not os.path.isfile(args.gguf):
-        fail(f"GGUF file not found: {args.gguf}")
-
-    ours = run_ramvamp(
-        args,
-        [
-            "generate",
-            "--model",
-            args.rvmp,
-            "--prompt",
-            args.prompt,
-            "--greedy",
-            "--max-new",
-            str(args.max_new),
-            "--skip-hashes",
-        ],
-    ).rstrip("\n")
-
-    helptext = probe_flags(llama_cli)
-    # -c bounds the KV cache; see the --ctx help text for why it is vital.
-    cmd = [llama_cli, "-m", args.gguf, "-c", str(args.ctx), "-p", args.prompt, "--temp", "0", "-n", str(args.max_new)]
-    # Flag spellings move between llama.cpp releases; probe --help.
-    if "-no-cnv" in helptext:
-        cmd.append("-no-cnv")
-    elif "--no-conversation" in helptext:
-        cmd.append("--no-conversation")
-    if "--no-display-prompt" in helptext:
-        cmd.append("--no-display-prompt")
-    # Skip the load-time warmup that touches every weight byte: on hosts
-    # with less RAM than the model, it triggers OOM killers (earlyoom).
-    if "--no-warmup" in helptext:
-        cmd.append("--no-warmup")
-    # Force mmap loading: recent builds (b10217+) can auto-select DirectIO,
-    # which reads the whole model into anonymous RAM (observed kill:
-    # anon-rss 7 GB, file-rss 8 kB on a 16 GB host). mmap keeps weights
-    # file-backed and evictable.
-    if "--load-mode" in helptext:
-        cmd.extend(["--load-mode", "mmap"])
-    elif "--mmap" in helptext:
-        cmd.append("--mmap")
-    if "--seed" in helptext:
-        cmd += ["--seed", "42"]
-    print(f"+ {' '.join(cmd)}", file=sys.stderr)
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=args.timeout, check=False
-    )
-    if result.returncode != 0:
-        fail(f"llama-cli exited {result.returncode}\nstderr:\n{result.stderr[-2000:]}")
-    theirs = result.stdout
-    # Without --no-display-prompt llama-cli echoes the prompt; strip it.
-    if "--no-display-prompt" not in cmd and args.prompt in theirs:
-        theirs = theirs.split(args.prompt, 1)[1]
-    theirs = theirs.strip("\n")
-    # llama-cli appends end-of-generation markers on some builds.
-    for marker in ("[end of text]", "<|im_end|>", "<|endoftext|>"):
-        theirs = theirs.replace(marker, "")
-    theirs = theirs.rstrip()
-
-    match = 0
-    for a, b in zip(ours, theirs):
-        if a != b:
-            break
-        match += 1
-    full = ours == theirs
-    print(json.dumps(
-        {
-            "mode": "greedy",
-            "prompt": args.prompt,
-            "max_new": args.max_new,
-            "ramvamp_text": ours,
-            "llamacpp_text": theirs,
-            "match_chars": match,
-            "ramvamp_chars": len(ours),
-            "llamacpp_chars": len(theirs),
-            "full_match": full,
-        },
-        indent=2,
-        ensure_ascii=False,
-    ))
-    # Match length is reported, not gated (see docs/architecture.md gate 4).
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# logits mode
+# llama-server helpers (shared by both modes)
 # ---------------------------------------------------------------------------
 
 
@@ -229,6 +126,150 @@ def wait_health(base: str, proc: subprocess.Popen, deadline: float) -> None:
             pass
         time.sleep(0.5)
     fail("llama-server did not become healthy in time")
+
+
+def resolve_llama_server(args: argparse.Namespace) -> str:
+    """Resolve the llama-server binary and sanity-check the GGUF path."""
+    llama_server = resolve_binary(
+        args.llama_server, ["llama-server", "server"], "llama-server"
+    )
+    if llama_server is None:
+        fail(
+            "llama-server not found (looked at --llama-server and PATH). "
+            "Install llama.cpp and re-run; the ramvamp side alone can be "
+            "exercised with `ramvamp generate --greedy` / `ramvamp logits`."
+        )
+    if not os.path.isfile(args.gguf):
+        fail(f"GGUF file not found: {args.gguf}")
+    return llama_server
+
+
+def start_llama_server(
+    binary: str, args: argparse.Namespace
+) -> tuple[subprocess.Popen, str]:
+    """Spawn llama-server on loopback; returns (process, base URL).
+
+    The caller must wait_health() before talking to it and must
+    stop_llama_server() when done (use try/finally).
+    """
+    port = args.port or free_port()
+    base = f"http://127.0.0.1:{port}"
+    server_cmd = [
+        binary,
+        "-m",
+        args.gguf,
+        # -c bounds the KV cache; see the --ctx help text for why it is vital.
+        "-c",
+        str(args.ctx),
+        # Skip the load-time warmup that touches every weight byte: on hosts
+        # with less RAM than the model, it triggers OOM killers (earlyoom).
+        "--no-warmup",
+        # Force mmap loading: recent builds (b10217+) can auto-select
+        # DirectIO, which reads the whole model into anonymous RAM (observed
+        # kill: anon-rss 7 GB, file-rss 8 kB on a 16 GB host). mmap keeps
+        # weights file-backed and evictable.
+        "--load-mode",
+        "mmap",
+        "--port",
+        str(port),
+        "--host",
+        "127.0.0.1",
+    ]
+    print(f"+ {' '.join(server_cmd)}", file=sys.stderr)
+    proc = subprocess.Popen(
+        server_cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return proc, base
+
+
+def stop_llama_server(proc: subprocess.Popen) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def post_completion(base: str, body: dict, timeout: float) -> dict:
+    """POST a JSON body to /completion and return the parsed response."""
+    req = urllib.request.Request(
+        base + "/completion",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+# ---------------------------------------------------------------------------
+# greedy mode
+# ---------------------------------------------------------------------------
+
+
+def cmd_greedy(args: argparse.Namespace) -> int:
+    llama_server = resolve_llama_server(args)
+
+    ours = run_ramvamp(
+        args,
+        [
+            "generate",
+            "--model",
+            args.rvmp,
+            "--prompt",
+            args.prompt,
+            "--greedy",
+            "--max-new",
+            str(args.max_new),
+            "--skip-hashes",
+        ],
+    ).rstrip("\n")
+
+    proc, base = start_llama_server(llama_server, args)
+    try:
+        wait_health(base, proc, time.time() + args.timeout)
+        payload = post_completion(
+            base,
+            {
+                "prompt": args.prompt,
+                "temperature": 0,
+                "n_predict": args.max_new,
+                "cache_prompt": False,
+            },
+            args.timeout,
+        )
+    finally:
+        stop_llama_server(proc)
+
+    content = payload.get("content")
+    if content is None:
+        fail(f"no content in llama-server /completion response: {list(payload)}")
+    # ramvamp's CLI prints a final newline after the stream; normalize
+    # trailing newlines the same way on both sides.
+    theirs = content.rstrip("\n")
+
+    match = 0
+    for a, b in zip(ours, theirs):
+        if a != b:
+            break
+        match += 1
+    # One side may stop earlier (EOS vs max-new); a full common prefix
+    # still counts as agreement for the gate-4 smoke.
+    full = match == min(len(ours), len(theirs))
+    print(f"prompt: {args.prompt!r}")
+    print(f"ramvamp   [{len(ours)} chars]: {ours!r}")
+    print(f"llama.cpp [{len(theirs)} chars]: {theirs!r}")
+    print(f"common prefix: {match} chars")
+    if full:
+        print("FULL MATCH (one side is a prefix of the other)")
+    # Match length is reported, not gated (see docs/architecture.md gate 4).
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# logits mode
+# ---------------------------------------------------------------------------
 
 
 def extract_top_probs(payload: dict) -> list[dict]:
@@ -264,17 +305,7 @@ def extract_top_probs(payload: dict) -> list[dict]:
 
 
 def cmd_logits(args: argparse.Namespace) -> int:
-    llama_server = resolve_binary(
-        args.llama_server, ["llama-server", "server"], "llama-server"
-    )
-    if llama_server is None:
-        fail(
-            "llama-server not found (looked at --llama-server and PATH). "
-            "Install llama.cpp and re-run; the ramvamp side alone can be "
-            "exercised with `ramvamp logits`."
-        )
-    if not os.path.isfile(args.gguf):
-        fail(f"GGUF file not found: {args.gguf}")
+    llama_server = resolve_llama_server(args)
 
     ours = json.loads(
         run_ramvamp(
@@ -293,55 +324,22 @@ def cmd_logits(args: argparse.Namespace) -> int:
     )
     our_top = ours["top"]  # [{token_id, logit, logprob, text}]
 
-    port = args.port or free_port()
-    base = f"http://127.0.0.1:{port}"
-    server_cmd = [
-        llama_server,
-        "-m",
-        args.gguf,
-        # -c bounds the KV cache; see the --ctx help text for why it is vital.
-        "-c",
-        str(args.ctx),
-        # See the greedy path: full-weight warmup OOM-kills small-RAM hosts.
-        "--no-warmup",
-        # See the greedy path: force file-backed loading, not DirectIO.
-        "--load-mode",
-        "mmap",
-        "--port",
-        str(port),
-        "--host",
-        "127.0.0.1",
-    ]
-    print(f"+ {' '.join(server_cmd)}", file=sys.stderr)
-    proc = subprocess.Popen(
-        server_cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    proc, base = start_llama_server(llama_server, args)
     try:
         wait_health(base, proc, time.time() + args.timeout)
-        body = json.dumps(
+        payload = post_completion(
+            base,
             {
                 "prompt": args.prompt,
                 "n_predict": 1,
                 "n_probs": args.top,
                 "temperature": 0.0,
                 "samplers": [],
-            }
-        ).encode()
-        req = urllib.request.Request(
-            base + "/completion",
-            data=body,
-            headers={"Content-Type": "application/json"},
+            },
+            args.timeout,
         )
-        with urllib.request.urlopen(req, timeout=args.timeout) as resp:
-            payload = json.loads(resp.read())
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        stop_llama_server(proc)
 
     their_top = extract_top_probs(payload)
 
@@ -420,6 +418,12 @@ def main() -> int:
         "--ramvamp",
         help="path to the ramvamp binary (default: cargo run --release -p ramvamp)",
     )
+    common.add_argument(
+        "--llama-server", help="path to llama-server (default: search PATH)"
+    )
+    common.add_argument(
+        "--port", type=int, help="llama-server port (default: free port)"
+    )
     common.add_argument("--prompt", default="The capital of France is")
     common.add_argument(
         "--timeout", type=float, default=600.0, help="per-command timeout (s)"
@@ -434,14 +438,11 @@ def main() -> int:
     )
 
     g = sub.add_parser("greedy", parents=[common], help="greedy text comparison")
-    g.add_argument("--llama-cli", help="path to llama-cli (default: search PATH)")
     g.add_argument("--max-new", type=int, default=16)
     g.set_defaults(func=cmd_greedy)
 
     l = sub.add_parser("logits", parents=[common], help="top-logprob comparison")
-    l.add_argument("--llama-server", help="path to llama-server (default: search PATH)")
     l.add_argument("--top", type=int, default=20)
-    l.add_argument("--port", type=int, help="llama-server port (default: free port)")
     l.set_defaults(func=cmd_logits)
 
     args = parser.parse_args()
