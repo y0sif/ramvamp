@@ -39,6 +39,7 @@ which is the reason their claims are credible.
 - [EXP-002: AVX2 activation quantizers](#exp-002-avx2-activation-quantizers) — KEEP
 - [EXP-003: Forward-pass validation vs llama.cpp b10217 (same Q4_K_M bytes)](#exp-003-forward-pass-validation-vs-llamacpp-b10217-same-q4_k_m-bytes) — KEEP
 - [EXP-004: Full-vocab KL vs llama.cpp reference dumps; scalar/AVX2 noise floor](#exp-004-full-vocab-kl-vs-llamacpp-reference-dumps-scalaravx2-noise-floor) — KEEP
+- [EXP-005: Expert cache hit rate on measured routing traces (policy and slot sweep)](#exp-005-expert-cache-hit-rate-on-measured-routing-traces-policy-and-slot-sweep) — KEEP
 
 ## EXP-001: AVX2 K-quant dot kernels vs scalar reference
 
@@ -214,3 +215,73 @@ which is the reason their claims are credible.
   512-3492 on the 185H — the baseline the phase-5/6 io and cache work
   must improve on. Kaggle is no longer needed for validation; everything
   compares against the saved dumps locally.
+
+## EXP-005: Expert cache hit rate on measured routing traces (policy and slot sweep)
+
+- Date / commit: 2026-08-03 / on top of d80cc84 (`feat/expert-streaming`,
+  pre-commit)
+- Hypothesis: the per-layer LFU expert cache reaches the 40-60% hit rate
+  the performance model assumes, and ~10 slots/layer is the right dial.
+- Method: `--trace-experts` records each layer's final top-k routing
+  decision (after renormalization, before any expert read) to a compact
+  binary trace; `scripts/lfu_sim.py` replays traces against the real
+  per-layer strides from `experts/layout.json`. Four generations on the
+  pinned Qwen3-30B-A3B install (factual, code/chat-template, long-context,
+  greedy) totalling **556 decode tokens**. Simulation only - no cgroup or
+  cold-cache rules apply; the I/O times below are derived, not measured
+  end to end. Bandwidth constant 1.59 GB/s, a provisional figure from
+  O_DIRECT random reads at the real expert stride on a machine that was
+  NOT quiet (a concurrent reader was active); it needs re-measuring under
+  rule 2 before any tok/s figure derived from it is published, and the
+  same probe on a quiet run gave 1.35 GB/s, so treat the io ms/token
+  column as optimistic by roughly 15%. Policies compared on identical traces:
+  per-slot LFU, expert-indexed LFU with counters surviving eviction
+  ("ghost"), LRU, aged LFU, windowed LFU, and Belady offline-optimal.
+- Baseline: the architecture doc's estimate of 40-60% hit rate at 10
+  slots/layer, and its 4-8 tok/s expected decode band.
+- Result (policy `lfu-ghost`; pool sizes use real strides, totals add the
+  1023 MiB mmap'd common core and a 384 MiB FP16 KV cache at 4K):
+
+  | slots | hit % | pool MiB | total MiB | fits 3G | io ms/token | io-only tok/s |
+  |------:|------:|---------:|----------:|:-------:|------------:|--------------:|
+  | 8     | 37.4  | 1046     | 2454      | yes     | 434         | 2.30          |
+  | 10    | 44.8  | 1308     | 2715      | yes     | 383         | 2.61          |
+  | 12    | 49.9  | 1569     | 2977      | yes     | 348         | 2.87          |
+  | 16    | 58.1  | 2092     | 3500      | no      | 291         | 3.43          |
+  | 24    | 70.3  | 3139     | 4546      | no      | 207         | 4.84          |
+  | none  | 0     | 0        | 1407      | yes     | 690         | 1.45          |
+
+  Policy deltas at 10 / 16 slots (hit %): ghost-LFU 44.8 / 58.1,
+  windowed LFU 44.7 / 58.0, aged LFU 43.0 / 56.6, per-slot LFU 42.6 /
+  55.4, LRU 42.6 / 57.1, Belady 55.8 / 72.0.
+
+  Routing statistics: 109.3 of 128 experts touched per layer, router
+  entropy 6.12 of 7.00 bits, top-8 mass 24.9%, consecutive-token reuse
+  44.1%, infinite-cache ceiling 97.7% after 32 tokens. Miss mix at 10
+  slots: 12.1% cold, 87.9% eviction, of which 52.5% are re-requested
+  within 4 decode tokens. Per-layer hit rate spans 13.4% (layer 0) to
+  66.5% (layer 31), with no early/late gradient. Cold start reaches
+  within 2 points of steady state by token 48.
+- Verdict: KEEP (measurement stands; three design changes follow)
+- Notes: three decisions come out of this entry. (1) **The dial moves to
+  12 slots/layer**, the largest pool that fits `memory.max=3G`, worth
+  +5.1 points and -35 io ms/token over 10 for 261 MiB; there is no knee,
+  marginal value falls monotonically, so the cgroup is the binding
+  constraint rather than diminishing returns. (2) **The LFU win comes
+  from ghost history, not from LFU.** Counters must be indexed by expert
+  id over all `n_experts` and survive eviction (128 x u32 = 512 B per
+  layer, 24 KiB total); per-slot LFU beats LRU by only 0.0-1.7 points at
+  usable slot counts and loses at 48. `docs/architecture.md` said "LFU
+  eviction with recency tie-break", which reads as per-slot counters and
+  is the weaker policy. (3) **A global slot pool and prefill cache
+  warming are both closed as "no"** - the best static per-layer split
+  buys +0.53 points at the operating point, and replaying the prompt
+  into the cache buys +0.09. Upstream's 66.6% at 16 slots does not
+  reproduce here (58.1%, 8.5 points low) though the 16->24 and 16->32
+  deltas match their published shape, so no published claim should lean
+  on their absolute number. The doc's 4-8 tok/s band assumed 3.6 GB/s;
+  at the measured bandwidth the I/O-only ceiling at 12 slots is 2.87
+  tok/s, and I/O is not yet the binding constraint (phase-4 decode is
+  ~2 s/token, of which uncached I/O is 690 ms). Trace capture verified
+  numerically inert: `ramvamp logits --top 1000` output is SHA-256
+  identical with and without `--trace-experts`.

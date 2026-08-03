@@ -46,5 +46,7 @@ pub use crate::io::LoadOptions;
 pub use error::ModelError;
 #[cfg(test)]
 pub(crate) use forward::testsupport;
-pub use forward::{ForwardError, ForwardState, forward_token};
+pub use forward::{
+    ExpertRouteSink, ForwardError, ForwardState, forward_token, forward_token_traced,
+};
 pub use weights::{F32Tensor, LayerWeights, Model, QuantTensor};

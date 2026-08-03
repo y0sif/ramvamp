@@ -257,6 +257,18 @@ impl ForwardState {
     }
 }
 
+/// Observer for the router's decision, called once per layer per token
+/// with `(layer, top_k)` where `top_k` is the final `(expert, weight)`
+/// selection in routed order (descending router probability, weights
+/// already renormalized when `norm_topk_prob`).
+///
+/// This exists so the offline expert-cache simulator can capture real
+/// routing traces (`scripts/lfu_sim.py`); the runtime passes `None` and
+/// pays one null check per layer. The sink is called after the routing
+/// decision is final and before any expert is read, so it observes but
+/// cannot influence numerics.
+pub type ExpertRouteSink<'a> = &'a mut dyn FnMut(u32, &[(u32, f32)]);
+
 /// Plain f32 dot product with f32 accumulation, matching the reference
 /// router matvec (HF computes router logits in f32).
 #[inline]
@@ -289,6 +301,28 @@ pub fn forward_token<'s>(
     token_id: u32,
     position: usize,
     want_logits: bool,
+) -> Result<Option<&'s [f32]>, ForwardError> {
+    forward_token_traced(model, state, token_id, position, want_logits, None)
+}
+
+/// [`forward_token`] with an optional [`ExpertRouteSink`] observing every
+/// layer's routing decision.
+///
+/// Numerically identical to [`forward_token`]: the sink runs after the
+/// top-k selection and renormalization are final and touches no state.
+/// With `on_route` `None` the only cost is one `Option` check per layer,
+/// and nothing is allocated either way.
+///
+/// # Errors
+///
+/// Exactly [`forward_token`]'s.
+pub fn forward_token_traced<'s>(
+    model: &Model,
+    state: &'s mut ForwardState,
+    token_id: u32,
+    position: usize,
+    want_logits: bool,
+    mut on_route: Option<ExpertRouteSink<'_>>,
 ) -> Result<Option<&'s [f32]>, ForwardError> {
     let arch = model.arch();
     let n_heads = arch.n_heads as usize;
@@ -418,6 +452,9 @@ pub fn forward_token<'s>(
             for (_, w) in state.topk.iter_mut() {
                 *w /= sum;
             }
+        }
+        if let Some(sink) = on_route.as_deref_mut() {
+            sink(layer, &state.topk);
         }
 
         // Experts: quantize the normed input once, then gate/up -> SwiGLU
