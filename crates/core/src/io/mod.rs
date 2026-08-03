@@ -6,9 +6,10 @@
 //!   `io-uring` feature (default), misses are fetched with io_uring +
 //!   O_DIRECT into pre-allocated page-aligned slot buffers; the portable
 //!   fallback uses positioned reads (`pread`) on a small thread pool.
-//! - Cache: per-layer fixed slot arrays with LFU eviction (recency as
-//!   tie-breaker). No cross-layer prefetch: measured predictability is too
-//!   low to pay for speculative reads.
+//! - Cache: per-layer fixed slot arrays with LFU eviction over frequency
+//!   counters indexed by expert id, sized `n_experts`, whose counts survive
+//!   eviction (ghost history; EXP-005). No cross-layer prefetch: measured
+//!   predictability is too low to pay for speculative reads.
 //!
 //! Concurrency invariant: a slot being filled by an in-flight read, or still
 //! owned by queued compute, is never reassigned.
@@ -32,18 +33,22 @@
 //! [`LoadOptions::skip_hashes`] skips every SHA-256 check for fast dev
 //! iteration; size checks always run.
 
+mod cache;
 mod common;
 mod error;
 mod expert;
+mod slots;
 #[cfg(test)]
 pub(crate) mod testutil;
 
 use std::fs;
 use std::path::Path;
 
+pub use cache::{CacheError, CachePlan, CacheStats, LayerCache};
 pub use common::MappedCommon;
 pub use error::IoError;
 pub use expert::{ExpertReader, ExpertSlab, ExpertView};
+pub use slots::{MAX_POOL_BYTES, SLOT_ALIGN, SlotError, SlotGuard, SlotPool};
 
 use crate::format::{FormatError, Manifest, sha256_file};
 use crate::kernels::quants::QuantFormat;

@@ -87,6 +87,14 @@ pub enum IoError {
         /// The oversized value.
         value: u64,
     },
+
+    /// Sizing, allocating, or leasing an expert slot buffer failed.
+    #[error(transparent)]
+    Slots(#[from] crate::io::SlotError),
+
+    /// Planning one routing step against a layer's slots failed.
+    #[error(transparent)]
+    Cache(#[from] crate::io::CacheError),
 }
 
 impl IoError {

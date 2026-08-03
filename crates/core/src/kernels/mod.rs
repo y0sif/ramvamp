@@ -20,4 +20,4 @@ pub mod primitives;
 
 pub use backend::{Backend, CpuBackend};
 pub use error::KernelError;
-pub use gemv::{gemv_q8_0, gemv_q8_k};
+pub use gemv::{gemv_q8_0, gemv_q8_0_rows, gemv_q8_k, gemv_q8_k_rows};

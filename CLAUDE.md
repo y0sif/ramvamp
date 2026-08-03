@@ -26,8 +26,9 @@ Pre-push: all four must pass.
 
 ## Hard rules
 
-- Explicit reads for experts, never mmap demand paging (measured 8x slower
-  upstream). Common weights are mmap'd; experts are pread/io_uring'd.
+- Explicit reads for experts, never mmap demand paging (measured 3.54x
+  slower per cold read upstream, ~8x end to end in their simulator).
+  Common weights are mmap'd; experts are pread/io_uring'd.
 - No speculative cross-layer expert prefetch (measured ~7% predictability).
 - No full model, shard, or tensor may ever be materialized in heap memory,
   in the runtime or the repacker.

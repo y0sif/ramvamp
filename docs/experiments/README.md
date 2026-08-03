@@ -40,6 +40,7 @@ which is the reason their claims are credible.
 - [EXP-003: Forward-pass validation vs llama.cpp b10217 (same Q4_K_M bytes)](#exp-003-forward-pass-validation-vs-llamacpp-b10217-same-q4_k_m-bytes) — KEEP
 - [EXP-004: Full-vocab KL vs llama.cpp reference dumps; scalar/AVX2 noise floor](#exp-004-full-vocab-kl-vs-llamacpp-reference-dumps-scalaravx2-noise-floor) — KEEP
 - [EXP-005: Expert cache hit rate on measured routing traces (policy and slot sweep)](#exp-005-expert-cache-hit-rate-on-measured-routing-traces-policy-and-slot-sweep) — KEEP
+- [EXP-006: The phase-4 baseline cannot be measured cleanly in a 3G cgroup](#exp-006-the-phase-4-baseline-cannot-be-measured-cleanly-in-a-3g-cgroup) — NEUTRAL
 
 ## EXP-001: AVX2 K-quant dot kernels vs scalar reference
 
@@ -201,8 +202,19 @@ which is the reason their claims are credible.
   gate 3 to mean full-vocab KL <= 3e-2 with the intra-engine scalar/AVX2
   A/B recorded alongside as the noise floor; perplexity (gate 5) remains
   the quality backstop. Reference capture also produced per-position
-  top-5000 dumps along 64-token greedy paths (`path_*.npz`) and 128-token
+  top-5000 dumps along 64-token paths (`path_*.npz`) and 128-token
   greedy texts (`greedy_texts.json`) for phase-5/6 regression fixtures.
+  **Correction (2026-08-03, found while wiring these fixtures into
+  `scripts/greedy_regression.py`):** this entry originally called
+  `path_*.npz` *greedy* paths at context depth ~5000. Both halves are
+  wrong. The paths are **sampled**: `chosen_ids` differs from the argmax
+  at 5/64, 15/64 and 26/64 positions for path_00/01/02, and path_00's
+  continuation begins " Barcelona" where greedy gives " Paris". And
+  `depth: 5000` in `meta.json` is the top-k *dump* depth, not context
+  length - actual context runs 5 to 68 tokens. Consequence: these
+  fixtures must be replayed **teacher-forced on `chosen_ids`**, since a
+  free-running greedy comparison would diverge at position 0 by
+  construction.
   llama.cpp ran its AVX2 activation quantizer, whose rounding deliberately
   differs from the scalar reference ramvamp matches (EXP-002) — one more
   reorder-class contributor, indistinguishable in size from dot-order
@@ -263,6 +275,23 @@ which is the reason their claims are credible.
   66.5% (layer 31), with no early/late gradient. Cold start reaches
   within 2 points of steady state by token 48.
 - Verdict: KEEP (measurement stands; three design changes follow)
+- **Correction (2026-08-03, found by replaying the shipped `io/cache.rs`
+  against these same traces):** the hit rates above understate the
+  implementation by ~5 points, because of how the simulator models
+  pinning rather than any policy difference. `scripts/lfu_sim.py`
+  resolves a step one expert at a time, so it protects only experts
+  *already fetched* during that step; a later miss may therefore evict a
+  resident expert that the same token is about to request, and pay to
+  read it straight back. The runtime's `LayerCache::plan` takes all
+  `top_k` ids in one call and protects the whole step, which cannot
+  happen. Replaying the shipped Rust over the identical four traces
+  (213,504 accesses) reproduces the simulator **exactly** when driven
+  one expert at a time - 95,626 hits at 10 slots and 106,523 at 12, with
+  matching cold and eviction counts - and yields **50.02% at 10 slots
+  and 54.48% at 12** when driven the way the runtime actually calls it.
+  Batch-pinned 10 slots therefore beats sequential 12 slots. Read the
+  slot sweep above as a lower bound; the per-slot ordering, the policy
+  ranking, and the marginal-value curve are unaffected.
 - Notes: three decisions come out of this entry. (1) **The dial moves to
   12 slots/layer**, the largest pool that fits `memory.max=3G`, worth
   +5.1 points and -35 io ms/token over 10 for 261 MiB; there is no knee,
@@ -285,3 +314,56 @@ which is the reason their claims are credible.
   ~2 s/token, of which uncached I/O is 690 ms). Trace capture verified
   numerically inert: `ramvamp logits --top 1000` output is SHA-256
   identical with and without `--trace-experts`.
+
+## EXP-006: The phase-4 baseline cannot be measured cleanly in a 3G cgroup
+
+- Date / commit: 2026-08-03 / 650b5ea (`feat/expert-streaming`)
+- Hypothesis: the phase-4 decode baseline (~1.9-2.5 s/token, recorded in
+  EXP-004's notes) can be re-measured under this log's rule 2 - cold page
+  cache, inside `memory.max=3G` with `memory.swap.max=0` - to give phase 5
+  a publishable number to beat.
+- Method: new `scripts/cold_bench.py`. Evicts the model via
+  `posix_fadvise(POSIX_FADV_DONTNEED)` over all 53 files the runtime
+  touches and **verifies eviction with `mincore`** rather than trusting
+  the return code (fadvise reports success and evicts nothing when a
+  process holds the file mmap'd, so the harness also refuses to start
+  while any `ramvamp` process is alive). Runs the binary under
+  `systemd-run --user --wait -q --collect -p MemoryMax=3G
+  -p MemorySwapMax=0 -p MemoryAccounting=yes`, re-execing an inner
+  wrapper that reads `memory.peak`, `memory.events` and `memory.stat`
+  from inside the cgroup before exit, plus `/proc/self/io read_bytes`
+  for block-layer bytes. Workload: `generate --max-new 8` (13 tokens
+  total), one discarded warmup plus one scored run.
+- Baseline: none - this entry establishes whether a baseline is
+  measurable at all.
+- Result: **it is not.** Scored run, verified cold (3595.0 MiB resident
+  evicted to 0.0 across 53 files in 2.0 s):
+
+  | metric | value |
+  |---|---|
+  | wall / decode | 18.56 s, 0.81 tok/s |
+  | `MemoryPeak` | 3072.0 MiB (pinned at the 3072.0 MiB ceiling) |
+  | `memory.events max` | 6203 |
+  | `pgscan` / `pgsteal` | 1,263,046 / 1,263,046 (~4.8 GiB reclaimed) |
+  | `read_bytes` | 8,217,182,208 (7836.5 MiB) |
+
+  A 13-token generation pulled **7.8 GiB** through the block layer and
+  charged all of it to the cgroup as page cache, because phase 4 reads
+  experts with buffered `pread`. The cgroup sat on its limit for the
+  whole run and the kernel reclaimed continuously. Every number from
+  such a run is a measurement of reclaim behaviour, not of decode.
+- Verdict: NEUTRAL (no change shipped; the finding redefines the gate)
+- Notes: three consequences. (1) **The "baseline to beat" of 1.9-2.5
+  s/token was never a rule-2 number** - it came from warm-cache,
+  uncgrouped diagnostic runs in EXP-004, and it must be cited that way
+  until phase 5 can produce a clean one. (2) **`memory.events max == 0`
+  is not a sufficient hygiene check.** A separate run showed `max 0`
+  while `pgsteal` revealed 2.4 GiB had been silently reclaimed; clean
+  page cache is dropped well before the hard limit trips. `cold_bench.py`
+  therefore gates on `pgsteal == 0` and prints an explicit
+  CLEAN/DIRTY verdict separate from the performance figures. (3) The
+  first clean 3G measurement this project produces will be phase 5's,
+  and the buffered-to-O_DIRECT transition is precisely what makes it
+  possible: the same 1.4 GiB of expert reads measured a 1092.2 MiB
+  cgroup peak buffered versus 5.0 MiB with O_DIRECT. That transition
+  gets its own entry when it lands.
