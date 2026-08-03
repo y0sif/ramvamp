@@ -9,6 +9,7 @@
 //! guarantee less alignment than a wide load assumes. Every vectorized path
 //! must state, and test, the alignment it relies on.
 
+pub mod attention;
 pub mod backend;
 mod error;
 pub mod gemv;

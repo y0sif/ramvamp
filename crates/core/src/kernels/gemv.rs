@@ -22,6 +22,16 @@
 
 use super::KernelError;
 use super::quants::{BlockQ8_0, BlockQ8K, QuantFormat, avx2};
+use std::sync::OnceLock;
+
+/// Diagnostic escape hatch: `RAMVAMP_FORCE_SCALAR` (any value) pins every
+/// GEMV to the scalar reference kernels, so AVX2-vs-scalar output deltas
+/// can be measured end-to-end (the same A/B the benches do per-kernel).
+/// Read once; not a supported production knob.
+fn force_scalar() -> bool {
+    static FORCE: OnceLock<bool> = OnceLock::new();
+    *FORCE.get_or_init(|| std::env::var_os("RAMVAMP_FORCE_SCALAR").is_some())
+}
 
 /// Validate the shared GEMV geometry: `weight` is `out_dim` rows of
 /// `row_bytes`, `out` holds `out_dim` floats, and the activation row covers
@@ -103,8 +113,9 @@ pub fn gemv_q8_k(
         acts.len(),
         out.len(),
     )?;
+    let scalar = force_scalar();
     for (r, o) in out.iter_mut().enumerate() {
-        *o = dot(&weight[r * row_bytes..(r + 1) * row_bytes], acts, false)?;
+        *o = dot(&weight[r * row_bytes..(r + 1) * row_bytes], acts, scalar)?;
     }
     Ok(())
 }
@@ -136,8 +147,9 @@ pub fn gemv_q8_0(
         acts.len(),
         out.len(),
     )?;
+    let scalar = force_scalar();
     for (r, o) in out.iter_mut().enumerate() {
-        *o = avx2::vec_dot_q8_0_q8_0(&weight[r * row_bytes..(r + 1) * row_bytes], acts, false)?;
+        *o = avx2::vec_dot_q8_0_q8_0(&weight[r * row_bytes..(r + 1) * row_bytes], acts, scalar)?;
     }
     Ok(())
 }
