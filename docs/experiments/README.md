@@ -10,7 +10,9 @@ which is the reason their claims are credible.
    decide whether it ships.
 2. Cold measurements only for published numbers: run inside the benchmark
    cgroup (`memory.max=3G`, `memory.swap.max=0`; zram counts as swap) with a
-   dropped page cache.
+   dropped page cache. The machine those numbers come from, and the
+   constraints it puts on measurement, are recorded in
+   `docs/benchmark-machine.md`.
 3. Every entry records its own baseline. Entries use different machine states,
    so numbers from different entries must not be combined into one curve.
 4. Changes claiming identical math must produce identical output. Changes that
