@@ -1216,12 +1216,25 @@ provisional.
 
   So gate 2 covers multi-chunk at toy geometry and gate 1 covers real
   geometry at one chunk. **Multi-chunk at production dials on the real
-  model's geometry is covered by neither, and that is outstanding.** Two
-  things close it: a wider fixture (`q_dim` unequal to hidden, several blocks
-  per row, more than one expert per window), which is being added, and the
-  long-prompt bit-identity baseline against the real model, whose reference
-  prompts are 512, 1891 and 3492 tokens and are therefore 1, 4 and 7 chunks
-  at the default chunk size (EXP-015 Note 6).
+  model's geometry was covered by neither.**
+
+  **Correction (2026-08-04, found by the final review): the fixture half of
+  that gap was already closed when this entry was written**, in commit
+  `09ab935`, two commits earlier. The wide fixture separates every width
+  (`hidden` 512, `q_dim` 768, `kv_dim` 192, `moe` 256, pairwise distinct and
+  asserted by loop), gives 2 Q8_K blocks per hidden-width row, and runs at
+  `experts_per_window` 1, 4 and 8 with `windows_in_flight` up to 3, over 6
+  prompt lengths x 4 chunk sizes: 96 sweep runs against 6 token-major
+  baselines. `plan_arena` narrows only `rows` and `windows_in_flight`, never
+  `experts_per_window`, so those runs really do use the dials they name, and
+  that is pinned by its own test.
+
+  What remains outstanding is only the real-model half, which a warm A/B has
+  since paid at 512 tokens: sweep prefill is byte-identical to token-major at
+  chunk 128, 256 and 512, i.e. across 4, 2 and 1 chunks, at the shipped
+  geometry and dials (EXP-017 Result). A cold long-prompt baseline over the
+  512, 1891 and 3492 token reference prompts (EXP-015 Note 6) would still be
+  stronger, and is not run.
 
   **Memory: prefill still costs zero additional bytes.** Both spans are
   sub-allocations of the `PrefillSession` arena, which is the head of the
@@ -1279,10 +1292,20 @@ provisional.
      Emitting layer-major would have silently changed what every past
      simulation measured, including the policy decisions in EXP-005, while
      still producing a file that parses. A `RouteRecorder` buffers a chunk
-     and hands the writer whole records in position order, the resulting file
-     is asserted byte-identical to what token-major wrote, and records leave
-     the buffer as each position completes so a run that dies mid-prefill
-     still leaves every finished record readable.
+     and hands the writer whole records in position order, and the resulting
+     file is asserted byte-identical to what token-major wrote.
+
+     **Correction (2026-08-04, found by the final review): this note
+     originally claimed records leave the buffer as each position completes,
+     so a run dying mid-prefill still left every finished record readable.
+     That is false under the sweep**, and the code comment added in the same
+     commit says so. No position in a chunk completes until that chunk's last
+     layer, so the granularity is a chunk: a run that dies at layer 30 of 48
+     loses the whole chunk in progress. What does leave the buffer goes into
+     `TraceWriter`'s `BufWriter`, which nothing flushes before `finish`, so
+     the tail of earlier chunks can go with it. A truncated trace is still
+     readable, by counting records from the file length and ignoring a
+     trailing partial one.
   4. **Keeping the token-major path is not sentiment.** It is the reference
      half of gate 2; deleting it deletes the only test that covers the
      multi-chunk seams at all, and it is also the A/B arm EXP-017 needs to
@@ -1322,9 +1345,13 @@ provisional.
   total by construction, they sum to it, and whatever no phase claims stays
   visible as `other` instead of being folded into whichever region happened to
   be open. Instrumentation overhead is bounded at roughly **2.5 ppm** for a
-  512-token sweep chunk (about 13,104 clock reads per chunk at ~25 ns),
-  because per-row sites are timed around the enclosing loop rather than per
-  iteration.
+  512-token sweep chunk, because per-row sites are timed around the enclosing
+  loop rather than per iteration. Counting the charge sites gives `16 + 2R`
+  per layer, so at `R = 128` routed experts that is `48 x 272` plus two for
+  the logits tail and one for the clock's construction, i.e. **13,059** reads
+  per chunk at roughly 25 ns, or 2.6 ppm of a 124.27 s run. An earlier
+  revision of this entry said 13,104, which is one extra read per layer; the
+  conclusion is unchanged either way.
 - Baseline: the token-major run from the same session at the same 512 tokens,
   which is the path EXP-016 displaced and which it deliberately kept
   selectable for exactly this comparison (EXP-016 Note 4). Both arms are in

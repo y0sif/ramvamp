@@ -1177,17 +1177,6 @@ fn report_stream_stats(state: &ForwardState) {
     report_stream_span(state, &PhaseStats::take(state), None);
 }
 
-/// The same report over one span of a longer-lived state: everything that
-/// happened since `start`, and nothing that happened before it.
-///
-/// What `chat` prints under a reply. The footer sits directly beneath the
-/// tokens it describes, so it has to describe *those* tokens — before this,
-/// turn three's line covered all three turns and all three prefills, under a
-/// heading the docs above call "the run just finished".
-fn report_stream_stats_since(state: &ForwardState, start: &PhaseStats) {
-    report_stream_span(state, &PhaseStats::take(state).since(start), None);
-}
-
 /// Everything the process streamed, labelled so it cannot be read as a turn.
 ///
 /// `chat` prints this once, on the way out, because the per-turn deltas no
@@ -1201,6 +1190,12 @@ fn report_stream_stats_total(state: &ForwardState) {
 
 /// Geometry, then one line per phase that did something. `scope` names the
 /// span when it is not the obvious one.
+///
+/// Callers under a `chat` reply must pass a **delta**, not `PhaseStats::take`.
+/// The REPL keeps one `ForwardState` for the session and the stream counters
+/// are cumulative from its construction, so the raw snapshot makes turn
+/// three's footer cover all three turns and all three prefills, under a
+/// heading the docs above call "the run just finished".
 fn report_stream_span(state: &ForwardState, stats: &PhaseStats, scope: Option<&str>) {
     eprintln!(
         "experts{}: {} mode, {} slots/layer ({})",
@@ -1836,8 +1831,10 @@ fn chat_turn(
             history.extend_from_slice(&stats.generated_ids);
             println!();
             report_generate_stats(&stats, None);
+            // One snapshot for both footers, so they provably describe the
+            // same span rather than two takes that happen to agree.
             let span = PhaseStats::take(state).since(&at_turn_start);
-            report_stream_stats_since(state, &at_turn_start);
+            report_stream_span(state, &span, None);
             // The timing is rearmed by every prefill, so it already describes
             // this turn; the streaming counters it quotes are not, hence the
             // delta.
@@ -1856,8 +1853,13 @@ fn chat_turn(
             history.extend_from_slice(&spoken);
             println!();
             // The abort path reports the same delta: the tokens are fewer,
-            // not a different span.
-            report_stream_stats_since(state, &at_turn_start);
+            // not a different span. The prefill split is reported here too:
+            // Ctrl-C can only ever cut decode, because the whole prompt is
+            // prefilled before the first on_token fires, so the split is
+            // complete and valid on this path as well.
+            let span = PhaseStats::take(state).since(&at_turn_start);
+            report_stream_span(state, &span, None);
+            report_prefill_timing(state, &span);
             Ok((reply, interrupted))
         }
     }
