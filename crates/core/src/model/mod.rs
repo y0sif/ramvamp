@@ -47,9 +47,21 @@
 //! [`ForwardState`] (KV cache + preallocated scratch); see `forward` for
 //! the reference-fidelity notes (HF `Qwen3MoeDecoderLayer` order,
 //! QK-RMSNorm before RoPE, router softmax-then-top-k).
+//!
+//! # Prefill
+//!
+//! [`prefill_prompt`] consumes a whole prompt. By default it runs the
+//! chunked layer-major sweep (`prefill`): up to
+//! [`DEFAULT_PREFILL_CHUNK`] positions are carried through the model
+//! together and each layer's expert file is streamed once per chunk, which
+//! takes expert traffic from ~1,097 MB per token to ~34 MB.
+//! [`PrefillMode::TokenMajor`] keeps the old `forward_token`-in-a-loop path
+//! selectable in the same binary, which is what makes the byte-identical
+//! -logits A/B a unit test rather than a cross-build comparison.
 
 mod error;
 mod forward;
+mod prefill;
 mod shapes;
 mod weights;
 
@@ -60,5 +72,8 @@ pub(crate) use forward::testsupport;
 pub use forward::{
     DEFAULT_CACHE_BYTES, ExpertRouteSink, ForwardError, ForwardState, RuntimeConfig, forward_token,
     forward_token_traced,
+};
+pub use prefill::{
+    DEFAULT_PREFILL_CHUNK, PrefillConfig, PrefillMode, PrefillRouteSink, prefill_prompt,
 };
 pub use weights::{F32Tensor, LayerWeights, Model, QuantTensor};

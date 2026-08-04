@@ -1,20 +1,33 @@
 //! Generation orchestration: prefill, token-by-token decode, sampling.
 //!
-//! **Prefill today is decode**: [`forward_token`] in a loop over the prompt,
-//! one token at a time, through the same [`ForwardState`] and therefore the
-//! same expert cache, with logits requested only for the last prompt token.
-//! Decode then repeats that loop one generated token at a time. Sampling
-//! supports greedy, temperature, top-k, and top-p (repetition penalty is
-//! not implemented yet); greedy decode must be deterministic for
-//! validation against reference implementations.
+//! **Prefill is the chunked layer-major sweep** ([`prefill_prompt`]): up to
+//! [`DEFAULT_PREFILL_CHUNK`](crate::model::DEFAULT_PREFILL_CHUNK) prompt
+//! positions are carried through the model together and each layer's expert
+//! file is streamed once per chunk, bypassing the decode cache entirely.
+//! Decode then runs [`forward_token`] one generated token at a time through
+//! that cache. Sampling supports greedy, temperature, top-k, and top-p
+//! (repetition penalty is not implemented yet); greedy decode must be
+//! deterministic for validation against reference implementations.
 //!
-//! The layer-major chunked prefill `docs/architecture.md` specifies — a
-//! bounded chunk of positions swept per layer, so one fetched expert serves
-//! many rows and the cache is bypassed entirely — is phase 6, and is not
-//! this code. Nothing here bypasses or bounds the cache differently for
-//! prompt tokens, and the streaming counters reflect that: a pure-prefill
-//! run reports cache hits, because prompt positions reuse each other's
-//! experts exactly the way decode positions do.
+//! The streaming counters reflect the split: a pure-prefill run reports **no
+//! cache accesses at all** (its bytes land in `sweep_bytes_read` and its
+//! windows in `sweep_windows_read`), because prompt positions no longer
+//! request experts through the slot cache. Selecting
+//! [`PrefillMode::TokenMajor`](crate::model::PrefillMode) restores the
+//! phase-5 behaviour, cache accounting included; it exists for the
+//! byte-identical-logits A/B and is not the default.
+//!
+//! # Continuing a sequence
+//!
+//! [`generate_from`] takes a starting position, so a second turn prefills
+//! only the new tokens against a KV cache the first turn left behind. This
+//! is the *only* correct way to continue a conversation: a ChatML
+//! generation-prompt render is not always an id-prefix of the finished
+//! assistant turn (the `\n` that ends `<|im_start|>assistant\n` and the head
+//! of the reply are candidates for the same BPE merge), so a cache cannot be
+//! extended by re-encoding the reply's text. The ids that were actually
+//! generated are reported in [`GenerateStats::generated_ids`] for exactly
+//! that reason.
 //!
 //! # Sampling
 //!
@@ -41,24 +54,27 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::model::{
-    ForwardError, ForwardState, Model, StreamPhase, forward_token, forward_token_traced,
+    ForwardError, ForwardState, Model, PrefillRouteSink, StreamPhase, forward_token,
+    forward_token_traced, prefill_prompt,
 };
 use crate::tokenizer::{RvmpTokenizer, SamplingDefaults, TokenizerError};
 
 /// Which pass a routing record came from.
 ///
-/// Both passes go through the same [`ForwardState`] and the same expert
-/// cache in this build (see the module docs), so the tag is not a statement
-/// about how the experts were fetched. It exists because the two passes are
-/// not comparable *workloads*: prefill walks a prompt whose positions the
-/// caller chose, decode walks the model's own output, and a cache-hit rate
-/// quoted over both at once is a different number from either. The offline
-/// simulator (`scripts/lfu_sim.py`) filters on it and models decode only, so
-/// anything measured against that simulation has to filter the same way.
+/// The two passes are not comparable *workloads*: prefill walks a prompt
+/// whose positions the caller chose, decode walks the model's own output,
+/// and a cache-hit rate quoted over both at once is a different number from
+/// either. The offline simulator (`scripts/lfu_sim.py`) filters on this tag
+/// and models decode only, so anything measured against that simulation has
+/// to filter the same way.
 ///
-/// `docs/architecture.md` ("Prefill") specifies a cache-bypassing
-/// layer-major prefill sweep for phase 6. When that lands the tag will
-/// additionally mean "fetched differently"; today it does not.
+/// Under the default [`PrefillMode::Sweep`](crate::model::PrefillMode) the
+/// tag additionally means "fetched differently": prefill bypasses the slot
+/// cache and streams each layer front to back. It also means "emitted in a
+/// different order" — the sweep reports `(layer, row)`, the token-major path
+/// reports `(token, layer)` — because that is the order the work happens in.
+/// The set of `(position, layer)` pairs and the selections at each are
+/// identical either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TracePhase {
     /// A prompt token.
@@ -129,16 +145,25 @@ pub enum StopReason {
     MaxNew,
 }
 
-/// Counters and timings from one [`generate`] call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Counters, timings and output ids from one [`generate`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateStats {
     /// Prompt tokens prefilled.
     pub prompt_tokens: usize,
-    /// Tokens generated (stop token excluded).
+    /// Tokens generated (stop token excluded). Always
+    /// `generated_ids.len()`.
     pub generated: usize,
+    /// The ids that were generated, in order, stop token excluded.
+    ///
+    /// The only sound way to continue a conversation: a KV cache is extended
+    /// by appending the ids that were actually produced, never by re-encoding
+    /// the reply's text (see the module docs). `on_token` cannot substitute
+    /// for this, because its final flush event repeats the last id to carry
+    /// the withheld tail of a split character.
+    pub generated_ids: Vec<u32>,
     /// Why generation stopped.
     pub stop: StopReason,
-    /// Wall time of the prefill loop.
+    /// Wall time of the prefill pass.
     pub prefill: Duration,
     /// Wall time of the decode loop (sampling + forward passes).
     pub decode: Duration,
@@ -158,6 +183,19 @@ pub enum GenerateError {
     /// The prompt has no tokens: there are no logits to sample from.
     #[error("generate: empty prompt")]
     EmptyPrompt,
+
+    /// `start_position` does not continue the state's KV cache.
+    ///
+    /// Validated rather than trusted: a caller continuing a conversation owns
+    /// the bookkeeping, and a silent off-by-one would prefill the new turn at
+    /// the wrong RoPE positions and produce plausible nonsense.
+    #[error("generate: start_position {position}, but the state holds {expected} positions")]
+    PositionMismatch {
+        /// The position the caller asked to continue from.
+        position: usize,
+        /// The position the state actually expects next.
+        expected: usize,
+    },
 
     /// Internal invariant: a `want_logits` pass returned no logits.
     /// Unreachable through the public API; reported instead of asserted.
@@ -523,18 +561,19 @@ impl StreamDecoder {
 /// Prefill `prompt_ids` and decode up to `max_new` tokens, streaming each
 /// token id and its newly-decoded text through `on_token`.
 ///
-/// Prefill runs [`forward_token`] per prompt token (logits only for the
-/// last). Decode samples per [`GenerateParams`], stops on any of the
-/// tokenizer's stop tokens (the stop token is neither counted nor
+/// Prefill runs [`prefill_prompt`] over the whole prompt (logits only for
+/// the last position). Decode samples per [`GenerateParams`], stops on any of
+/// the tokenizer's stop tokens (the stop token is neither counted nor
 /// streamed) or after `max_new` tokens, and streams text via incremental
 /// detokenization (see the module docs). `state` must be fresh (empty KV
-/// cache); positions continue from the prompt.
+/// cache); use [`generate_from`] to continue one.
 ///
 /// # Errors
 ///
-/// [`GenerateError::EmptyPrompt`] on an empty prompt; forward-pass and
-/// tokenizer failures pass through typed. On error the state is mid-token
-/// and must be discarded.
+/// [`GenerateError::EmptyPrompt`] on an empty prompt;
+/// [`GenerateError::PositionMismatch`] when `state` is not fresh;
+/// forward-pass and tokenizer failures pass through typed. On error the
+/// state is mid-pass and must be discarded or [`ForwardState::reset`].
 pub fn generate(
     model: &Model,
     state: &mut ForwardState,
@@ -548,6 +587,70 @@ pub fn generate(
         state,
         tokenizer,
         prompt_ids,
+        0,
+        params,
+        tokenizer.stop_tokens(),
+        &mut on_token,
+        None,
+    )
+}
+
+/// [`generate`] continuing a KV cache that already holds `start_position`
+/// positions.
+///
+/// `prompt_ids` is only the **new** tokens — the next turn's render minus
+/// everything the state has already seen — and `start_position` must equal
+/// [`ForwardState::seq_len`]. This is what makes a multi-turn REPL cost one
+/// turn's prefill instead of one whole conversation's, and one
+/// [`ForwardState`] instead of one per turn: constructing a state reserves
+/// the ~1,438 MiB expert slot pool, opens io_uring and spawns the pinned
+/// compute pool.
+///
+/// The new tokens must be the ids that actually continue the sequence. For an
+/// assistant turn that means the ids in
+/// [`GenerateStats::generated_ids`], never a re-encoding of the reply's text:
+/// a generation-prompt render is not always an id-prefix of the finished
+/// turn, because the `\n` closing `<|im_start|>assistant\n` and the first
+/// characters of the reply can merge (measured, across `"hello"`,
+/// `" hello"`, `"\nhello"`, `"```rust"` and `"    indented"`).
+///
+/// # Which ids are "new"
+///
+/// Not every generated id reaches the cache: the last one sampled is emitted
+/// and never fed back (there is nothing left to predict from it), and a
+/// sampled stop token is not fed either. So a caller keeps the full id
+/// history and lets the cache say where it is:
+///
+/// ```text
+/// history.extend(&stats.generated_ids);      // turn N's reply
+/// history.extend(render_next_user_turn());   // turn N+1's prompt
+/// let fed = state.seq_len()?;                // what the model has seen
+/// generate_from(model, state, tok, &history[fed..], fed, params, on_token)?;
+/// ```
+///
+/// `state.seq_len()` is authoritative and `history[fed..]` is by construction
+/// exactly the suffix it has not consumed.
+///
+/// # Errors
+///
+/// [`GenerateError::PositionMismatch`] when `start_position` disagrees with
+/// the cache — including when a previous pass failed and left it ragged —
+/// plus everything [`generate`] returns.
+pub fn generate_from(
+    model: &Model,
+    state: &mut ForwardState,
+    tokenizer: &RvmpTokenizer,
+    prompt_ids: &[u32],
+    start_position: usize,
+    params: &GenerateParams,
+    mut on_token: impl FnMut(u32, &str),
+) -> Result<GenerateStats, GenerateError> {
+    generate_with_stops(
+        model,
+        state,
+        tokenizer,
+        prompt_ids,
+        start_position,
         params,
         tokenizer.stop_tokens(),
         &mut on_token,
@@ -577,6 +680,7 @@ pub fn generate_traced(
         state,
         tokenizer,
         prompt_ids,
+        0,
         params,
         tokenizer.stop_tokens(),
         &mut on_token,
@@ -619,52 +723,66 @@ fn traced_step<'s>(
 }
 
 /// [`generate`] with an explicit stop set (unit tests drive this with
-/// synthetic stop tokens a tiny fixture model can actually emit) and an
-/// optional routing trace.
+/// synthetic stop tokens a tiny fixture model can actually emit), a starting
+/// position, and an optional routing trace.
 #[allow(clippy::too_many_arguments)]
 fn generate_with_stops(
     model: &Model,
     state: &mut ForwardState,
     tokenizer: &RvmpTokenizer,
     prompt_ids: &[u32],
+    start_position: usize,
     params: &GenerateParams,
     stop_tokens: &[u32],
     on_token: &mut dyn FnMut(u32, &str),
     mut trace: Option<RouteSink<'_>>,
 ) -> Result<GenerateStats, GenerateError> {
-    let (&last, rest) = prompt_ids.split_last().ok_or(GenerateError::EmptyPrompt)?;
+    if prompt_ids.is_empty() {
+        return Err(GenerateError::EmptyPrompt);
+    }
+    // The cache decides where the sequence actually is; `start_position` is
+    // the caller's claim about it, and the two have to agree before a single
+    // RoPE position is computed. A ragged cache (a previous pass abandoned
+    // mid-token) reports as a mismatch rather than as an opaque kv error.
+    let expected = state
+        .seq_len()
+        .map_err(|_| GenerateError::PositionMismatch {
+            position: start_position,
+            expected: usize::MAX,
+        })?;
+    if start_position != expected {
+        return Err(GenerateError::PositionMismatch {
+            position: start_position,
+            expected,
+        });
+    }
 
     let prefill_start = Instant::now();
-    for (pos, &id) in rest.iter().enumerate() {
-        traced_step(
-            model,
-            state,
-            id,
-            pos,
-            false,
-            TracePhase::Prefill,
-            &mut trace,
-        )?;
-    }
-    let mut logits = traced_step(
-        model,
-        state,
-        last,
-        rest.len(),
-        true,
-        TracePhase::Prefill,
-        &mut trace,
-    )?
-    .ok_or(GenerateError::MissingLogits)?;
+    state.set_stream_phase(StreamPhase::Prefill);
+    let mut logits = {
+        // The sink borrows `trace` for the length of the prefill only; the
+        // decode loop below needs it back.
+        let mut tagged;
+        let sink: Option<PrefillRouteSink<'_>> = match trace.as_deref_mut() {
+            Some(inner) => {
+                tagged = |position: usize, layer: u32, topk: &[(u32, f32)]| {
+                    inner(TracePhase::Prefill, position, layer, topk);
+                };
+                Some(&mut tagged)
+            }
+            None => None,
+        };
+        prefill_prompt(model, state, prompt_ids, sink)?
+    };
     let prefill = prefill_start.elapsed();
 
     let decode_start = Instant::now();
     let mut sampler = Sampler::new(params, logits.len());
     let mut stream = StreamDecoder::new();
-    let mut position = prompt_ids.len();
-    let mut generated = 0usize;
+    let mut position = start_position + prompt_ids.len();
+    let mut generated_ids: Vec<u32> = Vec::with_capacity(params.max_new);
     let mut stop = StopReason::MaxNew;
-    while generated < params.max_new {
+    while generated_ids.len() < params.max_new {
         let next = sampler.sample(logits);
         if stop_tokens.contains(&next) {
             stop = StopReason::StopToken(next);
@@ -672,8 +790,8 @@ fn generate_with_stops(
         }
         let text = stream.push(tokenizer, next)?;
         on_token(next, &text);
-        generated += 1;
-        if generated == params.max_new {
+        generated_ids.push(next);
+        if generated_ids.len() == params.max_new {
             break;
         }
         logits = traced_step(
@@ -698,7 +816,8 @@ fn generate_with_stops(
 
     Ok(GenerateStats {
         prompt_tokens: prompt_ids.len(),
-        generated,
+        generated: generated_ids.len(),
+        generated_ids,
         stop,
         prefill,
         decode: decode_start.elapsed(),
@@ -712,7 +831,7 @@ mod tests {
     use super::*;
     use crate::io::LoadOptions;
     use crate::io::testutil::build_install;
-    use crate::model::{ForwardState, RuntimeConfig};
+    use crate::model::{ForwardState, PrefillConfig, PrefillMode, RuntimeConfig};
 
     /// Fixture-sized runtime dials: an unpinned two-shard pool and a small
     /// expert budget, so a test suite that runs many states in parallel
@@ -720,6 +839,18 @@ mod tests {
     /// 1,438 MiB per state.
     fn small(model: &Model, context_cap: usize) -> ForwardState {
         ForwardState::with_config(model, context_cap, RuntimeConfig::testing()).unwrap()
+    }
+
+    /// Sweep prefill with a ring narrow enough that the fixture's sub-1 MiB
+    /// slot pool still leaves room for a chunk wider than any prompt here, so
+    /// every test prompt is prefilled as exactly one chunk.
+    fn one_chunk_sweep() -> PrefillConfig {
+        PrefillConfig {
+            mode: PrefillMode::Sweep,
+            chunk: 512,
+            experts_per_window: 1,
+            windows_in_flight: 1,
+        }
     }
 
     /// The committed real-tokenizer fixtures (pinned Qwen3 vocabulary).
@@ -1250,6 +1381,7 @@ mod tests {
             &mut state,
             &h.tokenizer,
             prompt,
+            0,
             &greedy_params(max_new),
             stops,
             &mut on_token,
@@ -1257,9 +1389,17 @@ mod tests {
         )
         .unwrap();
         // One event per generated token, plus at most one flush event that
-        // re-reports the last id with the withheld tail text.
+        // re-reports the last id with the withheld tail text. That repeat is
+        // exactly why `GenerateStats::generated_ids` exists: `on_token`'s ids
+        // are a stream, not a list, and only the stats carry the sequence a
+        // caller can append to a KV cache.
         assert!(events.len() == stats.generated || events.len() == stats.generated + 1);
+        assert_eq!(stats.generated_ids.len(), stats.generated);
         let ids: Vec<u32> = events.iter().take(stats.generated).map(|e| e.0).collect();
+        assert_eq!(
+            ids, stats.generated_ids,
+            "the stream and the stats disagree"
+        );
         let text: String = events.iter().map(|e| e.1.as_str()).collect();
         (ids, text, stats)
     }
@@ -1326,6 +1466,10 @@ mod tests {
             records.push((phase, pos, layer, topk.iter().map(|&(e, _)| e).collect()));
         };
         let mut state = small(&h.model, 16);
+        // One chunk for the whole prompt, so the layer-major emission order
+        // asserted below is not at the mercy of how many rows the fixture's
+        // sub-1 MiB slot pool happens to leave room for.
+        state.set_prefill_config(one_chunk_sweep()).unwrap();
         let mut ids = Vec::new();
         let mut text = String::new();
         let stats = generate_traced(
@@ -1348,20 +1492,18 @@ mod tests {
         assert_eq!(ids[..want_ids.len()], want_ids[..]);
         assert_eq!(text, want_text);
 
-        // One record per layer per token, layers in order, phases split at
-        // the prompt boundary, and every routed id inside the expert count.
+        // One record per layer per token, phases split at the prompt
+        // boundary, and every routed id inside the expert count.
         let tokens = prompt.len() + stats.generated - 1;
         assert_eq!(records.len(), tokens * n_layers as usize);
-        for (i, (phase, pos, layer, experts)) in records.iter().enumerate() {
-            let token = i / n_layers as usize;
-            assert_eq!(*layer as usize, i % n_layers as usize);
-            assert_eq!(*pos, token);
-            let want_phase = if token < prompt.len() {
+        for (phase, pos, layer, experts) in &records {
+            let want_phase = if *pos < prompt.len() {
                 TracePhase::Prefill
             } else {
                 TracePhase::Decode
             };
-            assert_eq!(*phase, want_phase, "record {i}");
+            assert_eq!(*phase, want_phase, "position {pos}");
+            assert!(*layer < n_layers);
             assert_eq!(experts.len(), top_k);
             assert!(experts.iter().all(|&e| e < arch.n_experts), "{experts:?}");
             // torch.topk semantics: no expert is selected twice.
@@ -1370,55 +1512,308 @@ mod tests {
             unique.dedup();
             assert_eq!(unique.len(), top_k, "{experts:?}");
         }
+
+        // Every (position, layer) pair exactly once, across both phases.
+        let mut pairs: Vec<(usize, u32)> = records.iter().map(|r| (r.1, r.2)).collect();
+        pairs.sort_unstable();
+        let want: Vec<(usize, u32)> = (0..tokens)
+            .flat_map(|pos| (0..n_layers).map(move |layer| (pos, layer)))
+            .collect();
+        assert_eq!(pairs, want);
+
+        // Emission *order* differs by phase, and that is the documented
+        // contract on `TracePhase`: the sweep reports (layer, row) because
+        // that is the order it does the work in, while decode — still one
+        // `forward_token` per token — reports (token, layer).
+        let decode: Vec<_> = records
+            .iter()
+            .filter(|r| r.0 == TracePhase::Decode)
+            .collect();
+        for (i, record) in decode.iter().enumerate() {
+            assert_eq!(
+                record.2 as usize,
+                i % n_layers as usize,
+                "decode record {i}"
+            );
+            assert_eq!(record.1, prompt.len() + i / n_layers as usize);
+        }
+        let prefill: Vec<_> = records
+            .iter()
+            .filter(|r| r.0 == TracePhase::Prefill)
+            .collect();
+        for (i, record) in prefill.iter().enumerate() {
+            assert_eq!(
+                record.2 as usize,
+                i / prompt.len(),
+                "prefill record {i} is not layer-major"
+            );
+            assert_eq!(record.1, i % prompt.len());
+        }
     }
 
     /// F3. The streamer's counters are cumulative from construction, so a
     /// footer that quotes them reports prefill folded into what reads as a
-    /// decode number: a five-token prompt and `--max-new 4` is eight forward
-    /// passes, five of them prefill. `generate` declares the phase to the
-    /// streamer per token; this pins that the split is real, exhaustive, and
-    /// lands exactly where the pass counts say it should.
+    /// decode number. `generate` declares the phase to the streamer for every
+    /// pass; this pins that the split is real, exhaustive, and lands exactly
+    /// where the pass counts say it should — in **both** prefill modes, which
+    /// now account for their expert bytes in different counters entirely.
     #[test]
     fn streaming_counters_split_prefill_from_decode() {
         let h = harness("gen-phase-split");
         let prompt = [1u32, 2, 3];
         let max_new = 4;
-        let mut state = small(&h.model, 16);
-        let stats = generate_with_stops(
-            &h.model,
-            &mut state,
-            &h.tokenizer,
-            &prompt,
-            &greedy_params(max_new),
-            &[],
-            &mut |_, _| {},
-            None,
-        )
-        .unwrap();
-        assert_eq!(stats.generated, max_new);
-
         let arch = h.model.arch();
-        // One request per routed expert per layer per forward pass.
+        // One cache request per routed expert per layer per forward pass.
         let per_pass = u64::from(arch.n_layers) * u64::from(arch.top_k);
+
+        let run = |config: PrefillConfig| {
+            let mut state = small(&h.model, 16);
+            state.set_prefill_config(config).unwrap();
+            let stats = generate_with_stops(
+                &h.model,
+                &mut state,
+                &h.tokenizer,
+                &prompt,
+                0,
+                &greedy_params(max_new),
+                &[],
+                &mut |_, _| {},
+                None,
+            )
+            .unwrap();
+            assert_eq!(stats.generated, max_new);
+            state
+        };
+
+        // Token-major prefill: one cache pass per prompt token, exactly as in
+        // phase 5. Decode runs one pass per generated token *after* the
+        // first, which is sampled from the prompt's logits.
+        let state = run(PrefillConfig {
+            mode: PrefillMode::TokenMajor,
+            ..one_chunk_sweep()
+        });
         let prefill = state.stream_stats_in(StreamPhase::Prefill);
         let decode = state.stream_stats_in(StreamPhase::Decode);
         let total = state.stream_stats();
-
-        // Prefill runs one pass per prompt token. Decode runs one per
-        // generated token *after* the first, which is sampled from the
-        // prompt's logits.
         assert_eq!(prefill.accesses(), prompt.len() as u64 * per_pass);
         assert_eq!(decode.accesses(), (max_new as u64 - 1) * per_pass);
-
         // Exhaustive and disjoint: every request lands in exactly one phase.
         assert_eq!(prefill.accesses() + decode.accesses(), total.accesses());
         assert_eq!(prefill.misses + decode.misses, total.misses);
         assert_eq!(prefill.hits + decode.hits, total.hits);
         assert_eq!(prefill.bytes_read + decode.bytes_read, total.bytes_read);
-
-        // And the point of all of it: the cumulative figure is not the decode
+        // The point of all of it: the cumulative figure is not the decode
         // figure, and quoting it as one overstates the work by the prompt.
         assert_ne!(total.accesses(), decode.accesses());
+
+        // The sweep: prefill makes **no cache requests at all**. Its bytes
+        // are in the sweep counters, which is the whole reason those exist
+        // separately — a prefill hit rate is no longer a number that means
+        // anything, and a decode one is finally clean of the prompt.
+        let state = run(one_chunk_sweep());
+        let prefill = state.stream_stats_in(StreamPhase::Prefill);
+        let decode = state.stream_stats_in(StreamPhase::Decode);
+        let total = state.stream_stats();
+        assert_eq!(prefill.accesses(), 0, "the sweep bypasses the slot cache");
+        assert_eq!(prefill.hits, 0);
+        assert_eq!(prefill.misses, 0);
+        assert_eq!(prefill.bytes_read, 0);
+        assert!(prefill.sweep_windows_read > 0, "no window was ever read");
+        assert!(prefill.sweep_bytes_read > 0, "no expert bytes were swept");
+        assert_eq!(decode.accesses(), (max_new as u64 - 1) * per_pass);
+        assert_eq!(total.accesses(), decode.accesses());
+        assert_eq!(decode.sweep_windows_read, 0, "decode never sweeps");
+    }
+
+    /// A multi-turn conversation on one [`ForwardState`] must produce exactly
+    /// what a fresh state fed the whole history produces. This is what makes
+    /// a REPL affordable: a second turn prefills only its new tokens instead
+    /// of the whole conversation, and reuses the ~1,438 MiB expert slot pool,
+    /// the io_uring ring and the pinned compute pool rather than rebuilding
+    /// them.
+    ///
+    /// It also pins the "which ids are new" rule from `generate_from`'s docs:
+    /// the last sampled id is emitted but never fed, so the un-fed suffix is
+    /// `history[state.seq_len()..]` and nothing else.
+    #[test]
+    fn a_second_turn_continues_an_existing_cache() {
+        let h = harness("gen-continue");
+        let params = greedy_params(3);
+        let mut history: Vec<u32> = vec![1, 2, 3];
+
+        let mut state = small(&h.model, 24);
+        state.set_prefill_config(one_chunk_sweep()).unwrap();
+        let turn1 = generate_with_stops(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            &history.clone(),
+            0,
+            &params,
+            &[],
+            &mut |_, _| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(turn1.generated_ids.len(), 3);
+        history.extend(&turn1.generated_ids);
+
+        // The last generated id was emitted but never fed, so the cache is
+        // one short of the history.
+        let fed = state.seq_len().unwrap();
+        assert_eq!(fed, history.len() - 1);
+
+        // Turn two: the un-fed suffix, which is that trailing id plus the new
+        // user tokens.
+        history.extend([7u32, 8]);
+        let segment = history[fed..].to_vec();
+        let turn2 = generate_with_stops(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            &segment,
+            fed,
+            &params,
+            &[],
+            &mut |_, _| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(turn2.prompt_tokens, segment.len());
+
+        // The reference: a fresh state fed the whole history at once.
+        let mut fresh = small(&h.model, 24);
+        fresh.set_prefill_config(one_chunk_sweep()).unwrap();
+        let want = generate_with_stops(
+            &h.model,
+            &mut fresh,
+            &h.tokenizer,
+            &history,
+            0,
+            &params,
+            &[],
+            &mut |_, _| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            turn2.generated_ids, want.generated_ids,
+            "a continued cache diverged from a rebuilt one"
+        );
+        assert_eq!(state.seq_len().unwrap(), fresh.seq_len().unwrap());
+    }
+
+    /// `start_position` is validated, not trusted: an off-by-one would prefill
+    /// the new turn at the wrong RoPE positions and produce plausible
+    /// nonsense.
+    #[test]
+    fn a_wrong_start_position_is_typed() {
+        let h = harness("gen-start-position");
+        let mut state = small(&h.model, 16);
+        state.set_prefill_config(one_chunk_sweep()).unwrap();
+
+        // A fresh state is at 0, so anything else is refused, both through
+        // the public wrapper and before any work happens.
+        let err = generate_from(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            &[1, 2],
+            1,
+            &greedy_params(1),
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GenerateError::PositionMismatch {
+                    position: 1,
+                    expected: 0
+                }
+            ),
+            "unexpected error: {err}"
+        );
+        assert_eq!(state.seq_len().unwrap(), 0, "nothing was consumed");
+
+        // And `generate` is `generate_from(.., 0, ..)`, so a state that is
+        // *not* fresh is refused rather than silently mis-positioned.
+        generate_from(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            &[1, 2],
+            0,
+            &greedy_params(2),
+            |_, _| {},
+        )
+        .unwrap();
+        let held = state.seq_len().unwrap();
+        assert!(held > 0);
+        let err = generate(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            &[3],
+            &greedy_params(1),
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GenerateError::PositionMismatch {
+                    position: 0,
+                    expected,
+                } if expected == held
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `reset` starts a fresh sequence on an existing state, which must be
+    /// indistinguishable from a brand-new one — without paying for a new
+    /// expert slot pool.
+    #[test]
+    fn reset_starts_a_fresh_sequence() {
+        let h = harness("gen-reset");
+        let prompt = [4u32, 5, 6];
+        let params = greedy_params(3);
+
+        let mut reused = small(&h.model, 16);
+        reused.set_prefill_config(one_chunk_sweep()).unwrap();
+        let first = generate_with_stops(
+            &h.model,
+            &mut reused,
+            &h.tokenizer,
+            &prompt,
+            0,
+            &params,
+            &[],
+            &mut |_, _| {},
+            None,
+        )
+        .unwrap();
+        assert!(reused.seq_len().unwrap() > 0);
+
+        reused.reset();
+        assert_eq!(reused.seq_len().unwrap(), 0);
+        for layer in 0..h.model.n_layers() as usize {
+            assert_eq!(reused.kv_len(layer).unwrap(), 0);
+        }
+        let second = generate_with_stops(
+            &h.model,
+            &mut reused,
+            &h.tokenizer,
+            &prompt,
+            0,
+            &params,
+            &[],
+            &mut |_, _| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(second.generated_ids, first.generated_ids);
     }
 
     #[test]

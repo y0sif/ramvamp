@@ -86,7 +86,9 @@ use std::fmt;
 use std::sync::{Mutex, PoisonError};
 
 use crate::format::ArchInfo;
-use crate::io::{ExpertStream, ExpertView, IoError, StreamMode, StreamPhase, StreamStats};
+use crate::io::{
+    ExpertStream, ExpertView, IoError, StreamMode, StreamPhase, StreamStats, SweepError, SweepPlan,
+};
 use crate::kernels::KernelError;
 use crate::kernels::attention::{AttentionError, AttentionScratch, decode_attention};
 use crate::kernels::primitives::{
@@ -101,6 +103,7 @@ use crate::threads::{ComputePool, PoolConfig};
 use thiserror::Error;
 
 use super::error::ModelError;
+use super::prefill::PrefillConfig;
 use super::weights::Model;
 
 /// Default total expert-cache budget: 1,440 MiB.
@@ -273,6 +276,82 @@ pub enum ForwardError {
         /// Its value in the model passed to [`forward_token`].
         given: u32,
     },
+
+    /// A chunked-prefill layer sweep failed. See
+    /// [`crate::model::prefill_prompt`].
+    #[error(transparent)]
+    Sweep(#[from] SweepError),
+
+    /// The expert slot slab cannot host a prefill chunk beside the sweep
+    /// ring, even narrowed to a single row with one window in flight.
+    #[error(
+        "prefill: the expert slot pool holds {available} B, but the narrowest \
+         chunk needs {needed} B of scratch plus its sweep ring"
+    )]
+    PrefillScratch {
+        /// Bytes the narrowest viable carve would have needed.
+        needed: u64,
+        /// Bytes the slot pool actually reserved.
+        available: u64,
+    },
+
+    /// The prefill scratch span cannot be aligned for a buffer the chunk
+    /// needs. Ruled out by the slab's page-aligned base; checked rather than
+    /// assumed, because the alternative is an unaligned reinterpretation.
+    #[error("prefill: the scratch span cannot be aligned to {align} B")]
+    PrefillScratchAlign {
+        /// The alignment that could not be met.
+        align: usize,
+    },
+
+    /// The configured prefill chunk is not a usable number of positions.
+    #[error("prefill: chunk size {chunk} is not a usable number of positions")]
+    InvalidPrefillChunk {
+        /// The rejected chunk size.
+        chunk: usize,
+    },
+
+    /// Prefill was handed an empty prompt: there is nothing to run and no
+    /// logits to produce.
+    #[error("prefill: no tokens to prefill")]
+    EmptyPrefill,
+
+    /// A layer sweep finished without computing every routed `(row, slot)`
+    /// pair, so some staging slot would have been reduced stale — the
+    /// chunked analogue of [`ForwardError::StreamPlanCoverage`].
+    #[error("prefill: layer {layer}: the sweep covered {covered} of {expected} routed rows")]
+    PrefillCoverage {
+        /// The layer whose sweep came up short.
+        layer: u32,
+        /// Routed `(row, slot)` pairs actually computed.
+        covered: usize,
+        /// Routed `(row, slot)` pairs the chunk asked for.
+        expected: usize,
+    },
+
+    /// A router selection named an expert the layer does not have. Reported
+    /// rather than trusted: it would otherwise index past the routing index.
+    #[error("prefill: routed expert {expert} is outside the layer's {n_experts} experts")]
+    RoutedExpertOutOfRange {
+        /// The offending expert id.
+        expert: u32,
+        /// Routed experts the layer has.
+        n_experts: usize,
+    },
+
+    /// One chunk row selected the same expert twice, so more `(row, slot)`
+    /// pairs route to it than the chunk has rows and its batch would not fit
+    /// the scratch. Unreachable through the router — top-k selection blanks
+    /// each winner — and refused rather than allowed to index past a buffer.
+    #[error("prefill: expert {expert} is routed {count} times by only {rows} chunk rows")]
+    RepeatedRoutedExpert {
+        /// The over-subscribed expert.
+        expert: u32,
+        /// `(row, slot)` pairs that named it.
+        count: usize,
+        /// Rows the chunk actually holds.
+        rows: usize,
+    },
 }
 
 /// The architecture dimensions a [`ForwardState`]'s buffers were sized from.
@@ -403,6 +482,18 @@ pub struct ForwardState {
     pool: ComputePool,
     /// Expert cache + io_uring/O_DIRECT streamer.
     stream: ExpertStream,
+
+    /// Which prefill path [`crate::model::prefill_prompt`] takes, and how
+    /// wide its chunks are. Seeded from [`PrefillConfig::from_env`].
+    prefill: PrefillConfig,
+    /// The sweep's per-layer window geometry, reused across every layer of
+    /// every chunk so only the first layer of the first prefill allocates.
+    sweep_plan: SweepPlan,
+    /// Deduplicated routed expert ids for the layer being swept, preallocated
+    /// to `n_experts`. Lives here rather than in the session scratch because
+    /// [`crate::io::PrefillSession::split`] takes it *while* handing that
+    /// scratch back, and the two may not alias.
+    routed: Vec<u32>,
 }
 
 impl fmt::Debug for ForwardState {
@@ -525,9 +616,121 @@ impl ForwardState {
             logits: vec![0.0; vocab],
             pool,
             stream,
+            prefill: PrefillConfig::from_env(),
+            sweep_plan: SweepPlan::new(),
+            routed: Vec::with_capacity(n_experts),
         })
     }
 
+    /// The prefill dials this state runs with.
+    pub fn prefill_config(&self) -> PrefillConfig {
+        self.prefill
+    }
+
+    /// Replace the prefill dials.
+    ///
+    /// This is the path-selection and chunk-size dial the CLI wires up; it is
+    /// deliberately not a field on [`RuntimeConfig`], whose fields are
+    /// constructed positionally by another crate.
+    ///
+    /// # Errors
+    ///
+    /// [`ForwardError::InvalidPrefillChunk`] for a zero chunk.
+    pub fn set_prefill_config(&mut self, config: PrefillConfig) -> Result<(), ForwardError> {
+        self.prefill = config.validate()?;
+        Ok(())
+    }
+
+    /// The last `want_logits` pass's `[vocab]` output.
+    pub fn logits(&self) -> &[f32] {
+        &self.logits
+    }
+
+    /// Positions appended to one layer of the KV cache.
+    ///
+    /// Unlike [`ForwardState::seq_len`] this does not require the layers to
+    /// agree, which is what makes it usable during a chunked prefill (see
+    /// [`crate::model::prefill_prompt`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ForwardError::Kv`] when `layer` is outside the cache.
+    pub fn kv_len(&self, layer: usize) -> Result<usize, ForwardError> {
+        Ok(self.kv.len(layer)?)
+    }
+
+    /// Drop every cached position, keeping every allocation.
+    ///
+    /// For starting a fresh sequence on an existing state — a new REPL
+    /// conversation, say — without rebuilding the ~1,438 MiB expert slot pool,
+    /// the io_uring ring and the pinned compute pool, which is what
+    /// constructing a new [`ForwardState`] costs.
+    ///
+    /// The KV planes are not zeroed: every read is bounded by the per-layer
+    /// cursor this resets, so stale bits are unreachable. The expert cache,
+    /// its LFU history and the streaming counters all survive on purpose —
+    /// they describe the process, not the sequence.
+    pub fn reset(&mut self) {
+        self.kv.clear();
+    }
+
+    /// Borrow the pieces the chunked prefill driver needs, all at once.
+    ///
+    /// Field-by-field so the compute pool, the streamer, the KV cache and the
+    /// scratch buffers can be held simultaneously — the same destructuring
+    /// [`forward_token`] does, exposed to the sibling module.
+    pub(super) fn prefill_parts(&mut self) -> PrefillParts<'_> {
+        PrefillParts {
+            kv: &mut self.kv,
+            attn_scratch: &mut self.attn_scratch,
+            topk: &mut self.topk,
+            logits: &mut self.logits,
+            pool: &mut self.pool,
+            stream: &mut self.stream,
+            sweep_plan: &mut self.sweep_plan,
+            routed: &mut self.routed,
+        }
+    }
+
+    /// Refuse a model this state's buffers were not sized for.
+    ///
+    /// # Errors
+    ///
+    /// [`ForwardError::ArchMismatch`] naming the first dimension that differs.
+    pub(super) fn check_arch(&self, arch: &ArchInfo) -> Result<(), ForwardError> {
+        self.arch.check(arch)
+    }
+
+    /// All appended K rows of one layer, f16 bits. Test-only: the planes are
+    /// an implementation detail, and this exists so the prefill tests can
+    /// compare what two paths left behind.
+    #[cfg(test)]
+    pub(super) fn kv_k_layer(&self, layer: usize) -> Result<&[u16], ForwardError> {
+        Ok(self.kv.k_layer(layer)?)
+    }
+
+    /// All appended V rows of one layer; see [`ForwardState::kv_k_layer`].
+    #[cfg(test)]
+    pub(super) fn kv_v_layer(&self, layer: usize) -> Result<&[u16], ForwardError> {
+        Ok(self.kv.v_layer(layer)?)
+    }
+}
+
+/// The [`ForwardState`] pieces one chunked prefill borrows, split out so they
+/// can be held at the same time.
+pub(super) struct PrefillParts<'a> {
+    pub(super) kv: &'a mut KvCache,
+    pub(super) attn_scratch: &'a mut AttentionScratch,
+    /// `(expert, weight)` staging for the route sink.
+    pub(super) topk: &'a mut Vec<(u32, f32)>,
+    pub(super) logits: &'a mut Vec<f32>,
+    pub(super) pool: &'a mut ComputePool,
+    pub(super) stream: &'a mut ExpertStream,
+    pub(super) sweep_plan: &'a mut SweepPlan,
+    pub(super) routed: &'a mut Vec<u32>,
+}
+
+impl ForwardState {
     /// Positions appended so far (the position the next token must use).
     ///
     /// # Errors
@@ -613,7 +816,7 @@ pub type ExpertRouteSink<'a> = &'a mut dyn FnMut(u32, &[(u32, f32)]);
 /// Plain f32 dot product with f32 accumulation, matching the reference
 /// router matvec (HF computes router logits in f32).
 #[inline]
-fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+pub(super) fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = 0.0f32;
     for (&x, &y) in a.iter().zip(b) {
         acc += x * y;
@@ -623,7 +826,7 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 
 /// Remember the first kernel error any shard reported, without panicking
 /// out of a worker thread.
-fn record(slot: &Mutex<Option<KernelError>>, err: KernelError) {
+pub(super) fn record(slot: &Mutex<Option<KernelError>>, err: KernelError) {
     let mut held = slot.lock().unwrap_or_else(PoisonError::into_inner);
     if held.is_none() {
         *held = Some(err);
@@ -631,7 +834,7 @@ fn record(slot: &Mutex<Option<KernelError>>, err: KernelError) {
 }
 
 /// Take whatever [`record`] stored.
-fn taken(slot: Mutex<Option<KernelError>>) -> Result<(), KernelError> {
+pub(super) fn taken(slot: Mutex<Option<KernelError>>) -> Result<(), KernelError> {
     match slot.into_inner().unwrap_or_else(PoisonError::into_inner) {
         Some(err) => Err(err),
         None => Ok(()),
@@ -643,7 +846,7 @@ fn taken(slot: Mutex<Option<KernelError>>) -> Result<(), KernelError> {
 /// Bit-identical to `gemv_q8_k` over the same operands: the pool's shards
 /// tile `0..out_dim` in ascending contiguous order and each output row is an
 /// independent dot product (see the module docs).
-fn pool_gemv_q8_k(
+pub(super) fn pool_gemv_q8_k(
     pool: &mut ComputePool,
     format: QuantFormat,
     weight: &[u8],
@@ -953,6 +1156,10 @@ pub fn forward_token_traced<'s>(
         logits,
         pool,
         stream,
+        // Prefill-only state; `forward_token` neither reads nor advances it.
+        prefill: _,
+        sweep_plan: _,
+        routed: _,
     } = state;
 
     let expected = kv.seq_len()?;
