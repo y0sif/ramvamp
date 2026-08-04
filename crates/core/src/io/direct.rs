@@ -52,6 +52,26 @@
 //!   silently look like a clean O_DIRECT pass. If the control fails the probe
 //!   reports [`DirectFault::NoResidencySignal`] and the caller degrades.
 //!
+//! # `mincore` does not answer for files this process does not own
+//!
+//! Since Linux 4.19 (`mm/mincore.c`, "make mincore() more conservative")
+//! `mincore` reveals page-cache residency for a file-backed mapping only when
+//! the caller passes `inode_owner_or_capable()` or could open the file for
+//! writing. When it refuses it does **not** fail: it fills the vector with
+//! `1`, reporting everything as resident. Ownership is what decides it, not
+//! the mode bits — `chmod 444` on your own file still answers truthfully.
+//!
+//! That turns every deployment where the install is not owned by the running
+//! user — a model unpacked into `/opt` by root, a bind-mount with a uid
+//! mismatch, `ramvamp-repack` run under a different account — into a probe
+//! that can never clear its baseline and always reports
+//! [`DirectFault::DirtyBaseline`], naming the wrong cause for a filesystem
+//! where O_DIRECT is working perfectly. So the condition is checked before the
+//! measurement is attempted and reported as [`DirectFault::ResidencyDenied`].
+//! The verdict is still a degradation — nothing here can prove the bypass
+//! without a residency signal — but it names the real fault, and it is a
+//! permission problem the operator can fix.
+//!
 //! Everything degrades: a machine with no working O_DIRECT still runs, with
 //! a warning and a page-cache-charged budget.
 
@@ -146,6 +166,15 @@ pub enum DirectFault {
     /// same range left `mincore` reporting nothing resident, so a clean
     /// result would have been meaningless.
     NoResidencySignal,
+    /// The kernel will not reveal this file's page-cache residency to this
+    /// process. Since Linux 4.19 `mincore` reports a file-backed range as
+    /// *fully resident* — silently, without an error — unless the caller owns
+    /// the inode or could open the file for writing, so no measurement over
+    /// this install is meaningful. Says nothing about O_DIRECT: the install is
+    /// simply owned by another user (root-owned `/opt`, a bind-mount with a
+    /// uid mismatch, a repack run under a different account). Run as the
+    /// owner of the install to get a verdict.
+    ResidencyDenied,
     /// `mmap`, `mincore` or `posix_fadvise` failed during the probe.
     ProbeFailed,
 }
@@ -164,6 +193,11 @@ impl fmt::Display for DirectFault {
             Self::PageCacheGrew => "the read populated the page cache: a silent buffered fallback",
             Self::NoResidencySignal => {
                 "mincore reports nothing resident even after a buffered read"
+            }
+            Self::ResidencyDenied => {
+                "mincore will not report page-cache residency for a file this \
+                 process neither owns nor may write, so O_DIRECT cannot be \
+                 measured on this install"
             }
             Self::ProbeFailed => "the probe's own mmap/mincore/fadvise failed",
         };
@@ -287,6 +321,19 @@ pub fn probe(path: &Path, buf: &mut [u8]) -> DirectSupport {
         Err(_) => return DirectSupport::Unusable(DirectFault::ProbeFailed),
     }
 
+    // Before any measurement: `mincore` answers "everything is resident" for
+    // a file this process neither owns nor may write, which would make the
+    // baseline below permanently dirty and blame the filesystem for a
+    // permission fact. See the module docs.
+    if !residency_is_visible(path, &buffered) {
+        tracing::warn!(
+            path = %path.display(),
+            "the install is owned by another user, so the kernel will not \
+             report its page-cache residency; O_DIRECT cannot be verified"
+        );
+        return DirectSupport::Degraded(DirectFault::ResidencyDenied);
+    }
+
     // Baseline: nothing of the window may be resident, or "the cache grew"
     // cannot be told from "the cache was already warm". tmpfs stops here,
     // which is correct: on tmpfs the page cache *is* the file.
@@ -341,6 +388,57 @@ pub fn probe(path: &Path, buf: &mut [u8]) -> DirectSupport {
 /// Whether `value` satisfies the direct-I/O alignment requirement.
 pub fn is_aligned(value: u64) -> bool {
     value % DIO_ALIGN == 0
+}
+
+/// Whether [`resident_pages`] will tell the truth about `file`.
+///
+/// `mincore` reveals page-cache residency for a file-backed mapping only when
+/// `can_do_mincore()` passes, which since Linux 4.19 means
+/// `inode_owner_or_capable() || file_permission(MAY_WRITE) == 0`. Otherwise it
+/// reports the whole range resident and returns success, so a caller that does
+/// not ask this question first cannot tell a warm cache from a refused answer.
+///
+/// This mirrors the kernel's test rather than probing for it, because there is
+/// no range whose true residency is known in advance to compare against — the
+/// refusal is indistinguishable from a genuinely warm file. Conservative in the
+/// safe direction: a `false` here degrades the verdict, it never claims one.
+#[cfg(target_os = "linux")]
+fn residency_is_visible(path: &Path, file: &File) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    // `inode_owner_or_capable()`: the owner, or anyone with CAP_FOWNER over
+    // the inode, which root always has.
+    if euid == 0 {
+        return true;
+    }
+    if file.metadata().is_ok_and(|meta| meta.uid() == euid) {
+        return true;
+    }
+    // Or write permission, checked against the effective ids the way the
+    // kernel's own permission check is.
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c_path` is a live NUL-terminated string for the call's
+    // duration and `faccessat` only reads it.
+    let rc = unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::W_OK,
+            libc::AT_EACCESS,
+        )
+    };
+    rc == 0
+}
+
+/// Off Linux the probe short-circuits long before residency is consulted.
+#[cfg(not(target_os = "linux"))]
+fn residency_is_visible(_path: &Path, _file: &File) -> bool {
+    false
 }
 
 /// Evict `file[..len]` from the page cache and report what is left.
@@ -452,6 +550,11 @@ pub fn fadvise_dontneed(_file: &File, _offset: u64, _len: u64) -> io::Result<()>
 /// `fincore(1)` does. Mapping the range does not read it: an untouched
 /// mapping holds no page references, so this neither warms the cache nor
 /// stops [`fadvise_dontneed`] from clearing it.
+///
+/// **Only meaningful when [`residency_is_visible`] holds.** For a file the
+/// caller neither owns nor may write, `mincore` reports every page resident
+/// and returns success rather than refusing, so this answers `len / page_size`
+/// no matter what the cache actually holds.
 ///
 /// # Errors
 ///
@@ -698,6 +801,90 @@ mod tests {
         if before == 0 {
             assert!(after > 0, "buffered read left nothing resident");
         }
+    }
+
+    /// A file that exists, is big enough to probe, and belongs to somebody
+    /// else — the shape every root-installed model has. `None` when the test
+    /// is running as root (which passes `inode_owner_or_capable` for every
+    /// inode) or when no such file is reachable.
+    #[cfg(target_os = "linux")]
+    fn foreign_file() -> Option<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return None;
+        }
+        [
+            "/usr/lib/libc.so.6",
+            "/usr/lib/x86_64-linux-gnu/libc.so.6",
+            "/usr/bin/env",
+            "/bin/sh",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| {
+            let Ok(meta) = std::fs::metadata(path) else {
+                return false;
+            };
+            // SAFETY: as above.
+            meta.is_file()
+                && meta.len() >= DIO_ALIGN
+                && meta.uid() != unsafe { libc::geteuid() }
+                && File::open(path).is_ok_and(|file| !residency_is_visible(path, &file))
+        })
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn residency_is_visible_for_a_file_this_process_owns() {
+        // The kernel's rule is ownership, not the mode bits: a read-only file
+        // of our own still answers.
+        let fx = build_install("direct-residency-owner");
+        let path = fx.root.join(&fx.layout.layers[0].file);
+        let file = File::open(&path).unwrap();
+        assert!(
+            residency_is_visible(&path, &file),
+            "our own install must have a residency signal"
+        );
+        let mut mode = std::fs::metadata(&path).unwrap().permissions();
+        mode.set_readonly(true);
+        std::fs::set_permissions(&path, mode).unwrap();
+        assert!(
+            residency_is_visible(&path, &file),
+            "chmod 444 on our own file must not hide residency"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_names_the_permission_fault_on_a_file_owned_by_someone_else() {
+        // The deployment shape no fixture can reproduce: the install belongs
+        // to root and the runtime does not. `mincore` then reports the whole
+        // window resident without erroring, which used to surface as
+        // `DirtyBaseline` — the filesystem blamed for a permission fact.
+        let Some(path) = foreign_file() else {
+            eprintln!("skipping: no foreign-owned probe target (running as root?)");
+            return;
+        };
+        let scratch = Scratch::new();
+        let outcome = scratch.with(|buf| probe(&path, buf));
+        println!("probe outcome on {}: {outcome}", path.display());
+        assert_eq!(
+            outcome,
+            DirectSupport::Degraded(DirectFault::ResidencyDenied),
+            "a file we do not own must report the permission fault, not a \
+             filesystem one"
+        );
+        // And the reason it matters: the raw signal really does lie here.
+        let file = File::open(&path).unwrap();
+        let _ = fadvise_dontneed(&file, 0, DIO_ALIGN);
+        let pages = resident_pages(&file, DIO_ALIGN as usize).unwrap();
+        assert_eq!(
+            pages,
+            (DIO_ALIGN as usize).div_ceil(page_size()),
+            "mincore was expected to claim full residency for a foreign file"
+        );
     }
 
     #[test]

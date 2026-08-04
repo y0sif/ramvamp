@@ -21,12 +21,21 @@ use anyhow::{Context, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use ramvamp_core::generate::{GenerateParams, StopReason, TracePhase, generate, generate_traced};
 use ramvamp_core::model::{
-    ForwardState, LoadOptions, Model, RuntimeConfig, forward_token, forward_token_traced,
+    ForwardState, LoadOptions, Model, RuntimeConfig, StreamPhase, forward_token,
+    forward_token_traced,
 };
 use ramvamp_core::tokenizer::{ChatMessage, RvmpTokenizer};
 
 /// v0 scope cap: single sequence, 4K context (`docs/architecture.md`).
 const CONTEXT_CAP: usize = 4096;
+
+/// Upper bound accepted for `--threads`.
+///
+/// Comfortably above any machine this runs on and well under
+/// `ramvamp_core::threads::MAX_SHARDS`, so the pool never has to clamp a
+/// number the user actually typed. The point is that an absurd value is
+/// rejected with a message rather than quietly turned into something else.
+const MAX_THREADS: u64 = 256;
 
 #[derive(Parser)]
 #[command(
@@ -60,7 +69,16 @@ struct RuntimeArgs {
     /// runtime's own CPU topology detection: one thread per physical
     /// performance core, no SMT siblings, pinned. Degrades to unpinned on
     /// any machine whose topology cannot be read.
-    #[arg(long, value_name = "N")]
+    ///
+    /// Range-checked here rather than clamped later: `ComputePool` clamps to
+    /// `1..=MAX_SHARDS`, so `--threads 0` used to run a correct one-shard
+    /// decode without a word about having ignored the number, and a fat-
+    /// fingered `--threads 99999` used to try to spawn `MAX_SHARDS` of them.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=MAX_THREADS),
+    )]
     threads: Option<usize>,
 
     /// Skip every SHA-256 integrity check (fast dev loads). Size checks
@@ -103,6 +121,12 @@ impl RuntimeArgs {
 /// Binary throughout (`M` is 1024^2, never 1000^2) — the value sizes a
 /// page-aligned buffer pool, so decimal units would silently mean a
 /// different number of slots than the documentation says.
+///
+/// Zero is rejected. A budget buys `budget / sum(layer strides)` slots per
+/// layer and the streamer refuses a layer with none
+/// (`SlotError::ZeroSlotsPerLayer`), so `--cache-bytes 0` can only ever fail
+/// — several hundred milliseconds into a model load, pointing at the slot
+/// pool rather than at the flag that caused it.
 fn parse_bytes(text: &str) -> Result<u64, String> {
     let text = text.trim();
     if text.is_empty() {
@@ -112,6 +136,13 @@ fn parse_bytes(text: &str) -> Result<u64, String> {
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .unwrap_or(text.len());
     let (number, suffix) = text.split_at(digits_end);
+    if number.is_empty() {
+        // Everything after the (absent) digits is the "suffix", so without
+        // this a value like `abc` reports itself as an unknown size suffix.
+        return Err(format!(
+            "{text:?}: a byte budget starts with digits, e.g. 1440M or 1509949440"
+        ));
+    }
     let shift: u32 = match suffix.trim().to_ascii_uppercase().as_str() {
         "" | "B" => 0,
         "K" | "KB" | "KIB" => 10,
@@ -121,19 +152,27 @@ fn parse_bytes(text: &str) -> Result<u64, String> {
         other => return Err(format!("unknown size suffix {other:?} (use K, M, G, or T)")),
     };
     // Integer path first, so exact byte counts never round through f64.
-    if let Ok(whole) = number.parse::<u64>() {
-        return whole
+    let bytes = if let Ok(whole) = number.parse::<u64>() {
+        whole
             .checked_mul(1u64 << shift)
-            .ok_or_else(|| format!("{text}: byte budget overflows u64"));
+            .ok_or_else(|| format!("{text}: byte budget overflows u64"))?
+    } else {
+        let scaled = number
+            .parse::<f64>()
+            .map_err(|_| format!("{number:?} is not a number"))?
+            * 2f64.powi(shift as i32);
+        if !scaled.is_finite() || !(0.0..u64::MAX as f64).contains(&scaled) {
+            return Err(format!("{text}: byte budget out of range"));
+        }
+        scaled as u64
+    };
+    if bytes == 0 {
+        return Err(format!(
+            "{text}: an expert-cache budget of zero bytes buys no slots, \
+             which the streamer refuses; give it at least one slot per layer"
+        ));
     }
-    let scaled = number
-        .parse::<f64>()
-        .map_err(|_| format!("{number:?} is not a number"))?
-        * 2f64.powi(shift as i32);
-    if !scaled.is_finite() || !(0.0..u64::MAX as f64).contains(&scaled) {
-        return Err(format!("{text}: byte budget out of range"));
-    }
-    Ok(scaled as u64)
+    Ok(bytes)
 }
 
 /// Render a byte count with a binary suffix, for the stats footer.
@@ -347,10 +386,13 @@ const TRACE_RECORD_HEAD_BYTES: usize = 8;
 /// ```
 ///
 /// One record per token, in stream order (a generation writes its prefill
-/// records then its decode records). The phase byte exists because the
-/// design bypasses the expert cache during prefill
-/// (`docs/architecture.md`, "Prefill"), so a consumer must be able to
-/// filter.
+/// records then its decode records). The phase byte is there so a consumer
+/// can filter: `scripts/lfu_sim.py` simulates decode records only, and this
+/// build runs prefill through the same expert cache as decode, so a trace
+/// analysed without filtering measures a different workload than the
+/// simulation does. It does not mean the two passes fetch differently —
+/// that is the phase-6 layer-major prefill sweep `docs/architecture.md`
+/// specifies, which does not exist yet.
 ///
 /// # Record count
 ///
@@ -702,39 +744,56 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
 
 /// Expert-streaming counters for the run just finished, on stderr.
 ///
-/// This is what an `docs/experiments/README.md` entry quotes: what fraction
+/// This is what a `docs/experiments/README.md` entry quotes: what fraction
 /// of routed experts the cache served, how the misses split between cold and
 /// evicted, how many bytes actually left the drive, how long the decode
 /// thread spent blocked on them, and — because O_DIRECT can be silently
 /// downgraded to buffered I/O — which submission path was actually achieved.
+///
+/// **One line per phase, never a total.** Prefill and decode share one
+/// expert cache in this build, and a `generate --max-new 4` over a five-token
+/// prompt runs eight forward passes, five of them prefill. The cumulative
+/// counter therefore reported roughly twice the requests a reader would
+/// attribute to four decode tokens, with prefill's cold-miss share mixed in
+/// — and `scripts/lfu_sim.py` simulates decode records only, so the two
+/// numbers were never comparable in the first place. EXP-013 was written
+/// from that figure. A phase with no requests is left out rather than
+/// printed as a row of zeros.
 fn report_stream_stats(state: &ForwardState) {
-    let s = state.stream_stats();
-    let served = s.hits + s.pending_hits + s.misses;
-    let pct = |n: u64| {
-        if served == 0 {
-            0.0
-        } else {
-            n as f64 / served as f64 * 100.0
-        }
-    };
     eprintln!(
-        "experts: {} mode, {} slots/layer ({}); {served} requests, {} hits ({:.1}%), \
-         {} pending hits, {} misses ({} cold / {} eviction); {} read in {} reads \
-         ({} retries); io wait {:.2}s",
+        "experts: {} mode, {} slots/layer ({})",
         state.stream_mode(),
         state.slots_per_layer(),
         human_bytes(state.cache_bytes()),
-        s.hits,
-        pct(s.hits),
-        s.pending_hits,
-        s.misses,
-        s.cold_misses,
-        s.eviction_misses,
-        human_bytes(s.bytes_read),
-        s.reads_submitted,
-        s.read_retries,
-        s.io_wait.as_secs_f64(),
     );
+    let mut reported = false;
+    for phase in StreamPhase::ALL {
+        let s = state.stream_stats_in(phase);
+        let served = s.accesses();
+        if served == 0 {
+            continue;
+        }
+        reported = true;
+        let pct = |n: u64| n as f64 / served as f64 * 100.0;
+        eprintln!(
+            "  {phase:>7}: {served} requests, {} hits ({:.1}%), {} pending hits, \
+             {} misses ({} cold / {} eviction); {} read in {} reads ({} retries); \
+             io wait {:.2}s",
+            s.hits,
+            pct(s.hits),
+            s.pending_hits,
+            s.misses,
+            s.cold_misses,
+            s.eviction_misses,
+            human_bytes(s.bytes_read),
+            s.reads_submitted,
+            s.read_retries,
+            s.io_wait.as_secs_f64(),
+        );
+    }
+    if !reported {
+        eprintln!("  no expert requests");
+    }
 }
 
 /// One forward pass over a raw prompt; top-N logits as JSON on stdout.
@@ -762,6 +821,11 @@ fn run_logits(args: LogitsArgs) -> anyhow::Result<()> {
     let mut writer = trace_experts
         .map(|path| TraceWriter::create(path, arch.n_layers, arch.n_experts, arch.top_k))
         .transpose()?;
+
+    // Every pass here is a prompt position. That is also where a stream
+    // starts, but this command exists to be quoted from, so it says so
+    // rather than relying on the default.
+    state.set_stream_phase(StreamPhase::Prefill);
 
     let last = ids.len() - 1;
     for (pos, &id) in ids[..last].iter().enumerate() {
@@ -851,8 +915,7 @@ mod tests {
     #[test]
     fn byte_budgets_parse_binary_suffixes() {
         for (text, want) in [
-            ("0", 0u64),
-            ("1507852288", 1_507_852_288),
+            ("1507852288", 1_507_852_288u64),
             ("1438M", 1438 * 1024 * 1024),
             ("1438MiB", 1438 * 1024 * 1024),
             ("1438mb", 1438 * 1024 * 1024),
@@ -862,6 +925,9 @@ mod tests {
             ("64", 64),
             ("  1438M  ", 1438 * 1024 * 1024),
             ("1T", 1024u64.pow(4)),
+            // Smallest accepted value: nonsensical as a budget, but the
+            // parser's job is the syntax and the zero case, not the geometry.
+            ("1", 1),
         ] {
             assert_eq!(parse_bytes(text), Ok(want), "{text}");
         }
@@ -872,6 +938,75 @@ mod tests {
         }
         // Overflow is an error, never a wrap.
         assert!(parse_bytes("18446744073709551615T").is_err());
+    }
+
+    /// A value with no digits is not a value with a weird suffix, and saying
+    /// so is the difference between `unknown size suffix "abc"` — which
+    /// invites the user to look for the suffix they mistyped — and a message
+    /// about the part that is actually wrong.
+    #[test]
+    fn a_digitless_budget_is_not_reported_as_a_suffix() {
+        for bad in ["abc", "M", "GiB", "x86"] {
+            let err = parse_bytes(bad).unwrap_err();
+            assert!(
+                err.contains("starts with digits"),
+                "{bad:?} reported as {err:?}"
+            );
+            assert!(!err.contains("suffix"), "{bad:?} reported as {err:?}");
+        }
+        // A real bad suffix still reports as one.
+        let err = parse_bytes("1438X").unwrap_err();
+        assert!(err.contains("unknown size suffix"), "{err}");
+    }
+
+    /// Zero parses arithmetically but cannot buy a slot, so it is refused at
+    /// the flag rather than at the slot pool, however it is spelled.
+    #[test]
+    fn a_zero_budget_is_rejected_by_the_parser() {
+        for zero in ["0", "0M", "0G", "0.0", "0.0000001"] {
+            let err = parse_bytes(zero).unwrap_err();
+            assert!(
+                err.contains("buys no slots"),
+                "{zero:?} reported as {err:?}"
+            );
+        }
+    }
+
+    /// `ComputePool` clamps its shard count to `1..=MAX_SHARDS`, so a
+    /// nonsense `--threads` used to produce a correct run at some other
+    /// width without ever saying it had ignored the number. The range is
+    /// enforced where the user can see it.
+    #[test]
+    fn thread_counts_outside_the_accepted_range_are_rejected() {
+        let parse = |threads: &str| {
+            Cli::try_parse_from([
+                "ramvamp",
+                "generate",
+                "--model",
+                "/does/not/matter",
+                "--prompt",
+                "hi",
+                "--threads",
+                threads,
+            ])
+        };
+        // Out of range: rejected, and the message says what the range is
+        // rather than leaving the user to discover the clamp empirically.
+        for bad in ["0", "99999"] {
+            let Err(err) = parse(bad) else {
+                panic!("--threads {bad} should not parse");
+            };
+            let text = err.to_string();
+            assert!(text.contains("1..=256"), "--threads {bad}: {text}");
+        }
+        // Not a count at all. `-1` is refused as an unknown flag rather than
+        // as a range violation, which is clap's business and equally fine.
+        for bad in ["-1", "1.5", "many", ""] {
+            assert!(parse(bad).is_err(), "--threads {bad:?} should not parse");
+        }
+        for ok in ["1", "8", "256"] {
+            assert!(parse(ok).is_ok(), "--threads {ok} should parse");
+        }
     }
 
     #[test]

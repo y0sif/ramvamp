@@ -57,7 +57,7 @@ pub use direct::{DIO_ALIGN, DirectFault, DirectSupport};
 pub use error::IoError;
 pub use expert::{ExpertReader, ExpertSlab, ExpertView};
 pub use slots::{MAX_POOL_BYTES, SLOT_ALIGN, SlotError, SlotGuard, SlotPool};
-pub use stream::{ExpertStream, StreamMode, StreamStats};
+pub use stream::{ExpertStream, StreamMode, StreamPhase, StreamStats};
 
 use crate::format::{FormatError, Manifest, sha256_file};
 use crate::kernels::quants::QuantFormat;

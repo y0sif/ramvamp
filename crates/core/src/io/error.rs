@@ -88,6 +88,27 @@ pub enum IoError {
         value: u64,
     },
 
+    /// The expert-cache byte budget buys fewer slots per layer than the model
+    /// routes experts per step, so no forward pass could ever be served.
+    ///
+    /// Raised when the stream opens, not when the first step fails: by then
+    /// the pool has been allocated and pre-faulted and the model is loaded.
+    #[error(
+        "expert cache budget of {given} B buys {slots} slot(s) per layer but \
+         the model routes {top_k} experts per step; use at least {needed} B \
+         ({:.2} MiB)", *needed as f64 / (1024.0 * 1024.0)
+    )]
+    CacheBudgetTooSmall {
+        /// Budget the caller asked for, in bytes.
+        given: u64,
+        /// Smallest budget that would fit `top_k` slots per layer, in bytes.
+        needed: u64,
+        /// Slots per layer the budget actually bought.
+        slots: u32,
+        /// Experts the model routes per step.
+        top_k: u32,
+    },
+
     /// Sizing, allocating, or leasing an expert slot buffer failed.
     #[error(transparent)]
     Slots(#[from] crate::io::SlotError),

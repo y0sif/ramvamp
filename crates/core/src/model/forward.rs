@@ -2,10 +2,21 @@
 //!
 //! [`forward_token`] runs one token through every layer against a
 //! [`ForwardState`] that owns the KV cache, the expert streamer, the pinned
-//! compute pool, and every scratch buffer; the layer loop itself allocates
-//! nothing after [`ForwardState::new`] (remaining small per-token
-//! allocations: [`Model::embed`]'s dequant `Vec` and the stream decoder's
-//! `String`).
+//! compute pool, and every scratch buffer; in **steady state** the layer loop
+//! allocates nothing.
+//!
+//! The qualifier is load-bearing rather than decorative. Everything this
+//! module owns is sized once in [`ForwardState::new`] and never grows, but
+//! the streamer's per-step bookkeeping is not: [`ExpertStream::new`] builds
+//! its `CachePlan` hit/miss lists, the open step's hit/miss/protected lists
+//! and the in-flight read table **empty**, and they grow to their top-k
+//! working size the first time each layer is planned — i.e. five small `Vec`
+//! growths per layer, on token 0 only. After that they are cleared and
+//! reused, and the layer loop's only remaining allocations are
+//! [`Model::embed`]'s dequant `Vec` and, above this module, the stream
+//! decoder's `String`. Preallocating them (`CachePlan::with_capacity` exists
+//! for exactly this) would make the claim unconditional; until then it holds
+//! from token 1 on.
 //!
 //! # Decode loop shape
 //!
@@ -75,7 +86,8 @@
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
 
-use crate::io::{ExpertStream, ExpertView, IoError, StreamMode, StreamStats};
+use crate::format::ArchInfo;
+use crate::io::{ExpertStream, ExpertView, IoError, StreamMode, StreamPhase, StreamStats};
 use crate::kernels::KernelError;
 use crate::kernels::attention::{AttentionError, AttentionScratch, decode_attention};
 use crate::kernels::primitives::{
@@ -245,6 +257,90 @@ pub enum ForwardError {
         /// The requested position.
         position: usize,
     },
+
+    /// [`forward_token`] was handed a model whose architecture is not the
+    /// one the [`ForwardState`] was built from. Every buffer in the state —
+    /// the KV geometry, the staging slots, the activation blocks — is sized
+    /// from the construction-time model, so the pair must agree.
+    #[error(
+        "forward: this state was built for a model with {what} = {built}, \
+         but the model it was given has {what} = {given}"
+    )]
+    ArchMismatch {
+        /// The architecture field that differs.
+        what: &'static str,
+        /// Its value in the model the state was built from.
+        built: u32,
+        /// Its value in the model passed to [`forward_token`].
+        given: u32,
+    },
+}
+
+/// The architecture dimensions a [`ForwardState`]'s buffers were sized from.
+///
+/// [`forward_token`] takes the model and the state independently, and reads
+/// `top_k`/`hidden`/`moe_intermediate` from the *argument* model while
+/// `expert_staged`, `expert_done`, the activation blocks and the KV cache
+/// were all sized from the *construction-time* model. Pairing a state with a
+/// wider-`top_k` model would index out of bounds inside [`run_plan`] rather
+/// than report, so the pair is fingerprinted and checked once per token.
+///
+/// Only the dimensions that size something are compared. `rope_theta`,
+/// `rms_eps` and the rest are read fresh from the argument model every token
+/// and nothing caches them, so they are a caller's business, not an
+/// invariant of this state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArchFingerprint {
+    n_layers: u32,
+    n_experts: u32,
+    top_k: u32,
+    hidden: u32,
+    moe_intermediate: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    vocab: u32,
+}
+
+impl ArchFingerprint {
+    fn of(arch: &ArchInfo) -> Self {
+        Self {
+            n_layers: arch.n_layers,
+            n_experts: arch.n_experts,
+            top_k: arch.top_k,
+            hidden: arch.hidden,
+            moe_intermediate: arch.moe_intermediate,
+            n_heads: arch.n_heads,
+            n_kv_heads: arch.n_kv_heads,
+            head_dim: arch.head_dim,
+            vocab: arch.vocab,
+        }
+    }
+
+    /// Name the first dimension of `arch` that this state was not built for.
+    fn check(&self, arch: &ArchInfo) -> Result<(), ForwardError> {
+        let given = Self::of(arch);
+        for (what, built, given) in [
+            ("n_layers", self.n_layers, given.n_layers),
+            ("n_experts", self.n_experts, given.n_experts),
+            ("top_k", self.top_k, given.top_k),
+            ("hidden", self.hidden, given.hidden),
+            (
+                "moe_intermediate",
+                self.moe_intermediate,
+                given.moe_intermediate,
+            ),
+            ("n_heads", self.n_heads, given.n_heads),
+            ("n_kv_heads", self.n_kv_heads, given.n_kv_heads),
+            ("head_dim", self.head_dim, given.head_dim),
+            ("vocab", self.vocab, given.vocab),
+        ] {
+            if built != given {
+                return Err(ForwardError::ArchMismatch { what, built, given });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Owned per-sequence state for [`forward_token`]: the KV cache, the expert
@@ -252,6 +348,9 @@ pub enum ForwardError {
 /// writes, preallocated once so no per-token allocation happens after
 /// construction.
 pub struct ForwardState {
+    /// The architecture every buffer below was sized from. Checked against
+    /// the model [`forward_token`] is handed, once per token.
+    arch: ArchFingerprint,
     kv: KvCache,
     attn_scratch: AttentionScratch,
     /// Residual stream (`[hidden]`).
@@ -401,6 +500,7 @@ impl ForwardState {
         );
 
         Ok(Self {
+            arch: ArchFingerprint::of(arch),
             kv,
             attn_scratch: AttentionScratch::with_capacity(context_cap),
             hidden: vec![0.0; hidden],
@@ -467,9 +567,35 @@ impl ForwardState {
         self.stream.mode()
     }
 
-    /// Cumulative expert-streaming counters since this state was built.
+    /// Cumulative expert-streaming counters since this state was built,
+    /// summed over **every** phase.
+    ///
+    /// This is a whole-process figure and reads as one. A steady-state decode
+    /// hit rate has to come from [`ForwardState::stream_stats_in`]: prefill
+    /// runs through the same cache as decode in this build (there is no
+    /// cache-bypassing prompt sweep yet), so a prompt's worth of cold misses
+    /// is otherwise folded into a number quoted as a decode result. EXP-013
+    /// was written from exactly that mistake.
     pub fn stream_stats(&self) -> StreamStats {
         self.stream.stats()
+    }
+
+    /// The share of [`ForwardState::stream_stats`] recorded while the stream
+    /// was in `phase`.
+    pub fn stream_stats_in(&self, phase: StreamPhase) -> StreamStats {
+        self.stream.stats_in(phase)
+    }
+
+    /// Attribute every expert request from the next [`forward_token`] on to
+    /// `phase`.
+    ///
+    /// The stream sees one layer at a time and has no notion of a token
+    /// boundary, let alone of where a prompt ends, so the phase is the
+    /// caller's to declare. [`crate::generate::generate`] declares it per
+    /// token; a caller driving [`forward_token`] itself owns it. Everything
+    /// before the first call is attributed to [`StreamPhase::Prefill`].
+    pub fn set_stream_phase(&mut self, phase: StreamPhase) {
+        self.stream.set_phase(phase);
     }
 }
 
@@ -636,17 +762,23 @@ fn expert_ffn(
 /// Compute one phase of a layer's plan — the cache hits, or the misses —
 /// as a single unit, staging each expert's output into its top-k slot.
 ///
-/// `stream` is taken shared: the plan slice and every [`ExpertView`] borrow
-/// it for the length of the phase, and nothing here needs to mutate it.
+/// `plan` is `(index into the routed set, slot)`, exactly the encoding
+/// [`ExpertStream::hits`] and [`ExpertStream::misses`] report. It is passed
+/// in rather than read off `stream` so that the anti-staleness guard below
+/// is reachable from a test with a hand-built plan: it is the check that
+/// stops a stale `expert_staged` slot from being reduced into the residual,
+/// and it has to be pinned by something other than a healthy streamer.
+///
+/// `stream` is taken shared: every [`ExpertView`] borrows it for the length
+/// of the phase, and nothing here needs to mutate it.
 fn run_plan(
     stream: &ExpertStream,
     pool: &mut ComputePool,
     layer: u32,
     dims: MoeDims,
+    plan: &[(usize, u32)],
     scratch: &mut MoeScratch<'_>,
-    hits: bool,
 ) -> Result<(), ForwardError> {
-    let plan = if hits { stream.hits() } else { stream.misses() };
     for &(index, slot) in plan {
         if index >= dims.top_k || scratch.done[index] {
             return Err(ForwardError::StreamPlanIndex {
@@ -664,12 +796,18 @@ fn run_plan(
 }
 
 /// The overlapped body of one layer's expert phase, between
-/// [`ExpertStream::begin_layer`] and [`ExpertStream::end_layer`].
+/// [`ExpertStream::begin_layer`] and [`ExpertStream::end_layer`], with the
+/// step's reads drained on every error path.
 ///
-/// Hits first — they are the work that covers the in-flight reads — then a
-/// single block on every miss, then the misses as one unit. Neither phase
-/// reduces anything: both stage into `scratch.staged`, and the caller
-/// reduces in fixed top-k order.
+/// The drain is not optional. The hits phase runs *before*
+/// [`ExpertStream::await_misses`], so a failure in it — a shard's
+/// [`KernelError`], a rejected plan, a slot whose view cannot be carved —
+/// returns with this step's misses still in the ring, writing into slots the
+/// cache is protecting. [`ExpertStream::end_layer`] then cannot release a
+/// `Filling` slot, `outstanding` never drains, and every subsequent
+/// [`ExpertStream::begin_layer`] on *any* layer is refused for the rest of
+/// the process. [`ExpertStream::begin_layer`]'s own failure path already
+/// drains for the same reason; this is the symmetric half.
 fn stream_experts(
     stream: &mut ExpertStream,
     pool: &mut ComputePool,
@@ -677,10 +815,40 @@ fn stream_experts(
     dims: MoeDims,
     scratch: &mut MoeScratch<'_>,
 ) -> Result<(), ForwardError> {
+    let outcome = stage_expert_phases(stream, pool, layer, dims, scratch);
+    if outcome.is_err()
+        && let Err(drain) = stream.await_misses()
+    {
+        // The drain itself failed, which means the streamer has already
+        // invalidated or leaked the slots involved: the reads can no longer
+        // strand anything. The first error is the one worth propagating.
+        tracing::error!(
+            layer,
+            error = %drain,
+            "draining a failed expert phase also failed"
+        );
+    }
+    outcome
+}
+
+/// Hits first — they are the work that covers the in-flight reads — then a
+/// single block on every miss, then the misses as one unit. Neither phase
+/// reduces anything: both stage into `scratch.staged`, and the caller
+/// reduces in fixed top-k order.
+///
+/// Every exit from here is an error the caller must drain behind; see
+/// [`stream_experts`].
+fn stage_expert_phases(
+    stream: &mut ExpertStream,
+    pool: &mut ComputePool,
+    layer: u32,
+    dims: MoeDims,
+    scratch: &mut MoeScratch<'_>,
+) -> Result<(), ForwardError> {
     scratch.done.fill(false);
-    run_plan(stream, pool, layer, dims, scratch, true)?;
+    run_plan(stream, pool, layer, dims, stream.hits(), scratch)?;
     stream.await_misses()?;
-    run_plan(stream, pool, layer, dims, scratch, false)?;
+    run_plan(stream, pool, layer, dims, stream.misses(), scratch)?;
     let covered = scratch.done.iter().filter(|filled| **filled).count();
     if covered != dims.top_k {
         return Err(ForwardError::StreamPlanCoverage {
@@ -737,6 +905,10 @@ pub fn forward_token_traced<'s>(
     mut on_route: Option<ExpertRouteSink<'_>>,
 ) -> Result<Option<&'s [f32]>, ForwardError> {
     let arch = model.arch();
+    // `dims` below is read off this model, while every buffer in `state` was
+    // sized from the one it was built with. A mismatched pair would index
+    // out of bounds inside `run_plan`, so it is refused up front.
+    state.arch.check(arch)?;
     let n_heads = arch.n_heads as usize;
     let n_kv_heads = arch.n_kv_heads as usize;
     let head_dim = arch.head_dim as usize;
@@ -755,6 +927,8 @@ pub fn forward_token_traced<'s>(
     // Field-by-field, so the compute pool, the streamer and the scratch
     // buffers can be borrowed independently inside the layer loop.
     let ForwardState {
+        // Already checked against `arch` above.
+        arch: _,
         kv,
         attn_scratch,
         hidden: residual,
@@ -1192,6 +1366,250 @@ mod tests {
         assert_eq!(stats.hits + stats.misses, 0, "no experts read yet");
         // `Debug` must not depend on the streamer being `Debug`.
         assert!(format!("{st:?}").contains("ForwardState"));
+    }
+
+    /// Borrow the pieces of a state the expert phase needs, exactly the way
+    /// the layer loop does, and hand them to `body` alongside a
+    /// [`MoeScratch`] over `staged`/`done`.
+    ///
+    /// The staging buffers are supplied by the caller rather than taken from
+    /// the state, because two of these tests deliberately run with a `top_k`
+    /// the state was not built for.
+    fn with_expert_scratch<R>(
+        st: &mut ForwardState,
+        staged: &mut [f32],
+        done: &mut [bool],
+        body: impl FnOnce(&mut ExpertStream, &mut ComputePool, &mut MoeScratch<'_>) -> R,
+    ) -> R {
+        let ForwardState {
+            acts_q8k_hidden,
+            acts_q8k_moe,
+            gate,
+            up,
+            pool,
+            stream,
+            ..
+        } = st;
+        let mut scratch = MoeScratch {
+            ffn: FfnScratch {
+                acts_hidden: &acts_q8k_hidden[..],
+                acts_moe: &mut acts_q8k_moe[..],
+                gate: &mut gate[..],
+                up: &mut up[..],
+            },
+            staged,
+            done,
+        };
+        body(stream, pool, &mut scratch)
+    }
+
+    /// The fixture's MoE geometry with `top_k` overridden.
+    fn dims_with_top_k(model: &Model, top_k: usize) -> MoeDims {
+        MoeDims {
+            hidden: model.arch().hidden as usize,
+            moe: model.arch().moe_intermediate as usize,
+            top_k,
+        }
+    }
+
+    /// Warm one expert into layer `layer`'s cache and report the slot it
+    /// landed in. The slot stays `Ready` after the step closes.
+    fn warm(stream: &mut ExpertStream, layer: u32, expert: u32) -> u32 {
+        stream.begin_layer(layer, &[expert]).unwrap();
+        let slot = stream.misses()[0].1;
+        stream.await_misses().unwrap();
+        stream.end_layer(layer);
+        slot
+    }
+
+    /// F1. The hits phase runs *before* `await_misses`, so a failure in it
+    /// returns with the step's misses still in the ring, writing into slots
+    /// the cache is protecting. Without a drain, `end_layer` cannot release a
+    /// `Filling` slot, `outstanding` never reaches zero, and every later
+    /// `begin_layer` on any layer is refused for the life of the process.
+    #[test]
+    fn a_failed_hits_phase_drains_its_in_flight_reads() {
+        let (_fx, model) = load_fixture("fwd-drain");
+        assert_eq!(model.arch().top_k, 2, "the fixture routes two experts");
+        let hidden = model.arch().hidden as usize;
+        let mut st = state(&model, 4);
+
+        // A `top_k` of 1 with a two-expert step: the hits phase rejects the
+        // plan (request index 1 is outside 0..1) before it ever blocks.
+        let dims = dims_with_top_k(&model, 1);
+        let mut staged = vec![0.0f32; hidden];
+        let mut done = vec![false; 1];
+
+        with_expert_scratch(&mut st, &mut staged, &mut done, |stream, pool, scratch| {
+            warm(stream, 0, 0);
+
+            // One resident expert (a hit, to be computed first) and one cold
+            // one (a miss, in flight while that happens).
+            stream.begin_layer(0, &[1, 0]).unwrap();
+            assert_eq!(stream.hits().len(), 1, "expert 0 is resident");
+            assert_eq!(stream.misses().len(), 1, "expert 1 is cold");
+            assert_eq!(stream.hits()[0].0, 1, "the hit is the second routed id");
+
+            let err = stream_experts(stream, pool, 0, dims, scratch).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ForwardError::StreamPlanIndex {
+                        layer: 0,
+                        index: 1,
+                        top_k: 1
+                    }
+                ),
+                "{err}"
+            );
+
+            // The drain is the fix: the step can be closed, and the next one
+            // is accepted. Before it, this `begin_layer` failed with "reads
+            // from an earlier step were never awaited" — and so did every
+            // other one, on every layer, forever.
+            stream.end_layer(0);
+            stream.begin_layer(1, &[0, 1]).unwrap();
+            stream.await_misses().unwrap();
+            stream.end_layer(1);
+        });
+
+        // End to end: a whole token still runs on this state.
+        let logits = run(&model, &mut st, &[1, 2]);
+        assert_eq!(logits.len(), VOCAB);
+        assert!(logits.iter().all(|v| v.is_finite()), "{logits:?}");
+    }
+
+    /// F2. `StreamPlanIndex` is what stops a stale `expert_staged` slot from
+    /// being reduced into the residual, so it is pinned against a hand-built
+    /// plan rather than only against a healthy streamer: an index outside the
+    /// routed set, and an index the plan already filled.
+    #[test]
+    fn a_plan_that_is_not_a_permutation_is_rejected() {
+        let (_fx, model) = load_fixture("fwd-plan-index");
+        let hidden = model.arch().hidden as usize;
+        let mut st = state(&model, 4);
+        let dims = dims_with_top_k(&model, 2);
+        let mut staged = vec![0.0f32; 2 * hidden];
+        let mut done = vec![false; 2];
+
+        with_expert_scratch(&mut st, &mut staged, &mut done, |stream, pool, scratch| {
+            let slot = warm(stream, 0, 0);
+
+            // Past the end of the routed set: nothing is computed at all.
+            scratch.done.fill(false);
+            let err = run_plan(stream, pool, 0, dims, &[(2, slot)], scratch).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ForwardError::StreamPlanIndex {
+                        layer: 0,
+                        index: 2,
+                        top_k: 2
+                    }
+                ),
+                "{err}"
+            );
+            assert_eq!(scratch.done, &[false, false]);
+
+            // Repeated: the first occurrence stages, the second is refused
+            // because slot 0 is already filled. Reducing it twice would
+            // weight one expert twice and leave the other's slot stale.
+            scratch.done.fill(false);
+            let err =
+                run_plan(stream, pool, 0, dims, &[(0, slot), (0, slot)], scratch).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ForwardError::StreamPlanIndex {
+                        layer: 0,
+                        index: 0,
+                        top_k: 2
+                    }
+                ),
+                "{err}"
+            );
+            assert_eq!(scratch.done, &[true, false], "only the first ran");
+        });
+    }
+
+    /// F2. `StreamPlanCoverage` is the other half: a plan that is a valid
+    /// permutation but a *short* one leaves a staging slot holding the
+    /// previous layer's expert output, which the fixed-order reduction would
+    /// then weight as if it were this layer's.
+    ///
+    /// A duplicate expert id in one request is exactly that plan — the
+    /// streamer resolves it once and lists it once — so this is the shape the
+    /// guard would really see, not a synthetic one.
+    #[test]
+    fn a_plan_that_covers_fewer_than_top_k_experts_is_rejected() {
+        let (_fx, model) = load_fixture("fwd-plan-coverage");
+        let hidden = model.arch().hidden as usize;
+        let mut st = state(&model, 4);
+        let dims = dims_with_top_k(&model, 2);
+        let mut staged = vec![0.0f32; 2 * hidden];
+        let mut done = vec![false; 2];
+
+        with_expert_scratch(&mut st, &mut staged, &mut done, |stream, pool, scratch| {
+            stream.begin_layer(0, &[1, 1]).unwrap();
+            assert_eq!(
+                stream.hits().len() + stream.misses().len(),
+                1,
+                "a repeated id resolves once"
+            );
+            let err = stream_experts(stream, pool, 0, dims, scratch).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ForwardError::StreamPlanCoverage {
+                        layer: 0,
+                        covered: 1,
+                        top_k: 2
+                    }
+                ),
+                "{err}"
+            );
+
+            // Coverage fails after both phases, so nothing is in flight and
+            // the stream is still usable.
+            stream.end_layer(0);
+            stream.begin_layer(0, &[0, 1]).unwrap();
+            stream.await_misses().unwrap();
+            stream.end_layer(0);
+        });
+    }
+
+    /// F8. `forward_token` takes the model and the state independently, and
+    /// reads `top_k`/`hidden` off the *argument* model while the staging
+    /// buffers were sized from the construction-time one. A mismatched pair
+    /// used to index out of bounds inside `run_plan`; it is now typed.
+    #[test]
+    fn a_state_refuses_a_model_it_was_not_built_for() {
+        let (_fx, wide) = load_fixture("fwd-arch-wide");
+        let (_fx2, narrow) = load_fixture("fwd-arch-narrow");
+        let mut st = state(&narrow, 4);
+        // Same geometry: the fingerprint is about dimensions, not identity,
+        // so two separate installs of the same architecture must pair.
+        forward_token(&wide, &mut st, 1, 0, false).unwrap();
+
+        // Now a state built for a narrower router, handed a model whose
+        // top_k is one wider than its staging buffer holds.
+        let fingerprint = ArchFingerprint {
+            top_k: narrow.arch().top_k - 1,
+            ..st.arch
+        };
+        st.arch = fingerprint;
+        let err = forward_token(&narrow, &mut st, 1, 1, false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ForwardError::ArchMismatch {
+                    what: "top_k",
+                    built: 1,
+                    given: 2
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[test]

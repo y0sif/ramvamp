@@ -1,21 +1,22 @@
-//! Generation orchestration: chunked prefill, token-by-token decode, sampling.
+//! Generation orchestration: prefill, token-by-token decode, sampling.
 //!
-//! Prefill processes the prompt in bounded chunks (so one fetched expert
-//! serves many rows and scratch memory stays fixed) and is layer-major.
-//! Decode repeats the routed layer loop one token at a time. Sampling
+//! **Prefill today is decode**: [`forward_token`] in a loop over the prompt,
+//! one token at a time, through the same [`ForwardState`] and therefore the
+//! same expert cache, with logits requested only for the last prompt token.
+//! Decode then repeats that loop one generated token at a time. Sampling
 //! supports greedy, temperature, top-k, and top-p (repetition penalty is
 //! not implemented yet); greedy decode must be deterministic for
 //! validation against reference implementations.
 //!
-//! # What exists today
+//! The layer-major chunked prefill `docs/architecture.md` specifies — a
+//! bounded chunk of positions swept per layer, so one fetched expert serves
+//! many rows and the cache is bypassed entirely — is phase 6, and is not
+//! this code. Nothing here bypasses or bounds the cache differently for
+//! prompt tokens, and the streaming counters reflect that: a pure-prefill
+//! run reports cache hits, because prompt positions reuse each other's
+//! experts exactly the way decode positions do.
 //!
-//! [`generate`] is the token-at-a-time baseline: prefill is
-//! [`forward_token`] in a loop (logits requested only for the last prompt
-//! token — the layer-major chunked sweep replaces this later), then the
-//! decode loop samples, streams, and stops on a stop token or
-//! [`GenerateParams::max_new`].
-//!
-//! ## Sampling
+//! # Sampling
 //!
 //! Greedy is a pure argmax over the raw logits (first index wins ties) and
 //! is what the llama.cpp validation gates use. The stochastic path applies
@@ -26,7 +27,7 @@
 //! inline seeded xorshift64* PRNG — deterministic for a fixed seed, no
 //! external dependency.
 //!
-//! ## Streaming detokenization
+//! # Streaming detokenization
 //!
 //! Decoding each token id alone is wrong for byte-level BPE (one Unicode
 //! character can span tokens), so [`generate`] decodes the accumulated ids
@@ -38,20 +39,44 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::model::{ForwardError, ForwardState, Model, forward_token, forward_token_traced};
+use crate::model::{
+    ForwardError, ForwardState, Model, StreamPhase, forward_token, forward_token_traced,
+};
 use crate::tokenizer::{RvmpTokenizer, SamplingDefaults, TokenizerError};
 
 /// Which pass a routing record came from.
 ///
-/// The expert cache is bypassed during prefill (`docs/architecture.md`,
-/// "Prefill"), so anything consuming a routing trace has to be able to
-/// tell the two apart.
+/// Both passes go through the same [`ForwardState`] and the same expert
+/// cache in this build (see the module docs), so the tag is not a statement
+/// about how the experts were fetched. It exists because the two passes are
+/// not comparable *workloads*: prefill walks a prompt whose positions the
+/// caller chose, decode walks the model's own output, and a cache-hit rate
+/// quoted over both at once is a different number from either. The offline
+/// simulator (`scripts/lfu_sim.py`) filters on it and models decode only, so
+/// anything measured against that simulation has to filter the same way.
+///
+/// `docs/architecture.md` ("Prefill") specifies a cache-bypassing
+/// layer-major prefill sweep for phase 6. When that lands the tag will
+/// additionally mean "fetched differently"; today it does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TracePhase {
-    /// A prompt token: cache bypassed, one fetch per routed expert.
+    /// A prompt token.
     Prefill,
-    /// A generated token: the decode loop the cache serves.
+    /// A generated token.
     Decode,
+}
+
+impl From<TracePhase> for StreamPhase {
+    /// The two enums name the same split from opposite ends — the trace
+    /// format's phase byte and the streamer's counter bucket — and
+    /// [`generate`] is what keeps them in step, declaring the streamer's
+    /// phase for every token whether or not anything is tracing.
+    fn from(phase: TracePhase) -> Self {
+        match phase {
+            TracePhase::Prefill => Self::Prefill,
+            TracePhase::Decode => Self::Decode,
+        }
+    }
 }
 
 /// Observer for [`generate_traced`], called once per layer per token with
@@ -378,6 +403,11 @@ pub fn generate_traced(
 /// One [`forward_token`], tagging any routing it reports with `phase` and
 /// `position` before handing it to `trace`. Untraced runs take the plain
 /// [`forward_token`] path.
+///
+/// `phase` is also declared to the expert streamer here — every forward pass
+/// this module runs goes through this function, so the streamer's per-phase
+/// counters cannot drift out of step with the trace's phase byte. It costs
+/// one store per token, traced or not.
 fn traced_step<'s>(
     model: &Model,
     state: &'s mut ForwardState,
@@ -387,6 +417,7 @@ fn traced_step<'s>(
     phase: TracePhase,
     trace: &mut Option<RouteSink<'_>>,
 ) -> Result<Option<&'s [f32]>, ForwardError> {
+    state.set_stream_phase(StreamPhase::from(phase));
     match trace.as_deref_mut() {
         Some(sink) => {
             let mut on_route = |layer: u32, topk: &[(u32, f32)]| sink(phase, position, layer, topk);
@@ -828,6 +859,55 @@ mod tests {
             unique.dedup();
             assert_eq!(unique.len(), top_k, "{experts:?}");
         }
+    }
+
+    /// F3. The streamer's counters are cumulative from construction, so a
+    /// footer that quotes them reports prefill folded into what reads as a
+    /// decode number: a five-token prompt and `--max-new 4` is eight forward
+    /// passes, five of them prefill. `generate` declares the phase to the
+    /// streamer per token; this pins that the split is real, exhaustive, and
+    /// lands exactly where the pass counts say it should.
+    #[test]
+    fn streaming_counters_split_prefill_from_decode() {
+        let h = harness("gen-phase-split");
+        let prompt = [1u32, 2, 3];
+        let max_new = 4;
+        let mut state = small(&h.model, 16);
+        let stats = generate_with_stops(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            &prompt,
+            &greedy_params(max_new),
+            &[],
+            &mut |_, _| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(stats.generated, max_new);
+
+        let arch = h.model.arch();
+        // One request per routed expert per layer per forward pass.
+        let per_pass = u64::from(arch.n_layers) * u64::from(arch.top_k);
+        let prefill = state.stream_stats_in(StreamPhase::Prefill);
+        let decode = state.stream_stats_in(StreamPhase::Decode);
+        let total = state.stream_stats();
+
+        // Prefill runs one pass per prompt token. Decode runs one per
+        // generated token *after* the first, which is sampled from the
+        // prompt's logits.
+        assert_eq!(prefill.accesses(), prompt.len() as u64 * per_pass);
+        assert_eq!(decode.accesses(), (max_new as u64 - 1) * per_pass);
+
+        // Exhaustive and disjoint: every request lands in exactly one phase.
+        assert_eq!(prefill.accesses() + decode.accesses(), total.accesses());
+        assert_eq!(prefill.misses + decode.misses, total.misses);
+        assert_eq!(prefill.hits + decode.hits, total.hits);
+        assert_eq!(prefill.bytes_read + decode.bytes_read, total.bytes_read);
+
+        // And the point of all of it: the cumulative figure is not the decode
+        // figure, and quoting it as one overstates the work by the prompt.
+        assert_ne!(total.accesses(), decode.accesses());
     }
 
     #[test]

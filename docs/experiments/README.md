@@ -806,34 +806,47 @@ provisional.
 
   Generated text character-identical between the two.
 
-  **Cache behaviour**, 64 decode tokens at the shipped 11 slots/layer
-  default (1,440 MiB budget):
+  **Cache behaviour** at the shipped 11 slots/layer default (1,440 MiB
+  budget), 25 prompt tokens plus 64 decode tokens, **split by phase**:
 
-  | metric | value |
-  |---|---|
-  | requests | 33,792 |
-  | hit rate | **50.6%** (17,097 hits, 0 pending hits) |
-  | misses | 16,695 (3,326 cold / 13,369 eviction) |
-  | expert bytes read | 44.6 GiB in 16,695 reads |
-  | read retries / stale completions | 0 / 0 |
-  | I/O wait | 23.42 s of 48.30 s wall |
-  | mode | io_uring + O_DIRECT, probe `verified` |
+  | metric | prefill | decode |
+  |---|---|---|
+  | requests | 9,600 | 24,192 |
+  | hit rate | 45.3% (4,348 hits) | **52.7%** (12,749 hits) |
+  | pending hits | 0 | 0 |
+  | misses | 5,252 (2,517 cold / 2,735 eviction) | 11,443 (809 cold / 10,634 eviction) |
+  | expert bytes read | 14.0 GiB in 5,252 reads | 30.5 GiB in 11,443 reads |
+  | read retries / stale completions | 0 / 0 | 0 / 0 |
+  | I/O wait | 7.82 s | 16.63 s of 34.20 s decode |
+  | mode | io_uring + O_DIRECT, probe `verified` | same |
+
+  An earlier revision of this entry quoted a single blended 50.6% over
+  both phases and compared it against EXP-005, which simulates decode
+  records only. `StreamStats` was cumulative from `ForwardState`
+  construction with no phase split, so the two were never comparable.
+  `ExpertStream::stats_in(StreamPhase)` now separates them and the table
+  above is a re-measurement, not an annotation. The two phases differ
+  exactly as expected: prefill is cold-dominated (48% of its misses are
+  first-touch) while decode is eviction-dominated (93%), which is the
+  signature of a working cache on a warm working set.
 
 - Verdict: KEEP
 - Notes: four things worth carrying forward. (1) **The offline simulator
-  predicted this well.** EXP-005's batch-pinned replay gave 50.02% at 10
-  slots and 54.48% at 12; the running implementation measures 50.6% at 11,
-  which sits between them. The simulation is usable for future dial
-  decisions rather than needing a full run each time. (2) **The drive is
-  faster under the real access pattern than the synthetic probe suggested**
-  - 47.9 GB moved in 23.42 s of I/O wait is ~2.05 GB/s, against EXP-008's
+  predicted this to within half a point.** EXP-005's batch-pinned replay
+  gave 50.02% at 10 slots and 54.48% at 12, so linear interpolation puts
+  11 slots at ~52.3%; the running implementation measures **52.7%** on
+  decode. The simulation is usable for future dial decisions rather than
+  needing a full generation run each time, which matters because a real
+  run costs ~50 s and a quiet machine. (2) **The drive is faster under
+  the real access pattern than the synthetic probe suggested** - decode
+  moved 32.75 GB in 16.63 s of I/O wait, about 1.97 GB/s, against EXP-008's
   1.211-1.390 GB/s at the same block size and queue depth. EXP-008's
   numbers were taken on a contended machine and are already flagged as
   needing re-measurement; this strengthens that. It also means the
   performance model built on 1.35-1.59 GB/s is pessimistic. (3) **I/O is
-  still the wall**, 23.42 s of 48.30 s, which is the expected shape and
-  the reason the cache dial matters more than compute parallelism. (4)
-  Zero read retries and zero stale completions across 16,695 reads on
-  btrfs, with the O_DIRECT capability probe reporting `verified`, so the
-  page-cache bypass the 3 GB budget depends on is confirmed on the real
-  path rather than assumed.
+  still the wall**, 16.63 s of the 34.20 s decode, which is the expected
+  shape and the reason the cache dial matters more than compute
+  parallelism. (4) Zero read retries and zero stale completions across
+  16,695 reads on btrfs, with the O_DIRECT capability probe reporting
+  `verified`, so the page-cache bypass the 3 GB budget depends on is
+  confirmed on the real path rather than assumed.

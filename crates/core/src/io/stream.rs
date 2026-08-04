@@ -47,19 +47,33 @@
 //!   read now occupies that slot.
 //! - **`EIO` is a real, retryable outcome**, not an impossible one. Direct
 //!   I/O returns real errors and real short reads. A failed blob read is
-//!   retried exactly once and then reported as a typed error; a short read
-//!   continues from where it stopped; `result == 0` is EOF, never success.
-//! - **The SQ fills.** `PushError` means submit-then-retry, never drop.
-//! - **`submit_and_wait` returns `EINTR`.** Retried, not propagated.
+//!   retried exactly once and then reported as a typed error; `result == 0`
+//!   is EOF, never success.
+//! - **A short read is continued, or restarted.** A short read that stopped on
+//!   a block boundary is reissued from where it stopped. One that did not
+//!   cannot be: O_DIRECT rejects an unaligned offset with `EINVAL`, which is
+//!   not a retryable errno, so the blob is reissued from its base instead.
+//! - **The SQ fills.** `PushError` means submit-then-retry, never drop. If the
+//!   submit answers `EBUSY` the completion queue is drained first, because
+//!   `EBUSY` means "the CQ needs reaping", not "this read is lost".
+//! - **`submit_and_wait` returns `EINTR`.** Retried, up to a bound, so a
+//!   signal storm cannot park the decode thread forever.
 //! - **A failed fill leaves a slot un-owned.** The step invalidates it (the
 //!   completion has been reaped, which is that call's safety requirement) and
 //!   releases the rest, so a failed layer does not strand slots.
+//! - **A read that can never be reaped** (the ring itself failed) has its slot
+//!   *retired*: the buffer is leaked so a late kernel write is harmless, and
+//!   the layer is rebuilt one slot smaller so nothing can ever be handed that
+//!   slot again. The layer keeps serving steps on what is left, and once too
+//!   little is left it says so ([`super::CacheError::TooFewSlots`]) rather
+//!   than failing every read forever.
 
 use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "io-uring")]
@@ -72,8 +86,8 @@ use crate::format::{ExpertsLayout, FormatError, Manifest, sha256_file};
 
 use super::direct::{self, DirectFault, DirectSupport};
 use super::{
-    CachePlan, ExpertReader, ExpertView, IoError, LayerCache, LoadOptions, MAX_SLOTS, SLOT_ALIGN,
-    SlotError, SlotGuard, SlotPool,
+    CachePlan, CacheStats, ExpertReader, ExpertView, IoError, LayerCache, LoadOptions, MAX_SLOTS,
+    SLOT_ALIGN, SlotError, SlotGuard, SlotPool,
 };
 
 /// Submission queue depth.
@@ -92,6 +106,25 @@ const RING_ENTRIES: u32 = 8;
 /// livelock rather than a slow drive.
 #[cfg(feature = "io-uring")]
 const MAX_IDLE_PASSES: u32 = 1024;
+
+/// Pushes of one SQE, each separated by a submit and a completion-queue
+/// drain, before a full submission queue is called wedged.
+///
+/// Three is the worst case the shape of the retry implies — push fails, the
+/// submit answers `EBUSY` so the CQ is drained, push fails again because the
+/// SQ still holds the entry the kernel refused, the submit now succeeds and
+/// frees it — and this is comfortably above it.
+#[cfg(feature = "io-uring")]
+const MAX_PUSH_ATTEMPTS: u32 = 8;
+
+/// `io_uring_enter` calls interrupted by a signal before it is called a
+/// signal storm rather than a signal.
+///
+/// `EINTR` must be retried — propagating it would fail a step for a stray
+/// `SIGWINCH` — but an unbounded retry parks the decode thread with no way
+/// out, so the loop is bounded and reports a typed error at the end of it.
+#[cfg(feature = "io-uring")]
+const MAX_EINTR_RETRIES: u32 = 1024;
 
 /// How expert reads are actually being served.
 ///
@@ -123,11 +156,58 @@ impl fmt::Display for StreamMode {
     }
 }
 
+/// Which half of a generation the stream is serving.
+///
+/// Prefill and decode have different miss profiles — prefill touches every
+/// layer with a cold cache, decode reuses what prefill left resident — so a
+/// hit rate summed over both understates the steady state. EXP-013 quoted one
+/// such figure: 33,792 requests is 88 forward passes, about 24 of them
+/// prefill, and prefill carries a much higher cold-miss share.
+///
+/// The stream cannot infer the phase (it sees one layer at a time, with no
+/// notion of a token boundary), so the caller declares it with
+/// [`ExpertStream::set_phase`]. A caller that never does attributes everything
+/// to [`StreamPhase::Prefill`], which is where a stream starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum StreamPhase {
+    /// The prompt pass: every layer, cold cache, all positions at once.
+    #[default]
+    Prefill,
+    /// Token-by-token generation.
+    Decode,
+}
+
+impl StreamPhase {
+    /// Every phase, in the order a generation goes through them.
+    pub const ALL: [Self; 2] = [Self::Prefill, Self::Decode];
+
+    /// Index into a per-phase array.
+    fn index(self) -> usize {
+        match self {
+            Self::Prefill => 0,
+            Self::Decode => 1,
+        }
+    }
+}
+
+impl fmt::Display for StreamPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        })
+    }
+}
+
 /// Cumulative streaming telemetry, summed across every layer.
 ///
 /// The cache half comes from the per-layer [`LayerCache`]s; the I/O half is
 /// counted here. `hits + pending_hits + misses` is the number of routed
 /// experts resolved.
+///
+/// [`ExpertStream::stats`] returns this summed over the whole run;
+/// [`ExpertStream::stats_in`] returns one phase's share of it, which is what a
+/// steady-state decode hit rate has to be quoted from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamStats {
     /// Routed experts served from a slot whose bytes were already valid.
@@ -151,6 +231,62 @@ pub struct StreamStats {
     pub read_retries: u64,
     /// Wall time blocked in [`ExpertStream::await_misses`].
     pub io_wait: Duration,
+}
+
+impl StreamStats {
+    /// Routed experts resolved: hits, pending hits, and misses.
+    pub fn accesses(&self) -> u64 {
+        self.hits + self.pending_hits + self.misses
+    }
+
+    /// Fraction of routed experts served without waiting on a read; `0.0`
+    /// before any request.
+    ///
+    /// Pending hits are in the denominator and not the numerator, matching
+    /// [`CacheStats::hit_rate`](crate::io::CacheStats::hit_rate).
+    pub fn hit_rate(&self) -> f64 {
+        let accesses = self.accesses();
+        if accesses == 0 {
+            0.0
+        } else {
+            self.hits as f64 / accesses as f64
+        }
+    }
+
+    /// What happened between an earlier snapshot of the same stream and this
+    /// one.
+    ///
+    /// Saturating field by field. Every counter here is monotonic, so a
+    /// non-zero floor would only ever hide a bug in the caller's snapshot
+    /// order; it is not worth an error path in a telemetry accessor.
+    pub fn since(&self, earlier: &Self) -> Self {
+        Self {
+            hits: self.hits.saturating_sub(earlier.hits),
+            pending_hits: self.pending_hits.saturating_sub(earlier.pending_hits),
+            misses: self.misses.saturating_sub(earlier.misses),
+            cold_misses: self.cold_misses.saturating_sub(earlier.cold_misses),
+            eviction_misses: self.eviction_misses.saturating_sub(earlier.eviction_misses),
+            bytes_read: self.bytes_read.saturating_sub(earlier.bytes_read),
+            reads_submitted: self.reads_submitted.saturating_sub(earlier.reads_submitted),
+            read_retries: self.read_retries.saturating_sub(earlier.read_retries),
+            io_wait: self.io_wait.saturating_sub(earlier.io_wait),
+        }
+    }
+
+    /// Two disjoint spans of the same stream, added together.
+    fn plus(&self, other: &Self) -> Self {
+        Self {
+            hits: self.hits + other.hits,
+            pending_hits: self.pending_hits + other.pending_hits,
+            misses: self.misses + other.misses,
+            cold_misses: self.cold_misses + other.cold_misses,
+            eviction_misses: self.eviction_misses + other.eviction_misses,
+            bytes_read: self.bytes_read + other.bytes_read,
+            reads_submitted: self.reads_submitted + other.reads_submitted,
+            read_retries: self.read_retries + other.read_retries,
+            io_wait: self.io_wait + other.io_wait,
+        }
+    }
 }
 
 /// I/O counters kept by the stream itself.
@@ -196,6 +332,9 @@ struct Read {
     remaining: u32,
     /// Failed attempts already retried. The budget is one.
     attempts: u8,
+    /// Times this blob was restarted from its base after a short read that
+    /// stopped off a block boundary. The budget is one.
+    restarts: u8,
     /// Whether this read has reached a terminal state.
     done: bool,
 }
@@ -228,6 +367,13 @@ struct Inflight {
     /// Rolls once per submitted read, so a reissue invalidates the token of
     /// the attempt it replaces.
     next_tag: u32,
+    /// Alignment a reissue's file offset must satisfy, or `0` when reads are
+    /// buffered and any offset is legal. [`direct::DIO_ALIGN`] once layer
+    /// files are opened `O_DIRECT`: the kernel answers `EINVAL` — which
+    /// [`is_retryable`] deliberately excludes — for an unaligned offset,
+    /// length or destination, so a short read that stopped mid-block cannot be
+    /// continued and the blob is restarted instead.
+    align: u32,
 }
 
 impl Inflight {
@@ -244,6 +390,7 @@ impl Inflight {
             filled: 0,
             remaining: len,
             attempts: 0,
+            restarts: 0,
             done: false,
         });
         self.outstanding += 1;
@@ -271,6 +418,7 @@ impl Inflight {
     /// completions are the one input this layer cannot validate in advance.
     fn resolve(&mut self, user_data: u64, result: i32, io: &mut IoStats) -> Reap {
         let index = (user_data & 0xffff_ffff) as usize;
+        let align = self.align;
         let Some(read) = self.reads.get_mut(index) else {
             return Reap::Stale;
         };
@@ -290,6 +438,38 @@ impl Inflight {
                 return Reap::Done(index);
             }
             io.read_retries += 1;
+            if align != 0 && read.filled % align != 0 {
+                // Off a block boundary, so `base + filled` is an offset
+                // O_DIRECT will refuse. Start the blob again rather than
+                // submit a read that is guaranteed `EINVAL`.
+                if read.restarts > 0 {
+                    read.done = true;
+                    self.outstanding -= 1;
+                    let (base, filled) = (read.base, read.filled);
+                    return Reap::Failed(
+                        index,
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "expert blob at {base}: short reads keep stopping off a \
+                                 {align}-byte boundary (last at +{filled}), which direct \
+                                 I/O cannot resume from"
+                            ),
+                        ),
+                    );
+                }
+                read.restarts += 1;
+                tracing::warn!(
+                    layer = read.layer,
+                    expert = read.expert,
+                    slot = read.slot,
+                    filled = read.filled,
+                    "short read stopped off a block boundary; restarting the blob"
+                );
+                read.remaining += read.filled;
+                read.filled = 0;
+                return Reap::Again(index);
+            }
             return Reap::Again(index);
         }
         if result == 0 {
@@ -367,68 +547,153 @@ fn is_retryable(errno: i32) -> bool {
 /// the only name. A slot's address is then fixed for the process, which is
 /// what a cache entry that outlives a step needs.
 ///
-/// **Field order is load-bearing.** `guards` borrow `pool`; struct fields
-/// drop in declaration order, so the guards are released before the slab they
-/// point into is freed. (`SlotPool::drop` would refuse to free a slab with a
-/// live lease and leak it instead — correct, but 1.4 GiB of correct.)
+/// **Drop order is load-bearing.** Every guard borrows the pool, so all of
+/// them are released before the slab they point into is freed.
+/// (`SlotPool::drop` would refuse to free a slab with a live lease and leak it
+/// instead — correct, but 1.4 GiB of correct.) That ordering is spelled out in
+/// [`Drop for SlotTable`](SlotTable#impl-Drop-for-SlotTable) rather than left
+/// to field declaration order, because the pool is not dropped by a field at
+/// all.
+///
+/// # Why the pool is a raw pointer
+///
+/// The guards hold `&'static SlotPool` borrows of a heap allocation stored in
+/// the same value: a self-referential struct, which no lifetime can express.
+/// The obvious spelling — keep a `Box<SlotPool>` and hand out `&*box` — is the
+/// one shape that is *not* obviously sound: `Box` is the only non-reference
+/// type rustc gives `noalias` to, so under Stacked and Tree Borrows a `Unique`
+/// retag of the box (which happens every time it is moved, and on every
+/// `&mut` through it) invalidates references previously derived from it. It is
+/// why `ouroboros`, `yoke` and `self_cell` all reach for `AliasableBox` or a
+/// raw pointer here. So there is no `Box` and no `transmute`: the allocation
+/// is `Box::into_raw`'d once, every borrow is derived from the raw pointer,
+/// and `Drop` gives it back to a `Box` after the last guard is gone.
+///
+/// # Retirement
+///
+/// A slot whose read can never be reaped is *retired*: its guard is leaked, so
+/// the kernel may write into that buffer forever without aliasing anything,
+/// and it is struck from `live` so no later step can name it. Cache slot
+/// numbers index `live`, so retiring one renumbers the layer — which is safe
+/// only because the caller rebuilds that layer's [`LayerCache`] from scratch
+/// at the same moment. See [`ExpertStream::retire_slot`].
 struct SlotTable {
-    /// Flat `layer * slots_per_layer + slot`. `None` only where a guard was
-    /// leaked to protect an unreaped read.
+    /// Flat `layer * slots_per_layer + pool slot`. `None` where a guard was
+    /// leaked to protect a read that can never be reaped.
     guards: Box<[Option<SlotGuard<'static>>]>,
-    /// The pool every guard borrows. Boxed so its address is stable, and
-    /// declared last so it outlives them.
-    pool: Box<SlotPool>,
+    /// Per layer, the pool slots still usable, indexed by *cache* slot. Starts
+    /// as the identity and only ever shrinks.
+    live: Box<[Vec<u32>]>,
+    /// The pool every guard borrows, owned by this value and freed in `Drop`.
+    pool: NonNull<SlotPool>,
+    /// Slots the pool was built with, which is the stride of `guards` and the
+    /// count before any retirement.
     slots_per_layer: u32,
 }
+
+// SAFETY: the only field that is not already `Send` is `pool`, a uniquely
+// owned pointer to a `SlotPool`, and `SlotPool` is itself `Send`. Moving a
+// `SlotTable` to another thread moves the pool with it, exactly as the
+// `Box<SlotPool>` this replaced did.
+unsafe impl Send for SlotTable {}
+
+// SAFETY: `&SlotTable` grants no more than `&SlotPool` and `&SlotGuard`, both
+// of which are `Sync`. `write_ptr`, the one method that hands out a writable
+// address, takes `&mut self`.
+unsafe impl Sync for SlotTable {}
 
 impl fmt::Debug for SlotTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SlotTable")
             .field("slots_per_layer", &self.slots_per_layer)
-            .field("total_bytes", &self.pool.total_bytes())
+            .field("total_bytes", &self.pool().total_bytes())
             .finish()
+    }
+}
+
+impl Drop for SlotTable {
+    fn drop(&mut self) {
+        // Every lease first: `SlotPool::drop` leaks the whole slab rather than
+        // free memory a guard still names.
+        self.guards = Box::default();
+        // SAFETY: `pool` came from `Box::into_raw` in `new` and has not been
+        // freed. Every guard derived from it has just been dropped, and
+        // `SlotTable` hands no borrow of the pool to anything that outlives
+        // it, so this is the last use of the allocation.
+        drop(unsafe { Box::from_raw(self.pool.as_ptr()) });
     }
 }
 
 impl SlotTable {
     /// Allocate the pool and take every lease in it.
     fn new(slots_per_layer: u32, strides: &[u64]) -> Result<Self, SlotError> {
-        let pool = Box::new(SlotPool::new(slots_per_layer, strides)?);
+        let raw = Box::into_raw(Box::new(SlotPool::new(slots_per_layer, strides)?));
+        // SAFETY: `raw` is a live, uniquely owned allocation this function is
+        // about to take ownership of, and the borrow is only extended to
+        // `'static` because the guards derived from it are dropped by
+        // `Drop for SlotTable` before the allocation is freed. Deriving from
+        // the raw pointer rather than from a `Box` is what keeps the guards
+        // valid across every later move of this value: see the type's docs.
+        let pool: &'static SlotPool = unsafe { &*raw };
         let n_layers = pool.n_layers();
         let mut guards: Vec<Option<SlotGuard<'static>>> = (0..strides.len()
             * slots_per_layer as usize)
             .map(|_| None)
             .collect();
-        for layer in 0..n_layers {
+        let mut failure = None;
+        'lease: for layer in 0..n_layers {
             for _ in 0..slots_per_layer {
-                let guard = pool.acquire(layer)?;
-                // SAFETY: the lease is being extended to `'static` because it
-                // is stored beside the pool it borrows, which no lifetime can
-                // express. Three things make it sound, and all three are
-                // structural rather than conventional: `pool` is boxed, so
-                // its address does not change when this value moves; the
-                // guards are private to `SlotTable` and never handed out, so
-                // none can outlive it; and `guards` is declared before `pool`
-                // so every lease is dropped before the slab is freed.
-                let guard =
-                    unsafe { std::mem::transmute::<SlotGuard<'_>, SlotGuard<'static>>(guard) };
-                let flat = layer as usize * slots_per_layer as usize + guard.index() as usize;
-                guards[flat] = Some(guard);
+                match pool.acquire(layer) {
+                    Ok(guard) => {
+                        let flat =
+                            layer as usize * slots_per_layer as usize + guard.index() as usize;
+                        guards[flat] = Some(guard);
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        break 'lease;
+                    }
+                }
             }
+        }
+        if let Some(error) = failure {
+            drop(guards);
+            // SAFETY: every lease taken above has just been dropped, so the
+            // allocation is unborrowed and this is its last use.
+            drop(unsafe { Box::from_raw(raw) });
+            return Err(error);
         }
         Ok(Self {
             guards: guards.into_boxed_slice(),
-            pool,
+            live: (0..n_layers)
+                .map(|_| (0..slots_per_layer).collect())
+                .collect(),
+            // SAFETY: `Box::into_raw` never returns null.
+            pool: unsafe { NonNull::new_unchecked(raw) },
             slots_per_layer,
         })
     }
 
-    /// Flat index of `(layer, slot)`, or `None` if either is out of range.
+    /// The pool this table owns.
+    fn pool(&self) -> &SlotPool {
+        // SAFETY: the allocation is live for the whole life of this value —
+        // `Drop` is the only thing that frees it — and nothing hands out a
+        // `&mut SlotPool`, so a shared borrow is always legal.
+        unsafe { self.pool.as_ref() }
+    }
+
+    /// Pool slots layer `layer` can still use.
+    fn usable(&self, layer: u32) -> u32 {
+        self.live
+            .get(layer as usize)
+            .map_or(0, |live| live.len() as u32)
+    }
+
+    /// Flat index of `(layer, cache slot)`, or `None` if the layer is out of
+    /// range, the slot is out of range, or the slot has been retired.
     fn flat(&self, layer: u32, slot: u32) -> Option<usize> {
-        if slot >= self.slots_per_layer || layer >= self.pool.n_layers() {
-            return None;
-        }
-        Some(layer as usize * self.slots_per_layer as usize + slot as usize)
+        let pool_slot = *self.live.get(layer as usize)?.get(slot as usize)? as usize;
+        Some(layer as usize * self.slots_per_layer as usize + pool_slot)
     }
 
     /// Read-only view of a slot's bytes. Only valid when no read is in
@@ -464,17 +729,34 @@ impl SlotTable {
 
     /// Give up a slot permanently, so nothing can be handed its address
     /// again. For a read whose completion can no longer be reaped.
-    fn leak(&mut self, layer: u32, slot: u32) {
-        if let Some(flat) = self.flat(layer, slot)
-            && let Some(guard) = self.guards[flat].take()
-        {
+    ///
+    /// The buffer is leaked — a late kernel write into it then lands in memory
+    /// nothing else will ever own — and the slot is struck from the layer, so
+    /// [`SlotTable::flat`] can never resolve to it again however the caller's
+    /// cache renumbers itself. Returns whether anything was retired.
+    ///
+    /// Retiring renumbers the layer's cache slots: everything above `slot`
+    /// shifts down one. The caller must rebuild that layer's [`LayerCache`] to
+    /// match, which is why this is not public beyond
+    /// [`ExpertStream::retire_slot`]. Retiring several slots of one layer must
+    /// be done in *descending* slot order for the same reason.
+    fn retire(&mut self, layer: u32, slot: u32) -> bool {
+        let Some(flat) = self.flat(layer, slot) else {
+            return false;
+        };
+        if let Some(guard) = self.guards[flat].take() {
             guard.leak();
         }
+        self.live[layer as usize].remove(slot as usize);
+        true
     }
 
     /// Resident bytes of the whole pool.
+    ///
+    /// What was allocated, retirements included: a retired slot's pages are
+    /// leaked, not returned, so they still count against the process.
     fn total_bytes(&self) -> u64 {
-        self.pool.total_bytes() as u64
+        self.pool().total_bytes() as u64
     }
 }
 
@@ -516,9 +798,15 @@ pub struct ExpertStream {
     step: Step,
     inflight: Inflight,
     /// Completions drained from the ring before they are acted on, so that
-    /// reissuing does not need the completion queue borrowed.
+    /// reissuing does not need the completion queue borrowed. Bounded by the
+    /// reads one step can have outstanding, twice over (a retagged read can
+    /// leave a stale completion behind), and preallocated to that.
     #[cfg(feature = "io-uring")]
     completions: Vec<(u64, i32)>,
+    /// The batch of completions currently being acted on, swapped out of
+    /// `completions` so that a reissue may drain the ring into it meanwhile.
+    #[cfg(feature = "io-uring")]
+    reaping: Vec<(u64, i32)>,
     /// Declared before `slots`: the ring must be gone before the buffers its
     /// reads target are freed.
     #[cfg(feature = "io-uring")]
@@ -543,6 +831,20 @@ pub struct ExpertStream {
     /// [`LoadOptions::skip_hashes`].
     hash_layers: bool,
     io: IoStats,
+    /// Cache counters carried over from layers rebuilt by
+    /// [`ExpertStream::retire_slot`], so [`ExpertStream::stats`] stays
+    /// monotonic across a retirement.
+    retired: CacheStats,
+    /// Which half of the generation the caller says it is in.
+    phase: StreamPhase,
+    /// Cumulative totals at the moment `phase` began.
+    phase_start: StreamStats,
+    /// Totals accumulated by each phase, not counting the one now open.
+    phase_totals: [StreamStats; 2],
+    /// Test-only: submits still to be answered as `EBUSY` would be answered,
+    /// which no kernel new enough to run this can be made to do for real.
+    #[cfg(all(test, feature = "io-uring"))]
+    stalled_enters: u32,
 }
 
 impl fmt::Debug for ExpertStream {
@@ -578,13 +880,21 @@ impl ExpertStream {
     /// actually bypasses the page cache on this filesystem, and creates the
     /// ring. Layer files open lazily, verified on first use.
     ///
+    /// The floor is `top_k` slots per layer, not one: a step routes `top_k`
+    /// distinct experts and every one of them needs a slot at the same time,
+    /// so anything less fails at the first forward pass rather than at
+    /// startup. That is rejected here, naming the budget that would work —
+    /// after the pool has been allocated and pre-faulted and the tokenizer has
+    /// come up is far too late to learn it.
+    ///
     /// # Errors
     ///
     /// [`IoError::Format`] when the layout does not validate against the
-    /// manifest; [`IoError::Slots`] when the budget cannot fit one slot per
-    /// layer ([`SlotError::ZeroSlotsPerLayer`]) or the pool does not fit in
-    /// memory; [`IoError::Cache`] when a layer's expert count is out of
-    /// range; [`IoError::TooLarge`] for a blob stride past `u32`.
+    /// manifest; [`IoError::CacheBudgetTooSmall`] when the budget buys fewer
+    /// than `top_k` slots per layer; [`IoError::Slots`] when the budget cannot
+    /// fit one slot per layer ([`SlotError::ZeroSlotsPerLayer`]) or the pool
+    /// does not fit in memory; [`IoError::Cache`] when a layer's expert count
+    /// is out of range; [`IoError::TooLarge`] for a blob stride past `u32`.
     pub fn new(
         dir: &Path,
         manifest: &Manifest,
@@ -619,7 +929,8 @@ impl ExpertStream {
             strides.push(layer.stride);
         }
 
-        let slots_per_layer = slots_for_budget(cache_bytes, &strides, &layers)?;
+        let slots_per_layer =
+            slots_for_budget(cache_bytes, &strides, &layers, manifest.arch.top_k)?;
         let slots = SlotTable::new(slots_per_layer, &strides)?;
         let mut caches = Vec::with_capacity(layers.len());
         for layer in &layers {
@@ -637,7 +948,9 @@ impl ExpertStream {
             step: Step::default(),
             inflight: Inflight::default(),
             #[cfg(feature = "io-uring")]
-            completions: Vec::with_capacity(2 * RING_ENTRIES as usize),
+            completions: Vec::with_capacity(completion_capacity(slots_per_layer)),
+            #[cfg(feature = "io-uring")]
+            reaping: Vec::with_capacity(completion_capacity(slots_per_layer)),
             #[cfg(feature = "io-uring")]
             ring: None,
             #[cfg(feature = "io-uring")]
@@ -650,9 +963,22 @@ impl ExpertStream {
             direct_open: false,
             hash_layers: options.verify_layer_hashes && !options.skip_hashes,
             io: IoStats::default(),
+            retired: CacheStats::default(),
+            phase: StreamPhase::default(),
+            phase_start: StreamStats::default(),
+            phase_totals: [StreamStats::default(); 2],
+            #[cfg(all(test, feature = "io-uring"))]
+            stalled_enters: 0,
         };
         stream.support = stream.probe_direct_io(&strides);
         stream.direct_open = stream.support.is_usable();
+        // A short read cannot be continued from an unaligned offset through an
+        // O_DIRECT handle; see `Inflight::align`.
+        stream.inflight.align = if stream.direct_open {
+            direct::DIO_ALIGN as u32
+        } else {
+            0
+        };
 
         #[cfg(feature = "io-uring")]
         {
@@ -671,20 +997,46 @@ impl ExpertStream {
             n_layers = stream.layers.len(),
             "expert stream ready"
         );
-        if stream.mode != StreamMode::ODirect {
+        // The memory contract is about the page cache, not about the ring:
+        // `Pread` with a verified O_DIRECT handle still bypasses it, which is
+        // what `StreamMode::Pread`'s own docs say. So the warning follows the
+        // probe, not the mode.
+        if !stream.support.is_verified() {
+            let measured = stream.support.fault() == Some(DirectFault::PageCacheGrew);
             tracing::warn!(
                 mode = %stream.mode,
                 direct_io = %stream.support,
-                "expert reads are not verified to bypass the page cache; the \
-                 3 GB memory contract does not hold in this mode"
+                verdict = if measured { "measured" } else { "unmeasurable" },
+                "{}; the 3 GB memory contract does not hold in this mode",
+                if measured {
+                    "expert reads are charged to the page cache"
+                } else {
+                    "expert reads could not be shown to bypass the page cache"
+                }
+            );
+        } else if stream.mode != StreamMode::ODirect {
+            tracing::info!(
+                mode = %stream.mode,
+                "no io_uring on this host; expert reads are synchronous but \
+                 still bypass the page cache, so the memory contract holds"
             );
         }
         Ok(stream)
     }
 
-    /// Slots each layer's cache holds, as bought by the byte budget.
+    /// Slots each layer's cache was built with, as bought by the byte budget.
+    ///
+    /// A layer that has had a slot retired holds fewer than this; ask
+    /// [`ExpertStream::usable_slots`] for the current figure.
     pub fn slots_per_layer(&self) -> u32 {
         self.slots.slots_per_layer
+    }
+
+    /// Slots layer `layer` can still use, which is
+    /// [`ExpertStream::slots_per_layer`] less anything retired by a read that
+    /// could not be reaped. `0` for a layer out of range.
+    pub fn usable_slots(&self, layer: u32) -> u32 {
+        self.slots.usable(layer)
     }
 
     /// Bytes the slot pool actually made resident.
@@ -776,6 +1128,12 @@ impl ExpertStream {
         }
 
         self.inflight.clear();
+        #[cfg(feature = "io-uring")]
+        {
+            // Anything left here names a read of a step that is over; its tag
+            // can only resolve as stale, so it is dropped rather than walked.
+            self.completions.clear();
+        }
         let stride = self.layers[index].stride;
         let len = self.layers[index].len;
         let mut failure = None;
@@ -892,11 +1250,11 @@ impl ExpertStream {
     /// [`LayerCache::stuck_protected_slot`] detects and `plan` asserts
     /// against in debug builds.
     pub fn end_layer(&mut self, layer: u32) {
-        if !self.step.active {
+        if !self.step.active && self.inflight.outstanding == 0 {
             tracing::warn!(layer, "end_layer without an open step");
             return;
         }
-        if self.step.layer != layer {
+        if self.step.active && self.step.layer != layer {
             tracing::error!(
                 asked = layer,
                 open = self.step.layer,
@@ -905,13 +1263,20 @@ impl ExpertStream {
             );
         }
         if self.inflight.outstanding > 0 {
-            // Releasing a Filling slot is refused by the cache anyway; say so
-            // rather than leaving it silent.
+            // The caller skipped `await_misses`, so those reads are still
+            // live DMA into their slots and nothing here can prove otherwise.
+            // Leaving them in the table would refuse every later
+            // `begin_layer`, so they are retired instead: the buffers are
+            // leaked, the layers shrink, and the stream keeps working on what
+            // is left. Expensive and loud, but it terminates.
             tracing::error!(
                 layer = self.step.layer,
                 outstanding = self.inflight.outstanding,
-                "end_layer with reads still in flight; await_misses was skipped"
+                "end_layer with reads still in flight; await_misses was \
+                 skipped, so their slots are retired and the layer shrinks"
             );
+            self.strand_step();
+            return;
         }
         let index = self.step.layer as usize;
         if let Some(cache) = self.caches.get_mut(index) {
@@ -927,6 +1292,10 @@ impl ExpertStream {
 
     /// Cumulative telemetry: the cache half summed across layers, the I/O
     /// half counted by the stream.
+    ///
+    /// Summed over the whole run, prefill and decode together. Quoting this as
+    /// a decode figure understates the steady state, because prefill's share
+    /// of cold misses is much the larger; use [`ExpertStream::stats_in`].
     pub fn stats(&self) -> StreamStats {
         let mut stats = StreamStats {
             bytes_read: self.io.bytes_read,
@@ -935,15 +1304,61 @@ impl ExpertStream {
             io_wait: self.io.io_wait,
             ..StreamStats::default()
         };
-        for cache in &self.caches {
-            let cache = cache.stats();
+        let mut fold = |cache: CacheStats| {
             stats.hits += cache.hits;
             stats.pending_hits += cache.pending_hits;
             stats.misses += cache.misses;
             stats.cold_misses += cache.cold_misses;
             stats.eviction_misses += cache.eviction_misses;
+        };
+        for cache in &self.caches {
+            fold(cache.stats());
         }
+        // Layers rebuilt by a retirement lost their counters with their cache.
+        fold(self.retired);
         stats
+    }
+
+    /// Telemetry for one phase of the generation only.
+    ///
+    /// The decode-only figure is the one a steady-state hit rate is quoted
+    /// from. Requires the caller to have declared its phase transitions
+    /// through [`ExpertStream::set_phase`]; a caller that never does gets
+    /// everything under [`StreamPhase::Prefill`] and nothing under
+    /// [`StreamPhase::Decode`].
+    ///
+    /// `stats_in(Prefill) + stats_in(Decode) == stats()`, field by field.
+    pub fn stats_in(&self, phase: StreamPhase) -> StreamStats {
+        let closed = self.phase_totals[phase.index()];
+        if phase == self.phase {
+            closed.plus(&self.stats().since(&self.phase_start))
+        } else {
+            closed
+        }
+    }
+
+    /// Which half of the generation the stream is counting against.
+    pub fn phase(&self) -> StreamPhase {
+        self.phase
+    }
+
+    /// Declare which half of the generation the stream is now serving.
+    ///
+    /// Everything counted from here on is attributed to `phase`. Call it
+    /// before the prompt pass and again before the first decode token; calling
+    /// it with the phase already open does nothing, so it is safe to call once
+    /// per forward pass. Switching back and forth is allowed and accumulates:
+    /// a second prefill (a second prompt on the same stream) adds to the
+    /// prefill totals rather than replacing them.
+    pub fn set_phase(&mut self, phase: StreamPhase) {
+        if phase == self.phase {
+            return;
+        }
+        let now = self.stats();
+        let closed = &mut self.phase_totals[self.phase.index()];
+        *closed = closed.plus(&now.since(&self.phase_start));
+        self.phase_start = now;
+        self.phase = phase;
     }
 
     /// Completions that named no live read. Always zero in a healthy run.
@@ -964,6 +1379,10 @@ impl ExpertStream {
     }
 
     /// Wrap an I/O failure against the layer the open step is reading.
+    ///
+    /// Only the ring raises errors that are about the step rather than about a
+    /// named call; the synchronous path always has a read to blame.
+    #[cfg(feature = "io-uring")]
     fn layer_error(&self, source: io::Error) -> IoError {
         IoError::Io {
             path: self
@@ -1024,8 +1443,17 @@ impl ExpertStream {
                 .into());
             }
         }
-        if let Err(error) = direct::fadvise_dontneed(&file, 0, 0) {
-            tracing::debug!(path = %path.display(), %error, "could not drop the layer file's page cache");
+        if self.hash_layers {
+            // Only what this call pulled in. `POSIX_FADV_DONTNEED` is
+            // process-global — it evicts pages any other reader of the same
+            // install is using — so it is issued only when this process is the
+            // one that warmed the file, which is exactly the hash pass above.
+            // Without the hash pass nothing here has touched the file, and
+            // dropping a shared install's cache on every open would be a side
+            // effect on other processes rather than a cleanup of our own.
+            if let Err(error) = direct::fadvise_dontneed(&file, 0, 0) {
+                tracing::debug!(path = %path.display(), %error, "could not drop the layer file's page cache");
+            }
         }
         if self.direct_open && !applied {
             tracing::warn!(path = %path.display(), "O_DIRECT refused for this layer file");
@@ -1186,12 +1614,19 @@ impl ExpertStream {
     ///
     /// For the one case the retry logic cannot cover: the ring refused a
     /// submission, so whether the kernel took any of the reads already pushed
-    /// is unknowable. Their slots are **leaked** — the buffer is never handed
-    /// out again, which is what makes a late kernel write harmless — and
-    /// their cache entries are dropped so the layer keeps planning steps.
-    /// The layer loses that much cache capacity for good, which is the price
-    /// of not aliasing a live DMA destination.
+    /// is unknowable. Their slots are **retired** — the buffer is leaked, so a
+    /// late kernel write into it aliases nothing, and the layer is rebuilt one
+    /// slot smaller so the slot can never be handed out again. The layer loses
+    /// that much cache capacity for good, which is the price of not aliasing a
+    /// live DMA destination.
+    ///
+    /// Dropping the cache entry instead — which is what `invalidate` does —
+    /// would be worse than useless: an `Empty` entry is the *first* thing
+    /// `choose_victim` reaches for, so the next miss on that layer would be
+    /// assigned the leaked slot, fail to find a buffer, invalidate it back to
+    /// `Empty`, and be assigned it again for as long as the process lives.
     fn strand_step(&mut self) {
+        let mut retire: Vec<(u32, u32)> = Vec::new();
         for index in 0..self.inflight.reads.len() {
             let read = self.inflight.reads[index];
             if read.done {
@@ -1201,21 +1636,81 @@ impl ExpertStream {
                 layer = read.layer,
                 expert = read.expert,
                 slot = read.slot,
-                "expert read cannot be reaped; leaking its slot"
+                "expert read cannot be reaped; retiring its slot"
             );
             self.inflight.abandon(index);
-            self.slots.leak(read.layer, read.slot);
-            if let Some(cache) = self.caches.get_mut(read.layer as usize) {
-                // SAFETY: the slot's buffer has just been leaked, so nothing
-                // can ever be handed that address again. Re-assigning the
-                // slot *index* is then harmless: a fill into it fails with a
-                // typed error rather than aliasing whatever the kernel may
-                // still write.
-                unsafe { cache.invalidate(read.slot) };
-            }
+            retire.push((read.layer, read.slot));
             self.step.protected.retain(|slot| *slot != read.slot);
         }
+        // The step's surviving slots go back to the cache the way they were
+        // planned against, before any renumbering.
         self.abandon_step();
+        // Descending, because retiring a slot shifts every higher slot of that
+        // layer down one.
+        retire.sort_unstable_by(|a, b| b.cmp(a));
+        for (layer, slot) in retire {
+            self.retire_slot(layer, slot);
+        }
+    }
+
+    /// Take a slot away from a layer for good.
+    ///
+    /// The buffer is leaked and the layer's cache is rebuilt one slot smaller.
+    /// The rebuild is what makes the retirement stick: [`LayerCache`] has no
+    /// terminal state for a slot, and every non-terminal one it does have is
+    /// either a victim candidate (`Empty`, `Idle`) or a leak the stuck-slot
+    /// detector is entitled to panic on in debug builds (`Filling`, `Ready`).
+    /// A smaller cache has no entry to reach for at all.
+    ///
+    /// The cost is the layer's ghost history: a fresh [`LayerCache`] starts
+    /// with zeroed frequency counters, so the layer re-learns its hot experts
+    /// over the next few steps. That is a real regression and it is the right
+    /// trade against a layer that can never serve another read. The counters
+    /// it had are folded into [`ExpertStream::stats`] so the totals stay
+    /// monotonic.
+    ///
+    /// A layer retired down to fewer than `top_k` slots reports
+    /// [`CacheError::TooFewSlots`](crate::io::CacheError::TooFewSlots) on its
+    /// next step — a terminal error that names the real cause, not a wedge.
+    fn retire_slot(&mut self, layer: u32, slot: u32) {
+        if self.slots.flat(layer, slot).is_none() {
+            return; // already retired, or never existed
+        }
+        let usable = self.slots.usable(layer).saturating_sub(1);
+        let Some(cache) = self.caches.get(layer as usize) else {
+            return;
+        };
+        let (carried, n_experts) = (cache.stats(), cache.n_experts());
+        // Built *before* anything is renumbered: retiring the slot without
+        // replacing the cache would leave the surviving cache entries pointing
+        // at the wrong buffers. `usable` only shrinks and `n_experts` came from
+        // a cache already built with it, so this cannot actually fail.
+        let fresh = match LayerCache::new(usable, n_experts) {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                debug_assert!(false, "rebuilding a shrunken layer cache: {error}");
+                tracing::error!(
+                    layer,
+                    usable,
+                    %error,
+                    "could not rebuild a layer cache after a read that cannot \
+                     be reaped; the slot stays leased and the layer keeps its \
+                     old capacity"
+                );
+                return;
+            }
+        };
+        self.slots.retire(layer, slot);
+        self.caches[layer as usize] = fresh;
+        self.retired = add_cache_stats(self.retired, carried);
+        tracing::error!(
+            layer,
+            slot,
+            usable,
+            of = self.slots.slots_per_layer,
+            "expert slot retired; the layer's cache is rebuilt smaller and \
+             loses its ghost history"
+        );
     }
 
     /// Close a step that failed, so a caller that propagates the error
@@ -1268,6 +1763,52 @@ impl ExpertStream {
         self.mode = self.pick_mode();
     }
 
+    /// Give up the open step's reads as if the ring had failed, which is the
+    /// one thing that reaches [`ExpertStream::strand_step`] without a device
+    /// that can be made to fail. Test-only.
+    #[cfg(test)]
+    fn strand_open_step(&mut self) {
+        self.strand_step();
+    }
+
+    /// Answer the next `count` submits the way `enter` answers `EBUSY`:
+    /// submitted nothing, reap and come back. Test-only.
+    ///
+    /// Real `EBUSY` needs a kernel that refuses to submit while completions
+    /// are overflowed. Since 6.x the overflow list is unbounded and the
+    /// refusal is gone — measured on this machine, a one-entry ring took six
+    /// no-ops with the completion queue full throughout and answered `Ok` to
+    /// every submit — but `EBUSY` is still in `io_uring_enter(2)`'s contract
+    /// and still reachable on the older kernels this runtime supports. So the
+    /// answer is injected rather than provoked.
+    #[cfg(all(test, feature = "io-uring"))]
+    fn stall_enters(&mut self, count: u32) {
+        self.stalled_enters = count;
+    }
+
+    /// Leave the completion queue full, with entries spilled into the kernel's
+    /// overflow list — the state `EBUSY` used to be reported for, and the one
+    /// the drain has to cope with either way. No-ops are used because they
+    /// complete without touching a slot, and their completions read as stale.
+    /// Test-only.
+    #[cfg(all(test, feature = "io-uring"))]
+    fn force_cq_backlog(&mut self, count: usize) {
+        let ring = self.ring.as_mut().expect("ring");
+        for i in 0..count {
+            let nop = opcode::Nop::new()
+                .build()
+                .user_data(0xdead_beef_0000_0000 | i as u64);
+            // SAFETY: a no-op SQE borrows nothing at all.
+            while unsafe { ring.submission().push(&nop) }.is_err() {
+                let _ = ring.submitter().submit();
+            }
+            let _ = ring.submitter().submit();
+        }
+        // The kernel completes a no-op immediately, but "immediately" is still
+        // asynchronous.
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
     /// Replace the ring with the smallest one the kernel will build, so that
     /// a step with more misses than submission slots exercises the
     /// queue-full path. Test-only.
@@ -1305,35 +1846,85 @@ impl ExpertStream {
             .build()
             .user_data(read.user_data);
 
-        for attempt in 0..2 {
-            let ring = self.ring.as_mut().expect("ring");
-            // SAFETY: the destination stays alive and untouched until the
-            // completion is reaped, as argued above; `entry` is a plain
-            // `Read` with no borrowed state beyond that pointer.
-            let pushed = unsafe { ring.submission().push(&entry) };
-            if pushed.is_ok() {
+        for _ in 0..MAX_PUSH_ATTEMPTS {
+            let pushed = match self.ring.as_mut() {
+                // SAFETY: the destination stays alive and untouched until the
+                // completion is reaped, as argued above; `entry` is a plain
+                // `Read` with no borrowed state beyond that pointer.
+                Some(ring) => unsafe { ring.submission().push(&entry) }.is_ok(),
+                None => return Err(self.protocol_error(read.layer, "the io_uring ring is gone")),
+            };
+            if pushed {
                 self.io.reads_submitted += 1;
                 return Ok(());
             }
-            if attempt == 0 {
-                // A full SQ is a submit-and-retry, never a dropped read.
-                self.enter(0)?;
+            // A full SQ is a submit-and-retry, never a dropped read. The
+            // submit may answer `EBUSY`, which `enter` reports as "submitted
+            // nothing" and which means the *completion* queue needs draining
+            // before the kernel will take anything else — so drain it and push
+            // again, rather than calling a transient CQ overflow a fatal step
+            // failure.
+            if self.enter(0)? == 0 {
+                self.drain_cq();
             }
         }
-        Err(self.protocol_error(read.layer, "submission queue stayed full after a submit"))
+        Err(self.protocol_error(
+            read.layer,
+            "submission queue stayed full after submitting and draining completions",
+        ))
+    }
+
+    /// Move every completion the ring has ready into `self.completions`.
+    ///
+    /// Separate from acting on them so that a reissue can reap without the
+    /// completion queue borrowed, and so that a `push_sqe` blocked on a full
+    /// SQ can make room without losing what it drained.
+    #[cfg(feature = "io-uring")]
+    fn drain_cq(&mut self) {
+        let Some(ring) = self.ring.as_mut() else {
+            return;
+        };
+        let sink = &mut self.completions;
+        let mut cq = ring.completion();
+        cq.sync();
+        for cqe in &mut cq {
+            sink.push((cqe.user_data(), cqe.result()));
+        }
     }
 
     /// `io_uring_enter`, retrying `EINTR` rather than propagating it.
     ///
     /// `EBUSY` means the completion queue needs draining first; it is
     /// reported as "submitted nothing" so the caller reaps and comes back.
+    /// Both callers honour that: [`ExpertStream::await_ring`] reaps on its
+    /// next pass, [`ExpertStream::push_sqe`] reaps before it pushes again.
     #[cfg(feature = "io-uring")]
     fn enter(&mut self, want: usize) -> Result<usize, IoError> {
-        let ring = self.ring.as_ref().expect("ring");
+        #[cfg(test)]
+        if self.stalled_enters > 0 {
+            self.stalled_enters -= 1;
+            return Ok(0);
+        }
+        let Some(ring) = self.ring.as_ref() else {
+            return Err(self.protocol_error(self.step.layer, "the io_uring ring is gone"));
+        };
+        let mut interrupted = 0u32;
         loop {
             match ring.submitter().submit_and_wait(want) {
                 Ok(submitted) => return Ok(submitted),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    // Bounded: a signal every caller is expected to ignore
+                    // must not become a decode thread that never returns.
+                    interrupted += 1;
+                    if interrupted > MAX_EINTR_RETRIES {
+                        tracing::error!(
+                            retries = interrupted,
+                            "io_uring_enter interrupted on every attempt"
+                        );
+                        return Err(self.layer_error(error));
+                    }
+                    continue;
+                }
                 Err(error) if error.raw_os_error() == Some(libc::EBUSY) => return Ok(0),
                 Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
                     // A thread-bound ring reached from another task. The step
@@ -1359,19 +1950,15 @@ impl ExpertStream {
     fn await_ring(&mut self, failure: &mut Option<IoError>) -> Result<(), IoError> {
         let mut idle = 0;
         while self.inflight.outstanding > 0 {
-            let start = Instant::now();
-            self.enter(1)?;
-            self.io.io_wait += start.elapsed();
-
-            self.completions.clear();
-            {
-                let ring = self.ring.as_mut().expect("ring");
-                let sink = &mut self.completions;
-                let mut cq = ring.completion();
-                cq.sync();
-                for cqe in &mut cq {
-                    sink.push((cqe.user_data(), cqe.result()));
-                }
+            // `push_sqe` may already have reaped some of what is owed while
+            // making room in the submission queue; waiting on the ring before
+            // acting on those would block for completions that have already
+            // arrived.
+            if self.completions.is_empty() {
+                let start = Instant::now();
+                self.enter(1)?;
+                self.io.io_wait += start.elapsed();
+                self.drain_cq();
             }
             if self.completions.is_empty() {
                 idle += 1;
@@ -1384,8 +1971,12 @@ impl ExpertStream {
                 continue;
             }
             idle = 0;
-            for i in 0..self.completions.len() {
-                let (user_data, result) = self.completions[i];
+            // Swapped out of the sink, because reissuing a read below may
+            // drain the ring again and must not append to the batch being
+            // walked.
+            std::mem::swap(&mut self.completions, &mut self.reaping);
+            for i in 0..self.reaping.len() {
+                let (user_data, result) = self.reaping[i];
                 match self.inflight.resolve(user_data, result, &mut self.io) {
                     Reap::Done(index) => self.mark_ready(index),
                     Reap::Again(index) => {
@@ -1414,6 +2005,7 @@ impl ExpertStream {
                     }
                 }
             }
+            self.reaping.clear();
             self.flush()?;
         }
         Ok(())
@@ -1433,24 +2025,59 @@ impl Drop for ExpertStream {
             outstanding = self.inflight.outstanding,
             "expert stream dropped with reads in flight; leaking their slots"
         );
-        for index in 0..self.inflight.reads.len() {
-            let read = self.inflight.reads[index];
-            if !read.done {
-                self.slots.leak(read.layer, read.slot);
-            }
+        // Descending, so retiring one slot does not renumber the next.
+        let mut stranded: Vec<(u32, u32)> = self
+            .inflight
+            .reads
+            .iter()
+            .filter(|read| !read.done)
+            .map(|read| (read.layer, read.slot))
+            .collect();
+        stranded.sort_unstable_by(|a, b| b.cmp(a));
+        for (layer, slot) in stranded {
+            self.slots.retire(layer, slot);
         }
     }
+}
+
+/// Cache counters added together.
+///
+/// [`CacheStats`] is a plain counter bag with no arithmetic of its own, and
+/// this file only ever needs the one operation.
+fn add_cache_stats(a: CacheStats, b: CacheStats) -> CacheStats {
+    CacheStats {
+        hits: a.hits + b.hits,
+        pending_hits: a.pending_hits + b.pending_hits,
+        misses: a.misses + b.misses,
+        cold_misses: a.cold_misses + b.cold_misses,
+        eviction_misses: a.eviction_misses + b.eviction_misses,
+        evictions: a.evictions + b.evictions,
+    }
+}
+
+/// Completions one pass of the reap loop can hold.
+///
+/// A completion exists only for a submitted read, and a step submits at most
+/// one read per slot, so the live count is bounded by the slots of one layer —
+/// doubled, because a retagged read can leave the completion of the attempt it
+/// replaced behind. Preallocated to that so the decode loop never allocates
+/// inside the completion path, however badly the completion queue overflows.
+#[cfg(feature = "io-uring")]
+fn completion_capacity(slots_per_layer: u32) -> usize {
+    (2 * RING_ENTRIES as usize).max(2 * slots_per_layer as usize)
 }
 
 /// Slots per layer bought by a total byte budget.
 ///
 /// The pool charges each layer the page-aligned pitch of its own stride, so a
 /// slot costs the sum of those across all layers. Clamped to what a layer can
-/// use (its expert count) and to [`MAX_SLOTS`].
+/// use (its expert count) and to [`MAX_SLOTS`], and floored at `top_k`, which
+/// is the smallest number of slots any step of this model can be served from.
 fn slots_for_budget(
     cache_bytes: u64,
     strides: &[u64],
     layers: &[LayerState],
+    top_k: u32,
 ) -> Result<u32, IoError> {
     if strides.is_empty() {
         return Err(SlotError::NoLayers.into());
@@ -1485,15 +2112,44 @@ fn slots_for_budget(
         .min()
         .unwrap_or(MAX_SLOTS)
         .clamp(1, MAX_SLOTS);
-    if slots > usable {
+    let chosen = if slots > usable {
         tracing::info!(
             budget_slots = slots,
             slots_per_layer = usable,
             "expert cache budget buys more slots than a layer can use; clamping"
         );
-        return Ok(usable);
+        usable
+    } else {
+        slots
+    };
+
+    // One step routes `top_k` distinct experts and needs all of them resident
+    // at once, so a layer with fewer slots than that cannot serve a single
+    // forward pass. Caught here rather than mid-pass: by then the pool has
+    // been allocated and pre-faulted, the layer files are open and the
+    // tokenizer is up, and the error the cache raises names slots rather than
+    // the dial the operator actually set.
+    let floor = top_k.max(1);
+    if chosen < floor {
+        let needed = per_slot * u128::from(floor);
+        tracing::error!(
+            cache_bytes,
+            bytes_per_slot = %per_slot,
+            slots = chosen,
+            top_k = floor,
+            minimum_bytes = %needed,
+            "expert cache budget cannot fit one slot per routed expert"
+        );
+        return Err(IoError::CacheBudgetTooSmall {
+            given: cache_bytes,
+            // Saturating: a model whose `top_k` slots do not fit in 64 bits of
+            // budget cannot be run at all, and the number is for a message.
+            needed: u64::try_from(needed).unwrap_or(u64::MAX),
+            slots: chosen,
+            top_k: floor,
+        });
     }
-    Ok(slots)
+    Ok(chosen)
 }
 
 /// Where `expert` first appears in the request the step was planned from.
@@ -1601,8 +2257,9 @@ mod tests {
         let fx = build_install("stream-budget");
         let row = slot_row(&fx);
 
-        // Exactly n rows buys n slots; a fraction over buys no more.
-        for slots in 1..=3u32 {
+        // Exactly n rows buys n slots; a fraction over buys no more. Starts at
+        // `top_k`, which is the floor `new` enforces.
+        for slots in fx.manifest.arch.top_k..=3u32 {
             let stream = open(&fx, slots);
             assert_eq!(stream.slots_per_layer(), slots);
             let extra = ExpertStream::new(
@@ -1637,6 +2294,69 @@ mod tests {
         // hold anything.
         let huge = open(&fx, 64);
         assert_eq!(huge.slots_per_layer(), fx.layout.layers[0].n_experts);
+    }
+
+    #[test]
+    fn a_budget_below_top_k_is_rejected_at_construction() {
+        // `--cache-bytes 700M` on the shipped model buys 5 slots against a
+        // top_k of 8, and used to load the whole model, allocate and pre-fault
+        // the pool and start the tokenizer before dying in the first forward
+        // pass with an error about slots. The dial the operator set is the one
+        // named, and it is named before any of that work happens.
+        let fx = build_install("stream-budget-floor");
+        let row = slot_row(&fx);
+        let top_k = fx.manifest.arch.top_k;
+        assert!(top_k > 1, "fixture must route more than one expert");
+
+        for slots in 1..top_k {
+            let err = ExpertStream::new(
+                &fx.root,
+                &fx.manifest,
+                &fx.layout,
+                row * u64::from(slots),
+                LoadOptions::default(),
+            )
+            .unwrap_err();
+            match err {
+                IoError::CacheBudgetTooSmall {
+                    given,
+                    needed,
+                    slots: bought,
+                    top_k: k,
+                } => {
+                    assert_eq!(given, row * u64::from(slots));
+                    assert_eq!(bought, slots);
+                    assert_eq!(k, top_k);
+                    // The minimum it names has to be a budget that works.
+                    assert_eq!(needed, row * u64::from(top_k));
+                    assert!(
+                        err.to_string().contains(&needed.to_string()),
+                        "the error must name the minimum budget: {err}"
+                    );
+                }
+                other => panic!("unexpected error: {other}"),
+            }
+        }
+
+        // And the floor itself opens.
+        let ok = open(&fx, top_k);
+        assert_eq!(ok.slots_per_layer(), top_k);
+
+        // A budget under one whole slot is still the zero-slot error: there is
+        // no meaningful "minimum for top_k" to quote when the pool cannot hold
+        // a single row.
+        let err = ExpertStream::new(
+            &fx.root,
+            &fx.manifest,
+            &fx.layout,
+            row - 1,
+            LoadOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, IoError::Slots(SlotError::ZeroSlotsPerLayer)),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1751,6 +2471,230 @@ mod tests {
         stream.end_layer(1);
         assert_eq!(stream.stats().reads_submitted, 4);
         assert_eq!(stream.stale_completions(), 0);
+    }
+
+    #[cfg(feature = "io-uring")]
+    #[test]
+    fn a_full_completion_queue_is_drained_rather_than_reported_as_fatal() {
+        // `EBUSY` from `io_uring_enter` means "reap the completion queue and
+        // come back", which is what the call's own doc says and what
+        // `await_ring` honours. `push_sqe` used to answer it by retrying the
+        // push against a submission queue the kernel had just refused to
+        // drain, and calling the second failure fatal — so a transient
+        // completion-queue overflow killed a forward pass.
+        //
+        // The backlog below leaves the CQ full with entries spilled into the
+        // overflow list, which is exactly the state that makes every
+        // `io_uring_enter` answer `EBUSY`, and a one-entry ring makes the SQ
+        // full on every push after the first.
+        const BACKLOG: usize = 6;
+        const STALLS: u32 = 3;
+        let fx = build_install("stream-cq-overflow");
+        let mut stream = open(&fx, 4);
+        stream.force_tiny_ring();
+        stream.force_cq_backlog(BACKLOG);
+        stream.stall_enters(STALLS);
+
+        let request = [0u32, 1, 2, 3];
+        stream.begin_layer(1, &request).expect("step submits");
+        assert_eq!(stream.misses().len(), 4);
+        let misses = stream.misses().to_vec();
+        stream.await_misses().expect("step completes");
+        for &(index, slot) in &misses {
+            assert_eq!(
+                stream.view(1, slot).unwrap().blob(),
+                blob_on_disk(&fx, 1, request[index]),
+                "expert {} came back wrong through a full CQ",
+                request[index]
+            );
+        }
+        stream.end_layer(1);
+        assert_eq!(stream.stats().reads_submitted, 4);
+        // Every no-op of the backlog was reaped and recognised as naming no
+        // live read, which is what draining the CQ costs and all it costs.
+        assert_eq!(stream.stale_completions(), BACKLOG as u64);
+
+        // The layer is intact: nothing was retired and the next step hits.
+        assert_eq!(stream.usable_slots(1), 4);
+        stream.begin_layer(1, &request).unwrap();
+        assert_eq!(stream.hits().len(), 4);
+        stream.await_misses().unwrap();
+        stream.end_layer(1);
+    }
+
+    #[test]
+    fn a_retired_slot_is_never_handed_out_again() {
+        // The failure this guards: a slot whose read can never be reaped used
+        // to be leaked *and* invalidated, and `choose_victim` prefers `Empty`
+        // slots. So the next miss on that layer was assigned the leaked slot,
+        // found no buffer, invalidated it back to `Empty`, and was assigned it
+        // again — every `begin_layer` on that layer failing for the life of
+        // the process.
+        let fx = build_install("stream-retire");
+        let mut stream = open(&fx, 4);
+        let before = stream.usable_slots(0);
+        assert_eq!(before, 4);
+
+        stream.begin_layer(0, &[3]).unwrap();
+        assert_eq!(stream.misses().len(), 1);
+        stream.strand_open_step();
+
+        // The layer lost exactly that much capacity, and only that layer.
+        assert_eq!(stream.usable_slots(0), before - 1);
+        assert_eq!(stream.usable_slots(1), before);
+
+        // And it keeps working on what is left, for as long as it is driven.
+        for step in 0..64u32 {
+            let request = [step % 4, (step / 4 + 1) % 4];
+            let request: Vec<u32> = if request[0] == request[1] {
+                vec![request[0]]
+            } else {
+                request.to_vec()
+            };
+            stream
+                .begin_layer(0, &request)
+                .unwrap_or_else(|e| panic!("step {step} refused after a retirement: {e}"));
+            stream.await_misses().unwrap();
+            for &(index, slot) in stream.misses().to_vec().iter() {
+                assert_eq!(
+                    stream.view(0, slot).unwrap().blob(),
+                    blob_on_disk(&fx, 0, request[index]),
+                    "step {step} served the wrong blob after a retirement"
+                );
+            }
+            for &(index, slot) in stream.hits().to_vec().iter() {
+                assert_eq!(
+                    stream.view(0, slot).unwrap().blob(),
+                    blob_on_disk(&fx, 0, request[index]),
+                    "step {step} hit the wrong blob after a retirement"
+                );
+            }
+            stream.end_layer(0);
+        }
+        // The counters the rebuilt cache lost are still in the totals.
+        let stats = stream.stats();
+        assert!(stats.misses >= 1, "the stranded step's miss was dropped");
+        assert_eq!(
+            stats.hits + stats.pending_hits + stats.misses,
+            1 + 64 * 2 - 16
+        );
+    }
+
+    #[test]
+    fn retiring_a_layer_down_to_nothing_is_a_typed_error_not_a_wedge() {
+        // Retirement shrinks a layer, and a layer below `top_k` slots can no
+        // longer serve a step. It has to say so, once, in terms of slots —
+        // never fail every read forever with "slot is not in the pool".
+        let fx = build_install("stream-retire-all");
+        let mut stream = open(&fx, 4);
+        for expert in 0..4u32 {
+            if stream.usable_slots(0) == 0 {
+                break;
+            }
+            stream.begin_layer(0, &[expert]).unwrap();
+            stream.strand_open_step();
+        }
+        assert_eq!(stream.usable_slots(0), 0);
+        let err = stream.begin_layer(0, &[0]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IoError::Cache(CacheError::TooFewSlots { n_slots: 0, .. })
+            ),
+            "unexpected error: {err}"
+        );
+        // Twice, so the state is stable rather than degrading further.
+        assert!(matches!(
+            stream.begin_layer(0, &[0]).unwrap_err(),
+            IoError::Cache(CacheError::TooFewSlots { n_slots: 0, .. })
+        ));
+        // The other layer is untouched.
+        stream.begin_layer(1, &[0, 1]).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(1);
+    }
+
+    #[test]
+    fn end_layer_without_awaiting_retires_rather_than_wedging() {
+        // Skipping `await_misses` used to leave the in-flight table populated
+        // for good, and `begin_layer` refuses to start a step over live reads
+        // — so every later step failed with no path out. Those reads are
+        // genuinely unreapable, so their slots are retired and the stream
+        // keeps going one slot lighter.
+        let fx = build_install("stream-end-without-await");
+        let mut stream = open(&fx, 4);
+        stream.begin_layer(1, &[2]).unwrap();
+        stream.end_layer(1); // no await_misses
+
+        assert_eq!(stream.usable_slots(1), 3);
+        for expert in [0u32, 1, 3] {
+            stream
+                .begin_layer(1, &[expert])
+                .expect("layer still serves");
+            stream.await_misses().unwrap();
+            let slot = stream.misses()[0].1;
+            assert_eq!(
+                stream.view(1, slot).unwrap().blob(),
+                blob_on_disk(&fx, 1, expert)
+            );
+            stream.end_layer(1);
+        }
+    }
+
+    #[test]
+    fn phase_split_separates_prefill_from_decode() {
+        let fx = build_install("stream-phases");
+        let mut stream = open(&fx, 4);
+        assert_eq!(stream.phase(), StreamPhase::Prefill);
+
+        // Prefill: two cold misses.
+        stream.begin_layer(0, &[0, 1]).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(0);
+
+        let prefill = stream.stats_in(StreamPhase::Prefill);
+        assert_eq!(prefill.misses, 2);
+        assert_eq!(prefill.cold_misses, 2);
+        assert_eq!(prefill.hits, 0);
+        assert_eq!(stream.stats_in(StreamPhase::Decode), StreamStats::default());
+
+        stream.set_phase(StreamPhase::Decode);
+        assert_eq!(stream.phase(), StreamPhase::Decode);
+        // Idempotent.
+        stream.set_phase(StreamPhase::Decode);
+
+        // Decode: the same two experts are resident, so both hit.
+        for _ in 0..3 {
+            stream.begin_layer(0, &[0, 1]).unwrap();
+            stream.await_misses().unwrap();
+            stream.end_layer(0);
+        }
+
+        let decode = stream.stats_in(StreamPhase::Decode);
+        assert_eq!(decode.hits, 6);
+        assert_eq!(decode.misses, 0);
+        assert_eq!(decode.hit_rate(), 1.0);
+        assert_eq!(decode.bytes_read, 0, "decode read a resident expert");
+
+        // Prefill's share did not move, and the two add up to the whole.
+        assert_eq!(stream.stats_in(StreamPhase::Prefill), prefill);
+        let total = stream.stats();
+        assert_eq!(prefill.plus(&decode), total);
+        // The cumulative rate understates decode, which is the whole point.
+        assert!(
+            total.hit_rate() < decode.hit_rate(),
+            "cumulative {} vs decode {}",
+            total.hit_rate(),
+            decode.hit_rate()
+        );
+
+        // Going back to prefill accumulates rather than restarts.
+        stream.set_phase(StreamPhase::Prefill);
+        stream.begin_layer(1, &[2]).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(1);
+        assert_eq!(stream.stats_in(StreamPhase::Prefill).misses, 3);
+        assert_eq!(stream.stats_in(StreamPhase::Decode), decode);
     }
 
     #[test]
@@ -2120,5 +3064,69 @@ mod tests {
             other => panic!("expected Failed, got {other:?}"),
         }
         assert_eq!(inflight.outstanding, 0);
+    }
+
+    #[test]
+    fn an_unaligned_short_read_restarts_the_blob_instead_of_being_resumed() {
+        // Under O_DIRECT the reissue offset is `base + filled`, and the kernel
+        // answers `EINVAL` to an offset that is not a multiple of the block
+        // size — an errno `is_retryable` deliberately excludes, so continuing
+        // from an unaligned stop is a guaranteed terminal failure. The blob is
+        // started again instead.
+        let mut io = IoStats::default();
+        let mut inflight = Inflight {
+            align: direct::DIO_ALIGN as u32,
+            ..Inflight::default()
+        };
+        let tokens = tracked(&mut inflight, &[0]);
+
+        assert!(matches!(
+            inflight.resolve(tokens[0], 1536, &mut io),
+            Reap::Again(0)
+        ));
+        assert_eq!(
+            inflight.reads[0].filled, 0,
+            "reissue offset must be aligned"
+        );
+        assert_eq!(inflight.reads[0].remaining, 4096);
+        assert_eq!(inflight.reads[0].restarts, 1);
+        // The bytes really did move, even though they are being re-read.
+        assert_eq!(io.bytes_read, 1536);
+        assert_eq!(io.read_retries, 1);
+
+        // The restart budget is one: a device that keeps stopping mid-block is
+        // a terminal error, not a loop.
+        let next = inflight.retag(0);
+        match inflight.resolve(next, 1536, &mut io) {
+            Reap::Failed(0, error) => assert_eq!(error.kind(), io::ErrorKind::InvalidData),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(inflight.outstanding, 0);
+
+        // A short read that *did* stop on a block boundary still continues
+        // from where it stopped, which is the common case.
+        let mut aligned = Inflight {
+            align: direct::DIO_ALIGN as u32,
+            ..Inflight::default()
+        };
+        let index = aligned.track(0, 0, 0, 0, 8192);
+        let token = aligned.reads[index].user_data;
+        assert!(matches!(
+            aligned.resolve(token, 4096, &mut io),
+            Reap::Again(0)
+        ));
+        assert_eq!(aligned.reads[0].filled, 4096);
+        assert_eq!(aligned.reads[0].restarts, 0);
+
+        // And with no alignment requirement nothing is restarted at all.
+        let mut buffered = Inflight::default();
+        let index = buffered.track(0, 0, 0, 0, 4096);
+        let token = buffered.reads[index].user_data;
+        assert!(matches!(
+            buffered.resolve(token, 1536, &mut io),
+            Reap::Again(0)
+        ));
+        assert_eq!(buffered.reads[0].filled, 1536);
+        assert_eq!(buffered.reads[0].restarts, 0);
     }
 }
