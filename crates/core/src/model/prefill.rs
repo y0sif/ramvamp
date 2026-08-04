@@ -202,15 +202,28 @@ impl PrefillConfig {
         }
     }
 
-    /// Reject a degenerate chunk before it reaches the driver.
+    /// Reject a degenerate dial before it reaches the driver.
+    ///
+    /// **All three dials, one refusal point.** Every field here is `pub`, so
+    /// every field is caller-supplied, and each used to be refused somewhere
+    /// else: the chunk here, `experts_per_window == 0` silently coerced to 1
+    /// by `plan_arena`, and an oversized `windows_in_flight` only inside
+    /// `PrefillSession::begin`, several hundred lines and one arena plan
+    /// later. The sweep dials are delegated to [`SweepConfig::validate`],
+    /// which owns their bounds, so the two cannot drift apart.
     ///
     /// # Errors
     ///
-    /// [`ForwardError::InvalidPrefillChunk`] for a zero chunk.
+    /// [`ForwardError::InvalidPrefillChunk`] for a zero chunk;
+    /// [`ForwardError::Sweep`] with
+    /// [`SweepError::BadDials`](crate::io::SweepError::BadDials) for a zero
+    /// `experts_per_window`, a zero `windows_in_flight`, or more windows in
+    /// flight than `MAX_WINDOWS_IN_FLIGHT`.
     pub fn validate(self) -> Result<Self, ForwardError> {
         if self.chunk == 0 {
             return Err(ForwardError::InvalidPrefillChunk { chunk: self.chunk });
         }
+        self.sweep_config().validate()?;
         Ok(self)
     }
 }
@@ -324,6 +337,15 @@ impl<'a> Carver<'a> {
     fn take<T: ScratchPod>(&mut self, len: usize) -> Result<&'a mut [T], ForwardError> {
         let align = align_of::<T>();
         let pad = self.rest.as_ptr().align_offset(align);
+        // Before the byte arithmetic, not after: `usize::MAX` padding makes
+        // every `checked_add` below overflow, so an unalignable span would
+        // otherwise report `PrefillScratch { needed: u64::MAX }` for any
+        // non-zero `len` and `PrefillScratchAlign` never. Unreachable at a
+        // page-aligned slab base — but a diagnostic that lies is worse than
+        // one that is merely unreachable.
+        if pad == usize::MAX {
+            return Err(ForwardError::PrefillScratchAlign { align });
+        }
         let want = len
             .checked_mul(size_of::<T>())
             .and_then(|bytes| bytes.checked_add(pad))
@@ -331,9 +353,6 @@ impl<'a> Carver<'a> {
                 needed: u64::MAX,
                 available: self.rest.len() as u64,
             })?;
-        if pad == usize::MAX {
-            return Err(ForwardError::PrefillScratchAlign { align });
-        }
         if want > self.rest.len() {
             return Err(ForwardError::PrefillScratch {
                 needed: (self.used + want) as u64,
@@ -751,17 +770,50 @@ fn pool_batched_q8_0(
 ///
 /// Pure data movement: no float arithmetic happens here, so nothing about it
 /// can move a bit.
-fn transpose(src: &[f32], rows: usize, cols: usize, dst: &mut [f32]) {
-    if rows == 0 || cols == 0 {
-        return;
-    }
-    for (r, row) in src.chunks_exact(cols).take(rows).enumerate() {
-        for (c, &value) in row.iter().enumerate() {
-            if let Some(slot) = dst.get_mut(c * rows + r) {
-                *slot = value;
+///
+/// **Both slices must be exactly `rows * cols` long.** The size contract is
+/// checked rather than clamped on purpose: this module's thesis is that the
+/// driver may not assume the scratch it was handed is zeroed, and a silently
+/// truncated source or a silently dropped destination write would leave the
+/// previous chunk's arena bytes in `q`, `k`, `v` or `moe_t` — a numerical
+/// divergence with no error attached. Every call site passes exactly-sized
+/// slices today; a future sizing mistake gets a [`ForwardError`], not a wrong
+/// answer.
+///
+/// # Errors
+///
+/// [`ForwardError::Kernel`] with [`KernelError::LengthMismatch`] when either
+/// slice is not `rows * cols` long, or when that product overflows.
+fn transpose(src: &[f32], rows: usize, cols: usize, dst: &mut [f32]) -> Result<(), ForwardError> {
+    let expected = rows.checked_mul(cols).ok_or(KernelError::LengthMismatch {
+        what: "prefill transpose: rows * cols overflows",
+        left: rows,
+        right: cols,
+    })?;
+    for (what, len) in [
+        ("prefill transpose: src vs rows * cols", src.len()),
+        ("prefill transpose: dst vs rows * cols", dst.len()),
+    ] {
+        if len != expected {
+            return Err(KernelError::LengthMismatch {
+                what,
+                left: len,
+                right: expected,
             }
+            .into());
         }
     }
+    if expected == 0 {
+        return Ok(());
+    }
+    // `c < cols` and `r < rows`, so `c * rows + r < cols * rows == dst.len()`:
+    // the index below is in bounds because the lengths were just checked.
+    for (r, row) in src.chunks_exact(cols).take(rows).enumerate() {
+        for (c, &value) in row.iter().enumerate() {
+            dst[c * rows + r] = value;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -794,10 +846,14 @@ fn ring_bytes(layout: &ExpertsLayout, experts_per_window: u32, windows_in_flight
 /// total prefill bytes scale with `ceil(prompt / chunk)` and read-ahead is
 /// worth far less than chunk width.
 ///
+/// Dials are validated, never coerced: a zero on either sweep dial is
+/// [`PrefillConfig::validate`]'s refusal, and narrowing is only ever applied to
+/// values that were legal to begin with.
+///
 /// # Errors
 ///
 /// [`ForwardError::PrefillScratch`] when not even a single-row chunk fits
-/// beside a one-window ring.
+/// beside a one-window ring; whatever [`PrefillConfig::validate`] refuses.
 fn plan_arena(
     layout: &ExpertsLayout,
     dims: &PrefillDims,
@@ -806,10 +862,11 @@ fn plan_arena(
     pool_bytes: u64,
 ) -> Result<(usize, SweepConfig), ForwardError> {
     const PAGE: u64 = 4096;
-    let mut in_flight = config.windows_in_flight.max(1);
+    let config = config.validate()?;
+    let mut in_flight = config.windows_in_flight;
     let mut smallest_need = u64::MAX;
     loop {
-        let ring = ring_bytes(layout, config.experts_per_window.max(1), in_flight);
+        let ring = ring_bytes(layout, config.experts_per_window, in_flight);
         // `PrefillSession::begin` pads the scratch up to a page before the
         // ring, so the usable scratch is the page-floor of what is left.
         let budget = scratch_budget(pool_bytes, ring, PAGE);
@@ -844,7 +901,7 @@ fn plan_arena(
             return Ok((
                 rows,
                 SweepConfig {
-                    experts_per_window: config.experts_per_window.max(1),
+                    experts_per_window: config.experts_per_window,
                     windows_in_flight: in_flight,
                 },
             ));
@@ -1100,7 +1157,7 @@ fn run_chunk(
                 n,
                 &mut s.tmat[..q_dim * n],
             )?;
-            transpose(&s.tmat[..q_dim * n], q_dim, n, &mut s.q[..n * q_dim]);
+            transpose(&s.tmat[..q_dim * n], q_dim, n, &mut s.q[..n * q_dim])?;
             pool_batched_q8_0(
                 state.pool,
                 lw.attn_k.bytes,
@@ -1110,7 +1167,7 @@ fn run_chunk(
                 n,
                 &mut s.tmat[..kv_dim * n],
             )?;
-            transpose(&s.tmat[..kv_dim * n], kv_dim, n, &mut s.k[..n * kv_dim]);
+            transpose(&s.tmat[..kv_dim * n], kv_dim, n, &mut s.k[..n * kv_dim])?;
             pool_batched_q8_k(
                 state.pool,
                 lw.attn_v.format,
@@ -1121,7 +1178,7 @@ fn run_chunk(
                 n,
                 &mut s.tmat[..kv_dim * n],
             )?;
-            transpose(&s.tmat[..kv_dim * n], kv_dim, n, &mut s.v[..n * kv_dim]);
+            transpose(&s.tmat[..kv_dim * n], kv_dim, n, &mut s.v[..n * kv_dim])?;
 
             // (d) Per-head QK-RMSNorm then RoPE, at this row's absolute
             // position. HF order, exactly as `forward_token` does it.
@@ -1435,7 +1492,7 @@ fn run_expert(
         moe,
         count,
         &mut s.moe_t[..count * moe],
-    );
+    )?;
     for j in 0..count {
         quantize_row_q8_k(
             &s.moe_t[j * moe..(j + 1) * moe],
@@ -1497,8 +1554,8 @@ fn reduce_experts(s: &mut Scratch<'_>, dims: &PrefillDims, n: usize) -> Result<(
 mod tests {
     use super::*;
     use crate::format::{ExpertsLayout, LayerLayout};
-    use crate::io::LoadOptions;
     use crate::io::testutil::{Fixture, build_install};
+    use crate::io::{LoadOptions, SweepError};
     use crate::model::RuntimeConfig;
     use crate::model::testsupport::temper_install;
 
@@ -1543,6 +1600,398 @@ mod tests {
         logits.iter().map(|v| v.to_bits()).collect()
     }
 
+    /// The second bit-identity fixture: a geometry chosen so that no two of
+    /// the driver's widths can accidentally agree.
+    ///
+    /// [`build_install`] is one hard-coded geometry — `hidden 256`, `q_dim
+    /// 256`, `moe 256`, `4` experts, `top_k 2` — and every prefill test above
+    /// runs it at `experts_per_window: 1, windows_in_flight: 1`. Four things
+    /// the driver does are therefore never exercised there, each of which is
+    /// a place a future defect would hide silently rather than fail:
+    ///
+    /// - **`wide = max(q_dim, hidden)` is degenerate** at `256 == 256`, so
+    ///   `tmat`'s four slicings (`q_dim * n`, `kv_dim * n`, `hidden * n`,
+    ///   `hidden * count`) collapse to one width and a wrong one would still
+    ///   read the right bytes. The shipped model is `q_dim 4096` against
+    ///   `hidden 2048`.
+    /// - **`hidden_q8k == 1`**, so [`run_expert`]'s `acts_gather` block copy
+    ///   is a single-block copy. The shipped model has `2048 / 256 = 8`.
+    /// - **`experts_per_window == 1`**, so the sweep's intra-window
+    ///   `within * stride` offset is never reached from this driver. The
+    ///   production default is 8.
+    /// - **No skip pressure**: 4 experts at 1 per window leaves nothing for a
+    ///   chunk's routing to miss.
+    ///
+    /// `scripts/bitident.py` closes none of them either — its prompts are
+    /// 4-12 tokens and single-chunk. Hence this: `hidden 512`, `q_dim 768`,
+    /// `kv_dim 192`, `moe 256` (**pairwise different**, so a wrong width
+    /// cannot accidentally agree), `hidden_q8k 2`, `attn_q8k 3`, 16 experts
+    /// at `top_k 4`.
+    ///
+    /// It lives here rather than beside [`build_install`] because
+    /// `io/testutil.rs` belongs to another lane; the right home for a
+    /// geometry-parameterised builder is there, and this module keeps only
+    /// what the parameterisation would have produced.
+    mod wide {
+        use std::collections::BTreeMap;
+        use std::fs;
+        use std::path::PathBuf;
+
+        use crate::format::{
+            ArchInfo, CommonTensor, ExpertsLayout, FileEntry, LAYOUT_FILE, LayerLayout, Manifest,
+            Projection, ProjectionName, QuantInfo, RVMP_VERSION, SourceInfo, layer_file_name,
+            sha256_file, testutil::TempDir, write_layout, write_manifest,
+        };
+        use crate::kernels::quants::{QuantFormat, f32_to_f16};
+        use crate::model::testsupport::temper_parts;
+
+        /// Layers in the fixture.
+        pub(super) const N_LAYERS: u32 = 2;
+        /// Experts per layer — enough that a chunk's routing cannot cover
+        /// them all, which is what produces skipped windows.
+        pub(super) const N_EXPERTS: u32 = 16;
+        /// Experts per token.
+        pub(super) const TOP_K: u32 = 4;
+        /// Hidden dimension: two Q8_K super-blocks per row, unlike the
+        /// single-block fixture.
+        pub(super) const HIDDEN: usize = 512;
+        /// Per-expert FFN intermediate — deliberately not `HIDDEN`.
+        pub(super) const MOE: usize = 256;
+        /// Query heads.
+        pub(super) const N_HEADS: usize = 12;
+        /// KV heads: 4:1 GQA.
+        pub(super) const N_KV_HEADS: usize = 3;
+        /// Head dimension.
+        pub(super) const HEAD_DIM: usize = 64;
+        /// `n_heads * head_dim` = 768, so `wide = q_dim > hidden`.
+        pub(super) const Q_DIM: usize = N_HEADS * HEAD_DIM;
+        /// `n_kv_heads * head_dim` = 192.
+        pub(super) const KV_DIM: usize = N_KV_HEADS * HEAD_DIM;
+        /// Vocabulary size.
+        pub(super) const VOCAB: usize = 40;
+
+        /// A complete install in a self-cleaning temp dir.
+        pub(super) struct WideFixture {
+            _tmp: TempDir,
+            /// The install directory.
+            pub(super) root: PathBuf,
+        }
+
+        /// Deterministic filler byte for quantized payloads, as
+        /// `io::testutil` fills them; the scales are re-stamped by
+        /// [`temper_parts`] afterwards.
+        fn pattern_byte(seed: usize, block: usize, byte: usize) -> u8 {
+            (seed.wrapping_mul(31) ^ block.wrapping_mul(7) ^ byte.wrapping_mul(3)) as u8
+        }
+
+        /// Packed bytes for `rows` quantized rows of `in_dim` weights.
+        fn quant_bytes(format: QuantFormat, rows: usize, in_dim: usize, seed: usize) -> Vec<u8> {
+            let row_bytes = format.row_bytes(in_dim).expect("fixture dims divide");
+            let block_bytes = format.block_bytes();
+            let n_blocks = rows * row_bytes / block_bytes;
+            let mut out = vec![0u8; rows * row_bytes];
+            for block in 0..n_blocks {
+                let base = block * block_bytes;
+                for byte in 0..block_bytes {
+                    out[base + byte] = pattern_byte(seed, block, byte);
+                }
+                let d = f32_to_f16(0.5).to_le_bytes();
+                let dmin = f32_to_f16(0.25).to_le_bytes();
+                match format {
+                    QuantFormat::Q4_K | QuantFormat::Q5_K => {
+                        out[base..base + 2].copy_from_slice(&d);
+                        out[base + 2..base + 4].copy_from_slice(&dmin);
+                    }
+                    QuantFormat::Q6_K => out[base + 208..base + 210].copy_from_slice(&d),
+                    QuantFormat::Q8_0 => out[base..base + 2].copy_from_slice(&d),
+                    QuantFormat::Q8_K => unreachable!("activation-only format"),
+                }
+            }
+            out
+        }
+
+        /// RMSNorm weight near 1, varying per element.
+        ///
+        /// `io::testutil`'s ramp reaches 128 at `hidden 512`, which pushes the
+        /// value projections out of the KV cache's f16 range; this fixture is
+        /// twice as wide, so its norms are gentler on purpose.
+        fn norm_value(name: &str, index: usize) -> f32 {
+            1.0 + (((index * 7 + name.len()) % 13) as f32) / 64.0
+        }
+
+        /// Router weight: signed and non-monotonic, so different tokens
+        /// genuinely select different experts. A ramp would make every row
+        /// route to the same top-k and leave the skip logic untested.
+        fn router_value(index: usize) -> f32 {
+            ((((index * 37 + 11) % 29) as f32) - 14.0) / 64.0
+        }
+
+        /// LE bytes of `elements` values from `f`.
+        fn f32_bytes(elements: usize, f: impl Fn(usize) -> f32) -> Vec<u8> {
+            let mut out = Vec::with_capacity(elements * 4);
+            for i in 0..elements {
+                out.extend_from_slice(&f(i).to_le_bytes());
+            }
+            out
+        }
+
+        /// The fixture's architecture facts.
+        pub(super) fn arch() -> ArchInfo {
+            ArchInfo {
+                n_layers: N_LAYERS,
+                n_experts: N_EXPERTS,
+                top_k: TOP_K,
+                hidden: HIDDEN as u32,
+                moe_intermediate: MOE as u32,
+                n_heads: N_HEADS as u32,
+                n_kv_heads: N_KV_HEADS as u32,
+                head_dim: HEAD_DIM as u32,
+                vocab: VOCAB as u32,
+                context_length: 4096,
+                rope_theta: 1e7,
+                rms_eps: 1e-6,
+                norm_topk_prob: true,
+                tie_embeddings: false,
+                shared_expert: false,
+                sliding_window: None,
+            }
+        }
+
+        /// One common tensor's dtype and generated payload.
+        struct TensorDef {
+            dtype: &'static str,
+            bytes: Vec<u8>,
+        }
+
+        /// Every common tensor, keyed by GGUF name, with the same per-tensor
+        /// type mix `io::testutil` uses: layer 0 mirrors a Q6_K-down layer,
+        /// layer 1 is pure Q4_K.
+        fn common_defs() -> BTreeMap<String, TensorDef> {
+            let mut defs: BTreeMap<String, TensorDef> = BTreeMap::new();
+            let mut quant = |name: String, format: QuantFormat, rows: usize, in_dim: usize| {
+                let dtype = match format {
+                    QuantFormat::Q4_K => "q4_k",
+                    QuantFormat::Q5_K => "q5_k",
+                    QuantFormat::Q6_K => "q6_k",
+                    QuantFormat::Q8_0 => "q8_0",
+                    QuantFormat::Q8_K => unreachable!("activation-only format"),
+                };
+                let bytes = quant_bytes(format, rows, in_dim, name.len() + rows);
+                defs.insert(name, TensorDef { dtype, bytes });
+            };
+            quant(
+                "token_embd.weight".to_owned(),
+                QuantFormat::Q4_K,
+                VOCAB,
+                HIDDEN,
+            );
+            quant("output.weight".to_owned(), QuantFormat::Q6_K, VOCAB, HIDDEN);
+            for layer in 0..N_LAYERS {
+                quant(
+                    format!("blk.{layer}.attn_q.weight"),
+                    QuantFormat::Q4_K,
+                    Q_DIM,
+                    HIDDEN,
+                );
+                quant(
+                    format!("blk.{layer}.attn_k.weight"),
+                    QuantFormat::Q8_0,
+                    KV_DIM,
+                    HIDDEN,
+                );
+                let v_format = if layer == 0 {
+                    QuantFormat::Q6_K
+                } else {
+                    QuantFormat::Q4_K
+                };
+                quant(
+                    format!("blk.{layer}.attn_v.weight"),
+                    v_format,
+                    KV_DIM,
+                    HIDDEN,
+                );
+                quant(
+                    format!("blk.{layer}.attn_output.weight"),
+                    QuantFormat::Q5_K,
+                    HIDDEN,
+                    Q_DIM,
+                );
+            }
+            let mut f32_def = |name: String, bytes: Vec<u8>| {
+                defs.insert(
+                    name,
+                    TensorDef {
+                        dtype: "f32",
+                        bytes,
+                    },
+                );
+            };
+            f32_def(
+                "output_norm.weight".to_owned(),
+                f32_bytes(HIDDEN, |i| norm_value("output_norm.weight", i)),
+            );
+            for layer in 0..N_LAYERS {
+                for (stem, elements) in [
+                    ("attn_norm", HIDDEN),
+                    ("ffn_norm", HIDDEN),
+                    ("attn_q_norm", HEAD_DIM),
+                    ("attn_k_norm", HEAD_DIM),
+                ] {
+                    let name = format!("blk.{layer}.{stem}.weight");
+                    let bytes = f32_bytes(elements, |i| norm_value(&name, i));
+                    f32_def(name, bytes);
+                }
+                f32_def(
+                    format!("blk.{layer}.ffn_gate_inp.weight"),
+                    f32_bytes(N_EXPERTS as usize * HIDDEN, router_value),
+                );
+            }
+            defs
+        }
+
+        /// Build a complete, tempered install under a fresh temp dir.
+        ///
+        /// Load it with `skip_hashes`: the tempering rewrites block scales
+        /// after the manifest digests are taken, exactly as
+        /// `io::testutil` + `temper_install` do for the narrow fixture.
+        pub(super) fn build(tag: &str) -> WideFixture {
+            let tmp = TempDir::new(tag);
+            let root = tmp.path().join("model.rvmp");
+            fs::create_dir_all(root.join("experts")).expect("create install dirs");
+
+            let defs = common_defs();
+            let mut common_tensors = BTreeMap::new();
+            let mut common = Vec::new();
+            for (name, def) in &defs {
+                let offset = (common.len() as u64).next_multiple_of(64);
+                common.resize(offset as usize, 0);
+                common.extend_from_slice(&def.bytes);
+                common_tensors.insert(
+                    name.clone(),
+                    CommonTensor {
+                        offset,
+                        len: def.bytes.len() as u64,
+                        dtype: def.dtype.to_owned(),
+                    },
+                );
+            }
+            fs::write(root.join("common.bin"), &common).expect("write common.bin");
+
+            let mut layers = Vec::new();
+            for layer in 0..N_LAYERS {
+                let down_format = if layer == 0 {
+                    QuantFormat::Q6_K
+                } else {
+                    QuantFormat::Q4_K
+                };
+                let slabs: [(ProjectionName, QuantFormat, usize, usize); 3] = [
+                    (ProjectionName::Gate, QuantFormat::Q4_K, MOE, HIDDEN),
+                    (ProjectionName::Up, QuantFormat::Q4_K, MOE, HIDDEN),
+                    (ProjectionName::Down, down_format, HIDDEN, MOE),
+                ];
+                let mut projections = Vec::new();
+                let mut cursor: u64 = 0;
+                for (name, format, rows, in_dim) in slabs {
+                    let offset_in_blob = cursor.next_multiple_of(4096);
+                    let len = (format.row_bytes(in_dim).unwrap() * rows) as u64;
+                    projections.push(Projection {
+                        name,
+                        offset_in_blob,
+                        len,
+                        quant: match format {
+                            QuantFormat::Q4_K => "q4_k",
+                            QuantFormat::Q6_K => "q6_k",
+                            _ => unreachable!("fixture expert formats"),
+                        }
+                        .to_owned(),
+                    });
+                    cursor = offset_in_blob + len;
+                }
+                let stride = cursor.next_multiple_of(4096);
+
+                let mut file_bytes = vec![0u8; (stride * u64::from(N_EXPERTS)) as usize];
+                for expert in 0..N_EXPERTS {
+                    let blob_base = (u64::from(expert) * stride) as usize;
+                    for (p, ((_, format, rows, in_dim), projection)) in
+                        slabs.iter().zip(&projections).enumerate()
+                    {
+                        let seed = layer as usize * 1009 + expert as usize * 101 + p * 13;
+                        let bytes = quant_bytes(*format, *rows, *in_dim, seed);
+                        let start = blob_base + projection.offset_in_blob as usize;
+                        file_bytes[start..start + bytes.len()].copy_from_slice(&bytes);
+                    }
+                }
+                let file = layer_file_name(layer);
+                fs::write(root.join(&file), &file_bytes).expect("write layer file");
+                layers.push(LayerLayout {
+                    file,
+                    stride,
+                    n_experts: N_EXPERTS,
+                    projections,
+                });
+            }
+            let layout = ExpertsLayout { layers };
+            write_layout(&root, &layout).expect("write layout");
+
+            let mut files = BTreeMap::new();
+            let mut record = |name: String| {
+                let path = root.join(&name);
+                files.insert(
+                    name,
+                    FileEntry {
+                        size: fs::metadata(&path).unwrap().len(),
+                        sha256: sha256_file(&path).unwrap(),
+                    },
+                );
+            };
+            record("common.bin".to_owned());
+            record(LAYOUT_FILE.to_owned());
+            for layer in 0..N_LAYERS {
+                record(layer_file_name(layer));
+            }
+
+            let mut tensor_types: BTreeMap<String, String> = defs
+                .iter()
+                .map(|(name, def)| (name.clone(), def.dtype.to_owned()))
+                .collect();
+            for (layer, layout_layer) in layout.layers.iter().enumerate() {
+                for projection in &layout_layer.projections {
+                    let stem = match projection.name {
+                        ProjectionName::Gate => "ffn_gate_exps",
+                        ProjectionName::Up => "ffn_up_exps",
+                        ProjectionName::Down => "ffn_down_exps",
+                    };
+                    tensor_types.insert(
+                        format!("blk.{layer}.{stem}.weight"),
+                        projection.quant.clone(),
+                    );
+                }
+            }
+
+            let manifest = Manifest {
+                rvmp_version: RVMP_VERSION,
+                model_id: "fixture-moe-wide-2l".to_owned(),
+                source: SourceInfo {
+                    hf_repo: "test/fixture-wide".to_owned(),
+                    revision: "deadbeef".to_owned(),
+                    file: "fixture-wide-Q4_K_M.gguf".to_owned(),
+                    sha256: "0".repeat(64),
+                },
+                arch: arch(),
+                quant: QuantInfo {
+                    scheme: "gguf".to_owned(),
+                    tensor_types,
+                },
+                common_tensors,
+                files,
+            };
+            write_manifest(&root, &manifest).expect("write manifest");
+
+            temper_parts(&root, &manifest.common_tensors, &layout.layers);
+            WideFixture { _tmp: tmp, root }
+        }
+    }
+
     /// Prefill `ids` through a fresh state and return the final logits' bits.
     fn run(model: &Model, prefill: PrefillConfig, ids: &[u32]) -> Vec<u32> {
         let mut st = state_with(model, 64, prefill);
@@ -1576,6 +2025,301 @@ mod tests {
             }
         }
     }
+
+    // ---- the same test, on a geometry that cannot hide a width bug --------
+
+    /// A state over [`wide`]. Its expert blobs are ~252 KiB against the narrow
+    /// fixture's ~26 KiB, so the 4 MiB [`RuntimeConfig::testing`] budget
+    /// cannot host a multi-window ring beside a chunk and [`plan_arena`] would
+    /// narrow `windows_in_flight` straight back to 1 — which is the dial these
+    /// tests exist to raise. 24 MiB leaves ~16 MiB of scratch beside the
+    /// widest ring used here.
+    fn wide_state(model: &Model, cap: usize, prefill: PrefillConfig) -> ForwardState {
+        let runtime = RuntimeConfig {
+            cache_bytes: 24 * 1024 * 1024,
+            threads: Some(2),
+            pin: false,
+        };
+        let mut st = ForwardState::with_config(model, cap, runtime).unwrap();
+        st.set_prefill_config(prefill).unwrap();
+        st
+    }
+
+    fn wide_dials(
+        mode: PrefillMode,
+        chunk: usize,
+        experts_per_window: u32,
+        windows_in_flight: u32,
+    ) -> PrefillConfig {
+        PrefillConfig {
+            mode,
+            chunk,
+            experts_per_window,
+            windows_in_flight,
+        }
+    }
+
+    fn load_wide(tag: &str) -> (wide::WideFixture, Model) {
+        let fx = wide::build(tag);
+        let model = Model::load(&fx.root, SKIP).unwrap();
+        (fx, model)
+    }
+
+    /// Prefill `ids` through a fresh wide state and return the logits' bits.
+    fn wide_run(model: &Model, prefill: PrefillConfig, ids: &[u32]) -> Vec<u32> {
+        let mut st = wide_state(model, 64, prefill);
+        let logits = prefill_prompt(model, &mut st, ids, None).unwrap();
+        assert_eq!(logits.len(), wide::VOCAB);
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "the wide fixture produced non-finite logits, so bit-identity \
+             between two NaN-producing paths would prove nothing"
+        );
+        logit_bits(logits)
+    }
+
+    /// The fixture is only worth its runtime if every width it was built to
+    /// separate is actually separated. Asserted rather than commented,
+    /// because a later edit that quietly collapses two of them would make
+    /// every test below pass for the wrong reason.
+    #[test]
+    fn the_wide_geometry_separates_every_width() {
+        let (_fx, model) = load_wide("prefill-wide-geometry");
+        let dims = PrefillDims::new(model.arch()).unwrap();
+
+        let widths = [dims.hidden, dims.q_dim, dims.kv_dim, dims.moe];
+        for (i, a) in widths.iter().enumerate() {
+            for b in &widths[i + 1..] {
+                assert_ne!(a, b, "{widths:?} are not pairwise distinct");
+            }
+        }
+        // `wide = max(q_dim, hidden)` is no longer both of them at once, so a
+        // `tmat` slicing that used the wrong one would read the wrong bytes.
+        assert_eq!(dims.wide, dims.q_dim);
+        assert!(dims.wide > dims.hidden, "`wide` is degenerate again");
+        // `run_expert`'s `acts_gather` copy is a multi-block copy.
+        assert_eq!(dims.hidden_q8k, 2);
+        assert_eq!(dims.attn_q8k, 3);
+        assert_eq!(dims.moe_q8k, 1);
+        assert_eq!(dims.hidden_q80, 16);
+        // Enough experts that a chunk's routing cannot cover them all.
+        assert_eq!((dims.n_experts, dims.top_k), (16, 4));
+
+        // And [`wide_state`]'s budget really does host the dials the tests
+        // below raise: `plan_arena` hands them back unnarrowed, so those tests
+        // run at the dials they name rather than quietly falling back to one
+        // expert per window and one window in flight.
+        let cache_bytes =
+            wide_state(&model, 8, wide_dials(PrefillMode::Sweep, 512, 8, 3)).cache_bytes();
+        for (experts_per_window, windows_in_flight) in [(1u32, 1u32), (4, 1), (4, 2), (8, 3)] {
+            let config = wide_dials(
+                PrefillMode::Sweep,
+                512,
+                experts_per_window,
+                windows_in_flight,
+            );
+            let (rows, planned) =
+                plan_arena(model.layout(), &dims, config, 9, cache_bytes).unwrap();
+            assert_eq!(rows, 9, "the chunk was narrowed at {config:?}");
+            assert_eq!(planned.experts_per_window, experts_per_window);
+            assert_eq!(
+                planned.windows_in_flight, windows_in_flight,
+                "read-ahead was given up at {config:?}"
+            );
+        }
+    }
+
+    /// [`sweep_and_token_major_agree_bit_for_bit`], run through [`wide`] at
+    /// `experts_per_window` **1 and above** and several `windows_in_flight`.
+    ///
+    /// What this covers that the narrow fixture cannot:
+    ///
+    /// - every `tmat` slicing is a distinguishable width (`q_dim * n` 768n,
+    ///   `kv_dim * n` 192n, `hidden * n` 512n) against a buffer carved for
+    ///   `wide = 768`, so a slicing that took the wrong dimension would read
+    ///   stale arena bytes rather than the right ones by coincidence;
+    /// - `run_expert`'s `acts_gather` gather is a two-block copy;
+    /// - `experts_per_window > 1` puts more than one expert in a window, which
+    ///   is the only way the sweep's intra-window `within * stride` offset is
+    ///   reached from this driver;
+    /// - `windows_in_flight > 1` overlaps window reads with compute.
+    ///
+    /// Prompt lengths and chunk widths still cross seams (5 at chunk 2, 8 at
+    /// chunk 3), land on exact multiples (4 at chunk 2, 8 at chunk 4, 9 at
+    /// chunk 3), leave a ragged final chunk (5 at chunk 4, 9 at chunk 4) and
+    /// run shorter than one chunk (every length at chunk 512).
+    #[test]
+    fn wide_sweep_and_token_major_agree_bit_for_bit() {
+        let (_fx, model) = load_wide("prefill-wide-bitident");
+        let vocab = wide::VOCAB as u32;
+        let prompt: Vec<u32> = (0..9u32).map(|i| (i * 11 + 3) % vocab).collect();
+        let dials: [(u32, u32); 4] = [(1, 1), (4, 1), (4, 2), (8, 3)];
+
+        for &len in &[1usize, 3, 4, 5, 8, 9] {
+            let ids = &prompt[..len];
+            let want = wide_run(&model, wide_dials(PrefillMode::TokenMajor, 1, 1, 1), ids);
+            for &chunk in &[2usize, 3, 4, 512] {
+                for &(experts_per_window, windows_in_flight) in &dials {
+                    let got = wide_run(
+                        &model,
+                        wide_dials(
+                            PrefillMode::Sweep,
+                            chunk,
+                            experts_per_window,
+                            windows_in_flight,
+                        ),
+                        ids,
+                    );
+                    assert_eq!(
+                        got,
+                        want,
+                        "prompt len {len}, chunk {chunk}, {experts_per_window} experts/window, \
+                         {windows_in_flight} in flight: sweep prefill diverged \
+                         (exact multiple: {})",
+                        len % chunk == 0
+                    );
+                }
+            }
+        }
+
+        // Not a degenerate model whose logits ignore their input: a prompt one
+        // token longer must land somewhere else, and the vocabulary must not
+        // come back flat. Without this the agreement above could be two paths
+        // agreeing on a constant.
+        let dials = wide_dials(PrefillMode::Sweep, 4, 4, 2);
+        let eight = wide_run(&model, dials, &prompt[..8]);
+        assert_ne!(wide_run(&model, dials, &prompt), eight);
+        assert!(eight.iter().any(|&bits| bits != eight[0]));
+    }
+
+    /// The wide fixture's KV cache agrees too, at a dial pair the narrow
+    /// fixture cannot reach.
+    #[test]
+    fn wide_paths_leave_the_same_kv_cache() {
+        let (_fx, model) = load_wide("prefill-wide-kv");
+        let ids: Vec<u32> = (0..7u32)
+            .map(|i| (i * 5 + 2) % wide::VOCAB as u32)
+            .collect();
+
+        let mut token_major = wide_state(&model, 32, wide_dials(PrefillMode::TokenMajor, 1, 1, 1));
+        prefill_prompt(&model, &mut token_major, &ids, None).unwrap();
+        let mut sweep = wide_state(&model, 32, wide_dials(PrefillMode::Sweep, 3, 4, 2));
+        prefill_prompt(&model, &mut sweep, &ids, None).unwrap();
+
+        assert_eq!(sweep.seq_len().unwrap(), ids.len());
+        for layer in 0..model.n_layers() as usize {
+            assert_eq!(
+                sweep.kv_k_layer(layer).unwrap(),
+                token_major.kv_k_layer(layer).unwrap(),
+                "layer {layer} keys"
+            );
+            assert_eq!(
+                sweep.kv_v_layer(layer).unwrap(),
+                token_major.kv_v_layer(layer).unwrap(),
+                "layer {layer} values"
+            );
+        }
+    }
+
+    /// Windows no row routed are skipped, and the routing that produces them
+    /// is genuinely row-dependent.
+    ///
+    /// The narrow fixture has 4 experts at 1 per window and `top_k 2`, so a
+    /// chunk of two rows can cover every window and the skip path may never
+    /// run. Here 16 experts at `top_k 4` guarantee it: a one-row chunk names
+    /// 4 experts, which at 1 and 2 experts per window cannot reach more than
+    /// 4 of the 16 (resp. 8) windows.
+    ///
+    /// The second assertion is the one that keeps the first honest — a
+    /// fixture whose router picked the same 4 experts for every token would
+    /// skip windows for a reason that has nothing to do with the driver.
+    #[test]
+    fn the_wide_sweep_skips_windows_nothing_routed_to() {
+        use std::collections::BTreeSet;
+
+        let (_fx, model) = load_wide("prefill-wide-skips");
+        let ids: Vec<u32> = (0..6u32)
+            .map(|i| (i * 13 + 5) % wide::VOCAB as u32)
+            .collect();
+
+        for experts_per_window in [1u32, 2] {
+            let mut st = wide_state(
+                &model,
+                32,
+                wide_dials(PrefillMode::Sweep, 1, experts_per_window, 2),
+            );
+            let mut routed: BTreeSet<u32> = BTreeSet::new();
+            {
+                let mut sink = |_pos: usize, _layer: u32, topk: &[(u32, f32)]| {
+                    routed.extend(topk.iter().map(|&(expert, _)| expert));
+                };
+                prefill_prompt(&model, &mut st, &ids, Some(&mut sink)).unwrap();
+            }
+
+            let stats = st.stream_stats();
+            assert_eq!(
+                stats.accesses(),
+                0,
+                "a swept prefill bypasses the expert cache entirely"
+            );
+            assert!(stats.sweep_windows_read > 0, "{experts_per_window}/window");
+            assert!(
+                stats.sweep_windows_skipped > 0,
+                "{experts_per_window} experts/window: no window went unrouted, \
+                 so the skip path is still untested"
+            );
+            assert!(
+                routed.len() > model.arch().top_k as usize,
+                "the router picks the same experts for every row, so the skips \
+                 above prove nothing about the driver: {routed:?}"
+            );
+        }
+    }
+
+    /// `experts_per_window > 1` really does reach the sweep's intra-window
+    /// `within * stride` slice.
+    ///
+    /// Every other prefill test runs one expert per window, where `within` is
+    /// always 0 and slicing the window at the wrong offset would still hand
+    /// back the right blob. The bit-identity test above runs at 4 and 8
+    /// experts per window and would fail if the slice were wrong — but only if
+    /// a routed expert ever sits somewhere other than the head of its window.
+    /// That precondition is asserted here rather than assumed, because it
+    /// depends on the fixture's router and nothing else would notice if it
+    /// stopped holding.
+    #[test]
+    fn a_wide_window_slices_experts_at_a_non_zero_offset() {
+        const EXPERTS_PER_WINDOW: u32 = 4;
+        let (_fx, model) = load_wide("prefill-wide-within");
+        let ids: Vec<u32> = (0..6u32)
+            .map(|i| (i * 13 + 5) % wide::VOCAB as u32)
+            .collect();
+
+        // Chunk 1, so each layer's sweep plans on exactly one row's top-k and
+        // the sink reports that set directly.
+        let mut st = wide_state(
+            &model,
+            32,
+            wide_dials(PrefillMode::Sweep, 1, EXPERTS_PER_WINDOW, 2),
+        );
+        let mut off_head = 0usize;
+        {
+            let mut sink = |_pos: usize, _layer: u32, topk: &[(u32, f32)]| {
+                off_head += topk
+                    .iter()
+                    .filter(|&&(expert, _)| expert % EXPERTS_PER_WINDOW != 0)
+                    .count();
+            };
+            prefill_prompt(&model, &mut st, &ids, Some(&mut sink)).unwrap();
+        }
+        assert!(
+            off_head > 0,
+            "every routed expert led its window, so `within` was always 0 and \
+             the intra-window offset is still untested"
+        );
+    }
+
+    // ---- back to the narrow fixture --------------------------------------
 
     /// The KV cache the two paths leave behind must also agree: same length,
     /// same stored f16 bits, on every layer.
@@ -2219,15 +2963,123 @@ mod tests {
     fn transpose_moves_every_element() {
         let src: Vec<f32> = (0..12).map(|i| i as f32).collect();
         let mut dst = vec![0.0f32; 12];
-        transpose(&src, 3, 4, &mut dst);
+        transpose(&src, 3, 4, &mut dst).unwrap();
         for r in 0..3 {
             for c in 0..4 {
                 assert_eq!(dst[c * 3 + r], src[r * 4 + c]);
             }
         }
-        // Degenerate shapes are no-ops rather than panics.
-        transpose(&[], 0, 4, &mut dst);
-        transpose(&src, 3, 0, &mut dst);
+        // Degenerate shapes are no-ops rather than panics, as long as both
+        // slices agree with `rows * cols == 0`.
+        let mut empty: [f32; 0] = [];
+        transpose(&[], 0, 4, &mut empty).unwrap();
+        transpose(&[], 3, 0, &mut empty).unwrap();
+    }
+
+    /// A mis-sized `transpose` is a typed refusal, not a partial copy.
+    ///
+    /// The old shape dropped out-of-range writes with `dst.get_mut` and
+    /// truncated a short source with `chunks_exact(cols).take(rows)`. Both are
+    /// silent, and in a module whose whole thesis is that the driver may not
+    /// assume its scratch is zeroed, either one would leave the *previous*
+    /// chunk's arena bytes in `q`, `k`, `v` or `moe_t` and carry them into the
+    /// residual. A numerical divergence with no error attached is the one
+    /// failure this module cannot afford; every call site is exactly sized
+    /// today, and this is what keeps that a checked fact.
+    #[test]
+    fn a_mis_sized_transpose_is_typed() {
+        let src: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let mut dst = vec![0.0f32; 12];
+
+        // A source one row short would have been silently truncated, leaving
+        // the last output column holding whatever `dst` already had.
+        assert!(matches!(
+            transpose(&src[..8], 3, 4, &mut dst),
+            Err(ForwardError::Kernel(KernelError::LengthMismatch {
+                left: 8,
+                right: 12,
+                ..
+            }))
+        ));
+        // A destination one element short would have dropped that write.
+        assert!(matches!(
+            transpose(&src, 3, 4, &mut dst[..11]),
+            Err(ForwardError::Kernel(KernelError::LengthMismatch {
+                left: 11,
+                right: 12,
+                ..
+            }))
+        ));
+        // And a degenerate shape does not excuse a mis-sized slice either.
+        assert!(transpose(&[], 0, 4, &mut dst).is_err());
+        // `rows * cols` overflowing is typed rather than wrapping.
+        assert!(transpose(&src, usize::MAX, 2, &mut dst).is_err());
+    }
+
+    /// All three dials refuse at one point.
+    ///
+    /// They used to refuse at three: the chunk in [`PrefillConfig::validate`],
+    /// `experts_per_window == 0` nowhere (it was silently coerced to 1 by
+    /// [`plan_arena`]), and an oversized `windows_in_flight` only once the
+    /// sweep session was already being opened. Every field is `pub`, so every
+    /// field is caller-supplied.
+    #[test]
+    fn every_prefill_dial_refuses_at_validate() {
+        let base = PrefillConfig::default();
+        assert!(base.validate().is_ok());
+
+        assert!(matches!(
+            PrefillConfig { chunk: 0, ..base }.validate().unwrap_err(),
+            ForwardError::InvalidPrefillChunk { chunk: 0 }
+        ));
+        for bad in [
+            PrefillConfig {
+                experts_per_window: 0,
+                ..base
+            },
+            PrefillConfig {
+                windows_in_flight: 0,
+                ..base
+            },
+            PrefillConfig {
+                windows_in_flight: crate::io::MAX_WINDOWS_IN_FLIGHT + 1,
+                ..base
+            },
+        ] {
+            let err = bad.validate().unwrap_err();
+            assert!(
+                matches!(err, ForwardError::Sweep(SweepError::BadDials { .. })),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+
+        // And the same refusal reaches the driver's own entry points rather
+        // than being coerced by either of them.
+        let layout = layout_of(&[(65_536, 4)]);
+        assert!(matches!(
+            plan_arena(
+                &layout,
+                &tiny_dims(),
+                PrefillConfig {
+                    experts_per_window: 0,
+                    ..base
+                },
+                4,
+                64 * 1024 * 1024,
+            )
+            .unwrap_err(),
+            ForwardError::Sweep(SweepError::BadDials { .. })
+        ));
+        let (_fx, model) = load_fixture("prefill-dials");
+        let mut st = state_with(&model, 8, sweep_config(4));
+        assert!(matches!(
+            st.set_prefill_config(PrefillConfig {
+                windows_in_flight: crate::io::MAX_WINDOWS_IN_FLIGHT + 1,
+                ..sweep_config(4)
+            })
+            .unwrap_err(),
+            ForwardError::Sweep(SweepError::BadDials { .. })
+        ));
     }
 
     #[test]

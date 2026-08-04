@@ -635,7 +635,9 @@ impl ForwardState {
     ///
     /// # Errors
     ///
-    /// [`ForwardError::InvalidPrefillChunk`] for a zero chunk.
+    /// Whatever [`PrefillConfig::validate`] refuses:
+    /// [`ForwardError::InvalidPrefillChunk`] for a zero chunk, and
+    /// [`ForwardError::Sweep`] for a degenerate or oversized sweep dial.
     pub fn set_prefill_config(&mut self, config: PrefillConfig) -> Result<(), ForwardError> {
         self.prefill = config.validate()?;
         Ok(())
@@ -772,12 +774,27 @@ impl ForwardState {
     /// Cumulative expert-streaming counters since this state was built,
     /// summed over **every** phase.
     ///
-    /// This is a whole-process figure and reads as one. A steady-state decode
-    /// hit rate has to come from [`ForwardState::stream_stats_in`]: prefill
-    /// runs through the same cache as decode in this build (there is no
-    /// cache-bypassing prompt sweep yet), so a prompt's worth of cold misses
-    /// is otherwise folded into a number quoted as a decode result. EXP-013
-    /// was written from exactly that mistake.
+    /// This is a whole-process figure and reads as one. **A steady-state
+    /// decode hit rate has to come from [`ForwardState::stream_stats_in`]**,
+    /// and what "hit rate" even means depends on which prefill path ran:
+    ///
+    /// - [`PrefillMode::Sweep`](super::PrefillMode::Sweep), the default: prefill bypasses the expert
+    ///   cache entirely and reports through the sweep counters instead
+    ///   ([`StreamStats::sweep_bytes_read`],
+    ///   [`StreamStats::sweep_windows`] and their siblings). It contributes
+    ///   **no** cache accesses, so [`StreamStats::hit_rate`] over the whole
+    ///   run is a decode figure — but [`StreamStats::bytes_read`] is not the
+    ///   whole story any more, because the prompt's bytes are in
+    ///   `sweep_bytes_read` and nowhere else. A phase with zero
+    ///   [`StreamStats::accesses`] is not an idle phase; ask
+    ///   [`StreamStats::is_idle`].
+    /// - [`PrefillMode::TokenMajor`](super::PrefillMode::TokenMajor), the A/B path: prefill *is* decode, one
+    ///   [`forward_token`] per prompt token through the same cache, so a
+    ///   prompt's worth of cold misses lands in these totals and folds into
+    ///   any hit rate quoted from them. EXP-013 was published from exactly
+    ///   that mistake, when this was the only path there was.
+    ///
+    /// Split by phase before quoting either one.
     pub fn stream_stats(&self) -> StreamStats {
         self.stream.stats()
     }
@@ -1333,6 +1350,10 @@ pub fn forward_token_traced<'s>(
 /// these helpers re-stamp the install with small scales.
 #[cfg(test)]
 pub(crate) mod testsupport {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use crate::format::{CommonTensor, LayerLayout};
     use crate::io::parse_quant_format;
     use crate::io::testutil::Fixture;
     use crate::kernels::quants::{QuantFormat, f32_to_f16};
@@ -1361,9 +1382,25 @@ pub(crate) mod testsupport {
     /// with tempered block scales so a full pass stays in f16 range.
     /// Load afterwards with `skip_hashes` (the manifest digests are stale).
     pub(crate) fn temper_install(fx: &Fixture) {
-        let path = fx.root.join("common.bin");
+        temper_parts(&fx.root, &fx.manifest.common_tensors, &fx.layout.layers);
+    }
+
+    /// [`temper_install`] against an install described by its parts rather
+    /// than by an `io::testutil::Fixture`.
+    ///
+    /// The shared builder in `io/testutil.rs` hard-codes one geometry and
+    /// keeps its `TempDir` private, so a test that needs a *different*
+    /// geometry (`prefill.rs`'s wide fixture: `q_dim != hidden`, more than
+    /// one Q8_K block per row, 16 experts) cannot produce a `Fixture` to
+    /// pass here. This takes exactly the three things the tempering reads.
+    pub(crate) fn temper_parts(
+        root: &Path,
+        common_tensors: &BTreeMap<String, CommonTensor>,
+        layers: &[LayerLayout],
+    ) {
+        let path = root.join("common.bin");
         let mut bytes = std::fs::read(&path).unwrap();
-        for tensor in fx.manifest.common_tensors.values() {
+        for tensor in common_tensors.values() {
             if let Some(format) = parse_quant_format(&tensor.dtype) {
                 let start = tensor.offset as usize;
                 restamp_scales(&mut bytes[start..start + tensor.len as usize], format);
@@ -1371,8 +1408,8 @@ pub(crate) mod testsupport {
         }
         std::fs::write(&path, bytes).unwrap();
 
-        for layer in &fx.layout.layers {
-            let path = fx.root.join(&layer.file);
+        for layer in layers {
+            let path = root.join(&layer.file);
             let mut bytes = std::fs::read(&path).unwrap();
             for expert in 0..layer.n_experts {
                 let base = expert as usize * layer.stride as usize;
