@@ -351,8 +351,19 @@ impl SlotPool {
             let base_offset = total;
             total += u128::from(pitch) * u128::from(slots_per_layer);
             if total > cap {
+                // Report what the whole geometry needs, not the running total
+                // at the layer that first crossed the cap. Bailing out here
+                // with `total` understates the requirement by however many
+                // layers are left, which for a 48-layer model is roughly 4x.
+                let mut needed = total;
+                for &rest in &layer_strides[layers.len() + 1..] {
+                    let pitch = rest.checked_next_multiple_of(align).unwrap_or(rest);
+                    needed = needed.saturating_add(
+                        u128::from(pitch).saturating_mul(u128::from(slots_per_layer)),
+                    );
+                }
                 return Err(SlotError::PoolTooLarge {
-                    requested: total,
+                    requested: needed,
                     limit: cap,
                 });
             }
