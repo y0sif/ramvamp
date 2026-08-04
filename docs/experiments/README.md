@@ -50,6 +50,7 @@ which is the reason their claims are credible.
 - [EXP-011: Row-range GEMV as the single code path](#exp-011-row-range-gemv-as-the-single-code-path) — KEEP
 - [EXP-012: Anonymous runtime memory is missing from the memory contract](#exp-012-anonymous-runtime-memory-is-missing-from-the-memory-contract) — KEEP
 - [EXP-013: io_uring + O_DIRECT streaming and the two-phase decode loop](#exp-013-io_uring--o_direct-streaming-and-the-two-phase-decode-loop) — KEEP
+- [EXP-014: First clean cold measurement inside the 3G cgroup](#exp-014-first-clean-cold-measurement-inside-the-3g-cgroup) — KEEP
 
 Entries EXP-007 through EXP-013 were measured on a machine that was not
 quiet, and most are microbenchmarks rather than end-to-end runs. Under rule 2
@@ -850,3 +851,69 @@ provisional.
   16,695 reads on btrfs, with the O_DIRECT capability probe reporting
   `verified`, so the page-cache bypass the 3 GB budget depends on is
   confirmed on the real path rather than assumed.
+
+## EXP-014: First clean cold measurement inside the 3G cgroup
+
+- Date / commit: 2026-08-04 / a58a701 (`feat/expert-streaming`)
+- Hypothesis: with O_DIRECT expert reads the runtime can produce a
+  measurement that satisfies rule 2 - cold page cache, inside
+  `memory.max=3G` with `memory.swap.max=0`, with no reclaim - which
+  EXP-006 established phase 4 could never do.
+- Method: `scripts/cold_bench.py --max-new 64 --repeats 5`, run by y0sif
+  on the reference machine (`docs/benchmark-machine.md`). Per scored run:
+  evict all 53 files the runtime touches via
+  `posix_fadvise(POSIX_FADV_DONTNEED)` and **verify** eviction with
+  `mincore` (the harness refuses to start while any `ramvamp` process
+  holds the model mmap'd, because `fadvise` silently evicts nothing in
+  that case); launch under
+  `systemd-run --user --wait -p MemoryMax=3G -p MemorySwapMax=0
+  -p MemoryAccounting=yes`; read `memory.peak`, `memory.events` and
+  `memory.stat` from **inside** the cgroup before exit. One warmup run
+  discarded, 5 scored, medians reported. Workload:
+  `generate --prompt "The capital of France is" --max-new 64 --greedy
+  --skip-hashes`, 5 prompt tokens. Hygiene gate is `pgsteal == 0` plus
+  readable counters, cgroup limit as requested, swap peak zero, and both
+  return codes; **any** reclaim marks the run DIRTY.
+- Baseline: none available. EXP-006 recorded that phase 4 cannot be
+  measured cleanly here at all: buffered `pread` pulled 7.8 GiB through
+  the page cache for a 13-token run, pinned the cgroup at its ceiling and
+  forced ~4.82 GiB of reclaim. The phase-4 speed figures this project has
+  quoted (1.9-2.5 s/token) are warm, uncgrouped diagnostics.
+- Result: **5 of 5 scored runs CLEAN**, `pgsteal 0` on every one.
+
+  | metric | median |
+  |---|---:|
+  | decode | **1.88 tok/s** |
+  | prefill | 1.33 tok/s |
+  | model load | 1.32 s |
+  | wall | 39.55 s |
+  | cgroup `memory.peak` | **2,471.1 MiB** of 3,072 |
+  | expert bytes read | 36.9 GiB |
+
+  A first attempt the same day scored 3 of 5 clean; the two DIRTY runs
+  recorded `pgsteal` of 2,817 and 2,946 pages (11.0 and 11.5 MiB) and
+  coincided with the operator opening a terminal mid-run. A second
+  attempt with the machine left alone scored 5 of 5. Generated text was
+  identical across clean and dirty runs.
+- Verdict: KEEP
+- Notes: (1) **This is the project's first number that satisfies rule 2**
+  and therefore the first that may be published. It should be quoted as
+  "1.88 tok/s decode, cold, inside `memory.max=3G` with swap disabled, on
+  a DRAM-less Micron 2400" - the device matters, since EXP-008 measured it
+  well below the 3.6 GB/s the original design assumed. (2) **The memory
+  contract holds with room to spare**: 2,471.1 MiB peak against a 3,072
+  MiB ceiling, 601 MiB unused. That is *lower* than EXP-012's predicted
+  2,961 MiB, because this workload reaches only 69 tokens of context so
+  the KV cache is a few MiB rather than its 384 MiB reservation at 4K.
+  **The dial is therefore not yet validated at full context** - a 4K-context
+  run should add roughly 377 MiB, landing near 2,848 MiB, which still fits
+  but has not been measured. That measurement is the remaining open item
+  on the 11-slots decision. (3) The DIRTY/CLEAN split is evidence the
+  hygiene gate works rather than evidence of a problem: it caught operator
+  activity that changed timing without changing output, which is exactly
+  the contamination rule 2 exists to exclude. Note that identical output
+  is not evidence of a clean measurement - reclaim distorts timing, not
+  correctness. (4) Decode I/O wait is roughly half of decode wall time in
+  the equivalent uncgrouped runs, so I/O and compute are now close to
+  balanced; further gains need either a higher hit rate (more slots, which
+  the budget does not allow) or a faster device.
