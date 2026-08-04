@@ -1666,10 +1666,25 @@ impl ExpertStream {
     /// [`SweepError::ArenaTooSmall`] when the pool is smaller than the carve;
     /// [`SweepError::ArenaOverRetired`] when the carve would cover a buffer
     /// some earlier lost read may still be writing into;
-    /// [`SweepError::ArenaPoisoned`] once a sweep read has been lost.
+    /// [`SweepError::ArenaPoisoned`] once a sweep read has been lost;
+    /// [`SweepError::ArenaOut`] when one is out already.
     pub(super) fn take_arena(&mut self, bytes: usize) -> Result<(), SweepError> {
         if self.arena_poisoned {
             return Err(SweepError::ArenaPoisoned);
+        }
+        // A second carve over the first one's bytes. Every holder gives the
+        // arena back on `Drop`, which both `?` and a panic run — but leaking is
+        // safe Rust, and a forgotten `PrefillSession` ends its borrow of this
+        // stream without ever releasing. The next carve would then hand out a
+        // second `&mut [u8]` over the first one's scratch, which is UB reached
+        // from two safe `pub` calls.
+        if let Some(arena) = self.arena {
+            tracing::error!(
+                live_bytes = arena.len,
+                bytes,
+                "refusing a second prefill arena over a live one"
+            );
+            return Err(SweepError::ArenaOut { bytes: arena.len });
         }
         if self.inflight.outstanding > 0 {
             return Err(SweepError::ReadsInFlight {
@@ -1753,9 +1768,21 @@ impl ExpertStream {
         if self.arena.take().is_none() {
             return;
         }
-        self.invalidate_all_slots();
+        // Both callers drain before releasing, so this is always taken — but
+        // `invalidate_all_slots` unprotects every slot of every layer without
+        // proving anything about the kernel, and "the caller drained first" is
+        // an argument, not a check. The check is one comparison and it is
+        // already made on the next line for the read table.
         if self.inflight.outstanding == 0 {
+            self.invalidate_all_slots();
             self.inflight.clear();
+        } else {
+            tracing::error!(
+                outstanding = self.inflight.outstanding,
+                "the prefill arena was released with window reads still in \
+                 flight; leaving slot occupancy alone, since it is already \
+                 empty from the carve"
+            );
         }
         self.io.in_sweep = false;
     }
@@ -1872,6 +1899,18 @@ impl ExpertStream {
         }
     }
 
+    /// Reads this stream has handed to the kernel and not yet reaped.
+    ///
+    /// For [`LayerSweep::begin_within`](super::sweep::LayerSweep), which reuses
+    /// a ring the session already carved and so reaches none of
+    /// [`take_arena`](Self::take_arena)'s checks. Note what this does *not*
+    /// say: `Inflight::abandon` drains the counter for reads that can never be
+    /// reaped, so `0` means "nothing is awaitable", not "nothing is writing".
+    /// The second statement is `SlotTable::retired_within`'s to make.
+    pub(super) fn reads_outstanding(&self) -> usize {
+        self.inflight.outstanding
+    }
+
     /// Forget every resolved read, so one sweep's window indices do not
     /// accumulate across layers. Only valid with nothing outstanding.
     pub(super) fn sweep_clear_reads(&mut self) {
@@ -1925,12 +1964,14 @@ impl ExpertStream {
     /// runs with nothing in flight.
     fn invalidate_all_slots(&mut self) {
         for cache in &mut self.caches {
-            // SAFETY: `take_arena` refuses while anything is outstanding *and*
-            // while the carve covers a buffer a lost read may still be writing
-            // into; `release_arena` runs after the sweep has drained. So no
-            // read is writing into any slot of any layer at either call site,
-            // which is exactly `reset_occupancy`'s obligation — one statement
-            // about one moment, made once per layer rather than once per slot.
+            // SAFETY: both call sites check `inflight.outstanding == 0` first,
+            // and both also rule out a read that was *abandoned* rather than
+            // reaped — `take_arena` by refusing a carve over any retired slot
+            // buffer, `release_arena` because `strand_arena` takes the arena
+            // away, so the release is a no-op after one. So no read is writing
+            // into any slot of any layer at either call site, which is exactly
+            // `reset_occupancy`'s obligation — one statement about one moment,
+            // made once per layer rather than once per slot.
             unsafe { cache.reset_occupancy() };
         }
     }
@@ -2547,12 +2588,37 @@ impl ExpertStream {
     /// A layer retired down to fewer than `top_k` slots reports
     /// [`CacheError::TooFewSlots`](crate::io::CacheError::TooFewSlots) on its
     /// next step — a terminal error that names the real cause, not a wedge.
+    ///
+    /// # Why the failure path poisons the arena
+    ///
+    /// By the time this runs, `strand_step` has already called
+    /// [`Inflight::abandon`] on the read, so `outstanding` has drained *for a
+    /// read that may still be writing*. Retiring is what makes that buffer
+    /// visible again, to `SlotTable::retired_within` and so to
+    /// [`take_arena`](Self::take_arena). A path out of here that retires
+    /// nothing would leave the buffer abandoned-but-invisible: every
+    /// `take_arena` guard would pass and the next sweep would carve a window
+    /// over pages a decode read is still writing into.
+    ///
+    /// So the one way out that does not retire says so the only other way it
+    /// can — by poisoning the arena, which is the exact permission
+    /// `retired_within` would have withdrawn. The invariant then reads off this
+    /// function alone: **`retire_slot` either retires the slot or refuses the
+    /// process another arena.**
+    ///
+    /// The alternative — retire first and rebuild the cache after — makes the
+    /// buffer visible unconditionally but leaves the layer's live
+    /// [`LayerCache`] describing a slot numbering that no longer exists, which
+    /// is silently wrong weights rather than a loud refusal. Loud wins.
     fn retire_slot(&mut self, layer: u32, slot: u32) {
         if self.slots.flat(layer, slot).is_none() {
-            return; // already retired, or never existed
+            // Already retired — so `retired_within` already sees the buffer —
+            // or it never existed and there is no buffer to see.
+            return;
         }
         let usable = self.slots.usable(layer).saturating_sub(1);
         let Some(cache) = self.caches.get(layer as usize) else {
+            self.poison_arena_unretired(layer, slot, "the layer has no cache");
             return;
         };
         let (carried, n_experts) = (cache.stats(), cache.n_experts());
@@ -2564,14 +2630,8 @@ impl ExpertStream {
             Ok(fresh) => fresh,
             Err(error) => {
                 debug_assert!(false, "rebuilding a shrunken layer cache: {error}");
-                tracing::error!(
-                    layer,
-                    usable,
-                    %error,
-                    "could not rebuild a layer cache after a read that cannot \
-                     be reaped; the slot stays leased and the layer keeps its \
-                     old capacity"
-                );
+                let reason = error.to_string();
+                self.poison_arena_unretired(layer, slot, &reason);
                 return;
             }
         };
@@ -2585,6 +2645,22 @@ impl ExpertStream {
             of = self.slots.slots_per_layer,
             "expert slot retired; the layer's cache is rebuilt smaller and \
              loses its ghost history"
+        );
+    }
+
+    /// [`retire_slot`](Self::retire_slot) could not retire, so the buffer stays
+    /// leased and invisible to `SlotTable::retired_within`: refuse this process
+    /// another arena instead, which is the permission the retirement would have
+    /// withdrawn.
+    fn poison_arena_unretired(&mut self, layer: u32, slot: u32, reason: &str) {
+        self.arena_poisoned = true;
+        tracing::error!(
+            layer,
+            slot,
+            reason,
+            "could not retire a slot after a read that cannot be reaped; the \
+             slot stays leased and the layer keeps its old capacity, so this \
+             process will not sweep again"
         );
     }
 

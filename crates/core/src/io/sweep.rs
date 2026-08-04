@@ -202,6 +202,23 @@ pub enum SweepError {
         available: u64,
     },
 
+    /// An arena is already out, so a second carve would name the same bytes
+    /// twice.
+    ///
+    /// Not reachable from ordinary control flow — every path that takes the
+    /// arena parks the stream's `&mut` and gives it back on `Drop`, and both
+    /// `?` and panics run `Drop`. Leaking is what gets past that, and
+    /// [`std::mem::forget`] is safe Rust: a forgotten
+    /// [`PrefillSession`](super::PrefillSession) ends its borrow without ever
+    /// releasing, so the next
+    /// [`begin_prefill`](crate::io::ExpertStream::begin_prefill) would hand out
+    /// a second `&mut [u8]` over the first one's scratch.
+    #[error("a prefill arena of {bytes} B is already out")]
+    ArenaOut {
+        /// Bytes the live arena covers.
+        bytes: usize,
+    },
+
     /// A window read was lost, so the arena's bytes can never be handed out
     /// again in this process.
     #[error(
@@ -265,11 +282,13 @@ pub enum SweepError {
 
     /// The sweep already failed and cannot be resumed.
     ///
-    /// Latched on the first failure of [`LayerSweep::next_expert`]. Every
-    /// later call reports this instead of walking a cursor that has already
-    /// moved: the window it would hand out was never filled, so its bytes are
-    /// a previous window's or the zeros the slab was born with — silently
-    /// wrong expert weights with no error and no log line.
+    /// [`LayerSweep::next_expert`]'s first failure is latched and returned as
+    /// it was raised; every *later* call reports this instead of walking a
+    /// cursor that has already moved, because the window it would hand out was
+    /// never filled, so its bytes are a previous window's or the zeros the slab
+    /// was born with — silently wrong expert weights with no error and no log
+    /// line. [`LayerSweep::finish`] reports the latched error rather than this,
+    /// so nothing that only looks there loses an errno.
     #[error("this prefill sweep already failed and cannot be resumed: {reason}")]
     Aborted {
         /// What the original failure said.
@@ -579,10 +598,15 @@ pub struct LayerSweep<'a> {
     counted: usize,
     /// The first failure, latched.
     ///
-    /// A `SweepError` is not `Clone` — it carries an `io::Error` — so what is
-    /// kept is what it said. See [`SweepError::Aborted`] for why anything at
-    /// all has to be kept.
-    failed: Option<String>,
+    /// Typed, not rendered: a driver that reaches the failure through
+    /// [`finish`](Self::finish) rather than through the call that raised it
+    /// still gets a `SweepError::Io` it can tell `ENOSPC` from `EIO` in.
+    ///
+    /// A `SweepError` is not `Clone` — it carries an `io::Error` — and the
+    /// original leaves by value on the call that raised it, so what is latched
+    /// is [`latchable`]'s reconstruction of it. See [`SweepError::Aborted`] for
+    /// why anything at all has to be kept.
+    failed: Option<SweepError>,
     /// Whether teardown gives the arena back. False inside a
     /// [`PrefillSession`], which owns the arena across every layer.
     owns_arena: bool,
@@ -641,6 +665,22 @@ impl<'a> LayerSweep<'a> {
     /// its head is the driver's scratch, so this claims neither and works
     /// `ring_bytes` in from `ring_base`. The arena is *not* given back at
     /// teardown; the session owns it.
+    ///
+    /// # The guard this does not inherit
+    ///
+    /// [`begin`](Self::begin) reaches [`ExpertStream::take_arena`]'s checks by
+    /// taking the arena. This one deliberately does not take it, so it
+    /// inherits none of them — including the one that matters here, that
+    /// nothing is still writing into the pool. The window ring is reused layer
+    /// after layer, and every sweep starts by submitting into buffer 0, so a
+    /// previous layer's windows still in flight would be a second O_DIRECT read
+    /// onto a live DMA destination: the corruption EXP-007 measured as 13-27%
+    /// spurious btrfs `EIO` plus permanent `corruption_errs`.
+    ///
+    /// A `LayerSweep` drains its own windows in `teardown`, which both `?` and
+    /// a panic run — but [`std::mem::forget`] is safe Rust and skips it, and
+    /// this is a `pub` API two lanes up. So the check is made here rather than
+    /// argued from the caller.
     pub(super) fn begin_within(
         stream: &'a mut ExpertStream,
         plan: &'a mut SweepPlan,
@@ -650,6 +690,16 @@ impl<'a> LayerSweep<'a> {
         ring_base: usize,
         ring_bytes: u64,
     ) -> Result<Self, SweepError> {
+        let outstanding = stream.reads_outstanding();
+        if outstanding > 0 {
+            tracing::error!(
+                layer,
+                outstanding,
+                "refusing a sweep into a ring a previous sweep's windows are \
+                 still writing into"
+            );
+            return Err(SweepError::ReadsInFlight { outstanding });
+        }
         let config = config.validate()?;
         let (stride, n_experts) = stream.layer_geometry(layer)?;
         plan.build(n_experts, stride, config, routed)?;
@@ -758,9 +808,9 @@ impl<'a> LayerSweep<'a> {
     /// [`SweepError::Aborted`] rather than handing back arena bytes that hold
     /// a previous window, or the zeros the slab was born with.
     pub fn next_expert(&mut self) -> Result<Option<SweepExpert<'_>>, SweepError> {
-        if let Some(reason) = &self.failed {
+        if let Some(error) = &self.failed {
             return Err(SweepError::Aborted {
-                reason: reason.clone(),
+                reason: error.to_string(),
             });
         }
         let position = match self.advance() {
@@ -778,7 +828,7 @@ impl<'a> LayerSweep<'a> {
             // and nothing else. The cursor has already stepped past this
             // expert, so a retry would *skip* it rather than repeat it —
             // latch, exactly as for a failed read.
-            self.failed = Some(SweepError::NoArena.to_string());
+            self.failed = Some(SweepError::NoArena);
             return Err(SweepError::NoArena);
         };
         // The latch is written field by field rather than through `latch`:
@@ -788,7 +838,7 @@ impl<'a> LayerSweep<'a> {
             Ok(view) => view,
             Err(error) => {
                 let error = SweepError::Io(error);
-                self.failed = Some(error.to_string());
+                self.failed = Some(latchable(&error));
                 return Err(error);
             }
         };
@@ -812,19 +862,24 @@ impl<'a> LayerSweep<'a> {
     ///
     /// # Errors
     ///
-    /// [`SweepError::Io`] when a window still in flight failed, or
-    /// [`SweepError::Aborted`] when the drain was clean but an earlier
-    /// [`next_expert`](Self::next_expert) was not: a sweep that stopped short
-    /// of the layer did not do what the caller asked, and saying so is the
-    /// point of calling this rather than dropping.
+    /// [`SweepError::Io`] when a window still in flight failed; otherwise the
+    /// first failure an earlier [`next_expert`](Self::next_expert) latched,
+    /// reported as it was raised — a sweep that stopped short of the layer did
+    /// not do what the caller asked, and saying so is the point of calling this
+    /// rather than dropping. The latched error keeps its type, so a driver that
+    /// only looks here can still tell `ENOSPC` from `EIO`.
     pub fn finish(mut self) -> Result<(), SweepError> {
         self.teardown()
     }
 
     /// Record the first failure and hand it back unchanged.
+    ///
+    /// The caller gets the error it caused, by value and unaltered; the latch
+    /// keeps [`latchable`]'s reconstruction of it, which is the closest a
+    /// non-`Clone` error gets to being in two places at once.
     fn latch(&mut self, error: SweepError) -> SweepError {
         if self.failed.is_none() {
-            self.failed = Some(error.to_string());
+            self.failed = Some(latchable(&error));
         }
         error
     }
@@ -975,7 +1030,10 @@ impl<'a> LayerSweep<'a> {
             // The drain's own failure first: it is the newer fact, and the
             // latched one has already been reported to whoever caused it.
             (Err(error), _) => Err(error),
-            (Ok(()), Some(reason)) => Err(SweepError::Aborted { reason }),
+            // The latched one moves out as it was, rather than as a message: a
+            // driver that reaches the failure here — because it discarded what
+            // `next_expert` returned — still gets the errno.
+            (Ok(()), Some(error)) => Err(error),
             (Ok(()), None) => Ok(()),
         }
     }
@@ -991,6 +1049,54 @@ impl Drop for LayerSweep<'_> {
             );
         }
     }
+}
+
+/// A copy of a failure, good enough to latch, keeping the errno where there is
+/// one.
+///
+/// [`SweepError`] is not `Clone` — `io::Error` is not — and the original has to
+/// leave by value on the call that raised it, so the latch keeps this instead.
+/// The reconstruction is exact for the one shape that carries an errno; every
+/// other variant is plain data whose own message is all it ever had, and
+/// becomes the [`SweepError::Aborted`] a later `next_expert` would have made of
+/// it anyway.
+///
+/// Rendering *everything* — which is what this replaced — turned `ENOSPC` into
+/// a string, the same loss `ExpertStream`'s `flatten_io` exists to prevent on
+/// the decode path.
+fn latchable(error: &SweepError) -> SweepError {
+    match error {
+        SweepError::Io(IoError::Io { path, source }) => SweepError::Io(IoError::Io {
+            path: path.clone(),
+            source: dup_os(source),
+        }),
+        SweepError::CacheStranded {
+            layer,
+            slots,
+            top_k,
+            source: IoError::Io { path, source },
+        } => SweepError::CacheStranded {
+            layer: *layer,
+            slots: *slots,
+            top_k: *top_k,
+            source: IoError::Io {
+                path: path.clone(),
+                source: dup_os(source),
+            },
+        },
+        other => SweepError::Aborted {
+            reason: other.to_string(),
+        },
+    }
+}
+
+/// An `io::Error` rebuilt from its errno, or from its kind and message when it
+/// never had one (an `UnexpectedEof` this module synthesised, say).
+fn dup_os(error: &std::io::Error) -> std::io::Error {
+    error.raw_os_error().map_or_else(
+        || std::io::Error::new(error.kind(), error.to_string()),
+        std::io::Error::from_raw_os_error,
+    )
 }
 
 /// Bytes one window buffer occupies for a layer of `n_experts` experts.
@@ -2030,11 +2136,14 @@ mod tests {
             }
             // The drain is clean — the failed read reached a terminal state —
             // so what `finish` has left to report is that the sweep never
-            // covered the layer.
-            assert!(matches!(
-                sweep.finish().unwrap_err(),
-                SweepError::Aborted { .. }
-            ));
+            // covered the layer, as the error that stopped it rather than as a
+            // rendering of one.
+            match sweep.finish().unwrap_err() {
+                SweepError::Io(IoError::Io { source, .. }) => {
+                    assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
+                }
+                other => panic!("unexpected error: {other}"),
+            }
         }
 
         // The arena went back, so the stream is a cache again.
@@ -2076,11 +2185,13 @@ mod tests {
             SweepError::Aborted { reason } => assert_eq!(reason, SweepError::NoArena.to_string()),
             other => panic!("unexpected error: {other}"),
         }
-        // A clean drain still reports that the sweep did not finish the layer.
-        assert!(matches!(
-            sweep.finish().unwrap_err(),
-            SweepError::Aborted { .. }
-        ));
+        // A clean drain still reports that the sweep did not finish the layer,
+        // as the error that stopped it rather than as a rendering of one.
+        let err = sweep.finish().unwrap_err();
+        assert!(
+            matches!(err, SweepError::NoArena),
+            "unexpected error: {err}"
+        );
     }
 
     /// The window counters describe what the sweep did, not what it planned.
@@ -2269,6 +2380,146 @@ mod tests {
             matches!(err, SweepError::ArenaTooSmall { .. }),
             "unexpected error: {err}"
         );
+    }
+
+    /// A sweep that was leaked rather than dropped never drained its windows,
+    /// and the next sweep of the session carves the same ring from buffer 0
+    /// up.
+    #[test]
+    fn a_leaked_sweep_cannot_start_a_second_one_over_its_ring() {
+        // The failure this guards: `begin_within` deliberately does not take
+        // the arena, so it inherited none of `take_arena`'s checks — nothing on
+        // that path looked at `outstanding` at all. `mem::forget(sweep)` is
+        // safe Rust, skips the teardown that drains the windows, and ends the
+        // borrow that made the session unusable; the next `split` then computed
+        // `arena_offset = ring_base + 0`, the exact address layer 0's still-live
+        // window read was writing into. Two O_DIRECT reads on one destination,
+        // which EXP-007 measured as 13-27% spurious btrfs EIO.
+        let fx = build_install("prefill-leaked-sweep");
+        let mut stream = open(&fx, 4);
+        let config = SweepConfig {
+            experts_per_window: 1,
+            windows_in_flight: 2,
+        };
+        let mut plan = SweepPlan::new();
+        let routed0 = all_experts(&fx, 0);
+        let routed1 = all_experts(&fx, 1);
+        let mut session = stream.begin_prefill(0, config).expect("session opens");
+
+        let (_staging, sweep) = session
+            .split(&mut plan, 0, &routed0)
+            .expect("layer 0 sweeps");
+        std::mem::forget(sweep);
+
+        // Both backends leave a submitted window outstanding until someone
+        // reaps it, and the leak is precisely nobody reaping.
+        let outstanding = session.stream.reads_outstanding();
+        assert!(outstanding > 0, "the leak left no windows on the wire");
+        match session.split(&mut plan, 1, &routed1) {
+            Err(SweepError::ReadsInFlight { outstanding: seen }) => assert_eq!(seen, outstanding),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("a leaked sweep's live windows started a second sweep"),
+        }
+
+        // The session is still the arena's owner and still drains the leak.
+        session.finish().expect("the session drains what was left");
+        stream.begin_layer(0, &[0, 1]).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(0);
+    }
+
+    /// A session that was leaked rather than dropped never gave the arena back,
+    /// so a second carve would be a second `&mut [u8]` over the same scratch.
+    #[test]
+    fn a_leaked_prefill_session_cannot_take_a_second_arena() {
+        let fx = build_install("prefill-leaked-session");
+        let mut stream = open(&fx, 4);
+        let config = SweepConfig {
+            experts_per_window: 1,
+            windows_in_flight: 1,
+        };
+        let session = stream.begin_prefill(4096, config).expect("session opens");
+        let scratch = session.scratch_len();
+        std::mem::forget(session);
+
+        match stream.begin_prefill(scratch, config).unwrap_err() {
+            SweepError::ArenaOut { bytes } => assert!(bytes >= scratch),
+            other => panic!("unexpected error: {other}"),
+        }
+        // And a plain sweep, which takes the arena through the same door.
+        let mut plan = SweepPlan::new();
+        let routed = all_experts(&fx, 0);
+        match stream
+            .sweep_layer(&mut plan, 0, &routed, config)
+            .unwrap_err()
+        {
+            SweepError::ArenaOut { .. } => {}
+            other => panic!("unexpected error: {other}"),
+        }
+
+        // Giving the leaked carve back by hand puts the pool back to a cache,
+        // which is the only thing left that can.
+        stream.release_arena();
+        stream.begin_layer(0, &[0, 1]).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(0);
+    }
+
+    /// The latch keeps the failure rather than a rendering of it, so a driver
+    /// that only reads `finish` can still tell `ENOSPC` from `EIO`.
+    #[test]
+    fn a_latched_failure_keeps_its_errno() {
+        let path = std::path::Path::new("layer_00.bin");
+        let enospc = SweepError::Io(IoError::io(
+            path,
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+        ));
+        match latchable(&enospc) {
+            SweepError::Io(IoError::Io { source, .. }) => {
+                assert_eq!(source.raw_os_error(), Some(libc::ENOSPC));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        // Through a stranding, which is the shape that also names dead layers.
+        let stranded = SweepError::CacheStranded {
+            layer: 3,
+            slots: 0,
+            top_k: 8,
+            source: IoError::io(path, std::io::Error::from_raw_os_error(libc::EIO)),
+        };
+        match latchable(&stranded) {
+            SweepError::CacheStranded {
+                layer,
+                slots,
+                top_k,
+                source: IoError::Io { source, .. },
+            } => {
+                assert_eq!((layer, slots, top_k), (3, 0, 8));
+                assert_eq!(source.raw_os_error(), Some(libc::EIO));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        // A synthesised error has no errno, so its kind is what survives.
+        let eof = SweepError::Io(IoError::io(
+            path,
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short read"),
+        ));
+        match latchable(&eof) {
+            SweepError::Io(IoError::Io { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
+                assert_eq!(source.to_string(), "short read");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        // A variant with nothing but data in it renders, which is all it had.
+        let plain = SweepError::NoArena;
+        match latchable(&plain) {
+            SweepError::Aborted { reason } => assert_eq!(reason, plain.to_string()),
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

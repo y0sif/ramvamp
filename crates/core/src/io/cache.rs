@@ -701,7 +701,18 @@ impl LayerCache {
     /// # Safety
     ///
     /// [`invalidate`](Self::invalidate)'s contract, for every slot of the
-    /// layer: no read may be in flight into *any* of this layer's buffers.
+    /// layer: every read into every one of this layer's buffers must have
+    /// completed, or been **cancelled and reaped**, before this is called.
+    ///
+    /// "Nothing is outstanding" is *not* that statement and must not be
+    /// mistaken for it. A read given up through `Inflight::abandon` — the
+    /// stream's recovery for a completion that can never be reaped — drains the
+    /// outstanding counter *because the read is unknowable*, not because it
+    /// finished; the kernel may write into that buffer forever. A caller with
+    /// such a read behind it has to reason about the buffers it abandoned (the
+    /// stream retires them, which strikes them from the layer), not about the
+    /// counter.
+    ///
     /// Unprotecting a slot the kernel is still writing into makes it the first
     /// pick of the next victim search, which puts two O_DIRECT reads on one
     /// destination — the corruption the slot discipline exists to prevent.
