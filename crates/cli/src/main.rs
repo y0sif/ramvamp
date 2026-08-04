@@ -35,7 +35,7 @@
 use std::io::{BufRead as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand};
@@ -44,8 +44,8 @@ use ramvamp_core::generate::{
 };
 use ramvamp_core::io::StreamStats;
 use ramvamp_core::model::{
-    ForwardState, LoadOptions, Model, PrefillConfig, PrefillMode, RuntimeConfig, StreamPhase,
-    prefill_prompt,
+    ForwardState, LoadOptions, Model, PrefillConfig, PrefillMode, PrefillTiming, RuntimeConfig,
+    StreamPhase, prefill_prompt,
 };
 use ramvamp_core::tokenizer::{ChatMessage, ContentSanitizer, Role, RvmpTokenizer};
 
@@ -1049,6 +1049,9 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
 
     report_generate_stats(&stats, None);
     report_stream_stats(&state);
+    // A `generate` is one prefill and then decode, so the whole snapshot is
+    // that prefill's span.
+    report_prefill_timing(&state, &PhaseStats::take(&state));
     Ok(())
 }
 
@@ -1130,6 +1133,14 @@ impl PhaseStats {
     /// Each phase with its counters, in [`StreamPhase::ALL`] order.
     fn iter(&self) -> impl Iterator<Item = (StreamPhase, &StreamStats)> {
         StreamPhase::ALL.into_iter().zip(self.0.iter())
+    }
+
+    /// One phase's counters.
+    fn phase(&self, want: StreamPhase) -> StreamStats {
+        self.iter()
+            .find(|(phase, _)| *phase == want)
+            .map(|(_, stats)| *stats)
+            .unwrap_or_default()
     }
 }
 
@@ -1259,6 +1270,85 @@ fn sweep_stats_line(phase: StreamPhase, s: &StreamStats) -> String {
         s.sweep_read_retries,
         s.sweep_io_wait.as_secs_f64(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// prefill: where the wall time went
+// ---------------------------------------------------------------------------
+
+/// The prefill phase split, on stderr, under the streaming block.
+///
+/// `span` is the streaming counters covering the same prefill, which is where
+/// the drive-blocked share of `expert io` comes from — the streamer already
+/// measures it and this deliberately does not measure it again. For a
+/// one-run-per-process command that is the whole snapshot; for `chat` it is
+/// the turn's delta, or the figure would be a session total under a turn's
+/// heading (the same trap [`report_stream_stats_since`] exists for).
+///
+/// Silent when nothing has prefilled on this state.
+fn report_prefill_timing(state: &ForwardState, span: &PhaseStats) {
+    let timing = state.prefill_timing();
+    let blocked = prefill_drive_wait(timing.mode, &span.phase(StreamPhase::Prefill));
+    for line in prefill_timing_lines(&timing, blocked) {
+        eprintln!("{line}");
+    }
+}
+
+/// The drive-blocked share of a prefill's expert I/O, from whichever streamer
+/// counter that path feeds.
+///
+/// The sweep bypasses the expert cache and reports through `sweep_io_wait`;
+/// the token-major path *is* decode and reports through `io_wait`. Reading the
+/// wrong one would quietly print a zero.
+fn prefill_drive_wait(mode: Option<PrefillMode>, stats: &StreamStats) -> Duration {
+    match mode {
+        Some(PrefillMode::Sweep) => stats.sweep_io_wait,
+        Some(PrefillMode::TokenMajor) => stats.io_wait,
+        None => Duration::ZERO,
+    }
+}
+
+/// The exact text [`report_prefill_timing`] prints.
+///
+/// Separate from the printing so a test can read it, exactly as
+/// [`stream_stats_lines`] is.
+///
+/// **This must not look like the timing line.** `scripts/cold_bench.py` finds
+/// prefill's wall time with a regex anchored on `prefill:\s*\d+\s*tokens in`,
+/// so the heading here says `prefill split (...)` and never `prefill:`. The
+/// whole block is stderr; `logits`' stdout, which `scripts/bitident.py`
+/// compares byte for byte, is untouched.
+fn prefill_timing_lines(timing: &PrefillTiming, blocked_on_drive: Duration) -> Vec<String> {
+    let Some(mode) = timing.mode else {
+        return Vec::new();
+    };
+    let mode = match mode {
+        PrefillMode::Sweep => "sweep",
+        PrefillMode::TokenMajor => "token-major",
+    };
+    let total = timing.total.as_secs_f64();
+    let mut lines = vec![format!(
+        "prefill split ({mode}): {} tokens in {total:.2}s",
+        timing.tokens
+    )];
+    for (label, spent) in timing.phases() {
+        let secs = spent.as_secs_f64();
+        let pct = if total > 0.0 {
+            secs / total * 100.0
+        } else {
+            0.0
+        };
+        let note = if label == "expert io" {
+            format!(
+                " [{:.2}s blocked on the drive]",
+                blocked_on_drive.as_secs_f64()
+            )
+        } else {
+            String::new()
+        };
+        lines.push(format!("  {label:>14}: {secs:7.2}s ({pct:5.1}%){note}"));
+    }
+    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -1746,7 +1836,12 @@ fn chat_turn(
             history.extend_from_slice(&stats.generated_ids);
             println!();
             report_generate_stats(&stats, None);
+            let span = PhaseStats::take(state).since(&at_turn_start);
             report_stream_stats_since(state, &at_turn_start);
+            // The timing is rearmed by every prefill, so it already describes
+            // this turn; the streaming counters it quotes are not, hence the
+            // delta.
+            report_prefill_timing(state, &span);
             Ok((reply, false))
         }
         Err(payload) => {
@@ -2032,8 +2127,10 @@ fn run_logits(args: LogitsArgs) -> anyhow::Result<()> {
         "top": top_entries,
     });
     println!("{}", serde_json::to_string_pretty(&out)?);
-    // After the last use of `logits`, which borrows `state`.
+    // After the last use of `logits`, which borrows `state`. Both reports are
+    // stderr; the JSON above is what `scripts/bitident.py` compares.
     report_stream_stats(&state);
+    report_prefill_timing(&state, &PhaseStats::take(&state));
     Ok(())
 }
 
@@ -3493,6 +3590,74 @@ mod tests {
                 "{rest}"
             );
         }
+    }
+
+    /// The phase split prints under the timing line and must not look like
+    /// it: `cold_bench.py` searches the *whole* stderr, so a second line
+    /// starting `prefill: <n> tokens in <x>s` would be a coin flip over which
+    /// one it recorded. It also has to stay off stdout, which `bitident.py`
+    /// compares byte for byte — that is enforced by where it is called, and
+    /// asserted here by the heading it uses.
+    #[test]
+    fn the_prefill_split_cannot_be_mistaken_for_the_timing_line() {
+        let ms = std::time::Duration::from_millis;
+        let timing = PrefillTiming {
+            mode: Some(PrefillMode::Sweep),
+            tokens: 512,
+            total: ms(131_200),
+            attention: ms(51_300),
+            projections: ms(4_200),
+            expert_compute: ms(60_100),
+            expert_io: ms(13_400),
+            elementwise: ms(1_800),
+        };
+        let lines = prefill_timing_lines(&timing, ms(12_830));
+        assert_eq!(lines.len(), 7, "a heading and six phases: {lines:?}");
+        assert_eq!(lines[0], "prefill split (sweep): 512 tokens in 131.20s");
+
+        // Everything `TIMING_RE` anchors on: `prefill:` immediately followed
+        // by a token count, and the `; decode: ` join.
+        for line in &lines {
+            assert!(
+                !line.contains("prefill: 512 tokens"),
+                "reads as the timing line: {line}"
+            );
+            assert!(!line.contains("; decode: "), "{line}");
+            assert!(!line.contains("tok/s"), "{line}");
+        }
+
+        assert_eq!(lines[1], "       attention:   51.30s ( 39.1%)");
+        assert_eq!(
+            lines[3], "       expert io:   13.40s ( 10.2%) [12.83s blocked on the drive]",
+            "the drive-blocked share comes from the streamer, not a second timer"
+        );
+        assert_eq!(lines[6], "           other:    0.40s (  0.3%)");
+
+        // The token-major path reports the same shape against `io_wait`, so
+        // the two can be read side by side.
+        let token_major = PrefillTiming {
+            mode: Some(PrefillMode::TokenMajor),
+            ..timing
+        };
+        assert_eq!(
+            prefill_timing_lines(&token_major, ms(0))[0],
+            "prefill split (token-major): 512 tokens in 131.20s"
+        );
+        assert_eq!(
+            prefill_drive_wait(
+                token_major.mode,
+                &StreamStats {
+                    io_wait: ms(700),
+                    sweep_io_wait: ms(12_830),
+                    ..StreamStats::default()
+                }
+            ),
+            ms(700),
+            "token-major prefill goes through the cache, not the sweep"
+        );
+
+        // Nothing has prefilled: nothing is printed.
+        assert!(prefill_timing_lines(&PrefillTiming::default(), ms(0)).is_empty());
     }
 
     /// Swept prefill resolves no cache accesses at all, so the old

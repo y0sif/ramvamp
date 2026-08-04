@@ -53,6 +53,7 @@ which is the reason their claims are credible.
 - [EXP-014: First clean cold measurement inside the 3G cgroup](#exp-014-first-clean-cold-measurement-inside-the-3g-cgroup) — KEEP
 - [EXP-015: Phase-6 building blocks, landed and unmeasured](#exp-015-phase-6-building-blocks-landed-and-unmeasured) — KEEP
 - [EXP-016: Chunked layer-major prefill lands as the default path](#exp-016-chunked-layer-major-prefill-lands-as-the-default-path) — KEEP
+- [EXP-017: The prefill phase split, and attention is the wall](#exp-017-the-prefill-phase-split-and-attention-is-the-wall) — NEUTRAL
 
 Entries EXP-007 through EXP-013 were measured on a machine that was not
 quiet, and most are microbenchmarks rather than end-to-end runs. Under rule 2
@@ -1251,6 +1252,14 @@ provisional.
      same prompt. EXP-015 said the measurement belonged to the driver's
      entry. The driver has an entry now and it is this one, and it does not
      have the number.
+
+     **Correction (2026-08-04, on writing EXP-017): EXP-017 did not pay this
+     debt either.** It is a warm, uncgrouped phase split, so it publishes
+     nothing under rule 2 and carries no `memory.peak`. What it did do is
+     redirect the work: attention, not I/O and not the expert GEMV, is the
+     binding term. The cold measurement is best taken after the attention
+     work rather than before it, and is now tracked in the backlog rather
+     than assigned to a numbered successor.
   2. **Attention is the deferred half, and it bears directly on that first
      measurement.** The driver batches the projections and the expert FFN
      across a chunk's rows, but it runs `attention_at` row by row on the
@@ -1281,3 +1290,163 @@ provisional.
      Both dials are `Option`s rather than clap defaults, so a flag left unset
      does not silently override the `RAMVAMP_PREFILL` environment variables
      the state seeds itself from.
+
+## EXP-017: The prefill phase split, and attention is the wall
+
+- Date / commit: 2026-08-04 / on top of 4254279 (`feat/prefill-sweep`,
+  pre-commit)
+- Hypothesis: EXP-016 left prefill hard compute-bound and named two candidates
+  for where the time goes, attention and the batched expert GEMV, with no way
+  to tell them apart from the counters that existed. The estimate made before
+  measuring, on a 512-token prompt, was **attention 26-52 s against expert
+  GEMV 70-96 s**, so the GEMV was expected to be the larger lever and phase
+  7's target. This entry measures the split instead of estimating it.
+- Method: three runs of `target/release/ramvamp logits --model
+  models/qwen3.rvmp --prompt "$(cat <fixture>)" --top 1 --skip-hashes` on the
+  reference machine (`docs/benchmark-machine.md`), with the prefill dials
+  varied: token-major at 512 tokens, sweep at 512, sweep at 1891. Fixtures are
+  `models/llamacpp-ref/llamacpp_ref/long_00.txt` (512 tokens) and
+  `long_01.txt` (1891 tokens).
+
+  **Rule-2 status, stated head-on: these are NOT publishable numbers.** Warm
+  page cache, no cgroup, and the machine was not quiet (a 50 minute regression
+  gate had just finished and the operator was using the machine). They are a
+  diagnostic split, not a throughput measurement. What survives rule 2 is the
+  *shape* of the split and the ratios within a single run, not the absolute
+  seconds. The cold rule-2 prefill measurement is still owed; Note 7 says so
+  in the place EXP-016 promised it would be paid.
+
+  How the split is charged: `PrefillTiming`, added in this phase, is filled by
+  a `PhaseClock` that charges at region boundaries rather than opening and
+  closing a pair per region, so the five phases are disjoint spans of the
+  total by construction, they sum to it, and whatever no phase claims stays
+  visible as `other` instead of being folded into whichever region happened to
+  be open. Instrumentation overhead is bounded at roughly **2.5 ppm** for a
+  512-token sweep chunk (about 13,104 clock reads per chunk at ~25 ns),
+  because per-row sites are timed around the enclosing loop rather than per
+  iteration.
+- Baseline: the token-major run from the same session at the same 512 tokens,
+  which is the path EXP-016 displaced and which it deliberately kept
+  selectable for exactly this comparison (EXP-016 Note 4). Both arms are in
+  the table below, so every 512-token ratio quoted here is a within-session
+  comparison and rule 3 is satisfied. EXP-014's cold 3G-cgroup medians remain
+  the last publishable numbers this project has, and nothing here replaces
+  them.
+- Result:
+
+  **The phase split**, seconds and share of that run's own total:
+
+  | phase | token-major 512 | sweep 512 | sweep 1891 |
+  | --- | ---: | ---: | ---: |
+  | attention | 82.38 s (25.9%) | 76.23 s (61.3%) | 1050.90 s (85.2%) |
+  | expert compute | 77.81 s (24.5%) | 23.78 s (19.1%) | 92.27 s (7.5%) |
+  | expert io | 114.88 s (36.2%) | 2.10 s (1.7%) | 6.68 s (0.5%) |
+  | projections | 36.65 s (11.5%) | 15.51 s (12.5%) | 59.85 s (4.8%) |
+  | elementwise | 6.03 s (1.9%) | 6.64 s (5.3%) | 24.36 s (2.0%) |
+  | other | 0.00 s | 0.00 s | 0.00 s |
+  | **total** | **317.75 s** | **124.27 s** | **1234.05 s** |
+
+  `other` is what no phase claimed: the arena plan, the session open and
+  close, the per-block scratch carves and the chunk loop's own scaffolding.
+  It came out at zero to the printed resolution on all three runs, so none of
+  the prefill wall time is unattributed and the five phases can be read as the
+  whole of it. That the remainder is *visible* rather than folded into
+  whichever region happened to be open is the point of charging at boundaries;
+  that it is zero is the result.
+
+  Of the `expert io` figures, the **drive-blocked** subset was 113.76 s,
+  1.76 s and 5.06 s respectively. That subset is the streamer's own counter,
+  not a second measurement of the same interval; the remainder is the sweep's
+  window bookkeeping.
+
+  **A separate byte-comparison run** (same binary, same 512-token prompt)
+  recorded sweep prefill **byte-identical to token-major at chunk sizes 128,
+  256 and 512**, that is across 4, 2 and 1 chunks:
+
+  | chunk size | chunks | windows (skipped) | wall |
+  | ---: | ---: | ---: | ---: |
+  | 128 | 4 | 3,072 (14) | 161 s |
+  | 256 | 2 | 1,536 (3) | 143 s |
+  | 512 | 1 | 768 (0) | 131 s |
+  | token-major | n/a | n/a | 321 s |
+
+  That run and the split run are **separate invocations**, so their absolute
+  seconds must not be combined into one curve (rule 3). The 512-token sweep
+  appears in both, at 131 s there and 124.27 s in the split table, which is
+  the size of the run-to-run spread on this machine in this state and is
+  another reason to read shares rather than seconds.
+- Verdict: NEUTRAL (a diagnostic that redirects phase 7; no change ships from
+  it, and under rule 2 it publishes nothing)
+- Notes:
+  1. **Comparing like for like at 512 tokens, phase 6 reduced everything it
+     touched by 4.9x**: 235.37 s of non-attention work token-major against
+     48.04 s swept. Per phase, expert io fell **55x** (114.88 to 2.10),
+     expert compute **3.27x** (77.81 to 23.78) and projections **2.36x**
+     (36.65 to 15.51). Elementwise is the exception and did not fall at all:
+     6.03 s to 6.64 s, roughly 10% higher. It is the one phase the
+     restructure gave nothing to, it is small either way, and this entry does
+     not have the evidence to say whether the 10% is a real cost of the
+     layer-major shape or the run-to-run spread the two 512-token sweep wall
+     times already show.
+  2. **End to end that shows up as only 2.45x**, because attention was
+     untouched and is now the dominant term: 61.3% of a 512-token prefill and
+     85.2% of a 1891-token one. (2.45x is 321 s to 131 s within the
+     byte-comparison run; the split run's own totals give 2.56x, 317.75 s to
+     124.27 s. Both are ratios inside one invocation, and the two invocations
+     are not put on one curve.) Amdahl, measured: 4.9x on 74% of the work
+     buys about 2.5x overall, and the remaining 26% is now 61%.
+  3. **Attention's total cost is quadratic in prompt length, and the two
+     lengths confirm it.** Per-token attention is **148.9 ms at 512 tokens**
+     (76.23 s / 512) and **555.7 ms at 1891** (1050.90 s / 1891), a ratio of
+     **3.73** against a prompt-length ratio of **3.69**. Per-token cost
+     scaling linearly with length is exactly what a quadratic total looks
+     like measured per token, and 3.73 against 3.69 is as clean a
+     confirmation as two points can give. No other phase behaves this way:
+     expert compute is 46.4 ms/token at 512 and 48.8 at 1891, essentially
+     flat, which is the linear term the amortization argument predicts.
+  4. **Attention runs single-threaded on the decode thread with one shared
+     scratch**, so it gets nothing from the six pinned P-cores, and it
+     converts K and V from f16 to f32 per element with no vectorization
+     (`kernels/attention.rs` stores the cache as f16 bits and converts on the
+     fly rather than keeping a dequantized plane). The implied rate is
+     roughly **0.68 GFLOP/s** against a rough **51.6 GFLOP estimate** for the
+     512-token case. The GFLOP figure is an **estimate** and is labelled one;
+     the 76.23 s it is divided by is measured. A sub-GFLOP/s rate on a
+     6-P-core AVX2 machine is the shape of the finding, and it holds even if
+     the estimate is off by a factor of two in either direction. It is not a
+     target, and no figure here says what the rate would become.
+  5. **This corrects a prediction made before the measurement, and rule 5 is
+     why it is written down.** The estimate in the Hypothesis put attention
+     at 26-52 s and expert GEMV at 70-96 s on this prompt and judged the GEMV
+     the larger lever. Measured, attention is **76.23 s** and expert compute
+     is **23.78 s**: both estimates were wrong, in opposite directions, and
+     the ordering they implied was backwards. The specific hypothesis that
+     the batched GEMV was thrashing on the activation side (~75 KB streamed
+     past every weight row) is **refuted**: the batched path delivers 3.27x
+     against the unbatched one on the same prompt in the same session. Rule 5
+     says negative results get entries because they stop bad ideas coming
+     back; this one would otherwise have sent phase 7 at the wrong target and
+     spent the phase optimizing a term worth 19% of prefill.
+  6. **Phase 7's target is attention.** Two levers, in the order the
+     measurement suggests. Parallelizing over rows is bit-neutral, since rows
+     are independent and each row's softmax and V sum are self-contained, but
+     it needs **one score buffer per shard** and the arena carve does not
+     have one today (EXP-016 Note 2 already named this as the blocker).
+     Vectorizing the f16 conversion and the dot is a second and independent
+     lever, and it is subject to rule 4 like every other kernel change: a
+     reordered reduction needs tolerance tests, an unreordered one needs bit
+     identity. **No speedup figure is predicted here.** The headroom looks
+     large and the measurement is owed, which is the same discipline Note 5
+     exists to enforce.
+  7. **What is still owed, and this entry does not pay it.** EXP-016 Note 1
+     named EXP-017 as the entry that would produce prefill throughput and
+     `memory.peak` for the swept path, cold inside `memory.max=3G`, against
+     the token-major path on the same prompt. This is EXP-017 and it does
+     not have that number either: every run above is warm, uncgrouped and on
+     a busy machine, and the memory peak was not sampled at all. What it does
+     instead is tell phase 7 where to aim, which EXP-016 Note 2 asked for in
+     those words ("measure before building it"). The cold cgroup prefill
+     measurement stays on the backlog in `docs/architecture.md`, and it
+     should be taken after the attention work rather than before it, since
+     the number it would produce today describes a term phase 7 is about to
+     move.

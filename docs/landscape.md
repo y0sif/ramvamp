@@ -138,8 +138,11 @@ number appears in anything published.
 - SSD-streamed MoE costs more energy per token than RAM-resident inference
   (up to ~12x per [arXiv:2508.06978](https://arxiv.org/html/2508.06978v1)).
   Reads do not wear SSDs, but battery life on laptops will be affected.
-- The approach stays I/O-bound: TurboFieldfare's tuned M2 path still spends
-  ~half its per-token time on expert reads. The slowdown versus a
+- **Decode** stays I/O-bound: TurboFieldfare's tuned M2 path still spends
+  ~half its per-token time on expert reads. That is a claim about decode, and
+  it does not carry to prefill on the swept path: EXP-017 measured expert I/O
+  at 1.7% of a 512-token swept prefill and 0.5% at 1891 tokens, with attention
+  taking 61.3% and 85.2%. The slowdown versus a
   fits-in-RAM engine is **drive-dependent and larger than the "2-3x" this
   document previously claimed**. On ramvamp's reference machine (Micron 2400,
   DRAM-less QLC, Qwen3-30B-A3B Q4_K_M at the shipped 11 slots/layer) the

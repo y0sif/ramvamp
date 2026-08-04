@@ -84,6 +84,7 @@
 
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::format::ArchInfo;
 use crate::io::{
@@ -103,7 +104,7 @@ use crate::threads::{ComputePool, PoolConfig};
 use thiserror::Error;
 
 use super::error::ModelError;
-use super::prefill::PrefillConfig;
+use super::prefill::{Phase, PhaseClock, PrefillConfig, PrefillMode, PrefillTiming};
 use super::weights::Model;
 
 /// Default total expert-cache budget: 1,440 MiB.
@@ -494,6 +495,22 @@ pub struct ForwardState {
     /// [`crate::io::PrefillSession::split`] takes it *while* handing that
     /// scratch back, and the two may not alias.
     routed: Vec<u32>,
+    /// Where the last [`crate::model::prefill_prompt`] call's wall time went.
+    ///
+    /// Rearmed and zeroed by every prefill, so it describes one prompt rather
+    /// than the process — the opposite of the streaming counters beside it.
+    /// `forward_token` charges into it too, but only while a prefill has armed
+    /// it, which is what keeps decode out of a prefill's numbers.
+    prefill_timing: PrefillTiming,
+    /// Whether [`forward_token`] should charge phases into `prefill_timing`.
+    ///
+    /// True only while [`crate::model::prefill_prompt`] is running the
+    /// token-major path. It is not a user-facing dial — instrumentation is
+    /// always on for prefill — but decode and the token-major prefill run the
+    /// *same* instrumented function, and folding a generated token's phases
+    /// into a prompt's split would make every number in it a lie the moment
+    /// generation started.
+    prefill_charging: bool,
 }
 
 impl fmt::Debug for ForwardState {
@@ -619,6 +636,8 @@ impl ForwardState {
             prefill: PrefillConfig::from_env(),
             sweep_plan: SweepPlan::new(),
             routed: Vec::with_capacity(n_experts),
+            prefill_timing: PrefillTiming::default(),
+            prefill_charging: false,
         })
     }
 
@@ -672,8 +691,15 @@ impl ForwardState {
     /// cursor this resets, so stale bits are unreachable. The expert cache,
     /// its LFU history and the streaming counters all survive on purpose —
     /// they describe the process, not the sequence.
+    ///
+    /// [`ForwardState::prefill_timing`] does **not** survive, for the same
+    /// reason inverted: it describes one prefill of one sequence, and a
+    /// per-phase split left over from the sequence that was just dropped would
+    /// be read as belonging to the one that replaced it.
     pub fn reset(&mut self) {
         self.kv.clear();
+        self.prefill_timing = PrefillTiming::default();
+        self.prefill_charging = false;
     }
 
     /// Borrow the pieces the chunked prefill driver needs, all at once.
@@ -691,7 +717,24 @@ impl ForwardState {
             stream: &mut self.stream,
             sweep_plan: &mut self.sweep_plan,
             routed: &mut self.routed,
+            timing: &mut self.prefill_timing,
         }
+    }
+
+    /// Drop the previous prefill's numbers and start charging this one.
+    ///
+    /// Paired with [`ForwardState::close_prefill_timing`], which must run
+    /// however the prefill ended: a state left charging would fold the next
+    /// decode token's phases into a prompt that is already over.
+    pub(super) fn arm_prefill_timing(&mut self, mode: PrefillMode, tokens: usize) {
+        self.prefill_timing = PrefillTiming::started(mode, tokens);
+        self.prefill_charging = true;
+    }
+
+    /// Record the whole `prefill_prompt` call's wall time and stop charging.
+    pub(super) fn close_prefill_timing(&mut self, total: Duration) {
+        self.prefill_timing.total = total;
+        self.prefill_charging = false;
     }
 
     /// Refuse a model this state's buffers were not sized for.
@@ -730,6 +773,8 @@ pub(super) struct PrefillParts<'a> {
     pub(super) stream: &'a mut ExpertStream,
     pub(super) sweep_plan: &'a mut SweepPlan,
     pub(super) routed: &'a mut Vec<u32>,
+    /// The per-phase timing the chunk driver charges into.
+    pub(super) timing: &'a mut PrefillTiming,
 }
 
 impl ForwardState {
@@ -803,6 +848,23 @@ impl ForwardState {
     /// was in `phase`.
     pub fn stream_stats_in(&self, phase: StreamPhase) -> StreamStats {
         self.stream.stats_in(phase)
+    }
+
+    /// Where the **last** [`crate::model::prefill_prompt`] call's wall time
+    /// went, split by phase.
+    ///
+    /// Unlike [`ForwardState::stream_stats`] this is not cumulative: every
+    /// prefill zeroes it, and so does [`ForwardState::reset`]. In a multi-turn
+    /// session it therefore describes the most recent turn's prompt.
+    /// [`PrefillTiming::ran`] says whether it describes anything at all.
+    ///
+    /// Both prefill paths report through it, so
+    /// [`PrefillMode::Sweep`](super::PrefillMode::Sweep) and
+    /// [`PrefillMode::TokenMajor`](super::PrefillMode::TokenMajor) can be
+    /// compared phase by phase; [`PrefillTiming::mode`] says which one these
+    /// numbers came from.
+    pub fn prefill_timing(&self) -> PrefillTiming {
+        self.prefill_timing
     }
 
     /// Attribute every expert request from the next [`forward_token`] on to
@@ -1033,8 +1095,9 @@ fn stream_experts(
     layer: u32,
     dims: MoeDims,
     scratch: &mut MoeScratch<'_>,
+    clock: &mut PhaseClock<'_>,
 ) -> Result<(), ForwardError> {
-    let outcome = stage_expert_phases(stream, pool, layer, dims, scratch);
+    let outcome = stage_expert_phases(stream, pool, layer, dims, scratch, clock);
     if outcome.is_err()
         && let Err(drain) = stream.await_misses()
     {
@@ -1057,17 +1120,27 @@ fn stream_experts(
 ///
 /// Every exit from here is an error the caller must drain behind; see
 /// [`stream_experts`].
+///
+/// The three phase boundaries are what let a token-major prefill report the
+/// same split a swept one does: the two `run_plan` calls are expert
+/// arithmetic, and the block between them is expert I/O. `await_misses`'s
+/// blocked time is separately (and independently) counted by the streamer as
+/// [`StreamStats::io_wait`], so nothing here re-times the drive.
 fn stage_expert_phases(
     stream: &mut ExpertStream,
     pool: &mut ComputePool,
     layer: u32,
     dims: MoeDims,
     scratch: &mut MoeScratch<'_>,
+    clock: &mut PhaseClock<'_>,
 ) -> Result<(), ForwardError> {
     scratch.done.fill(false);
     run_plan(stream, pool, layer, dims, stream.hits(), scratch)?;
+    clock.charge(Phase::ExpertCompute);
     stream.await_misses()?;
+    clock.charge(Phase::ExpertIo);
     run_plan(stream, pool, layer, dims, stream.misses(), scratch)?;
+    clock.charge(Phase::ExpertCompute);
     let covered = scratch.done.iter().filter(|filled| **filled).count();
     if covered != dims.top_k {
         return Err(ForwardError::StreamPlanCoverage {
@@ -1177,7 +1250,15 @@ pub fn forward_token_traced<'s>(
         prefill: _,
         sweep_plan: _,
         routed: _,
+        prefill_timing,
+        prefill_charging,
     } = state;
+
+    // Charges nothing unless `prefill_prompt` armed the timing, which it does
+    // only for `PrefillMode::TokenMajor`. A decode step therefore pays exactly
+    // one `Instant::now()` for the whole token and a predicted-not-taken
+    // branch per boundary; see `PhaseClock`.
+    let mut clock = PhaseClock::new(prefill_timing, *prefill_charging);
 
     let expected = kv.seq_len()?;
     if position != expected {
@@ -1199,6 +1280,7 @@ pub fn forward_token_traced<'s>(
         // projections, Q8_0 for the q8_0 attn_k projection.
         quantize_row_q8_k(normed, acts_q8k_hidden)?;
         quantize_row_q8_0(normed, acts_q8_0_hidden)?;
+        clock.charge(Phase::Elementwise);
 
         pool_gemv_q8_k(
             pool,
@@ -1219,6 +1301,7 @@ pub fn forward_token_traced<'s>(
             acts_q8k_hidden,
             v,
         )?;
+        clock.charge(Phase::Projections);
 
         // Per-head QK-RMSNorm, then RoPE — HF order: q_norm/k_norm apply
         // after the projection reshape and before rotary embedding
@@ -1234,10 +1317,13 @@ pub fn forward_token_traced<'s>(
         rope_neox_heads(k, n_kv_heads, head_dim, rope_pos, theta)?;
 
         kv.append(layer_idx, k, v)?;
+        clock.charge(Phase::Elementwise);
         decode_attention(q, kv, layer_idx, scale, attn_scratch, attn_out)?;
+        clock.charge(Phase::Attention);
 
         // Output projection (q5_k, Q8_K activations) and residual add.
         quantize_row_q8_k(attn_out, acts_q8k_attn)?;
+        clock.charge(Phase::Elementwise);
         pool_gemv_q8_k(
             pool,
             lw.attn_output.format,
@@ -1247,10 +1333,12 @@ pub fn forward_token_traced<'s>(
             acts_q8k_attn,
             o_proj,
         )?;
+        clock.charge(Phase::Projections);
         vec_add(residual, o_proj)?;
 
         // MoE block: residual = hidden; x = ffn_norm(hidden).
         rmsnorm(residual, lw.ffn_norm, eps, normed)?;
+        clock.charge(Phase::Elementwise);
 
         // Router: f32 matvec (rows validated `[n_experts, hidden]` at
         // load), softmax over all experts in f32, top-k by probability
@@ -1285,6 +1373,9 @@ pub fn forward_token_traced<'s>(
                 *w /= sum;
             }
         }
+        // Charged to `Projections`: the f32 router matvec dominates the
+        // softmax, the top-k scan and the sink it shares this region with.
+        clock.charge(Phase::Projections);
         if let Some(sink) = on_route.as_deref_mut() {
             sink(layer, topk);
         }
@@ -1295,8 +1386,10 @@ pub fn forward_token_traced<'s>(
         quantize_row_q8_k(normed, acts_q8k_hidden)?;
         expert_ids.clear();
         expert_ids.extend(topk.iter().map(|&(expert, _)| expert));
+        clock.charge(Phase::Elementwise);
 
         stream.begin_layer(layer, expert_ids)?;
+        clock.charge(Phase::ExpertIo);
         let mut scratch = MoeScratch {
             ffn: FfnScratch {
                 acts_hidden: acts_q8k_hidden,
@@ -1307,8 +1400,9 @@ pub fn forward_token_traced<'s>(
             staged: expert_staged,
             done: expert_done,
         };
-        let phases = stream_experts(stream, pool, layer, dims, &mut scratch);
+        let phases = stream_experts(stream, pool, layer, dims, &mut scratch, &mut clock);
         stream.end_layer(layer);
+        clock.charge(Phase::ExpertIo);
         phases?;
 
         // Fixed-order reduction: identical to the phase-4 sequential
@@ -1321,6 +1415,7 @@ pub fn forward_token_traced<'s>(
             }
         }
         vec_add(residual, expert_acc)?;
+        clock.charge(Phase::Elementwise);
     }
 
     if !want_logits {
@@ -1328,6 +1423,7 @@ pub fn forward_token_traced<'s>(
     }
     rmsnorm(residual, model.final_norm(), eps, normed)?;
     quantize_row_q8_k(normed, acts_q8k_hidden)?;
+    clock.charge(Phase::Elementwise);
     let head = model.lm_head();
     pool_gemv_q8_k(
         pool,
@@ -1338,6 +1434,7 @@ pub fn forward_token_traced<'s>(
         acts_q8k_hidden,
         logits,
     )?;
+    clock.charge(Phase::Projections);
     Ok(Some(logits))
 }
 
@@ -1693,7 +1790,16 @@ mod tests {
             assert_eq!(stream.misses().len(), 1, "expert 1 is cold");
             assert_eq!(stream.hits()[0].0, 1, "the hit is the second routed id");
 
-            let err = stream_experts(stream, pool, 0, dims, scratch).unwrap_err();
+            let mut timing = PrefillTiming::default();
+            let err = stream_experts(
+                stream,
+                pool,
+                0,
+                dims,
+                scratch,
+                &mut PhaseClock::new(&mut timing, false),
+            )
+            .unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -1799,7 +1905,16 @@ mod tests {
                 1,
                 "a repeated id resolves once"
             );
-            let err = stream_experts(stream, pool, 0, dims, scratch).unwrap_err();
+            let mut timing = PrefillTiming::default();
+            let err = stream_experts(
+                stream,
+                pool,
+                0,
+                dims,
+                scratch,
+                &mut PhaseClock::new(&mut timing, false),
+            )
+            .unwrap_err();
             assert!(
                 matches!(
                     err,

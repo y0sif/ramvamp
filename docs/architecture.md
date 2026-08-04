@@ -498,7 +498,14 @@ layer" no matter how it is scheduled. So:
   2.04-2.15 GB/s, which is roughly **60 tok/s of I/O-only prefill**
   (estimate derived from provisional bandwidth). Earlier revisions quoted
   that 60 tok/s as *the* prefill figure; it is not one, because it says
-  nothing about compute. The only measured anchor for the other half is
+  nothing about compute. **Measured, the I/O half is not the binding one at
+  all**: expert I/O is 1.7% of a 512-token sweep prefill and 0.5% of a
+  1891-token one, of which 1.76 s and 5.06 s were blocked on the drive
+  (EXP-017). Those runs were warm and uncgrouped, so the shares are what to
+  read and the seconds are not publishable, but no plausible correction to
+  them makes a 1.7% term the constraint. The binding constraint on prefill is
+  attention, which is the bullet after this one. The earlier measured anchor
+  for the compute half was
   EXP-013, where decode wall was 34.20 s with 16.63 s of I/O wait: 17.57 s
   of non-I/O time over 63 decode steps, so roughly **279 ms/token** (63, not
   the 64 that entry's prose names: the step count is recovered from its own
@@ -513,26 +520,45 @@ layer" no matter how it is scheduled. So:
   weight fetched). That transition is a mechanism, not a measurement: no
   roofline, bandwidth or arithmetic-intensity figure for the expert FFN is
   recorded in this document or the experiment log, so "RAM-bandwidth-bound"
-  is where the bound is expected to sit and not where it was observed. The
-  reuse ratio of ~32 is exact chunk geometry either way, and it is per
-  *weight*, not per byte: at Q4_K/Q6_K a byte holds roughly 1.33 to 2 of
-  them. **No new tok/s prediction is published here.** The measurement is
-  still owed: the driver landed without one (EXP-016), so it belongs to that
-  entry's successor. The earlier "~4.9 s, roughly 100 tok/s" figure assumed
-  the withdrawn 3.6 GB/s number and is superseded. TF's design (random tile
-  fetches through the decode cache) achieved ~28 tok/s, so the sequential
-  sweep is still the right call.
-- **A third term the ceiling above leaves out: attention.** The shipped
-  driver batches the projections and the expert FFN across a chunk's rows,
-  but it runs `attention_at` row by row on the calling thread through one
-  shared score buffer, so attention is neither batched nor parallel. That
-  work is quadratic in prompt length, and at a 4K prompt it is a term sitting
-  outside the compute pool entirely. Parallelizing over rows is bit-neutral,
-  since rows are independent, but it needs one score buffer per shard and the
-  arena carve does not have one (EXP-016). Nothing has been measured either
-  way. It is recorded here so that a first prefill number landing below what
-  the I/O arithmetic alone suggests has a candidate explanation to test
-  rather than being a surprise.
+  is where the bound is expected to sit and not where it was observed. What
+  *has* been observed is the wall-clock consequence: expert compute fell
+  **3.27x** against the token-major path on the same 512-token prompt in the
+  same session (EXP-017, 77.81 s to 23.78 s), so the batched GEMV delivered,
+  and the competing hypothesis that it was thrashing on its activation side
+  is refuted. That is a time, not an arithmetic intensity, so the roofline
+  framing above stays a mechanism. The reuse ratio of ~32 is exact chunk
+  geometry either way, and it is per *weight*, not per byte: at Q4_K/Q6_K a
+  byte holds roughly 1.33 to 2 of them. **No new tok/s prediction is
+  published here.** The measurement is still owed: the driver landed without
+  one (EXP-016), and EXP-017 measured the phase split rather than a rule-2
+  throughput number, so the cold cgroup prefill figure is still outstanding.
+  The earlier "~4.9 s, roughly 100 tok/s" figure assumed the withdrawn 3.6
+  GB/s number and is superseded. TF's design (random tile fetches through the
+  decode cache) achieved ~28 tok/s, so the sequential sweep is still the
+  right call.
+- **The third term the ceiling above leaves out is attention, and it is now
+  measured to be the largest one (EXP-017).** The shipped driver batches the
+  projections and the expert FFN across a chunk's rows, but it runs
+  `attention_at` row by row on the calling thread through one shared score
+  buffer, so attention is neither batched nor parallel, it gets nothing from
+  the six pinned P-cores, and it converts K and V from f16 to f32 per element
+  with no vectorization. Measured on the swept path, attention is **61.3% of
+  a 512-token prefill and 85.2% of a 1891-token one**, against expert I/O at
+  1.7% and 0.5% over the same runs. Per-token attention cost is 148.9 ms at
+  512 tokens and 555.7 ms at 1891, a ratio of 3.73 against a prompt-length
+  ratio of 3.69, which is what a quadratic total looks like measured per
+  token; the implied rate is roughly 0.68 GFLOP/s against a rough 51.6 GFLOP
+  *estimate* for the 512-token case. **Those runs were warm, uncgrouped and
+  on a machine that was not quiet, so under rule 2 none of their seconds is
+  publishable**; the shape of the split and the ratios inside a single run
+  are what this finding rests on, and the cold cgroup measurement is still
+  owed (backlog, below). Parallelizing over rows is bit-neutral, since rows
+  are independent, but it needs one score buffer per shard and the arena
+  carve does not have one (EXP-016); vectorizing the f16 conversion and the
+  dot is a second and independent lever. **No speedup figure is predicted
+  here.** The headroom looks large and the measurement is owed, which is the
+  same rule that made this term worth measuring before building anything
+  against it.
 - Decode cache starts cold after prefill; acceptable, first tokens warm it.
   Replaying the prompt into the cache during prefill is closed as a "no",
   see "Recorded decisions from phase-5 measurement".
@@ -865,11 +891,25 @@ are neither now, and they should not come back without new evidence.
   whether the shorter chunks' lower coverage pays for their smaller
   activation working set. The dial ships as `--prefill-chunk` /
   `RAMVAMP_PREFILL_CHUNK`, so this is now a run rather than a build
-  (EXP-015, EXP-016)
+  (EXP-015, EXP-016). One warm, uncgrouped run has since put 128, 256 and 512
+  at 161 s, 143 s and 131 s on a 512-token prompt, all three byte-identical
+  to token-major (EXP-017). That is a direction, not the sweep: it fails
+  rule 2, it does not cover 1024, and it says nothing about the memory peak
+- **Parallelize and vectorize prefill attention.** It is 61.3% of a 512-token
+  prefill and 85.2% of a 1891-token one (EXP-017), single-threaded on the
+  calling thread through one shared score buffer, with an unvectorized
+  per-element f16-to-f32 conversion. Parallelizing over rows is bit-neutral
+  and needs one score buffer per shard, which the arena carve does not have;
+  vectorizing the conversion and the dot is a second lever and is subject to
+  rule 4. No speedup is predicted, and the levers should be measured
+  separately
 - Prefill throughput and peak memory for the shipped sweep, cold inside the
   3G cgroup, against the token-major path on the same prompt. The driver
-  landed with correctness gates only (EXP-016), so this is the entry that
-  owes the number the whole phase exists for
+  landed with correctness gates only (EXP-016), and EXP-017 measured the
+  phase split on warm uncgrouped runs rather than paying this, so it is still
+  the number the whole phase exists for. Best taken *after* the attention
+  work above, since a figure taken today describes a term that is about to
+  move
 - Re-measure the O_DIRECT bandwidth probe under rule 2 (cold, inside the
   benchmark cgroup, quiet machine) and re-derive the performance model. This
   is the highest-value item on the list: the 1.59 GB/s constant the model

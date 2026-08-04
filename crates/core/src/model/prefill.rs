@@ -86,6 +86,7 @@
 use std::mem::{align_of, size_of};
 use std::ops::Range;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::format::{ArchInfo, ExpertsLayout};
 use crate::io::{PrefillSession, SweepConfig, SweepExpert, SweepPlan};
@@ -225,6 +226,210 @@ impl PrefillConfig {
         }
         self.sweep_config().validate()?;
         Ok(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Where the wall time went
+// ---------------------------------------------------------------------------
+
+/// One phase of a prefill pass, as charged by [`PhaseClock`].
+///
+/// Deliberately coarse. The point is to tell the two candidate causes of a
+/// compute-bound prefill apart — serial per-row attention against activation
+/// thrash in the batched expert GEMV — not to attribute every instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Phase {
+    /// The causal attention over the KV cache: `attention_at` per row on the
+    /// sweep, `decode_attention` per token on the token-major path.
+    Attention,
+    /// GEMVs against resident weights: Q/K/V, `o_proj`, the router matvec
+    /// (with its softmax and top-k selection, which it dominates) and
+    /// `lm_head`.
+    Projections,
+    /// Expert arithmetic: gate/up, SwiGLU, the intermediate quantization and
+    /// down, for every routed expert. Excludes waiting for its bytes.
+    ExpertCompute,
+    /// Getting expert bytes in front of that arithmetic.
+    ExpertIo,
+    /// Everything per-row and cheap per element: RMSNorms, RoPE, activation
+    /// quantization, transposes, KV appends, residual adds, the routing
+    /// bookkeeping and the top-k reduction.
+    Elementwise,
+}
+
+/// Where one [`prefill_prompt`] call's wall time went.
+///
+/// EXP-016 left prefill compute-bound: at a 512-token chunk expert reads fell
+/// from 82,233 to 768 windows while wall time only fell 2.45x. Two causes were
+/// proposed, attention (quadratic in prompt length, serial per row) and the
+/// batched expert GEMV (whose activation side streams ~75 KB past every weight
+/// row), and the counters that existed could not tell them apart.
+///
+/// EXP-017 answered it with these timers, and refuted the GEMV half: at 512
+/// tokens attention is 61.3% of prefill and expert compute is 19.1%, the
+/// batched GEMV having cut expert compute 3.27x against token-major. Expert
+/// I/O is down to 1.7%, so non-I/O work is 98.3% of a swept prefill, not the
+/// ~93% the 2.45x ratio implied. At 1891 tokens attention reaches 85.2%.
+///
+/// # What sums to what
+///
+/// [`PrefillTiming::total`] is the wall time of the whole `prefill_prompt`
+/// call. The five phase fields are **disjoint** spans inside it, charged by
+/// [`PhaseClock`] at region boundaries rather than opened and closed
+/// independently, so [`accounted`](PrefillTiming::accounted) cannot exceed
+/// `total` and [`other`](PrefillTiming::other) closes the sum exactly.
+///
+/// `other` is not noise. It is the arena plan, `begin_prefill`/`session
+/// finish`, the per-block scratch carves, and the chunk loop's own
+/// scaffolding — real work that is simply none of the five, made visible
+/// instead of being folded into whichever phase happened to be open.
+///
+/// # I/O wait is not measured twice
+///
+/// [`PrefillTiming::expert_io`] spans the calls that put expert bytes in front
+/// of the arithmetic: `split`, `next_expert` and `finish` on the sweep,
+/// `begin_layer`, `await_misses` and `end_layer` on the token-major path. The
+/// *blocked on the drive* subset of that is already counted by the streamer,
+/// as [`StreamStats::sweep_io_wait`](crate::io::StreamStats::sweep_io_wait)
+/// and [`StreamStats::io_wait`](crate::io::StreamStats::io_wait) respectively,
+/// and nothing here re-times it. `expert_io - sweep_io_wait` is the sweep's
+/// own window bookkeeping; reading the two side by side is the point, which is
+/// why the CLI prints them together.
+///
+/// # Lifetime
+///
+/// Zeroed at the start of every `prefill_prompt` and by
+/// [`ForwardState::reset`]. This describes **one** prefill, unlike the
+/// streaming counters, which describe the process and survive a reset on
+/// purpose; a cumulative timing across a chat session's turns would answer no
+/// question anyone has. Decode contributes nothing: `forward_token` shares its
+/// instrumentation with the token-major path and charges only while a prefill
+/// has armed the struct.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefillTiming {
+    /// Which path produced these numbers. `None` until a prefill has run,
+    /// which is what [`PrefillTiming::ran`] asks.
+    pub mode: Option<PrefillMode>,
+    /// Prompt positions the run consumed.
+    pub tokens: u64,
+    /// Wall time of the whole `prefill_prompt` call, phases and everything
+    /// between them.
+    pub total: Duration,
+    /// [`Phase::Attention`].
+    pub attention: Duration,
+    /// [`Phase::Projections`].
+    pub projections: Duration,
+    /// [`Phase::ExpertCompute`].
+    pub expert_compute: Duration,
+    /// [`Phase::ExpertIo`].
+    pub expert_io: Duration,
+    /// [`Phase::Elementwise`].
+    pub elementwise: Duration,
+}
+
+impl PrefillTiming {
+    /// The five phases together.
+    #[must_use]
+    pub fn accounted(&self) -> Duration {
+        self.attention + self.projections + self.expert_compute + self.expert_io + self.elementwise
+    }
+
+    /// The share of [`PrefillTiming::total`] no phase claimed.
+    ///
+    /// Saturating rather than checked because the phases are disjoint spans of
+    /// the total by construction: this is zero-or-positive unless the
+    /// instrumentation itself is wrong, which is exactly what the unit tests
+    /// assert.
+    #[must_use]
+    pub fn other(&self) -> Duration {
+        self.total.saturating_sub(self.accounted())
+    }
+
+    /// Whether a prefill has run and left numbers here.
+    #[must_use]
+    pub fn ran(&self) -> bool {
+        self.mode.is_some()
+    }
+
+    /// Every phase, in report order, with the unaccounted remainder last.
+    ///
+    /// Returned as an array rather than printed here because
+    /// `ramvamp-core` does not print.
+    #[must_use]
+    pub fn phases(&self) -> [(&'static str, Duration); 6] {
+        [
+            ("attention", self.attention),
+            ("expert compute", self.expert_compute),
+            ("expert io", self.expert_io),
+            ("projections", self.projections),
+            ("elementwise", self.elementwise),
+            ("other", self.other()),
+        ]
+    }
+
+    /// A zeroed timing labelled with the run that is about to fill it.
+    pub(super) fn started(mode: PrefillMode, tokens: usize) -> Self {
+        Self {
+            mode: Some(mode),
+            tokens: tokens as u64,
+            ..Self::default()
+        }
+    }
+}
+
+/// A stopwatch over a [`PrefillTiming`]: each [`charge`](PhaseClock::charge)
+/// closes the region that began at the previous boundary and opens the next
+/// one.
+///
+/// **One clock read per boundary, not two.** The alternative — an
+/// `Instant::now()` pair around every region — doubles the syscall-free
+/// `clock_gettime` count and leaves gaps between regions that silently vanish
+/// instead of landing in [`PrefillTiming::other`].
+///
+/// The boundaries are placed around *loops*, not around iterations, wherever a
+/// site is entered per row: the per-row attention loop is charged once per
+/// layer, not 512 times. The two sites charged per iteration are the ones
+/// whose iteration count is per expert rather than per row (~128 per layer),
+/// where the resolution is worth ~25 ns.
+pub(super) struct PhaseClock<'a> {
+    /// `None` when this pass charges nowhere, which is every `forward_token`
+    /// a decode step makes: the token-major prefill and decode run the same
+    /// instrumented code, and a decoded token's phases belong to no prefill.
+    timing: Option<&'a mut PrefillTiming>,
+    since: Instant,
+}
+
+impl<'a> PhaseClock<'a> {
+    /// Open the first region, charging into `timing` only when `armed`.
+    pub(super) fn new(timing: &'a mut PrefillTiming, armed: bool) -> Self {
+        Self {
+            timing: armed.then_some(timing),
+            since: Instant::now(),
+        }
+    }
+
+    /// Charge everything since the last boundary to `phase`, and open the
+    /// next region here.
+    ///
+    /// A no-op, down to the clock read, on an unarmed clock.
+    #[inline]
+    pub(super) fn charge(&mut self, phase: Phase) {
+        let Some(timing) = self.timing.as_deref_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        let slot = match phase {
+            Phase::Attention => &mut timing.attention,
+            Phase::Projections => &mut timing.projections,
+            Phase::ExpertCompute => &mut timing.expert_compute,
+            Phase::ExpertIo => &mut timing.expert_io,
+            Phase::Elementwise => &mut timing.elementwise,
+        };
+        // Saturating: `Instant` is monotonic, but a negative delta must not be
+        // a panic in library code whatever the platform's clock does.
+        *slot += now.saturating_duration_since(self.since);
+        self.since = now;
     }
 }
 
@@ -976,10 +1181,18 @@ pub fn prefill_prompt<'s>(
     if tokens.is_empty() {
         return Err(ForwardError::EmptyPrefill);
     }
-    match state.prefill_config().validate()?.mode {
-        PrefillMode::TokenMajor => prefill_token_major(model, state, tokens, on_route)?,
-        PrefillMode::Sweep => prefill_sweep(model, state, tokens, on_route)?,
-    }
+    let mode = state.prefill_config().validate()?.mode;
+    // Armed before the run and closed after it whatever the run did, so a
+    // prefill that failed mid-chunk still leaves a `total` the phases can be
+    // read against instead of a struct that claims a run is still in flight.
+    state.arm_prefill_timing(mode, tokens.len());
+    let started = Instant::now();
+    let outcome = match mode {
+        PrefillMode::TokenMajor => prefill_token_major(model, state, tokens, on_route),
+        PrefillMode::Sweep => prefill_sweep(model, state, tokens, on_route),
+    };
+    state.close_prefill_timing(started.elapsed());
+    outcome?;
     Ok(state.logits())
 }
 
@@ -1056,6 +1269,7 @@ fn prefill_sweep(
     );
 
     let parts = state.prefill_parts();
+    let timing = parts.timing;
     let mut chunk_state = ChunkState {
         kv: parts.kv,
         attn_scratch: parts.attn_scratch,
@@ -1066,6 +1280,15 @@ fn prefill_sweep(
         logits: parts.logits,
     };
     let mut session = parts.stream.begin_prefill(bytes, sweep_config)?;
+
+    // Started here, after the arena exists: the plan and `begin_prefill` are
+    // per-pass setup that belongs to no phase, and leaving them outside every
+    // region puts them in `other` rather than on the first `Elementwise`
+    // boundary that happens to close. The clock is a parameter of `run_chunk`
+    // rather than a `ChunkState` field so that it and the chunk driver's
+    // field-by-field reborrows stay independent. Always armed: this function
+    // is only reachable from `prefill_prompt`, which armed it.
+    let mut clock = PhaseClock::new(timing, true);
 
     let mut position = start;
     let mut rest = tokens;
@@ -1083,6 +1306,7 @@ fn prefill_sweep(
             position,
             tail.is_empty(),
             &mut on_route,
+            &mut clock,
         )?;
         position += n;
         rest = tail;
@@ -1107,6 +1331,7 @@ fn run_chunk(
     start: usize,
     want_logits: bool,
     on_route: &mut Option<PrefillRouteSink<'_>>,
+    clock: &mut PhaseClock<'_>,
 ) -> Result<(), ForwardError> {
     let n = tokens.len();
     let eps = arch.rms_eps as f32;
@@ -1147,6 +1372,7 @@ fn run_chunk(
 
             // (c) Q, K and V for the whole chunk, then transposed back to
             // row-major so every per-row step below reads a contiguous row.
+            clock.charge(Phase::Elementwise);
             pool_batched_q8_k(
                 state.pool,
                 lw.attn_q.format,
@@ -1157,7 +1383,9 @@ fn run_chunk(
                 n,
                 &mut s.tmat[..q_dim * n],
             )?;
+            clock.charge(Phase::Projections);
             transpose(&s.tmat[..q_dim * n], q_dim, n, &mut s.q[..n * q_dim])?;
+            clock.charge(Phase::Elementwise);
             pool_batched_q8_0(
                 state.pool,
                 lw.attn_k.bytes,
@@ -1167,7 +1395,9 @@ fn run_chunk(
                 n,
                 &mut s.tmat[..kv_dim * n],
             )?;
+            clock.charge(Phase::Projections);
             transpose(&s.tmat[..kv_dim * n], kv_dim, n, &mut s.k[..n * kv_dim])?;
+            clock.charge(Phase::Elementwise);
             pool_batched_q8_k(
                 state.pool,
                 lw.attn_v.format,
@@ -1178,6 +1408,7 @@ fn run_chunk(
                 n,
                 &mut s.tmat[..kv_dim * n],
             )?;
+            clock.charge(Phase::Projections);
             transpose(&s.tmat[..kv_dim * n], kv_dim, n, &mut s.v[..n * kv_dim])?;
 
             // (d) Per-head QK-RMSNorm then RoPE, at this row's absolute
@@ -1211,6 +1442,11 @@ fn run_chunk(
 
             // (f) Causal attention: row r sees positions 0..=start + r and
             // nothing of the rows queued behind it.
+            //
+            // Charged once around the whole loop, not per row: at a 512-row
+            // chunk this is 512 calls per layer, and the boundary is worth
+            // ~25 ns each while the loop is the phase under investigation.
+            clock.charge(Phase::Elementwise);
             for r in 0..n {
                 attention_at(
                     &s.q[r * q_dim..(r + 1) * q_dim],
@@ -1223,6 +1459,8 @@ fn run_chunk(
                 )?;
             }
 
+            clock.charge(Phase::Attention);
+
             // (g) Output projection and the attention residual add.
             for r in 0..n {
                 quantize_row_q8_k(
@@ -1230,6 +1468,7 @@ fn run_chunk(
                     &mut s.acts_attn[r * dims.attn_q8k..(r + 1) * dims.attn_q8k],
                 )?;
             }
+            clock.charge(Phase::Elementwise);
             pool_batched_q8_k(
                 state.pool,
                 lw.attn_output.format,
@@ -1240,6 +1479,7 @@ fn run_chunk(
                 n,
                 &mut s.tmat[..hidden * n],
             )?;
+            clock.charge(Phase::Projections);
             for r in 0..n {
                 let residual = &mut s.residual[r * hidden..(r + 1) * hidden];
                 for (h, value) in residual.iter_mut().enumerate() {
@@ -1261,6 +1501,11 @@ fn run_chunk(
             }
 
             // (i) Routing, per row, exactly as `forward_token` routes.
+            //
+            // Charged to `Projections`: the f32 router matvec is
+            // `n_experts * hidden` scalar MACs per row, which dwarfs the
+            // softmax and the top-k scan it shares this loop with.
+            clock.charge(Phase::Elementwise);
             for r in 0..n {
                 let normed = &s.normed[r * hidden..(r + 1) * hidden];
                 let logits = &mut s.router_logits[r * dims.n_experts..(r + 1) * dims.n_experts];
@@ -1301,6 +1546,8 @@ fn run_chunk(
                 }
             }
 
+            clock.charge(Phase::Projections);
+
             // (j) The inverse index, and the routed set the sweep plans on.
             build_index(&mut s, dims, n)?;
             state.routed.clear();
@@ -1309,17 +1556,28 @@ fn run_chunk(
                     state.routed.push(expert as u32);
                 }
             }
+            clock.charge(Phase::Elementwise);
         }
 
         // 2k. Sweep the layer, computing each expert against all its rows.
+        //
+        // The two boundaries here *are* per iteration, unlike the per-row
+        // loops above: this loop turns once per routed expert (~128 a layer,
+        // not ~512 a chunk), and splitting the window wait from the arithmetic
+        // is the whole question this instrumentation exists to answer.
         let covered = {
             let (bytes, mut sweep) = session.split(state.plan, layer, state.routed)?;
             let (mut s, _) = carve(bytes, dims, rows)?;
             let mut covered = 0usize;
-            while let Some(expert) = sweep.next_expert()? {
+            loop {
+                let next = sweep.next_expert()?;
+                clock.charge(Phase::ExpertIo);
+                let Some(expert) = next else { break };
                 covered += run_expert(state.pool, dims, &mut s, n, &expert)?;
+                clock.charge(Phase::ExpertCompute);
             }
             sweep.finish()?;
+            clock.charge(Phase::ExpertIo);
             covered
         };
         if covered != n * top_k {
@@ -1335,6 +1593,7 @@ fn run_chunk(
             let (mut s, _) = carve(session.scratch(), dims, rows)?;
             reduce_experts(&mut s, dims, n)?;
         }
+        clock.charge(Phase::Elementwise);
     }
 
     // 3. The tail, for the last row only: a `[rows][vocab]` logit buffer would
@@ -1347,6 +1606,7 @@ fn run_chunk(
         rmsnorm(residual, model.final_norm(), eps, normed)?;
         let acts = &mut s.acts_hidden[last * dims.hidden_q8k..(last + 1) * dims.hidden_q8k];
         quantize_row_q8_k(normed, acts)?;
+        clock.charge(Phase::Elementwise);
         let head = model.lm_head();
         pool_gemv_q8_k(
             state.pool,
@@ -1357,6 +1617,7 @@ fn run_chunk(
             acts,
             state.logits,
         )?;
+        clock.charge(Phase::Projections);
     }
     Ok(())
 }
@@ -3169,5 +3430,172 @@ mod tests {
         );
         assert!(base.validate().is_ok());
         assert!(PrefillConfig { chunk: 0, ..base }.validate().is_err());
+    }
+
+    // ---- the phase split ------------------------------------------------
+    //
+    // Nothing here asserts a *duration*. This machine runs the model under a
+    // cgroup while these tests run, so any "attention took at least X" would
+    // flake; what is asserted is the arithmetic — that the phases are disjoint
+    // spans of the total, that a run starts from zero, and that a reset drops
+    // them. A double-charged phase pushes `accounted` past `total` and every
+    // one of these catches it.
+
+    /// [`PrefillTiming::other`] closes the sum by construction, and
+    /// [`PrefillTiming::accounted`] is exactly the five phases. Pure
+    /// arithmetic: no model, no clock, nothing to flake.
+    #[test]
+    fn the_unaccounted_remainder_closes_the_sum() {
+        let ms = Duration::from_millis;
+        let timing = PrefillTiming {
+            mode: Some(PrefillMode::Sweep),
+            tokens: 512,
+            total: ms(1000),
+            attention: ms(400),
+            projections: ms(30),
+            expert_compute: ms(450),
+            expert_io: ms(90),
+            elementwise: ms(20),
+        };
+        assert_eq!(timing.accounted(), ms(990));
+        assert_eq!(timing.other(), ms(10));
+        assert_eq!(
+            timing.accounted() + timing.other(),
+            timing.total,
+            "the phases and the remainder must be the whole run"
+        );
+        assert!(timing.ran());
+
+        // A total shorter than its phases would be an instrumentation bug, not
+        // a panic: `other` saturates.
+        let broken = PrefillTiming {
+            total: ms(1),
+            ..timing
+        };
+        assert_eq!(broken.other(), Duration::ZERO);
+
+        // The default has run nothing and claims nothing.
+        let fresh = PrefillTiming::default();
+        assert!(!fresh.ran());
+        assert_eq!(fresh.accounted(), Duration::ZERO);
+        assert_eq!(fresh.other(), Duration::ZERO);
+        assert_eq!(fresh.phases().len(), 6);
+    }
+
+    /// Both paths report, and both report phases that fit inside their own
+    /// total. This is what makes the sweep and the token-major loop
+    /// comparable phase by phase, which is the whole point of instrumenting
+    /// the A/B path too.
+    #[test]
+    fn both_prefill_paths_report_phases_inside_their_total() {
+        let (_fx, model) = load_fixture("prefill-timing-split");
+        let ids = [1u32, 2, 3, 4, 5, 6];
+
+        for (want_mode, config) in [
+            (PrefillMode::Sweep, sweep_config(4)),
+            (PrefillMode::TokenMajor, token_major_config()),
+        ] {
+            let mut st = state_with(&model, 32, config);
+            assert!(
+                !st.prefill_timing().ran(),
+                "{want_mode:?}: a fresh state has no prefill to report"
+            );
+            prefill_prompt(&model, &mut st, &ids, None).unwrap();
+
+            let timing = st.prefill_timing();
+            assert_eq!(timing.mode, Some(want_mode));
+            assert_eq!(timing.tokens, ids.len() as u64);
+            assert!(timing.ran());
+            assert!(
+                timing.accounted() <= timing.total,
+                "{want_mode:?}: phases {:?} exceed the total {:?} — a region is \
+                 charged twice",
+                timing.accounted(),
+                timing.total
+            );
+            assert_eq!(
+                timing.accounted() + timing.other(),
+                timing.total,
+                "{want_mode:?}: the split must account for the whole run"
+            );
+            assert!(
+                timing.total > Duration::ZERO,
+                "{want_mode:?}: a prefill that ran took some time"
+            );
+        }
+    }
+
+    /// Every prefill starts from zero. Run a long prompt, then a one-token
+    /// one: if the phases accumulated across runs, the second run's phases
+    /// would carry the first run's work and overflow its much smaller total.
+    #[test]
+    fn every_prefill_rearms_the_timing() {
+        let (_fx, model) = load_fixture("prefill-timing-rearm");
+        let long: Vec<u32> = (0..12u32).map(|i| (i * 5 + 1) % 32).collect();
+
+        let mut st = state_with(&model, 64, sweep_config(4));
+        prefill_prompt(&model, &mut st, &long, None).unwrap();
+        assert_eq!(st.prefill_timing().tokens, long.len() as u64);
+
+        // A fresh sequence on the same state, on the other path.
+        st.reset();
+        st.set_prefill_config(token_major_config()).unwrap();
+        prefill_prompt(&model, &mut st, &long[..1], None).unwrap();
+
+        let timing = st.prefill_timing();
+        assert_eq!(timing.tokens, 1, "the token count is per run, not summed");
+        assert_eq!(
+            timing.mode,
+            Some(PrefillMode::TokenMajor),
+            "the mode is the run's, not the state's history"
+        );
+        assert!(
+            timing.accounted() <= timing.total,
+            "phases {:?} exceed this run's total {:?}: the previous run leaked in",
+            timing.accounted(),
+            timing.total
+        );
+    }
+
+    /// [`ForwardState::reset`] drops the timing, unlike the streaming counters
+    /// beside it. A per-phase split left over from a sequence that has been
+    /// thrown away would be read as belonging to the one that replaced it.
+    #[test]
+    fn a_reset_drops_the_prefill_timing() {
+        let (_fx, model) = load_fixture("prefill-timing-reset");
+        let mut st = state_with(&model, 32, sweep_config(4));
+        prefill_prompt(&model, &mut st, &[1, 2, 3, 4, 5], None).unwrap();
+        assert!(st.prefill_timing().ran());
+
+        st.reset();
+        assert_eq!(
+            st.prefill_timing(),
+            PrefillTiming::default(),
+            "a reset state reports no prefill at all"
+        );
+        assert!(!st.prefill_timing().ran());
+    }
+
+    /// Decode charges nothing. `forward_token` carries the same
+    /// instrumentation the token-major prefill does, and the only thing
+    /// keeping generation out of a prompt's numbers is that a prefill has to
+    /// arm the timing first.
+    #[test]
+    fn decode_does_not_charge_the_prefill_timing() {
+        let (_fx, model) = load_fixture("prefill-timing-decode");
+        let ids = [1u32, 2, 3, 4, 5];
+        let mut st = state_with(&model, 32, sweep_config(4));
+        prefill_prompt(&model, &mut st, &ids, None).unwrap();
+        let after_prefill = st.prefill_timing();
+
+        for step in 0..3usize {
+            let position = ids.len() + step;
+            crate::model::forward_token(&model, &mut st, 7, position, true).unwrap();
+        }
+        assert_eq!(
+            st.prefill_timing(),
+            after_prefill,
+            "three decode tokens moved a prefill counter"
+        );
     }
 }
