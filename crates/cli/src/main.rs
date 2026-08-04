@@ -2,23 +2,27 @@
 //!
 //! - `tokenize`: tokenizer + vendored chat template smoke test.
 //! - `generate`: run the forward pass end to end and stream text to
-//!   stdout (timing footer on stderr).
+//!   stdout (timing and expert-streaming footer on stderr).
 //! - `logits`: raw-encode a prompt, run one forward pass, and print the
 //!   top-N next-token logits as JSON — the llama.cpp comparison hook
 //!   consumed by `scripts/compare_llamacpp.py`.
 //!
 //! Both `generate` and `logits` can dump the router's per-layer expert
 //! selection with `--trace-experts <PATH>`; see [`TraceWriter`] for the
-//! file format and `scripts/lfu_sim.py` for the consumer.
+//! file format and `scripts/lfu_sim.py` for the consumer. Both also take
+//! the runtime dials in [`RuntimeArgs`] — the expert-cache byte budget, the
+//! compute thread count, and the integrity policy.
 
 use std::io::{Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, bail};
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use ramvamp_core::generate::{GenerateParams, StopReason, TracePhase, generate, generate_traced};
-use ramvamp_core::model::{ForwardState, LoadOptions, Model, forward_token, forward_token_traced};
+use ramvamp_core::model::{
+    ForwardState, LoadOptions, Model, RuntimeConfig, forward_token, forward_token_traced,
+};
 use ramvamp_core::tokenizer::{ChatMessage, RvmpTokenizer};
 
 /// v0 scope cap: single sequence, 4K context (`docs/architecture.md`).
@@ -35,111 +39,231 @@ struct Cli {
     command: Command,
 }
 
+/// Dials shared by every command that actually runs the model.
+#[derive(Args, Debug, Clone)]
+struct RuntimeArgs {
+    /// Total expert-cache budget for the whole model, divided across its
+    /// layers. Accepts a plain byte count or a binary suffix (K/M/G/T,
+    /// optionally spelled KiB/MiB/...), e.g. `1440M` or `1.4G`. This is a
+    /// budget, not a slot count: 1440M buys 11 slots/layer on
+    /// Qwen3-30B-A3B, and a model with a different layer count or expert
+    /// size gets a different number of slots out of the same budget.
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value = "1440M",
+        value_parser = parse_bytes,
+    )]
+    cache_bytes: u64,
+
+    /// Compute threads, counting the decode thread itself. Defaults to the
+    /// runtime's own CPU topology detection: one thread per physical
+    /// performance core, no SMT siblings, pinned. Degrades to unpinned on
+    /// any machine whose topology cannot be read.
+    #[arg(long, value_name = "N")]
+    threads: Option<usize>,
+
+    /// Skip every SHA-256 integrity check (fast dev loads). Size checks
+    /// still run.
+    #[arg(long)]
+    skip_hashes: bool,
+
+    /// Also SHA-256 every `experts/layer_NN.bin` when it is first opened.
+    /// Off by default, because that is a buffered read of the entire
+    /// expert set (16.35 GiB for Qwen3-30B-A3B) on every process start,
+    /// which is exactly what streaming experts with O_DIRECT exists to
+    /// avoid. Layer files are size-checked either way, and
+    /// `ramvamp-repack verify-install` remains the thorough check.
+    #[arg(long)]
+    verify_layer_hashes: bool,
+}
+
+impl RuntimeArgs {
+    /// The load-time integrity policy these flags describe.
+    fn load_options(&self) -> LoadOptions {
+        LoadOptions {
+            skip_hashes: self.skip_hashes,
+            verify_layer_hashes: self.verify_layer_hashes,
+        }
+    }
+
+    /// The decode-time runtime dials these flags describe.
+    fn runtime_config(&self) -> RuntimeConfig {
+        RuntimeConfig {
+            cache_bytes: self.cache_bytes,
+            threads: self.threads,
+            pin: true,
+        }
+    }
+}
+
+/// Parse a byte budget: digits, optionally fractional, with an optional
+/// binary suffix. `1440M`, `1440MiB`, `1.4G`, and `1509949440` all parse.
+///
+/// Binary throughout (`M` is 1024^2, never 1000^2) — the value sizes a
+/// page-aligned buffer pool, so decimal units would silently mean a
+/// different number of slots than the documentation says.
+fn parse_bytes(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("empty byte budget".to_owned());
+    }
+    let digits_end = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let (number, suffix) = text.split_at(digits_end);
+    let shift: u32 = match suffix.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 0,
+        "K" | "KB" | "KIB" => 10,
+        "M" | "MB" | "MIB" => 20,
+        "G" | "GB" | "GIB" => 30,
+        "T" | "TB" | "TIB" => 40,
+        other => return Err(format!("unknown size suffix {other:?} (use K, M, G, or T)")),
+    };
+    // Integer path first, so exact byte counts never round through f64.
+    if let Ok(whole) = number.parse::<u64>() {
+        return whole
+            .checked_mul(1u64 << shift)
+            .ok_or_else(|| format!("{text}: byte budget overflows u64"));
+    }
+    let scaled = number
+        .parse::<f64>()
+        .map_err(|_| format!("{number:?} is not a number"))?
+        * 2f64.powi(shift as i32);
+    if !scaled.is_finite() || !(0.0..u64::MAX as f64).contains(&scaled) {
+        return Err(format!("{text}: byte budget out of range"));
+    }
+    Ok(scaled as u64)
+}
+
+/// Render a byte count with a binary suffix, for the stats footer.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Tokenizer smoke test: encode a prompt or a chat transcript with an
     /// installed model's tokenizer and verify the decode round-trip.
-    #[command(group(
-        ArgGroup::new("input")
-            .required(true)
-            .args(["prompt", "messages_file"])
-    ))]
-    Tokenize {
-        /// Installed model directory (the .rvmp dir).
-        #[arg(long, value_name = "DIR")]
-        model: PathBuf,
-
-        /// Raw text to encode directly (no chat template).
-        #[arg(long, value_name = "TEXT")]
-        prompt: Option<String>,
-
-        /// JSON file with a conversation to render through the chat
-        /// template (with generation prompt) and encode:
-        /// [{"role": "user", "content": "..."}, ...]
-        #[arg(long, value_name = "FILE")]
-        messages_file: Option<PathBuf>,
-    },
+    Tokenize(TokenizeArgs),
 
     /// Generate text: raw completion from --prompt, or chat completion
     /// from a --messages-file rendered through the chat template. Streams
-    /// to stdout; timing goes to stderr.
-    #[command(group(
-        ArgGroup::new("input")
-            .required(true)
-            .args(["prompt", "messages_file"])
-    ))]
-    Generate {
-        /// Installed model directory (the .rvmp dir).
-        #[arg(long, value_name = "DIR")]
-        model: PathBuf,
-
-        /// Raw text prompt (no chat template).
-        #[arg(long, value_name = "TEXT")]
-        prompt: Option<String>,
-
-        /// JSON conversation file, rendered with the generation prompt.
-        #[arg(long, value_name = "FILE")]
-        messages_file: Option<PathBuf>,
-
-        /// Maximum tokens to generate.
-        #[arg(long, default_value_t = 128)]
-        max_new: usize,
-
-        /// Deterministic argmax decoding (the validation mode).
-        #[arg(long)]
-        greedy: bool,
-
-        /// Sampling temperature (default: the checkpoint's).
-        #[arg(long)]
-        temperature: Option<f32>,
-
-        /// Top-k cutoff (default: the checkpoint's).
-        #[arg(long)]
-        top_k: Option<u32>,
-
-        /// Top-p nucleus mass (default: the checkpoint's).
-        #[arg(long)]
-        top_p: Option<f32>,
-
-        /// PRNG seed for sampled decoding.
-        #[arg(long)]
-        seed: Option<u64>,
-
-        /// Dump the per-layer routed expert ids for every prefill and
-        /// decode position to a binary trace file (see the TraceWriter
-        /// docs; read by scripts/lfu_sim.py).
-        #[arg(long, value_name = "FILE")]
-        trace_experts: Option<PathBuf>,
-
-        /// Skip SHA-256 integrity checks (fast dev loads).
-        #[arg(long)]
-        skip_hashes: bool,
-    },
+    /// to stdout; timing and expert-streaming stats go to stderr.
+    Generate(Box<GenerateArgs>),
 
     /// Print the top-N next-token logits for a raw prompt as JSON (the
     /// llama.cpp logit-comparison hook).
-    Logits {
-        /// Installed model directory (the .rvmp dir).
-        #[arg(long, value_name = "DIR")]
-        model: PathBuf,
+    Logits(LogitsArgs),
+}
 
-        /// Raw text prompt (no chat template).
-        #[arg(long, value_name = "TEXT")]
-        prompt: String,
+#[derive(Args)]
+#[command(group(
+    ArgGroup::new("tokenize_input")
+        .required(true)
+        .args(["prompt", "messages_file"])
+))]
+struct TokenizeArgs {
+    /// Installed model directory (the .rvmp dir).
+    #[arg(long, value_name = "DIR")]
+    model: PathBuf,
 
-        /// How many top tokens to print.
-        #[arg(long, default_value_t = 20)]
-        top: usize,
+    /// Raw text to encode directly (no chat template).
+    #[arg(long, value_name = "TEXT")]
+    prompt: Option<String>,
 
-        /// Dump the per-layer routed expert ids for every prompt position
-        /// (all prefill) to a binary trace file.
-        #[arg(long, value_name = "FILE")]
-        trace_experts: Option<PathBuf>,
+    /// JSON file with a conversation to render through the chat
+    /// template (with generation prompt) and encode:
+    /// [{"role": "user", "content": "..."}, ...]
+    #[arg(long, value_name = "FILE")]
+    messages_file: Option<PathBuf>,
+}
 
-        /// Skip SHA-256 integrity checks (fast dev loads).
-        #[arg(long)]
-        skip_hashes: bool,
-    },
+#[derive(Args)]
+#[command(group(
+    ArgGroup::new("generate_input")
+        .required(true)
+        .args(["prompt", "messages_file"])
+))]
+struct GenerateArgs {
+    /// Installed model directory (the .rvmp dir).
+    #[arg(long, value_name = "DIR")]
+    model: PathBuf,
+
+    /// Raw text prompt (no chat template).
+    #[arg(long, value_name = "TEXT")]
+    prompt: Option<String>,
+
+    /// JSON conversation file, rendered with the generation prompt.
+    #[arg(long, value_name = "FILE")]
+    messages_file: Option<PathBuf>,
+
+    /// Maximum tokens to generate.
+    #[arg(long, default_value_t = 128)]
+    max_new: usize,
+
+    /// Deterministic argmax decoding (the validation mode).
+    #[arg(long)]
+    greedy: bool,
+
+    /// Sampling temperature (default: the checkpoint's).
+    #[arg(long)]
+    temperature: Option<f32>,
+
+    /// Top-k cutoff (default: the checkpoint's).
+    #[arg(long)]
+    top_k: Option<u32>,
+
+    /// Top-p nucleus mass (default: the checkpoint's).
+    #[arg(long)]
+    top_p: Option<f32>,
+
+    /// PRNG seed for sampled decoding.
+    #[arg(long)]
+    seed: Option<u64>,
+
+    /// Dump the per-layer routed expert ids for every prefill and
+    /// decode position to a binary trace file (see the TraceWriter
+    /// docs; read by scripts/lfu_sim.py).
+    #[arg(long, value_name = "FILE")]
+    trace_experts: Option<PathBuf>,
+
+    #[command(flatten)]
+    runtime: RuntimeArgs,
+}
+
+#[derive(Args)]
+struct LogitsArgs {
+    /// Installed model directory (the .rvmp dir).
+    #[arg(long, value_name = "DIR")]
+    model: PathBuf,
+
+    /// Raw text prompt (no chat template).
+    #[arg(long, value_name = "TEXT")]
+    prompt: String,
+
+    /// How many top tokens to print.
+    #[arg(long, default_value_t = 20)]
+    top: usize,
+
+    /// Dump the per-layer routed expert ids for every prompt position
+    /// (all prefill) to a binary trace file.
+    #[arg(long, value_name = "FILE")]
+    trace_experts: Option<PathBuf>,
+
+    #[command(flatten)]
+    runtime: RuntimeArgs,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -149,43 +273,9 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Tokenize {
-            model,
-            prompt,
-            messages_file,
-        } => tokenize(&model, prompt, messages_file),
-        Command::Generate {
-            model,
-            prompt,
-            messages_file,
-            max_new,
-            greedy,
-            temperature,
-            top_k,
-            top_p,
-            seed,
-            trace_experts,
-            skip_hashes,
-        } => run_generate(
-            &model,
-            prompt,
-            messages_file,
-            max_new,
-            greedy,
-            temperature,
-            top_k,
-            top_p,
-            seed,
-            trace_experts.as_deref(),
-            skip_hashes,
-        ),
-        Command::Logits {
-            model,
-            prompt,
-            top,
-            trace_experts,
-            skip_hashes,
-        } => run_logits(&model, &prompt, top, trace_experts.as_deref(), skip_hashes),
+        Command::Tokenize(args) => tokenize(&args.model, args.prompt, args.messages_file),
+        Command::Generate(args) => run_generate(*args),
+        Command::Logits(args) => run_logits(args),
     }
 }
 
@@ -473,22 +563,12 @@ fn forward_traced<'s>(
 }
 
 /// Generate and stream a completion.
-#[allow(clippy::too_many_arguments)]
-fn run_generate(
-    model_dir: &Path,
-    prompt: Option<String>,
-    messages_file: Option<PathBuf>,
-    max_new: usize,
-    greedy: bool,
-    temperature: Option<f32>,
-    top_k: Option<u32>,
-    top_p: Option<f32>,
-    seed: Option<u64>,
-    trace_experts: Option<&Path>,
-    skip_hashes: bool,
-) -> anyhow::Result<()> {
+fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
+    let model_dir = args.model.as_path();
+    let max_new = args.max_new;
+    let trace_experts = args.trace_experts.as_deref();
     let tokenizer = load_tokenizer(model_dir)?;
-    let (_, prompt_ids) = encode_input(&tokenizer, prompt, messages_file)?;
+    let (_, prompt_ids) = encode_input(&tokenizer, args.prompt, args.messages_file)?;
     if prompt_ids.is_empty() {
         bail!("prompt encodes to zero tokens");
     }
@@ -500,28 +580,33 @@ fn run_generate(
     }
 
     let load_start = Instant::now();
-    let model = Model::load(model_dir, LoadOptions { skip_hashes })
+    let model = Model::load(model_dir, args.runtime.load_options())
         .with_context(|| format!("loading model from {}", model_dir.display()))?;
-    let mut state = ForwardState::new(&model, CONTEXT_CAP)?;
+    let mut state = ForwardState::with_config(&model, CONTEXT_CAP, args.runtime.runtime_config())?;
     eprintln!(
-        "model loaded in {:.2}s ({} prompt tokens)",
+        "model loaded in {:.2}s ({} prompt tokens); {} compute shards, {} expert \
+         slots/layer from a {} budget, {} reads",
         load_start.elapsed().as_secs_f64(),
-        prompt_ids.len()
+        prompt_ids.len(),
+        state.shards(),
+        state.slots_per_layer(),
+        human_bytes(state.cache_bytes()),
+        state.stream_mode(),
     );
 
     let mut params = GenerateParams::from_defaults(tokenizer.sampling_defaults());
     params.max_new = max_new;
-    params.greedy = greedy;
-    if let Some(t) = temperature {
+    params.greedy = args.greedy;
+    if let Some(t) = args.temperature {
         params.temperature = t;
     }
-    if let Some(k) = top_k {
+    if let Some(k) = args.top_k {
         params.top_k = Some(k);
     }
-    if let Some(p) = top_p {
+    if let Some(p) = args.top_p {
         params.top_p = p;
     }
-    if let Some(s) = seed {
+    if let Some(s) = args.seed {
         params.seed = s;
     }
 
@@ -611,17 +696,52 @@ fn run_generate(
         },
         stats.generated,
     );
+    report_stream_stats(&state);
     Ok(())
 }
 
+/// Expert-streaming counters for the run just finished, on stderr.
+///
+/// This is what an `docs/experiments/README.md` entry quotes: what fraction
+/// of routed experts the cache served, how the misses split between cold and
+/// evicted, how many bytes actually left the drive, how long the decode
+/// thread spent blocked on them, and — because O_DIRECT can be silently
+/// downgraded to buffered I/O — which submission path was actually achieved.
+fn report_stream_stats(state: &ForwardState) {
+    let s = state.stream_stats();
+    let served = s.hits + s.pending_hits + s.misses;
+    let pct = |n: u64| {
+        if served == 0 {
+            0.0
+        } else {
+            n as f64 / served as f64 * 100.0
+        }
+    };
+    eprintln!(
+        "experts: {} mode, {} slots/layer ({}); {served} requests, {} hits ({:.1}%), \
+         {} pending hits, {} misses ({} cold / {} eviction); {} read in {} reads \
+         ({} retries); io wait {:.2}s",
+        state.stream_mode(),
+        state.slots_per_layer(),
+        human_bytes(state.cache_bytes()),
+        s.hits,
+        pct(s.hits),
+        s.pending_hits,
+        s.misses,
+        s.cold_misses,
+        s.eviction_misses,
+        human_bytes(s.bytes_read),
+        s.reads_submitted,
+        s.read_retries,
+        s.io_wait.as_secs_f64(),
+    );
+}
+
 /// One forward pass over a raw prompt; top-N logits as JSON on stdout.
-fn run_logits(
-    model_dir: &Path,
-    prompt: &str,
-    top: usize,
-    trace_experts: Option<&Path>,
-    skip_hashes: bool,
-) -> anyhow::Result<()> {
+fn run_logits(args: LogitsArgs) -> anyhow::Result<()> {
+    let model_dir = args.model.as_path();
+    let prompt = args.prompt.as_str();
+    let trace_experts = args.trace_experts.as_deref();
     let tokenizer = load_tokenizer(model_dir)?;
     let ids = tokenizer.encode(prompt)?;
     if ids.is_empty() {
@@ -634,9 +754,9 @@ fn run_logits(
         );
     }
 
-    let model = Model::load(model_dir, LoadOptions { skip_hashes })
+    let model = Model::load(model_dir, args.runtime.load_options())
         .with_context(|| format!("loading model from {}", model_dir.display()))?;
-    let mut state = ForwardState::new(&model, CONTEXT_CAP)?;
+    let mut state = ForwardState::with_config(&model, CONTEXT_CAP, args.runtime.runtime_config())?;
 
     let arch = model.arch();
     let mut writer = trace_experts
@@ -664,7 +784,7 @@ fn run_logits(
 
     let mut order: Vec<u32> = (0..logits.len() as u32).collect();
     order.sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
-    order.truncate(top);
+    order.truncate(args.top);
 
     let top_entries: Vec<serde_json::Value> = order
         .iter()
@@ -685,6 +805,8 @@ fn run_logits(
         "top": top_entries,
     });
     println!("{}", serde_json::to_string_pretty(&out)?);
+    // After the last use of `logits`, which borrows `state`.
+    report_stream_stats(&state);
     Ok(())
 }
 
@@ -725,6 +847,40 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
+
+    #[test]
+    fn byte_budgets_parse_binary_suffixes() {
+        for (text, want) in [
+            ("0", 0u64),
+            ("1507852288", 1_507_852_288),
+            ("1438M", 1438 * 1024 * 1024),
+            ("1438MiB", 1438 * 1024 * 1024),
+            ("1438mb", 1438 * 1024 * 1024),
+            ("1.4G", (1.4 * 1024.0 * 1024.0 * 1024.0) as u64),
+            ("2G", 2 * 1024 * 1024 * 1024),
+            ("512K", 512 * 1024),
+            ("64", 64),
+            ("  1438M  ", 1438 * 1024 * 1024),
+            ("1T", 1024u64.pow(4)),
+        ] {
+            assert_eq!(parse_bytes(text), Ok(want), "{text}");
+        }
+        // The documented default really is the documented number.
+        assert_eq!(parse_bytes("1438M").unwrap(), 1_507_852_288);
+        for bad in ["", "   ", "M", "1438X", "abc", "1.2.3M", "-5M"] {
+            assert!(parse_bytes(bad).is_err(), "{bad:?} should not parse");
+        }
+        // Overflow is an error, never a wrap.
+        assert!(parse_bytes("18446744073709551615T").is_err());
+    }
+
+    #[test]
+    fn human_bytes_rounds_to_binary_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1_507_852_288), "1.4 GiB");
+    }
 
     /// A trace file path unique to this process and call.
     fn temp_trace(tag: &str) -> PathBuf {

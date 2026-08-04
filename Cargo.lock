@@ -803,6 +803,7 @@ name = "ramvamp-core"
 version = "0.1.0"
 dependencies = [
  "io-uring",
+ "libc",
  "memmap2",
  "rustix",
  "serde",

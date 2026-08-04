@@ -4,8 +4,10 @@
 //! files: one `pread` of `stride` bytes fetches exactly one expert blob
 //! into a caller-owned buffer, and [`ExpertView`] carves the blob into its
 //! gate/up/down projection slabs using the validated layout. Layer files
-//! are opened lazily (handles cached per layer) and hashed on first open
-//! unless [`LoadOptions::skip_hashes`] is set; the size check always runs.
+//! are opened lazily (handles cached per layer) and size-checked on first
+//! open; the full SHA-256 runs only under
+//! [`LoadOptions::verify_layer_hashes`] (and never under
+//! [`LoadOptions::skip_hashes`]).
 //!
 //! This is the portable baseline the io_uring + O_DIRECT streamer will sit
 //! beside: same blob geometry, same validation, different submission path.
@@ -104,13 +106,16 @@ struct LayerFile {
 /// Construction validates the layout against the manifest and resolves the
 /// gate/up/down slab geometry for every layer; all three projections must
 /// be present with known quant formats. Files open on first use; the first
-/// open size-checks the file and (unless skipped) hashes it against the
-/// manifest. Concurrent first reads of one layer may both hash the file —
-/// benign, one handle wins.
+/// open size-checks the file always, and hashes it against the manifest only
+/// under [`LoadOptions::verify_layer_hashes`]. Concurrent first reads of one
+/// layer may both hash the file — benign, one handle wins.
 #[derive(Debug)]
 pub struct ExpertReader {
     layers: Vec<LayerFile>,
-    skip_hashes: bool,
+    /// Whether first-open hashes the whole layer file (the opt-in
+    /// [`LoadOptions::verify_layer_hashes`], and never with
+    /// [`LoadOptions::skip_hashes`]).
+    hash_layers: bool,
 }
 
 impl ExpertReader {
@@ -162,7 +167,7 @@ impl ExpertReader {
         }
         Ok(Self {
             layers,
-            skip_hashes: options.skip_hashes,
+            hash_layers: options.verify_layer_hashes && !options.skip_hashes,
         })
     }
 
@@ -216,6 +221,43 @@ impl ExpertReader {
         })
     }
 
+    /// View the projection slabs of a blob some other path already fetched.
+    ///
+    /// [`read_expert`](Self::read_expert) owns both halves — the read and the
+    /// slicing — which the streaming path cannot use: it reads into slot-pool
+    /// buffers through io_uring or a positioned read, and then needs exactly
+    /// the slicing. Same resolved geometry, no read.
+    ///
+    /// `bytes` must be at least the layer's blob stride; anything past it is
+    /// ignored, so a slot buffer padded to its pitch is fine.
+    ///
+    /// # Errors
+    ///
+    /// [`IoError::LayerOutOfRange`] past the last layer;
+    /// [`IoError::RangeOutOfBounds`] when `bytes` is shorter than the stride
+    /// the slab offsets were validated against.
+    pub fn view_over<'a>(&self, layer: u32, bytes: &'a [u8]) -> Result<ExpertView<'a>, IoError> {
+        let state = self
+            .layers
+            .get(layer as usize)
+            .ok_or(IoError::LayerOutOfRange {
+                layer,
+                n_layers: self.n_layers(),
+            })?;
+        let blob = bytes
+            .get(..state.stride_usize)
+            .ok_or_else(|| IoError::RangeOutOfBounds {
+                what: format!("layer {layer} expert blob"),
+                offset: 0,
+                len: state.stride,
+                available: bytes.len() as u64,
+            })?;
+        Ok(ExpertView {
+            bytes: blob,
+            slabs: state.slabs,
+        })
+    }
+
     /// The layer's cached file handle, opening and verifying on first use.
     fn layer_file<'a>(&self, state: &'a LayerFile) -> Result<&'a File, IoError> {
         if let Some(file) = state.file.get() {
@@ -234,7 +276,7 @@ impl ExpertReader {
             }
             .into());
         }
-        if !self.skip_hashes {
+        if self.hash_layers {
             let actual = sha256_file(&state.path)?;
             if !actual.eq_ignore_ascii_case(&state.expected_sha256) {
                 return Err(crate::format::FormatError::HashMismatch {
@@ -277,6 +319,18 @@ mod tests {
         ExpertReader::new(&fx.root, &fx.manifest, &fx.layout, options).unwrap()
     }
 
+    /// Skip everything (the dev flag).
+    const SKIP: LoadOptions = LoadOptions {
+        skip_hashes: true,
+        verify_layer_hashes: false,
+    };
+
+    /// Opt in to the full per-layer SHA-256.
+    const VERIFY: LoadOptions = LoadOptions {
+        skip_hashes: false,
+        verify_layer_hashes: true,
+    };
+
     #[test]
     fn reads_expert_and_slabs_match_layout_offsets() {
         let fx = build_install("expert-slabs");
@@ -311,7 +365,7 @@ mod tests {
     #[test]
     fn rejects_out_of_range_indices() {
         let fx = build_install("expert-bounds");
-        let reader = reader(&fx, LoadOptions { skip_hashes: true });
+        let reader = reader(&fx, SKIP);
         let mut buf = Vec::new();
         assert!(matches!(
             reader.read_expert(2, 0, &mut buf).unwrap_err(),
@@ -330,15 +384,18 @@ mod tests {
         ));
     }
 
+    /// Layer hashing is opt-in: the default load reads a corrupt layer file
+    /// without complaint, and only `verify_layer_hashes` catches it. That
+    /// asymmetry is deliberate — see [`LoadOptions::verify_layer_hashes`].
     #[test]
-    fn first_open_hash_check_toggles_with_skip_hashes() {
+    fn first_open_hash_check_is_opt_in() {
         let fx = build_install("expert-hash");
         let victim = fx.root.join(&fx.layout.layers[0].file);
         let mut data = std::fs::read(&victim).unwrap();
         data[5000] ^= 0xff;
         std::fs::write(&victim, data).unwrap();
 
-        let strict = reader(&fx, LoadOptions::default());
+        let strict = reader(&fx, VERIFY);
         let mut buf = Vec::new();
         assert!(matches!(
             strict.read_expert(0, 0, &mut buf).unwrap_err(),
@@ -347,22 +404,27 @@ mod tests {
         // The untouched layer still reads.
         strict.read_expert(1, 0, &mut buf).unwrap();
 
-        let lax = reader(&fx, LoadOptions { skip_hashes: true });
-        lax.read_expert(0, 0, &mut buf).unwrap();
+        // Neither the default nor the dev flag hashes layer files.
+        for options in [LoadOptions::default(), SKIP] {
+            reader(&fx, options).read_expert(0, 0, &mut buf).unwrap();
+        }
     }
 
     #[test]
-    fn size_check_runs_even_with_hashes_skipped() {
+    fn size_check_runs_whatever_the_hash_policy() {
         let fx = build_install("expert-size");
         let victim = fx.root.join(&fx.layout.layers[1].file);
         let data = std::fs::read(&victim).unwrap();
         std::fs::write(&victim, &data[..data.len() - 4096]).unwrap();
-        let lax = reader(&fx, LoadOptions { skip_hashes: true });
         let mut buf = Vec::new();
-        assert!(matches!(
-            lax.read_expert(1, 0, &mut buf).unwrap_err(),
-            IoError::Format(FormatError::SizeMismatch { .. })
-        ));
+        for options in [LoadOptions::default(), SKIP, VERIFY] {
+            assert!(matches!(
+                reader(&fx, options)
+                    .read_expert(1, 0, &mut buf)
+                    .unwrap_err(),
+                IoError::Format(FormatError::SizeMismatch { .. })
+            ));
+        }
     }
 
     #[test]

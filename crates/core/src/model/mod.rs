@@ -11,7 +11,10 @@
 //! Decode step per layer: attention + router on resident weights; read back
 //! the top-k expert IDs; plan hits/misses against the layer cache; start
 //! misses' reads while cache-hit expert work (and the shared expert, if any)
-//! runs; combine branches; layer tail.
+//! runs; combine branches; layer tail. Every GEMV on that path — the four
+//! attention projections, all three expert projections, and `lm_head` —
+//! fans out over contiguous output-row ranges across a pinned compute pool,
+//! which is bit-identical to the whole-matrix call by construction.
 //!
 //! # Loading layer
 //!
@@ -47,6 +50,7 @@ pub use error::ModelError;
 #[cfg(test)]
 pub(crate) use forward::testsupport;
 pub use forward::{
-    ExpertRouteSink, ForwardError, ForwardState, forward_token, forward_token_traced,
+    DEFAULT_CACHE_BYTES, ExpertRouteSink, ForwardError, ForwardState, RuntimeConfig, forward_token,
+    forward_token_traced,
 };
 pub use weights::{F32Tensor, LayerWeights, Model, QuantTensor};

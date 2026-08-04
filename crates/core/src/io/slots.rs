@@ -1078,15 +1078,16 @@ mod tests {
     fn construction_faults_in_every_page() {
         const SLAB: usize = 512 * 1024;
 
-        // Control first, before any pool allocation churns the allocator:
-        // a same-sized, same-aligned block that nobody touched.
-        let control_layout = Layout::from_size_align(SLAB, SLOT_ALIGN).unwrap();
-        // SAFETY: non-zero size, valid layout.
-        let control = unsafe { alloc(control_layout) };
-        assert!(!control.is_null());
-        let control_resident = resident_pages(control, SLAB);
-        // SAFETY: same pointer and layout as the allocation above.
-        unsafe { dealloc(control, control_layout) };
+        // A same-sized, same-aligned block that nobody touched. Mapped
+        // rather than `alloc`ed: freeing a large block anywhere else in the
+        // test binary raises glibc's dynamic `mmap_threshold` to that size,
+        // after which an `alloc` of SLAB comes off the heap and can hand back
+        // pages some earlier test already faulted in — which would fail this
+        // control for a reason that has nothing to do with the slot pool.
+        // Fresh anonymous pages are untouched by construction.
+        let control = memmap2::MmapOptions::new().len(SLAB).map_anon().unwrap();
+        let control_resident = resident_pages(control.as_ptr(), SLAB);
+        drop(control);
 
         // 4 layers * 8 slots * 16 KiB == SLAB.
         let pool = SlotPool::new(8, &[16384; 4]).unwrap();

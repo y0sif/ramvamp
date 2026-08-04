@@ -497,7 +497,15 @@ mod tests {
     use super::*;
     use crate::io::LoadOptions;
     use crate::io::testutil::build_install;
-    use crate::model::ForwardState;
+    use crate::model::{ForwardState, RuntimeConfig};
+
+    /// Fixture-sized runtime dials: an unpinned two-shard pool and a small
+    /// expert budget, so a test suite that runs many states in parallel
+    /// neither pins every thread to one core nor reserves the production
+    /// 1,438 MiB per state.
+    fn small(model: &Model, context_cap: usize) -> ForwardState {
+        ForwardState::with_config(model, context_cap, RuntimeConfig::testing()).unwrap()
+    }
 
     /// The committed real-tokenizer fixtures (pinned Qwen3 vocabulary).
     fn fixtures_dir() -> PathBuf {
@@ -669,7 +677,14 @@ mod tests {
     fn harness(tag: &str) -> Harness {
         let fx = build_install(tag);
         crate::model::testsupport::temper_install(&fx);
-        let model = Model::load(&fx.root, LoadOptions { skip_hashes: true }).unwrap();
+        let model = Model::load(
+            &fx.root,
+            LoadOptions {
+                skip_hashes: true,
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap();
         Harness {
             _fx: fx,
             model,
@@ -683,7 +698,7 @@ mod tests {
         max_new: usize,
         stops: &[u32],
     ) -> (Vec<u32>, String, GenerateStats) {
-        let mut state = ForwardState::new(&h.model, 16).unwrap();
+        let mut state = small(&h.model, 16);
         let mut events: Vec<(u32, String)> = Vec::new();
         let mut on_token = |id: u32, piece: &str| {
             events.push((id, piece.to_owned()));
@@ -768,7 +783,7 @@ mod tests {
         let mut sink = |phase: TracePhase, pos: usize, layer: u32, topk: &[(u32, f32)]| {
             records.push((phase, pos, layer, topk.iter().map(|&(e, _)| e).collect()));
         };
-        let mut state = ForwardState::new(&h.model, 16).unwrap();
+        let mut state = small(&h.model, 16);
         let mut ids = Vec::new();
         let mut text = String::new();
         let stats = generate_traced(
@@ -818,7 +833,7 @@ mod tests {
     #[test]
     fn empty_prompt_is_a_typed_error() {
         let h = harness("gen-empty");
-        let mut state = ForwardState::new(&h.model, 16).unwrap();
+        let mut state = small(&h.model, 16);
         let err = generate(
             &h.model,
             &mut state,
@@ -836,7 +851,7 @@ mod tests {
         // The fixture model's 32-token vocab can never emit 151645/151643,
         // so the public wrapper runs to max_new.
         let h = harness("gen-public");
-        let mut state = ForwardState::new(&h.model, 16).unwrap();
+        let mut state = small(&h.model, 16);
         let mut count = 0usize;
         let stats = generate(
             &h.model,

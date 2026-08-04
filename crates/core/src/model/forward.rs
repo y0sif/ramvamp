@@ -1,14 +1,52 @@
 //! Single-token forward pass over a loaded model.
 //!
 //! [`forward_token`] runs one token through every layer against a
-//! [`ForwardState`] that owns the KV cache and every scratch buffer; the
-//! layer loop itself allocates nothing after [`ForwardState::new`]
-//! (remaining small per-token allocations: [`Model::embed`]'s dequant `Vec`
-//! and the stream decoder's `String`). This is the
-//! single-threaded, buffered-`pread` baseline of the decode loop in
-//! `docs/architecture.md` ("Decode loop"): no LFU cache, no io_uring
-//! overlap yet — misses read synchronously through
-//! [`Model::expert_reader`].
+//! [`ForwardState`] that owns the KV cache, the expert streamer, the pinned
+//! compute pool, and every scratch buffer; the layer loop itself allocates
+//! nothing after [`ForwardState::new`] (remaining small per-token
+//! allocations: [`Model::embed`]'s dequant `Vec` and the stream decoder's
+//! `String`).
+//!
+//! # Decode loop shape
+//!
+//! This is the phase-5 shape from `docs/architecture.md` ("Decode loop").
+//! Per layer, once routing has produced the renormalized top-k:
+//!
+//! 1. [`ExpertStream::begin_layer`] plans the step against the layer's slot
+//!    cache and submits a read for every miss. It does not block.
+//! 2. **Every cache hit** is computed, row-parallel across the compute pool,
+//!    each expert's `[hidden]` output staged into its own slot of
+//!    [`ForwardState`]'s staging buffer. This is the work that overlaps the
+//!    in-flight reads; Qwen3 has no shared expert, so hits are all there is
+//!    to overlap with.
+//! 3. [`ExpertStream::await_misses`] blocks until every submitted read has
+//!    landed.
+//! 4. **Every miss** is computed the same way, as one unit.
+//! 5. The staged outputs are reduced in fixed top-k order:
+//!    `acc += w[i] * staged[i]` for `i` in `0..top_k`.
+//! 6. [`ExpertStream::end_layer`] hands the slots back.
+//!
+//! Steps 2 and 4 are deliberately coarse: per-expert progressive execution
+//! as completions land is measured-and-rejected upstream (TurboFieldfare's
+//! DEC-17, 4.799 -> 4.648 tok/s *with divergent output*), and flash-moe and
+//! the llama.cpp prototype independently converged on the same two-phase
+//! shape. Coarse hit/miss splitting was worth 14.4% for TF (DEC-18).
+//!
+//! # Bit-identity with the phase-4 baseline
+//!
+//! Phase 4 accumulated `acc += w_i * d_i` sequentially in top-k order.
+//! Staging each expert's `[hidden]` output and reducing afterwards in that
+//! same top-k order is the *identical* sequence of f32 operations, so the
+//! order experts are actually computed in cannot move a single bit. The
+//! renormalization sum (`topk.iter().map(|(_, w)| w).sum()`) is order
+//! dependent too, and is left exactly as it was.
+//!
+//! Row-parallel GEMV is bit-identical by construction: each output row is an
+//! independent dot product of one weight row against the shared activation
+//! row, and [`crate::threads::shard_range`] is a pure function of
+//! `(rows, shards)`. No dot product is ever split *within* a row — the
+//! kernels fix their float accumulation order per super-block, and float
+//! addition is not associative. See `kernels/gemv.rs`.
 //!
 //! # Reference fidelity
 //!
@@ -34,19 +72,88 @@
 //! `attn_k` dots Q8_0 activations. Activations are quantized once per
 //! distinct input vector, not once per consumer.
 
-use crate::io::IoError;
+use std::fmt;
+use std::sync::{Mutex, PoisonError};
+
+use crate::io::{ExpertStream, ExpertView, IoError, StreamMode, StreamStats};
 use crate::kernels::KernelError;
 use crate::kernels::attention::{AttentionError, AttentionScratch, decode_attention};
 use crate::kernels::primitives::{
     rmsnorm, rmsnorm_in_place, rope_neox_heads, softmax, swiglu_combine, vec_add,
 };
-use crate::kernels::quants::{BlockQ8_0, BlockQ8K, quantize_row_q8_0, quantize_row_q8_k};
-use crate::kernels::{gemv_q8_0, gemv_q8_k};
+use crate::kernels::quants::{
+    BlockQ8_0, BlockQ8K, QuantFormat, quantize_row_q8_0, quantize_row_q8_k,
+};
+use crate::kernels::{gemv_q8_0_rows, gemv_q8_k_rows};
 use crate::kv::{KvCache, KvError};
+use crate::threads::{ComputePool, PoolConfig};
 use thiserror::Error;
 
 use super::error::ModelError;
 use super::weights::Model;
+
+/// Default total expert-cache budget: 1,440 MiB.
+///
+/// The dial is a **total** byte budget for the whole model, divided by the
+/// summed per-layer blob strides to get slots per layer. On Qwen3-30B-A3B one
+/// slot across all 48 layers costs `24 * 3,059,712 + 24 * 2,654,208` =
+/// 137,134,080 B = 130.78 MiB, so 11 slots/layer costs **1,438.59 MiB** and
+/// the budget must clear that. 1,438 MiB does not: it floors to 10.
+///
+/// 11 slots/layer is what the 3 GiB memory contract leaves once anonymous
+/// runtime allocations are counted (EXP-012): 1,438.59 pool + 1,023.34 mmap'd
+/// core + 384 KV + 115.1 anon = 2,961.03 MiB, 111.0 MiB spare. 12 would be
+/// 19.8 MiB over.
+pub const DEFAULT_CACHE_BYTES: u64 = 1440 * 1024 * 1024;
+
+/// Runtime dials for [`ForwardState::with_config`].
+///
+/// These are the knobs that decide how much memory the expert cache may
+/// hold and how wide the compute fan-out is. Neither changes the arithmetic:
+/// the cache only changes *when* bytes are fetched, and row partitioning is
+/// bit-identical by construction (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeConfig {
+    /// Total expert-cache budget in bytes, divided across the layer count.
+    /// Defaults to [`DEFAULT_CACHE_BYTES`].
+    pub cache_bytes: u64,
+
+    /// Compute shards (threads, counting the decode thread itself).
+    /// `None` takes the pool's own topology detection, which picks one
+    /// shard per physical P-core.
+    pub threads: Option<usize>,
+
+    /// Pin compute threads (and the decode thread) to their CPUs. Failures
+    /// degrade to unpinned; see [`crate::threads`].
+    pub pin: bool,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            cache_bytes: DEFAULT_CACHE_BYTES,
+            threads: None,
+            pin: true,
+        }
+    }
+}
+
+impl RuntimeConfig {
+    /// A tiny unpinned configuration for unit tests over the synthetic
+    /// fixture installs: two shards, a 4 MiB budget, no affinity changes.
+    ///
+    /// Pinning is off because `cargo test` runs test bodies on many threads
+    /// at once and a pin outlives the state that requested it, which would
+    /// funnel the whole suite onto one core.
+    #[cfg(test)]
+    pub(crate) fn testing() -> Self {
+        Self {
+            cache_bytes: 4 * 1024 * 1024,
+            threads: Some(2),
+            pin: false,
+        }
+    }
+}
 
 /// Typed errors from the forward pass.
 #[derive(Debug, Error)]
@@ -92,6 +199,36 @@ pub enum ForwardError {
         n_experts: usize,
     },
 
+    /// The streamer's per-layer plan named an expert slot outside the
+    /// routed set, or named one twice. Reported rather than trusted:
+    /// staging into the wrong slot would silently weight the wrong expert.
+    #[error(
+        "forward: layer {layer}: the expert stream plan is not a permutation \
+         of the {top_k} routed experts (bad or repeated index {index})"
+    )]
+    StreamPlanIndex {
+        /// The layer whose plan was rejected.
+        layer: u32,
+        /// The offending index into the routed set.
+        index: usize,
+        /// Routed experts this layer.
+        top_k: usize,
+    },
+
+    /// The streamer's hits and misses together did not cover every routed
+    /// expert, so some staging slot would have been reduced stale.
+    #[error(
+        "forward: layer {layer}: the expert stream plan covered {covered} of {top_k} routed experts"
+    )]
+    StreamPlanCoverage {
+        /// The layer whose plan was rejected.
+        layer: u32,
+        /// Routed experts actually computed.
+        covered: usize,
+        /// Routed experts this layer.
+        top_k: usize,
+    },
+
     /// `position` does not continue the KV cache: tokens must be fed
     /// strictly in sequence order.
     #[error("forward: position {position}, but the kv cache holds {expected} positions")]
@@ -110,10 +247,10 @@ pub enum ForwardError {
     },
 }
 
-/// Owned per-sequence state for [`forward_token`]: the KV cache plus every
-/// scratch buffer the pass writes, preallocated once so no per-token
-/// allocation happens after construction.
-#[derive(Debug)]
+/// Owned per-sequence state for [`forward_token`]: the KV cache, the expert
+/// streamer, the pinned compute pool, and every scratch buffer the pass
+/// writes, preallocated once so no per-token allocation happens after
+/// construction.
 pub struct ForwardState {
     kv: KvCache,
     attn_scratch: AttentionScratch,
@@ -146,32 +283,70 @@ pub struct ForwardState {
     router_probs: Vec<f32>,
     /// Selected `(expert, weight)` pairs (`top_k` entries).
     topk: Vec<(u32, f32)>,
+    /// The routed expert ids alone (`top_k` entries), the streamer's input.
+    expert_ids: Vec<u32>,
     /// Expert gate projection output (`[moe_intermediate]`), then the
-    /// SwiGLU-combined value in place.
+    /// SwiGLU-combined value in place. Shared: experts are computed one at
+    /// a time, each one fanned out across the pool.
     gate: Vec<f32>,
     /// Expert up projection output (`[moe_intermediate]`).
     up: Vec<f32>,
-    /// Expert down projection output (`[hidden]`).
-    expert_down: Vec<f32>,
+    /// Per-expert staged down-projection outputs, `top_k * hidden` f32
+    /// (64 KiB at the v0 dims). Reduced in fixed top-k order after both
+    /// compute phases, which is what keeps the pass bit-identical.
+    expert_staged: Vec<f32>,
+    /// Which staging slots this layer's plan has filled (`top_k` flags).
+    expert_done: Vec<bool>,
     /// Weighted expert accumulator (`[hidden]`).
     expert_acc: Vec<f32>,
-    /// Expert blob read buffer, capacity = the largest layer stride.
-    expert_buf: Vec<u8>,
     /// Output logits (`[vocab]`), valid after a `want_logits` pass.
     logits: Vec<f32>,
+    /// Pinned row-parallel compute pool.
+    pool: ComputePool,
+    /// Expert cache + io_uring/O_DIRECT streamer.
+    stream: ExpertStream,
+}
+
+impl fmt::Debug for ForwardState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ForwardState")
+            .field("context_cap", &self.kv.capacity())
+            .field("top_k", &self.topk.capacity())
+            .field("shards", &self.pool.shards())
+            .field("slots_per_layer", &self.stream.slots_per_layer())
+            .field("cache_bytes", &self.stream.cache_bytes())
+            .field("stream_mode", &self.stream.mode())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ForwardState {
     /// Preallocate all state for a model and a context cap (positions the
-    /// KV cache can hold; v0 runs with 4096).
+    /// KV cache can hold; v0 runs with 4096), using [`RuntimeConfig`]'s
+    /// defaults.
     ///
     /// # Errors
     ///
     /// [`ForwardError::UnsupportedDim`] when an architecture dimension is
     /// not a whole number of activation blocks;
     /// [`ForwardError::InvalidTopK`] on a nonsensical router config;
-    /// [`ForwardError::Kv`] when the KV geometry is rejected.
+    /// [`ForwardError::Kv`] when the KV geometry is rejected;
+    /// [`ForwardError::Io`] when the expert streamer cannot open the
+    /// install or size its slot pool.
     pub fn new(model: &Model, context_cap: usize) -> Result<Self, ForwardError> {
+        Self::with_config(model, context_cap, RuntimeConfig::default())
+    }
+
+    /// [`ForwardState::new`] with explicit runtime dials.
+    ///
+    /// # Errors
+    ///
+    /// Exactly [`ForwardState::new`]'s.
+    pub fn with_config(
+        model: &Model,
+        context_cap: usize,
+        config: RuntimeConfig,
+    ) -> Result<Self, ForwardError> {
         let arch = model.arch();
         let hidden = arch.hidden as usize;
         let q_dim = arch.n_heads as usize * arch.head_dim as usize;
@@ -203,16 +378,27 @@ impl ForwardState {
             arch.head_dim as usize,
             context_cap,
         )?;
-        let reader = model.expert_reader();
-        let max_stride = (0..reader.n_layers())
-            .filter_map(|l| reader.stride(l))
-            .max()
-            .unwrap_or(0);
-        let max_stride = usize::try_from(max_stride).map_err(|_| ForwardError::UnsupportedDim {
-            what: "expert stride",
-            dim: usize::MAX,
-            block: 1,
-        })?;
+
+        let pool = ComputePool::with_config(PoolConfig {
+            shards: config.threads,
+            pin: config.pin,
+            pin_caller: config.pin,
+            inline_caller: true,
+        });
+        let stream = ExpertStream::new(
+            model.dir(),
+            model.manifest(),
+            model.layout(),
+            config.cache_bytes,
+            model.load_options(),
+        )?;
+        tracing::info!(
+            shards = pool.shards(),
+            slots_per_layer = stream.slots_per_layer(),
+            cache_bytes = stream.cache_bytes(),
+            mode = ?stream.mode(),
+            "decode runtime ready"
+        );
 
         Ok(Self {
             kv,
@@ -231,12 +417,15 @@ impl ForwardState {
             router_logits: vec![0.0; n_experts],
             router_probs: vec![0.0; n_experts],
             topk: Vec::with_capacity(top_k),
+            expert_ids: Vec::with_capacity(top_k),
             gate: vec![0.0; moe],
             up: vec![0.0; moe],
-            expert_down: vec![0.0; hidden],
+            expert_staged: vec![0.0; top_k * hidden],
+            expert_done: vec![false; top_k],
             expert_acc: vec![0.0; hidden],
-            expert_buf: Vec::with_capacity(max_stride),
             logits: vec![0.0; vocab],
+            pool,
+            stream,
         })
     }
 
@@ -254,6 +443,33 @@ impl ForwardState {
     /// construction).
     pub fn context_cap(&self) -> usize {
         self.kv.capacity()
+    }
+
+    /// Compute shards a GEMV is fanned out across, counting the decode
+    /// thread itself.
+    pub fn shards(&self) -> usize {
+        self.pool.shards()
+    }
+
+    /// Expert slots the cache holds per layer, derived from the byte budget.
+    pub fn slots_per_layer(&self) -> u32 {
+        self.stream.slots_per_layer()
+    }
+
+    /// Total bytes the expert slot pool actually reserved.
+    pub fn cache_bytes(&self) -> u64 {
+        self.stream.cache_bytes()
+    }
+
+    /// The submission path the streamer achieved (which is not always the
+    /// one it asked for; O_DIRECT can be silently downgraded).
+    pub fn stream_mode(&self) -> StreamMode {
+        self.stream.mode()
+    }
+
+    /// Cumulative expert-streaming counters since this state was built.
+    pub fn stream_stats(&self) -> StreamStats {
+        self.stream.stats()
     }
 }
 
@@ -278,6 +494,202 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         acc += x * y;
     }
     acc
+}
+
+/// Remember the first kernel error any shard reported, without panicking
+/// out of a worker thread.
+fn record(slot: &Mutex<Option<KernelError>>, err: KernelError) {
+    let mut held = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if held.is_none() {
+        *held = Some(err);
+    }
+}
+
+/// Take whatever [`record`] stored.
+fn taken(slot: Mutex<Option<KernelError>>) -> Result<(), KernelError> {
+    match slot.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Whole-matrix k-quant GEMV, fanned out over contiguous output-row ranges.
+///
+/// Bit-identical to `gemv_q8_k` over the same operands: the pool's shards
+/// tile `0..out_dim` in ascending contiguous order and each output row is an
+/// independent dot product (see the module docs).
+fn pool_gemv_q8_k(
+    pool: &mut ComputePool,
+    format: QuantFormat,
+    weight: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+    acts: &[BlockQ8K],
+    out: &mut [f32],
+) -> Result<(), KernelError> {
+    let failure: Mutex<Option<KernelError>> = Mutex::new(None);
+    pool.scatter(out, |shard, chunk| {
+        if let Err(err) = gemv_q8_k_rows(format, weight, in_dim, out_dim, acts, shard.rows, chunk) {
+            record(&failure, err);
+        }
+    });
+    taken(failure)
+}
+
+/// Whole-matrix Q8_0 GEMV, fanned out the same way as [`pool_gemv_q8_k`].
+fn pool_gemv_q8_0(
+    pool: &mut ComputePool,
+    weight: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+    acts: &[BlockQ8_0],
+    out: &mut [f32],
+) -> Result<(), KernelError> {
+    let failure: Mutex<Option<KernelError>> = Mutex::new(None);
+    pool.scatter(out, |shard, chunk| {
+        if let Err(err) = gemv_q8_0_rows(weight, in_dim, out_dim, acts, shard.rows, chunk) {
+            record(&failure, err);
+        }
+    });
+    taken(failure)
+}
+
+/// The three MoE dimensions the expert phase needs, bundled so the phase
+/// helpers take one value instead of three positional `usize`s.
+#[derive(Clone, Copy, Debug)]
+struct MoeDims {
+    hidden: usize,
+    moe: usize,
+    top_k: usize,
+}
+
+/// The scratch one expert's FFN writes, reused by every expert in a layer:
+/// experts are computed one at a time, each fanned out across the pool.
+struct FfnScratch<'a> {
+    /// Q8_K quantization of the layer's normed residual (`[hidden]`).
+    acts_hidden: &'a [BlockQ8K],
+    /// Q8_K quantization of the SwiGLU output (`[moe_intermediate]`).
+    acts_moe: &'a mut [BlockQ8K],
+    /// Gate projection, then the SwiGLU combination in place.
+    gate: &'a mut [f32],
+    /// Up projection.
+    up: &'a mut [f32],
+}
+
+/// Everything the expert phase writes, borrowed for one layer.
+struct MoeScratch<'a> {
+    /// Per-expert FFN scratch.
+    ffn: FfnScratch<'a>,
+    /// `top_k * hidden` staged expert outputs.
+    staged: &'a mut [f32],
+    /// Which staging slots are filled (`top_k` flags).
+    done: &'a mut [bool],
+}
+
+/// gate/up -> SwiGLU -> down for one expert, staging `[hidden]` into `out`.
+///
+/// Each of the three GEMVs is row-parallel across the pool; the two cheap
+/// `[moe_intermediate]` element-wise steps between them stay on the decode
+/// thread.
+fn expert_ffn(
+    pool: &mut ComputePool,
+    view: &ExpertView<'_>,
+    dims: MoeDims,
+    scratch: &mut FfnScratch<'_>,
+    out: &mut [f32],
+) -> Result<(), ForwardError> {
+    let gate_slab = view.gate();
+    let up_slab = view.up();
+    let down_slab = view.down();
+    pool_gemv_q8_k(
+        pool,
+        gate_slab.format,
+        gate_slab.bytes,
+        dims.hidden,
+        dims.moe,
+        scratch.acts_hidden,
+        scratch.gate,
+    )?;
+    pool_gemv_q8_k(
+        pool,
+        up_slab.format,
+        up_slab.bytes,
+        dims.hidden,
+        dims.moe,
+        scratch.acts_hidden,
+        scratch.up,
+    )?;
+    swiglu_combine(scratch.gate, scratch.up)?;
+    quantize_row_q8_k(scratch.gate, scratch.acts_moe)?;
+    pool_gemv_q8_k(
+        pool,
+        down_slab.format,
+        down_slab.bytes,
+        dims.moe,
+        dims.hidden,
+        scratch.acts_moe,
+        out,
+    )?;
+    Ok(())
+}
+
+/// Compute one phase of a layer's plan — the cache hits, or the misses —
+/// as a single unit, staging each expert's output into its top-k slot.
+///
+/// `stream` is taken shared: the plan slice and every [`ExpertView`] borrow
+/// it for the length of the phase, and nothing here needs to mutate it.
+fn run_plan(
+    stream: &ExpertStream,
+    pool: &mut ComputePool,
+    layer: u32,
+    dims: MoeDims,
+    scratch: &mut MoeScratch<'_>,
+    hits: bool,
+) -> Result<(), ForwardError> {
+    let plan = if hits { stream.hits() } else { stream.misses() };
+    for &(index, slot) in plan {
+        if index >= dims.top_k || scratch.done[index] {
+            return Err(ForwardError::StreamPlanIndex {
+                layer,
+                index,
+                top_k: dims.top_k,
+            });
+        }
+        let view = stream.view(layer, slot)?;
+        let out = &mut scratch.staged[index * dims.hidden..(index + 1) * dims.hidden];
+        expert_ffn(pool, &view, dims, &mut scratch.ffn, out)?;
+        scratch.done[index] = true;
+    }
+    Ok(())
+}
+
+/// The overlapped body of one layer's expert phase, between
+/// [`ExpertStream::begin_layer`] and [`ExpertStream::end_layer`].
+///
+/// Hits first — they are the work that covers the in-flight reads — then a
+/// single block on every miss, then the misses as one unit. Neither phase
+/// reduces anything: both stage into `scratch.staged`, and the caller
+/// reduces in fixed top-k order.
+fn stream_experts(
+    stream: &mut ExpertStream,
+    pool: &mut ComputePool,
+    layer: u32,
+    dims: MoeDims,
+    scratch: &mut MoeScratch<'_>,
+) -> Result<(), ForwardError> {
+    scratch.done.fill(false);
+    run_plan(stream, pool, layer, dims, scratch, true)?;
+    stream.await_misses()?;
+    run_plan(stream, pool, layer, dims, scratch, false)?;
+    let covered = scratch.done.iter().filter(|filled| **filled).count();
+    if covered != dims.top_k {
+        return Err(ForwardError::StreamPlanCoverage {
+            layer,
+            covered,
+            top_k: dims.top_k,
+        });
+    }
+    Ok(())
 }
 
 /// Run one token through the whole model at `position`.
@@ -331,94 +743,117 @@ pub fn forward_token_traced<'s>(
     let hidden = arch.hidden as usize;
     let q_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
-    let moe = arch.moe_intermediate as usize;
-    let top_k = arch.top_k as usize;
+    let dims = MoeDims {
+        hidden,
+        moe: arch.moe_intermediate as usize,
+        top_k: arch.top_k as usize,
+    };
     let eps = arch.rms_eps as f32;
     let theta = arch.rope_theta as f32;
     let scale = 1.0 / (head_dim as f32).sqrt();
 
-    let expected = state.kv.seq_len()?;
+    // Field-by-field, so the compute pool, the streamer and the scratch
+    // buffers can be borrowed independently inside the layer loop.
+    let ForwardState {
+        kv,
+        attn_scratch,
+        hidden: residual,
+        normed,
+        acts_q8k_hidden,
+        acts_q8k_moe,
+        acts_q8k_attn,
+        acts_q8_0_hidden,
+        q,
+        k,
+        v,
+        attn_out,
+        o_proj,
+        router_logits,
+        router_probs,
+        topk,
+        expert_ids,
+        gate,
+        up,
+        expert_staged,
+        expert_done,
+        expert_acc,
+        logits,
+        pool,
+        stream,
+    } = state;
+
+    let expected = kv.seq_len()?;
     if position != expected {
         return Err(ForwardError::PositionMismatch { position, expected });
     }
     let rope_pos =
         u32::try_from(position).map_err(|_| ForwardError::PositionOverflow { position })?;
 
-    model.embed(token_id, &mut state.hidden)?;
+    model.embed(token_id, residual)?;
 
     for layer in 0..model.n_layers() {
         let lw = model.layer(layer)?;
         let layer_idx = layer as usize;
 
         // Attention block: residual = hidden; x = attn_norm(hidden).
-        rmsnorm(&state.hidden, lw.attn_norm, eps, &mut state.normed)?;
+        rmsnorm(residual, lw.attn_norm, eps, normed)?;
 
         // Quantize the normed input both ways: Q8_K for the k-quant
         // projections, Q8_0 for the q8_0 attn_k projection.
-        quantize_row_q8_k(&state.normed, &mut state.acts_q8k_hidden)?;
-        quantize_row_q8_0(&state.normed, &mut state.acts_q8_0_hidden)?;
+        quantize_row_q8_k(normed, acts_q8k_hidden)?;
+        quantize_row_q8_0(normed, acts_q8_0_hidden)?;
 
-        gemv_q8_k(
+        pool_gemv_q8_k(
+            pool,
             lw.attn_q.format,
             lw.attn_q.bytes,
             hidden,
             q_dim,
-            &state.acts_q8k_hidden,
-            &mut state.q,
+            acts_q8k_hidden,
+            q,
         )?;
-        gemv_q8_0(
-            lw.attn_k.bytes,
-            hidden,
-            kv_dim,
-            &state.acts_q8_0_hidden,
-            &mut state.k,
-        )?;
-        gemv_q8_k(
+        pool_gemv_q8_0(pool, lw.attn_k.bytes, hidden, kv_dim, acts_q8_0_hidden, k)?;
+        pool_gemv_q8_k(
+            pool,
             lw.attn_v.format,
             lw.attn_v.bytes,
             hidden,
             kv_dim,
-            &state.acts_q8k_hidden,
-            &mut state.v,
+            acts_q8k_hidden,
+            v,
         )?;
 
         // Per-head QK-RMSNorm, then RoPE — HF order: q_norm/k_norm apply
         // after the projection reshape and before rotary embedding
         // (`Qwen3MoeAttention.forward`). The [head_dim] weight is shared
         // across heads; same eps as the layer norms.
-        for head in state.q.chunks_exact_mut(head_dim) {
+        for head in q.chunks_exact_mut(head_dim) {
             rmsnorm_in_place(head, lw.attn_q_norm, eps)?;
         }
-        for head in state.k.chunks_exact_mut(head_dim) {
+        for head in k.chunks_exact_mut(head_dim) {
             rmsnorm_in_place(head, lw.attn_k_norm, eps)?;
         }
-        rope_neox_heads(&mut state.q, n_heads, head_dim, rope_pos, theta)?;
-        rope_neox_heads(&mut state.k, n_kv_heads, head_dim, rope_pos, theta)?;
+        rope_neox_heads(q, n_heads, head_dim, rope_pos, theta)?;
+        rope_neox_heads(k, n_kv_heads, head_dim, rope_pos, theta)?;
 
-        state.kv.append(layer_idx, &state.k, &state.v)?;
-        decode_attention(
-            &state.q,
-            &state.kv,
-            layer_idx,
-            scale,
-            &mut state.attn_scratch,
-            &mut state.attn_out,
-        )?;
+        kv.append(layer_idx, k, v)?;
+        decode_attention(q, kv, layer_idx, scale, attn_scratch, attn_out)?;
 
         // Output projection (q5_k, Q8_K activations) and residual add.
-        quantize_row_q8_k(&state.attn_out, &mut state.acts_q8k_attn)?;
-        gemv_q8_k(
+        quantize_row_q8_k(attn_out, acts_q8k_attn)?;
+        pool_gemv_q8_k(
+            pool,
             lw.attn_output.format,
             lw.attn_output.bytes,
             q_dim,
             hidden,
-            &state.acts_q8k_attn,
-            &mut state.o_proj,
+            acts_q8k_attn,
+            o_proj,
         )?;
-        vec_add(&mut state.hidden, &state.o_proj)?;
+        vec_add(residual, o_proj)?;
 
         // MoE block: residual = hidden; x = ffn_norm(hidden).
-        rmsnorm(&state.hidden, lw.ffn_norm, eps, &mut state.normed)?;
+        rmsnorm(residual, lw.ffn_norm, eps, normed)?;
 
         // Router: f32 matvec (rows validated `[n_experts, hidden]` at
         // load), softmax over all experts in f32, top-k by probability
@@ -428,95 +863,85 @@ pub fn forward_token_traced<'s>(
             .router
             .data()
             .chunks_exact(hidden)
-            .zip(state.router_logits.iter_mut())
+            .zip(router_logits.iter_mut())
         {
-            *logit = dot_f32(row, &state.normed);
+            *logit = dot_f32(row, normed);
         }
-        state.router_probs.copy_from_slice(&state.router_logits);
-        softmax(&mut state.router_probs)?;
-        state.topk.clear();
-        for _ in 0..top_k {
+        router_probs.copy_from_slice(router_logits);
+        softmax(router_probs)?;
+        topk.clear();
+        for _ in 0..dims.top_k {
             let mut best_e = 0usize;
             let mut best_p = f32::NEG_INFINITY;
-            for (e, &p) in state.router_probs.iter().enumerate() {
+            for (e, &p) in router_probs.iter().enumerate() {
                 if p > best_p {
                     best_p = p;
                     best_e = e;
                 }
             }
-            state.topk.push((best_e as u32, best_p));
-            state.router_probs[best_e] = f32::NEG_INFINITY;
+            topk.push((best_e as u32, best_p));
+            router_probs[best_e] = f32::NEG_INFINITY;
         }
         if arch.norm_topk_prob {
-            let sum: f32 = state.topk.iter().map(|&(_, w)| w).sum();
-            for (_, w) in state.topk.iter_mut() {
+            let sum: f32 = topk.iter().map(|&(_, w)| w).sum();
+            for (_, w) in topk.iter_mut() {
                 *w /= sum;
             }
         }
         if let Some(sink) = on_route.as_deref_mut() {
-            sink(layer, &state.topk);
+            sink(layer, topk);
         }
 
-        // Experts: quantize the normed input once, then gate/up -> SwiGLU
-        // -> down per selected expert, accumulating the weighted outputs.
-        quantize_row_q8_k(&state.normed, &mut state.acts_q8k_hidden)?;
-        state.expert_acc.fill(0.0);
-        for i in 0..top_k {
-            let (expert, weight) = state.topk[i];
-            let view = model
-                .expert_reader()
-                .read_expert(layer, expert, &mut state.expert_buf)?;
-            let gate_slab = view.gate();
-            let up_slab = view.up();
-            let down_slab = view.down();
-            gemv_q8_k(
-                gate_slab.format,
-                gate_slab.bytes,
-                hidden,
-                moe,
-                &state.acts_q8k_hidden,
-                &mut state.gate,
-            )?;
-            gemv_q8_k(
-                up_slab.format,
-                up_slab.bytes,
-                hidden,
-                moe,
-                &state.acts_q8k_hidden,
-                &mut state.up,
-            )?;
-            swiglu_combine(&mut state.gate, &state.up)?;
-            quantize_row_q8_k(&state.gate, &mut state.acts_q8k_moe)?;
-            gemv_q8_k(
-                down_slab.format,
-                down_slab.bytes,
-                moe,
-                hidden,
-                &state.acts_q8k_moe,
-                &mut state.expert_down,
-            )?;
-            for (acc, &d) in state.expert_acc.iter_mut().zip(&state.expert_down) {
+        // Experts: quantize the normed input once, submit every miss, then
+        // compute hits and misses as two coarse units, staging each
+        // expert's `[hidden]` output.
+        quantize_row_q8_k(normed, acts_q8k_hidden)?;
+        expert_ids.clear();
+        expert_ids.extend(topk.iter().map(|&(expert, _)| expert));
+
+        stream.begin_layer(layer, expert_ids)?;
+        let mut scratch = MoeScratch {
+            ffn: FfnScratch {
+                acts_hidden: acts_q8k_hidden,
+                acts_moe: acts_q8k_moe,
+                gate,
+                up,
+            },
+            staged: expert_staged,
+            done: expert_done,
+        };
+        let phases = stream_experts(stream, pool, layer, dims, &mut scratch);
+        stream.end_layer(layer);
+        phases?;
+
+        // Fixed-order reduction: identical to the phase-4 sequential
+        // `acc += w_i * d_i`, whatever order the experts were computed in.
+        expert_acc.fill(0.0);
+        for (i, &(_, weight)) in topk.iter().enumerate() {
+            let staged = &expert_staged[i * hidden..(i + 1) * hidden];
+            for (acc, &d) in expert_acc.iter_mut().zip(staged) {
                 *acc += weight * d;
             }
         }
-        vec_add(&mut state.hidden, &state.expert_acc)?;
+        vec_add(residual, expert_acc)?;
     }
 
     if !want_logits {
         return Ok(None);
     }
-    rmsnorm(&state.hidden, model.final_norm(), eps, &mut state.normed)?;
-    quantize_row_q8_k(&state.normed, &mut state.acts_q8k_hidden)?;
+    rmsnorm(residual, model.final_norm(), eps, normed)?;
+    quantize_row_q8_k(normed, acts_q8k_hidden)?;
     let head = model.lm_head();
-    gemv_q8_k(
+    pool_gemv_q8_k(
+        pool,
         head.format,
         head.bytes,
         head.in_dim,
         head.out_dim,
-        &state.acts_q8k_hidden,
-        &mut state.logits,
+        acts_q8k_hidden,
+        logits,
     )?;
-    Ok(Some(&state.logits))
+    Ok(Some(logits))
 }
 
 /// Test support shared with the generation-loop tests: the io fixture's
@@ -589,13 +1014,21 @@ mod tests {
     use crate::io::LoadOptions;
     use crate::io::testutil::{Fixture, VOCAB, build_install};
 
-    const SKIP: LoadOptions = LoadOptions { skip_hashes: true };
+    const SKIP: LoadOptions = LoadOptions {
+        skip_hashes: true,
+        verify_layer_hashes: false,
+    };
 
     fn load_fixture(tag: &str) -> (Fixture, Model) {
         let fx = build_install(tag);
         temper_install(&fx);
         let model = Model::load(&fx.root, SKIP).unwrap();
         (fx, model)
+    }
+
+    /// A state over the tiny fixture: two unpinned shards, small budget.
+    pub(crate) fn state(model: &Model, context_cap: usize) -> ForwardState {
+        ForwardState::with_config(model, context_cap, RuntimeConfig::testing()).unwrap()
     }
 
     /// Run `ids` through a fresh state and return the final logits.
@@ -615,26 +1048,74 @@ mod tests {
     #[test]
     fn logits_are_finite_and_vocab_shaped() {
         let (_fx, model) = load_fixture("fwd-finite");
-        let mut state = ForwardState::new(&model, 8).unwrap();
-        assert_eq!(state.context_cap(), 8);
-        let logits = run(&model, &mut state, &[1, 2, 3]);
+        let mut st = state(&model, 8);
+        assert_eq!(st.context_cap(), 8);
+        let logits = run(&model, &mut st, &[1, 2, 3]);
         assert_eq!(logits.len(), VOCAB);
         assert!(logits.iter().all(|v| v.is_finite()), "{logits:?}");
         // The patterned fixture is not degenerate: logits differ.
         assert!(logits.iter().any(|&v| v != logits[0]));
-        assert_eq!(state.seq_len().unwrap(), 3);
+        assert_eq!(st.seq_len().unwrap(), 3);
     }
 
     #[test]
     fn identical_inputs_are_bitwise_deterministic() {
         let (_fx, model) = load_fixture("fwd-determinism");
-        let mut a = ForwardState::new(&model, 8).unwrap();
-        let mut b = ForwardState::new(&model, 8).unwrap();
+        let mut a = state(&model, 8);
+        let mut b = state(&model, 8);
         let la = run(&model, &mut a, &[5, 0, 7]);
         let lb = run(&model, &mut b, &[5, 0, 7]);
         let bits_a: Vec<u32> = la.iter().map(|v| v.to_bits()).collect();
         let bits_b: Vec<u32> = lb.iter().map(|v| v.to_bits()).collect();
         assert_eq!(bits_a, bits_b);
+    }
+
+    /// The load-bearing phase-5 property, exercised end to end on the
+    /// fixture: shard count and cache size are scheduling decisions, so a
+    /// one-shard cold-cache run and a four-shard run whose cache is already
+    /// warm must agree bit for bit.
+    #[test]
+    fn shard_count_and_cache_size_do_not_move_a_bit() {
+        let (_fx, model) = load_fixture("fwd-shards");
+
+        let single = RuntimeConfig {
+            cache_bytes: 4 * 1024 * 1024,
+            threads: Some(1),
+            pin: false,
+        };
+        let mut one = ForwardState::with_config(&model, 8, single).unwrap();
+        let want = run(&model, &mut one, &[5, 0, 7]);
+
+        // The tightest budget the cache accepts — one slot per routed
+        // expert, i.e. `top_k` slots per layer — so nothing survives a step
+        // and every request after the first is an eviction miss. That is the
+        // maximum amount of cache churn there is, and it must still not move
+        // a bit.
+        let layout = model.layout();
+        let widest = layout.layers.iter().map(|l| l.stride).max().unwrap();
+        let tightest = widest * layout.layers.len() as u64 * u64::from(model.arch().top_k.max(1));
+
+        for threads in [2usize, 4] {
+            for cache_bytes in [tightest, 4 * 1024 * 1024] {
+                let config = RuntimeConfig {
+                    cache_bytes,
+                    threads: Some(threads),
+                    pin: false,
+                };
+                let mut many = ForwardState::with_config(&model, 8, config).unwrap();
+                // Warm the cache, then re-run the same prompt.
+                let _ = run(&model, &mut many, &[5, 0, 7]);
+                let mut again = ForwardState::with_config(&model, 8, config).unwrap();
+                let got = run(&model, &mut again, &[5, 0, 7]);
+                for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "threads={threads} cache_bytes={cache_bytes}: logit {i}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -652,25 +1133,25 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         let model = Model::load(&fx.root, SKIP).unwrap();
-        let mut state = ForwardState::new(&model, 4).unwrap();
-        let logits = run(&model, &mut state, &[3]);
+        let mut st = state(&model, 4);
+        let logits = run(&model, &mut st, &[3]);
         assert!(logits.iter().all(|&v| v == 0.0), "{logits:?}");
     }
 
     #[test]
     fn positions_must_be_sequential() {
         let (_fx, model) = load_fixture("fwd-positions");
-        let mut state = ForwardState::new(&model, 4).unwrap();
+        let mut st = state(&model, 4);
         assert!(matches!(
-            forward_token(&model, &mut state, 0, 1, false).unwrap_err(),
+            forward_token(&model, &mut st, 0, 1, false).unwrap_err(),
             ForwardError::PositionMismatch {
                 position: 1,
                 expected: 0
             }
         ));
-        forward_token(&model, &mut state, 0, 0, false).unwrap();
+        forward_token(&model, &mut st, 0, 0, false).unwrap();
         assert!(matches!(
-            forward_token(&model, &mut state, 0, 0, false).unwrap_err(),
+            forward_token(&model, &mut st, 0, 0, false).unwrap_err(),
             ForwardError::PositionMismatch {
                 position: 0,
                 expected: 1
@@ -681,11 +1162,11 @@ mod tests {
     #[test]
     fn context_cap_exhaustion_is_typed() {
         let (_fx, model) = load_fixture("fwd-cap");
-        let mut state = ForwardState::new(&model, 2).unwrap();
-        forward_token(&model, &mut state, 0, 0, false).unwrap();
-        forward_token(&model, &mut state, 1, 1, false).unwrap();
+        let mut st = state(&model, 2);
+        forward_token(&model, &mut st, 0, 0, false).unwrap();
+        forward_token(&model, &mut st, 1, 1, false).unwrap();
         assert!(matches!(
-            forward_token(&model, &mut state, 2, 2, false).unwrap_err(),
+            forward_token(&model, &mut st, 2, 2, false).unwrap_err(),
             ForwardError::Kv(KvError::CapacityExceeded { .. })
         ));
     }
@@ -693,10 +1174,48 @@ mod tests {
     #[test]
     fn bad_token_is_typed() {
         let (_fx, model) = load_fixture("fwd-token");
-        let mut state = ForwardState::new(&model, 4).unwrap();
+        let mut st = state(&model, 4);
         assert!(matches!(
-            forward_token(&model, &mut state, VOCAB as u32, 0, true).unwrap_err(),
+            forward_token(&model, &mut st, VOCAB as u32, 0, true).unwrap_err(),
             ForwardError::Model(ModelError::TokenOutOfRange { .. })
         ));
+    }
+
+    #[test]
+    fn runtime_dials_are_reported() {
+        let (_fx, model) = load_fixture("fwd-dials");
+        let st = state(&model, 4);
+        assert_eq!(st.shards(), 2);
+        assert!(st.slots_per_layer() >= 1);
+        assert!(st.cache_bytes() > 0);
+        let stats = st.stream_stats();
+        assert_eq!(stats.hits + stats.misses, 0, "no experts read yet");
+        // `Debug` must not depend on the streamer being `Debug`.
+        assert!(format!("{st:?}").contains("ForwardState"));
+    }
+
+    #[test]
+    fn default_runtime_config_is_the_documented_budget() {
+        let config = RuntimeConfig::default();
+        assert_eq!(config.cache_bytes, DEFAULT_CACHE_BYTES);
+        assert_eq!(config.cache_bytes, 1_509_949_440);
+        assert_eq!(config.threads, None);
+        assert!(config.pin);
+    }
+
+    /// The default budget must clear 11 slots/layer on the audited Qwen3
+    /// geometry, and it clears it by only 1.4 MiB. One slot across all 48
+    /// layers costs `24 * 3,059,712 + 24 * 2,654,208` = 137,134,080 B, so 11
+    /// slots is 1,508,474,880 B (1,438.59 MiB). A budget expressed as a round
+    /// 1,438 MiB floors to **10**, which is the bug this pins: the dial
+    /// divides and floors, so the default has to clear the boundary, not sit
+    /// on it.
+    #[test]
+    fn the_default_budget_clears_eleven_slots_per_layer() {
+        const PER_SLOT_ALL_LAYERS: u64 = 24 * 3_059_712 + 24 * 2_654_208;
+        assert_eq!(PER_SLOT_ALL_LAYERS, 137_134_080);
+
+        assert_eq!(DEFAULT_CACHE_BYTES / PER_SLOT_ALL_LAYERS, 11);
+        assert_eq!(1438 * 1024 * 1024 / PER_SLOT_ALL_LAYERS, 10);
     }
 }

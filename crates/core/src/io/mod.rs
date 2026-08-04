@@ -29,15 +29,22 @@
 //! validation ([`Manifest::validate`](crate::format::Manifest::validate)).
 //! `common.bin` and `experts/layout.json` are hashed against the manifest
 //! when the model opens (the ~1 GiB `common.bin` hash is an accepted
-//! one-time cost); each `experts/layer_NN.bin` is hashed on first open.
+//! one-time cost); each `experts/layer_NN.bin` is **size-checked** on first
+//! open, and hashed in full only under
+//! [`LoadOptions::verify_layer_hashes`] — re-reading 16.35 GiB of expert
+//! files through the page cache on every process start is exactly what
+//! streaming them with O_DIRECT exists to avoid, and the thorough path is
+//! `ramvamp-repack verify-install`.
 //! [`LoadOptions::skip_hashes`] skips every SHA-256 check for fast dev
 //! iteration; size checks always run.
 
 mod cache;
 mod common;
+mod direct;
 mod error;
 mod expert;
 mod slots;
+mod stream;
 #[cfg(test)]
 pub(crate) mod testutil;
 
@@ -46,9 +53,11 @@ use std::path::Path;
 
 pub use cache::{CacheError, CachePlan, CacheStats, LayerCache, MAX_SLOTS, STUCK_PROTECTED_PLANS};
 pub use common::MappedCommon;
+pub use direct::{DIO_ALIGN, DirectFault, DirectSupport};
 pub use error::IoError;
 pub use expert::{ExpertReader, ExpertSlab, ExpertView};
 pub use slots::{MAX_POOL_BYTES, SLOT_ALIGN, SlotError, SlotGuard, SlotPool};
+pub use stream::{ExpertStream, StreamMode, StreamStats};
 
 use crate::format::{FormatError, Manifest, sha256_file};
 use crate::kernels::quants::QuantFormat;
@@ -60,6 +69,20 @@ pub struct LoadOptions {
     /// first-open layer-file hashes). Development flag only: size checks
     /// still run, but corruption goes undetected. Defaults to `false`.
     pub skip_hashes: bool,
+
+    /// Hash every `experts/layer_NN.bin` in full when it is first opened.
+    ///
+    /// **Off by default, deliberately.** The layer files are the bulk of an
+    /// install (16.35 GiB for Qwen3-30B-A3B), and hashing them is a
+    /// buffered sequential read of all of it — which both costs seconds of
+    /// startup and charges the whole model to the page cache, defeating the
+    /// point of streaming experts with O_DIRECT. Every layer file is still
+    /// **size-checked** on first open, unconditionally, and the thorough
+    /// path remains `ramvamp-repack verify-install`.
+    ///
+    /// Ignored when [`LoadOptions::skip_hashes`] is set; that flag skips
+    /// everything.
+    pub verify_layer_hashes: bool,
 }
 
 /// Map a lowercase on-disk quant name (as the repacker writes it) to the

@@ -30,6 +30,9 @@ sha2 = "0.10"
 memmap2 = "0.9"
 io-uring = "0.7"
 rustix = { version = "1", features = ["thread", "process", "mm"] }
+# mincore/posix_fadvise for the O_DIRECT capability probe: rustix exposes
+# neither, and libc is already in the tree via memmap2.
+libc = "0.2"
 tokenizers = "0.21"
 
 # Repacker HTTP (ranged downloads; rustls, no OpenSSL)
