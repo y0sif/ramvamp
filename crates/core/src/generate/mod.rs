@@ -30,10 +30,11 @@
 //! # Streaming detokenization
 //!
 //! Decoding each token id alone is wrong for byte-level BPE (one Unicode
-//! character can span tokens), so [`generate`] decodes the accumulated ids
-//! and emits the new suffix, withholding any trailing U+FFFD replacement
-//! characters until the bytes that complete them arrive (they are flushed
-//! verbatim at end of generation if the model stops mid-character).
+//! character can span tokens), so [`generate`] decodes a bounded trailing
+//! window of the generated ids and emits the new suffix, withholding any
+//! trailing U+FFFD replacement characters until the bytes that complete
+//! them arrive (they are flushed verbatim at end of generation if the model
+//! stops mid-character).
 
 use std::time::{Duration, Instant};
 
@@ -280,20 +281,68 @@ impl Sampler {
     }
 }
 
-/// Incremental detokenizer: accumulates generated ids, decodes the whole
-/// sequence each push, and returns only the newly-safe suffix. "Safe"
+/// Ids [`StreamDecoder`] keeps once their text has been emitted.
+///
+/// The window only has to span the ids that can still be holding the
+/// UTF-8 bytes of one unfinished character. A Unicode scalar is at most
+/// four UTF-8 bytes and every byte-level BPE token carries at least one
+/// byte, so at most four ids can split a character; eight leaves slack
+/// for added tokens and for a decoder that is less byte-exact than this
+/// vocabulary's plain `ByteLevel` one, at a bounded cost per push.
+const STREAM_WINDOW_KEEP: usize = 8;
+
+/// Hard cap on [`StreamDecoder`]'s window.
+///
+/// Reaching it means the window decode has ended in U+FFFD — or refused to
+/// split cleanly — for this many ids in a row, which well-formed UTF-8
+/// cannot do (see [`STREAM_WINDOW_KEEP`]); only a run of undecodable bytes
+/// gets here. The decoder then stops withholding, emits the replacement
+/// characters verbatim, and restarts with an empty window: visibly broken
+/// text for input that is already broken, instead of a window that grows
+/// with the generation. Well above the four ids real text needs, so no
+/// legitimate sequence trips it.
+const STREAM_WINDOW_MAX: usize = 64;
+
+/// Incremental detokenizer: decodes a bounded trailing window of the
+/// generated ids each push and returns only the newly-safe suffix. "Safe"
 /// excludes trailing U+FFFD replacement characters, which mark a Unicode
 /// character whose UTF-8 bytes are still split across future tokens
 /// (byte-level BPE decode is byte-prefix-stable except for that tail).
-/// DEFERRED (review 2026-08-02): re-decoding the full accumulated sequence
-/// is O(n^2) over a generation — fine at the v0 default `max_new` 128,
-/// must become a bounded-tail incremental decode before phase 6 raises
-/// generation lengths.
+///
+/// # Cost
+///
+/// [`push`](Self::push) decodes the window once and then searches for a
+/// clean cut (see [`trim`](Self::trim)), all of it bounded by
+/// [`STREAM_WINDOW_MAX`] ids and in practice a little over
+/// [`STREAM_WINDOW_KEEP`]. Nothing it does — decoded ids, bytes allocated,
+/// bytes copied — depends on how many tokens have already been generated,
+/// so a whole generation is O(n) rather than the O(n^2) of re-decoding the
+/// accumulated sequence once per token.
+///
+/// # Why sliding is sound
+///
+/// `tokenizers`' decode of this vocabulary is
+/// `String::from_utf8_lossy(concat(bytes(id) for id in ids))`: the bytes
+/// concatenate and the lossy read is taken once over the whole run. So if
+/// the ids dropped off the front decode on their own to complete, valid
+/// UTF-8 that is a prefix of the window's decode, the rest of the window
+/// decodes to exactly the suffix that [`emitted`](Self::emitted) indexes
+/// into. [`trim`](Self::trim) drops ids only after checking exactly that,
+/// so an added token or a split character straddling the window edge
+/// simply stays in the window until it is whole and emitted.
 #[derive(Debug, Default)]
 struct StreamDecoder {
-    ids: Vec<u32>,
-    /// Bytes of the accumulated decode already emitted.
+    /// Trailing ids of the generation, at most [`STREAM_WINDOW_MAX`].
+    window: Vec<u32>,
+    /// Bytes of the *window's* decode already emitted.
     emitted: usize,
+    /// Last id pushed, independent of what the window still holds.
+    last: Option<u32>,
+    /// Ids handed to [`RvmpTokenizer::decode`] since construction; the
+    /// scaling test asserts this grows per push by a bounded amount
+    /// rather than with the sequence length.
+    #[cfg(test)]
+    decoded_ids: usize,
 }
 
 impl StreamDecoder {
@@ -301,38 +350,110 @@ impl StreamDecoder {
         Self::default()
     }
 
+    /// Decode `self.window[start..end]`, counting the work for tests.
+    fn decode_range(
+        &mut self,
+        tokenizer: &RvmpTokenizer,
+        start: usize,
+        end: usize,
+    ) -> Result<String, TokenizerError> {
+        #[cfg(test)]
+        {
+            self.decoded_ids += end - start;
+        }
+        tokenizer.decode(&self.window[start..end], false)
+    }
+
     /// Append one id and return the newly emittable text (possibly empty).
     fn push(&mut self, tokenizer: &RvmpTokenizer, id: u32) -> Result<String, TokenizerError> {
-        self.ids.push(id);
-        let full = tokenizer.decode(&self.ids, false)?;
-        let mut safe = full.len();
-        while full[..safe].ends_with('\u{FFFD}') {
-            safe -= '\u{FFFD}'.len_utf8();
+        self.window.push(id);
+        self.last = Some(id);
+        let len = self.window.len();
+        let text = self.decode_range(tokenizer, 0, len)?;
+
+        // Withhold a trailing run of replacement characters: those are a
+        // character whose remaining bytes live in ids not pushed yet. At
+        // the cap that withholding is abandoned (see STREAM_WINDOW_MAX).
+        let capped = len >= STREAM_WINDOW_MAX;
+        let mut safe = text.len();
+        if !capped {
+            while text[..safe].ends_with('\u{FFFD}') {
+                safe -= '\u{FFFD}'.len_utf8();
+            }
         }
-        if safe <= self.emitted {
-            return Ok(String::new());
+        let mut out = String::new();
+        if safe > self.emitted {
+            // In range by construction; `get` keeps a hostile tokenizer
+            // from panicking us if decode were ever not prefix-stable.
+            out = text.get(self.emitted..safe).unwrap_or("").to_owned();
+            self.emitted = safe;
         }
-        // In range by construction; `get` keeps a hostile tokenizer from
-        // panicking us if decode were ever not prefix-stable.
-        let out = full.get(self.emitted..safe).unwrap_or("").to_owned();
-        self.emitted = safe;
+
+        if capped {
+            // The whole window has now been emitted, replacement
+            // characters and all, so it carries no debt: start over
+            // rather than keep growing.
+            self.window.clear();
+            self.emitted = 0;
+        } else {
+            self.trim(tokenizer, &text)?;
+        }
         Ok(out)
+    }
+
+    /// Drop the longest leading run of ids that splits cleanly, back down
+    /// to [`STREAM_WINDOW_KEEP`].
+    ///
+    /// `text` is the decode of the current window. A cut is clean when the
+    /// dropped run decodes to complete UTF-8 (no trailing U+FFFD) that is
+    /// already inside the emitted prefix and matches `text` there — the
+    /// conditions that make the rest of the window decode to exactly the
+    /// suffix `emitted` indexes into (see the type docs).
+    ///
+    /// Cuts have to be searched for rather than taken one id at a time:
+    /// byte-level BPE routinely ends an id in the middle of a character
+    /// (the rest of it merged into the next id), and no such id is ever a
+    /// clean cut on its own. So the widest useful cut is tried first and
+    /// narrowed — at most `len - STREAM_WINDOW_KEEP` decodes of at most
+    /// that many ids. When nothing splits, the window grows by one and the
+    /// next push searches one wider, bounded by [`STREAM_WINDOW_MAX`].
+    fn trim(&mut self, tokenizer: &RvmpTokenizer, text: &str) -> Result<(), TokenizerError> {
+        let len = self.window.len();
+        if len <= STREAM_WINDOW_KEEP {
+            return Ok(());
+        }
+        let mut cut = len - STREAM_WINDOW_KEEP;
+        while cut > 0 {
+            let head = self.decode_range(tokenizer, 0, cut)?;
+            if !head.is_empty()
+                && !head.ends_with('\u{FFFD}')
+                && head.len() <= self.emitted
+                && text.starts_with(&head)
+            {
+                self.window.drain(..cut);
+                self.emitted -= head.len();
+                return Ok(());
+            }
+            cut -= 1;
+        }
+        Ok(())
     }
 
     /// Everything still withheld (a trailing incomplete character, decoded
     /// with replacement characters), emptying the decoder's debt.
     fn flush(&mut self, tokenizer: &RvmpTokenizer) -> Result<String, TokenizerError> {
-        if self.ids.is_empty() {
+        if self.window.is_empty() {
             return Ok(String::new());
         }
-        let full = tokenizer.decode(&self.ids, false)?;
-        let out = full.get(self.emitted..).unwrap_or("").to_owned();
-        self.emitted = full.len();
+        let len = self.window.len();
+        let text = self.decode_range(tokenizer, 0, len)?;
+        let out = text.get(self.emitted..).unwrap_or("").to_owned();
+        self.emitted = text.len();
         Ok(out)
     }
 
     fn last_id(&self) -> Option<u32> {
-        self.ids.last().copied()
+        self.last
     }
 }
 
@@ -641,6 +762,219 @@ mod tests {
     }
 
     // --- StreamDecoder ---
+
+    use crate::tokenizer::{ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID, IM_START_TOKEN_ID};
+
+    /// A deliberately mixed sequence — ASCII, CJK, an emoji ZWJ cluster,
+    /// a ChatML marker (which encodes to its single added-token id),
+    /// astral-plane characters — repeated `reps` times, so a run over it
+    /// slides the window many times with every awkward case recurring on
+    /// both sides of a slide.
+    fn mixed_ids(tokenizer: &RvmpTokenizer, reps: usize) -> Vec<u32> {
+        const UNIT: &str = "hi \u{4F60}\u{597D}\u{4E16}\u{754C} \u{1F30D}\u{1F469}\u{200D}\u{1F4BB}\
+                            <|im_end|>\n\u{13000}\u{1D518} ok ";
+        tokenizer.encode(&UNIT.repeat(reps)).unwrap()
+    }
+
+    /// Drive a decoder over `ids`, asserting no push leaks a replacement
+    /// character and the window stays bounded. Returns the assembled text
+    /// (every push plus `flush`) and the ids each push handed to the
+    /// tokenizer.
+    fn drive_stream(tokenizer: &RvmpTokenizer, ids: &[u32]) -> (String, Vec<usize>) {
+        let mut stream = StreamDecoder::new();
+        let mut assembled = String::new();
+        let mut per_push = Vec::with_capacity(ids.len());
+        let mut counted = 0usize;
+        for (i, &id) in ids.iter().enumerate() {
+            let piece = stream.push(tokenizer, id).unwrap();
+            assert!(
+                !piece.contains('\u{FFFD}'),
+                "push {i} leaked a replacement char: {piece:?}"
+            );
+            assert!(
+                stream.window.len() <= STREAM_WINDOW_MAX,
+                "window grew past its cap at push {i}"
+            );
+            assembled.push_str(&piece);
+            per_push.push(stream.decoded_ids - counted);
+            counted = stream.decoded_ids;
+        }
+        assembled.push_str(&stream.flush(tokenizer).unwrap());
+        (assembled, per_push)
+    }
+
+    /// The property that actually matters: streaming is a partition of the
+    /// one-shot decode. Whatever the window does, every push concatenated
+    /// with the final flush must equal `decode(all_ids, false)`.
+    #[test]
+    fn stream_decoder_matches_the_full_decode() {
+        let tokenizer = fixture_tokenizer();
+        let enc = |s: &str| tokenizer.encode(s).unwrap();
+        let mut raw_specials = vec![IM_START_TOKEN_ID];
+        raw_specials.extend(enc("user\n"));
+        raw_specials.extend([IM_END_TOKEN_ID, ENDOFTEXT_TOKEN_ID, 151_668]);
+
+        let cases: Vec<(&str, Vec<u32>)> = vec![
+            ("empty", Vec::new()),
+            ("single ascii id", enc("hello")[..1].to_vec()),
+            ("single added-token id", vec![IM_END_TOKEN_ID]),
+            ("ascii", enc("hello world, 1 + 2 = 3. done!")),
+            (
+                "cjk",
+                enc("\u{4F60}\u{597D}\u{4E16}\u{754C}\u{3002}\u{6D4B}\u{8BD5}\u{4E00}\u{4E0B}"),
+            ),
+            (
+                "emoji",
+                enc("ok \u{1F30D}\u{1F680}\u{1F469}\u{200D}\u{1F4BB} fine"),
+            ),
+            ("astral planes", enc("\u{13000}\u{1D518}\u{10348}")),
+            (
+                "chatml round trip",
+                enc("<|im_start|>user\nhi \u{1F600}<|im_end|>\n<|im_start|>assistant\n"),
+            ),
+            ("raw added-token ids", raw_specials),
+            ("long mixed, many slides", mixed_ids(&tokenizer, 24)),
+        ];
+        for (name, ids) in cases {
+            let (assembled, _) = drive_stream(&tokenizer, &ids);
+            assert_eq!(
+                assembled,
+                tokenizer.decode(&ids, false).unwrap(),
+                "case {name}"
+            );
+        }
+    }
+
+    /// The window-boundary case the bounded tail introduces: a character
+    /// whose bytes are split across ids, arriving after the window has
+    /// already started sliding.
+    #[test]
+    fn stream_decoder_carries_a_character_across_a_window_slide() {
+        let tokenizer = fixture_tokenizer();
+        let split = ["\u{13000}", "\u{1D518}", "\u{10348}", "\u{1F30D}"]
+            .iter()
+            .map(|s| tokenizer.encode(s).unwrap())
+            .find(|ids| ids.len() >= 2)
+            .expect("some exotic character splits into multiple ids");
+        assert!(split.len() <= STREAM_WINDOW_KEEP);
+        let prefix = tokenizer
+            .encode(&"the quick brown fox jumps over the lazy dog ".repeat(3))
+            .unwrap();
+        assert!(
+            prefix.len() > STREAM_WINDOW_KEEP * 2,
+            "{} ids",
+            prefix.len()
+        );
+
+        let mut stream = StreamDecoder::new();
+        let mut assembled = String::new();
+        for &id in &prefix {
+            assembled.push_str(&stream.push(&tokenizer, id).unwrap());
+        }
+        // Trimmed to the keep bound, so the character below starts at a
+        // slid window edge rather than at the start of the sequence.
+        assert_eq!(stream.window.len(), STREAM_WINDOW_KEEP);
+        assert_eq!(assembled, tokenizer.decode(&prefix, false).unwrap());
+
+        for (i, &id) in split.iter().enumerate() {
+            let piece = stream.push(&tokenizer, id).unwrap();
+            assert!(!piece.contains('\u{FFFD}'), "push {i}: {piece:?}");
+            // The trim refuses to drop an id whose bytes are unfinished or
+            // still withheld, so a slide cannot cut the character in half.
+            assert!(stream.window.ends_with(&split[..=i]), "push {i}");
+            assembled.push_str(&piece);
+        }
+        assembled.push_str(&stream.flush(&tokenizer).unwrap());
+
+        let all: Vec<u32> = prefix.iter().chain(split.iter()).copied().collect();
+        assert_eq!(assembled, tokenizer.decode(&all, false).unwrap());
+    }
+
+    /// `generate` calls `on_token` once per generated token, plus one more
+    /// only when `flush` still owes text — `generated` or `generated + 1`,
+    /// never more. That contract lives in these two shapes.
+    #[test]
+    fn stream_decoder_flush_owes_text_at_most_once() {
+        let tokenizer = fixture_tokenizer();
+
+        // Nothing withheld: no extra event.
+        let mut stream = StreamDecoder::new();
+        for &id in &tokenizer.encode("all done.").unwrap() {
+            stream.push(&tokenizer, id).unwrap();
+        }
+        assert_eq!(stream.flush(&tokenizer).unwrap(), "");
+        assert_eq!(stream.flush(&tokenizer).unwrap(), "");
+
+        // Stopped mid-character: exactly one extra event, attributed to the
+        // last id pushed, and nothing after it.
+        let split = tokenizer.encode("\u{13000}").unwrap();
+        assert!(split.len() >= 2);
+        let head = &split[..split.len() - 1];
+        let mut stream = StreamDecoder::new();
+        for &id in head {
+            assert_eq!(stream.push(&tokenizer, id).unwrap(), "");
+        }
+        let tail = stream.flush(&tokenizer).unwrap();
+        assert!(tail.contains('\u{FFFD}'));
+        assert_eq!(stream.last_id(), head.last().copied());
+        assert_eq!(stream.flush(&tokenizer).unwrap(), "");
+    }
+
+    #[test]
+    fn stream_decoder_handles_empty_and_single_id_sequences() {
+        let tokenizer = fixture_tokenizer();
+        let mut empty = StreamDecoder::new();
+        assert_eq!(empty.flush(&tokenizer).unwrap(), "");
+        assert_eq!(empty.last_id(), None);
+
+        for id in [
+            tokenizer.encode("hi").unwrap()[0],
+            IM_START_TOKEN_ID,
+            IM_END_TOKEN_ID,
+        ] {
+            let mut stream = StreamDecoder::new();
+            let piece = stream.push(&tokenizer, id).unwrap();
+            assert_eq!(piece, tokenizer.decode(&[id], false).unwrap(), "id {id}");
+            assert_eq!(stream.flush(&tokenizer).unwrap(), "");
+            assert_eq!(stream.last_id(), Some(id));
+        }
+    }
+
+    /// The review finding this decoder closed (2026-08-02): re-decoding the
+    /// accumulated ids per token is O(n^2). Counted decode work — not wall
+    /// clock, which would flake on a loaded machine — pins that the cost of
+    /// a push is set by the window, not by how much has been generated.
+    #[test]
+    fn stream_decoder_decode_work_per_push_does_not_grow_with_length() {
+        let tokenizer = fixture_tokenizer();
+        let short = mixed_ids(&tokenizer, 3);
+        let long = mixed_ids(&tokenizer, 24);
+        assert!(long.len() > short.len() * 4, "{} ids", long.len());
+
+        let (short_text, short_push) = drive_stream(&tokenizer, &short);
+        let (long_text, long_push) = drive_stream(&tokenizer, &long);
+        assert_eq!(short_text, tokenizer.decode(&short, false).unwrap());
+        assert_eq!(long_text, tokenizer.decode(&long, false).unwrap());
+
+        // Same content, 8x the length, same worst-case push. The second
+        // bound is deliberately far below `STREAM_WINDOW_MAX`: a trim that
+        // stalls (an earlier draft cut one id at a time, which byte-level
+        // BPE blocks whenever an id ends mid-character) still terminates
+        // and still decodes correctly, but drifts the window up to the cap.
+        let short_worst = short_push.iter().copied().max().unwrap();
+        let long_worst = long_push.iter().copied().max().unwrap();
+        assert!(
+            long_worst <= short_worst && long_worst <= STREAM_WINDOW_KEEP * 3,
+            "per-push decode grew with length: {short_worst} -> {long_worst}"
+        );
+
+        // And therefore the whole run is linear, not quadratic: the old
+        // full re-decode would have cost n(n+1)/2 ids.
+        let n = long.len();
+        let total: usize = long_push.iter().sum();
+        assert!(total <= n * STREAM_WINDOW_KEEP * 3, "total {total}, n {n}");
+        assert!(total * 4 < n * (n + 1) / 2, "total {total}, n {n}");
+    }
 
     #[test]
     fn stream_decoder_withholds_split_utf8() {
