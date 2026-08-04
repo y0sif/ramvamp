@@ -77,6 +77,7 @@
 //! is a claim about code that changes.
 
 use std::fmt;
+use std::ptr::NonNull;
 
 use thiserror::Error;
 
@@ -147,8 +148,10 @@ pub enum SweepError {
         experts: u32,
         /// The layer's blob stride.
         stride: u64,
-        /// Bytes the window would read.
-        bytes: u64,
+        /// Bytes the window would read, computed in 128 bits so that a stride
+        /// past `u64::MAX / experts_per_window` is *reported* rather than an
+        /// overflow panic in a `pub` function over `pub` fields.
+        bytes: u128,
         /// The per-read ceiling.
         max: u64,
     },
@@ -207,9 +210,71 @@ pub enum SweepError {
     )]
     ArenaPoisoned,
 
-    /// A sweep operation ran with no arena out. A bug in this module.
+    /// A sweep operation ran with no arena out. A bug in this module, or the
+    /// arena being taken away mid-sweep by [`SweepError::ArenaPoisoned`]'s
+    /// cause.
     #[error("no prefill arena is out")]
     NoArena,
+
+    /// The carve would cover a slot buffer that was given up to protect a read
+    /// which could never be reaped, so the kernel may still be writing there.
+    ///
+    /// Retiring a slot leaks its buffer *inside* the slab rather than freeing
+    /// it — that is the whole point, a late kernel write has to land somewhere
+    /// harmless — so the bytes stay where they were and an arena carved over
+    /// them would put a window read on a live DMA destination.
+    #[error(
+        "the prefill arena of {bytes} B would cover layer {layer}'s retired \
+         slot buffer at slab offset {offset}; a read that could not be reaped \
+         may still be writing there"
+    )]
+    ArenaOverRetired {
+        /// Layer the retired buffer belonged to.
+        layer: u32,
+        /// Its offset from the slab base.
+        offset: usize,
+        /// Bytes the carve asked for.
+        bytes: usize,
+    },
+
+    /// A lost window read forced every slot the arena covered to be retired,
+    /// and that left a layer with fewer slots than the model routes experts
+    /// per step.
+    ///
+    /// The decode cache for that layer can no longer serve a single step. Said
+    /// here, at the cause, rather than as a
+    /// [`CacheError::TooFewSlots`](crate::io::CacheError::TooFewSlots) several
+    /// forward passes later. See [`ExpertStream::sweep_layer`]'s docs for the
+    /// geometry that makes this reachable at the shipped dials.
+    #[error(
+        "a prefill window read could not be reaped: every slot the arena \
+         covered is retired, which leaves layer {layer} with {slots} slot(s) \
+         against a top_k of {top_k}, so that layer can no longer decode"
+    )]
+    CacheStranded {
+        /// First layer left short.
+        layer: u32,
+        /// Slots it has left.
+        slots: u32,
+        /// Experts the model routes per step.
+        top_k: u32,
+        /// The read failure that started it.
+        #[source]
+        source: IoError,
+    },
+
+    /// The sweep already failed and cannot be resumed.
+    ///
+    /// Latched on the first failure of [`LayerSweep::next_expert`]. Every
+    /// later call reports this instead of walking a cursor that has already
+    /// moved: the window it would hand out was never filled, so its bytes are
+    /// a previous window's or the zeros the slab was born with — silently
+    /// wrong expert weights with no error and no log line.
+    #[error("this prefill sweep already failed and cannot be resumed: {reason}")]
+    Aborted {
+        /// What the original failure said.
+        reason: String,
+    },
 
     /// A read was about to be submitted with an offset, length, or destination
     /// direct I/O would answer `EINVAL` for.
@@ -288,8 +353,22 @@ impl SweepConfig {
     ///
     /// The full width even for a ragged last window: buffers are uniform so the
     /// address arithmetic is.
-    pub fn window_bytes(self, stride: u64) -> u64 {
-        u64::from(self.experts_per_window) * stride
+    ///
+    /// # Errors
+    ///
+    /// [`SweepError::WindowTooLarge`] when the product does not fit a `u64`.
+    /// Unreachable at any real geometry — a blob stride is narrowed to `u32`
+    /// when the stream opens — but both fields are `pub` on a `pub` struct, so
+    /// this is a value the caller can choose and an overflow panic in a
+    /// library is not an answer.
+    pub fn window_bytes(self, stride: u64) -> Result<u64, SweepError> {
+        let bytes = u128::from(self.experts_per_window) * u128::from(stride);
+        u64::try_from(bytes).map_err(|_| SweepError::WindowTooLarge {
+            experts: self.experts_per_window,
+            stride,
+            bytes,
+            max: u64::from(u32::MAX),
+        })
     }
 }
 
@@ -364,12 +443,12 @@ impl SweepPlan {
         routed: &[u32],
     ) -> Result<(), SweepError> {
         let config = config.validate()?;
-        let bytes = config.window_bytes(stride);
+        let bytes = config.window_bytes(stride)?;
         if bytes > u64::from(u32::MAX) {
             return Err(SweepError::WindowTooLarge {
                 experts: config.experts_per_window,
                 stride,
-                bytes,
+                bytes: u128::from(bytes),
                 max: u64::from(u32::MAX),
             });
         }
@@ -476,6 +555,13 @@ pub struct LayerSweep<'a> {
     stride: usize,
     /// Bytes one arena buffer occupies.
     window_bytes: usize,
+    /// Byte offset of buffer 0 within the arena.
+    ///
+    /// Zero for a sweep that took the arena itself. A sweep running inside a
+    /// [`PrefillSession`] is handed the ring *behind* the session's scratch
+    /// span, and every offset it computes is relative to the arena base, so
+    /// the two spans stay disjoint by arithmetic rather than by convention.
+    ring_base: usize,
     /// Buffers carved from the arena, `<= MAX_WINDOWS_IN_FLIGHT` of them.
     in_flight: [Option<Pending>; MAX_WINDOWS_IN_FLIGHT as usize],
     /// Buffers actually carved.
@@ -488,6 +574,18 @@ pub struct LayerSweep<'a> {
     current: Option<(usize, usize)>,
     /// Next expert offset within the current window.
     cursor: u32,
+    /// Windows accounted for in the stream's read/skipped counters. Only for
+    /// the teardown log line; the counters themselves live on the stream.
+    counted: usize,
+    /// The first failure, latched.
+    ///
+    /// A `SweepError` is not `Clone` — it carries an `io::Error` — so what is
+    /// kept is what it said. See [`SweepError::Aborted`] for why anything at
+    /// all has to be kept.
+    failed: Option<String>,
+    /// Whether teardown gives the arena back. False inside a
+    /// [`PrefillSession`], which owns the arena across every layer.
+    owns_arena: bool,
     /// Whether the teardown has run.
     finished: bool,
 }
@@ -519,67 +617,99 @@ impl<'a> LayerSweep<'a> {
         let config = config.validate()?;
         let (stride, n_experts) = stream.layer_geometry(layer)?;
         plan.build(n_experts, stride, config, routed)?;
-
-        // Uniform buffers, so a ragged last window still lands at a buffer
-        // base. Never wider than the layer — a window cannot cover experts
-        // that do not exist, and reserving for them would refuse arenas that
-        // are in fact big enough — and never more buffers than there are
-        // windows to put in them.
-        let window_bytes = u64::from(config.experts_per_window.min(n_experts.max(1))) * stride;
+        let window_bytes = window_span(config, stride, n_experts)?;
         let available = stream.cache_bytes();
-        if window_bytes > available {
-            return Err(SweepError::ArenaTooSmall {
-                needed: window_bytes,
-                available,
-            });
-        }
-        let buffers = (config.windows_in_flight as usize)
-            .min(plan.windows_to_read().max(1))
-            .min((available / window_bytes) as usize)
-            .max(1);
-        if buffers < config.windows_in_flight as usize {
-            tracing::debug!(
-                layer,
-                asked = config.windows_in_flight,
-                buffers,
-                window_bytes,
-                pool_bytes = available,
-                "fewer prefill windows in flight than asked for"
-            );
-        }
+        let buffers = fit_buffers(
+            layer,
+            config,
+            window_bytes,
+            available,
+            plan.windows_to_read(),
+        )?;
 
         // The file is opened and verified through the same first-use path
         // `begin_layer` takes, before the arena is out: an error here leaves
         // the cache untouched.
         stream.open_layer(layer)?;
         stream.take_arena(buffers * window_bytes as usize)?;
+        Self::start(stream, plan, layer, stride, window_bytes, buffers, 0, true)
+    }
 
-        for window in plan.windows() {
-            if !window.routed {
-                stream.count_window(false);
-            }
-        }
+    /// Sweep `layer` into a ring the caller already carved.
+    ///
+    /// The [`PrefillSession`] path: the arena is out for the whole prefill and
+    /// its head is the driver's scratch, so this claims neither and works
+    /// `ring_bytes` in from `ring_base`. The arena is *not* given back at
+    /// teardown; the session owns it.
+    pub(super) fn begin_within(
+        stream: &'a mut ExpertStream,
+        plan: &'a mut SweepPlan,
+        layer: u32,
+        routed: &[u32],
+        config: SweepConfig,
+        ring_base: usize,
+        ring_bytes: u64,
+    ) -> Result<Self, SweepError> {
+        let config = config.validate()?;
+        let (stride, n_experts) = stream.layer_geometry(layer)?;
+        plan.build(n_experts, stride, config, routed)?;
+        let window_bytes = window_span(config, stride, n_experts)?;
+        let buffers = fit_buffers(
+            layer,
+            config,
+            window_bytes,
+            ring_bytes,
+            plan.windows_to_read(),
+        )?;
+        stream.open_layer(layer)?;
+        Self::start(
+            stream,
+            plan,
+            layer,
+            stride,
+            window_bytes,
+            buffers,
+            ring_base,
+            false,
+        )
+    }
 
+    /// Assemble the sweep and put the first windows on the wire.
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        stream: &'a mut ExpertStream,
+        plan: &'a SweepPlan,
+        layer: u32,
+        stride: u64,
+        window_bytes: u64,
+        buffers: usize,
+        ring_base: usize,
+        owns_arena: bool,
+    ) -> Result<Self, SweepError> {
         let mut sweep = Self {
             stream,
             plan,
             layer,
             // Narrowing cannot fail: `window_bytes >= stride` was just
-            // compared against a `usize` pool size.
+            // compared against a `usize` byte count.
             stride: stride as usize,
             window_bytes: window_bytes as usize,
+            ring_base,
             in_flight: [None; MAX_WINDOWS_IN_FLIGHT as usize],
             buffers,
             next_submit: 0,
             next_consume: 0,
             current: None,
             cursor: 0,
+            counted: 0,
+            failed: None,
+            owns_arena,
             finished: false,
         };
         if let Err(error) = sweep.pump() {
-            // `finish` drains whatever did reach the kernel and gives the
+            // `teardown` drains whatever did reach the kernel and gives the
             // arena back, so a failed prime does not strand the pool.
-            let _ = sweep.finish();
+            let _ = sweep.teardown();
             return Err(error);
         }
         Ok(sweep)
@@ -617,23 +747,61 @@ impl<'a> LayerSweep<'a> {
     ///
     /// [`SweepError::Io`] when a window read fails terminally, after its one
     /// retry; [`SweepError::Misaligned`] if a window ever came out
-    /// unaligned, which the geometry rules out.
+    /// unaligned, which the geometry rules out; [`SweepError::Aborted`] on
+    /// every call after the first failure.
+    ///
+    /// **The first failure is final.** Nothing in the signature forbids
+    /// calling this again — it takes `&mut self`, and only
+    /// [`finish`](Self::finish) consumes — but a retry would walk a cursor
+    /// that has already moved, over a window whose read never filled it. So
+    /// the failure is latched and every later call reports
+    /// [`SweepError::Aborted`] rather than handing back arena bytes that hold
+    /// a previous window, or the zeros the slab was born with.
     pub fn next_expert(&mut self) -> Result<Option<SweepExpert<'_>>, SweepError> {
-        let Some((expert, offset)) = self.advance()? else {
-            return Ok(None);
+        if let Some(reason) = &self.failed {
+            return Err(SweepError::Aborted {
+                reason: reason.clone(),
+            });
+        }
+        let position = match self.advance() {
+            Ok(Some(position)) => position,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(self.latch(error)),
         };
+        let (expert, offset) = position;
         // SAFETY: `advance` returned this offset only after awaiting the read
         // that filled it, so no kernel write is outstanding into the range;
         // and the arena is exclusive to this sweep for as long as it holds the
         // stream's `&mut`, which is `'_` here.
-        let bytes =
-            unsafe { self.stream.arena_bytes(offset, self.stride) }.ok_or(SweepError::NoArena)?;
-        let view = self.stream.expert_reader().view_over(self.layer, bytes)?;
+        let Some(bytes) = (unsafe { self.stream.arena_bytes(offset, self.stride) }) else {
+            // The arena went away under a live sweep, which is `strand_arena`
+            // and nothing else. The cursor has already stepped past this
+            // expert, so a retry would *skip* it rather than repeat it —
+            // latch, exactly as for a failed read.
+            self.failed = Some(SweepError::NoArena.to_string());
+            return Err(SweepError::NoArena);
+        };
+        // The latch is written field by field rather than through `latch`:
+        // `bytes` borrows `self.stream`, and a `&mut self` method would
+        // conflict with a borrow the success path still needs.
+        let view = match self.stream.expert_reader().view_over(self.layer, bytes) {
+            Ok(view) => view,
+            Err(error) => {
+                let error = SweepError::Io(error);
+                self.failed = Some(error.to_string());
+                return Err(error);
+            }
+        };
         Ok(Some(SweepExpert {
             expert,
             bytes,
             view,
         }))
+    }
+
+    /// Whether this sweep has failed and will refuse every further expert.
+    pub fn is_aborted(&self) -> bool {
+        self.failed.is_some()
     }
 
     /// Finish the sweep: drain every window still on the wire and give the
@@ -644,9 +812,21 @@ impl<'a> LayerSweep<'a> {
     ///
     /// # Errors
     ///
-    /// [`SweepError::Io`] when a window still in flight failed.
+    /// [`SweepError::Io`] when a window still in flight failed, or
+    /// [`SweepError::Aborted`] when the drain was clean but an earlier
+    /// [`next_expert`](Self::next_expert) was not: a sweep that stopped short
+    /// of the layer did not do what the caller asked, and saying so is the
+    /// point of calling this rather than dropping.
     pub fn finish(mut self) -> Result<(), SweepError> {
         self.teardown()
+    }
+
+    /// Record the first failure and hand it back unchanged.
+    fn latch(&mut self, error: SweepError) -> SweepError {
+        if self.failed.is_none() {
+            self.failed = Some(error.to_string());
+        }
+        error
     }
 
     /// Position the sweep on the next routed expert, returning its id and its
@@ -663,7 +843,9 @@ impl<'a> LayerSweep<'a> {
                     self.cursor += 1;
                     let expert = win.first_expert + within;
                     if self.plan.is_routed(expert) {
-                        let offset = buffer * self.window_bytes + within as usize * self.stride;
+                        let offset = self.ring_base
+                            + buffer * self.window_bytes
+                            + within as usize * self.stride;
                         return Ok(Some((expert, offset)));
                     }
                 }
@@ -677,13 +859,20 @@ impl<'a> LayerSweep<'a> {
                 continue;
             }
             // Step over windows the chunk routes nothing in; they were never
-            // submitted and are already counted as skipped.
+            // submitted. Counted here, as they are stepped over, rather than
+            // all at once when the sweep starts: `next_consume` is the one
+            // monotone walk over every window, so counting both halves on it
+            // keeps `read + skipped` a description of what the sweep actually
+            // did. Counting the skips up front and the reads one at a time
+            // made an aborted sweep report a coverage it never achieved.
             while self
                 .plan
                 .windows()
                 .get(self.next_consume)
                 .is_some_and(|win| !win.routed)
             {
+                self.stream.count_window(false);
+                self.counted += 1;
                 self.next_consume += 1;
             }
             if self.next_consume >= self.plan.windows().len() {
@@ -697,6 +886,7 @@ impl<'a> LayerSweep<'a> {
             let read = self.in_flight[buffer].map(|pending| pending.read);
             self.stream.sweep_await(read)?;
             self.stream.count_window(true);
+            self.counted += 1;
             self.current = Some((self.next_consume, buffer));
             self.cursor = 0;
         }
@@ -720,7 +910,7 @@ impl<'a> LayerSweep<'a> {
             let Some(buffer) = self.free_buffer() else {
                 return Ok(());
             };
-            let arena_offset = buffer * self.window_bytes;
+            let arena_offset = self.ring_base + buffer * self.window_bytes;
             check_aligned("sweep window file offset", win.file_offset)?;
             check_aligned("sweep window length", win.len)?;
             check_aligned("sweep window arena offset", arena_offset as u64)?;
@@ -729,7 +919,7 @@ impl<'a> LayerSweep<'a> {
             let len = u32::try_from(win.len).map_err(|_| SweepError::WindowTooLarge {
                 experts: win.n_experts,
                 stride: self.stride as u64,
-                bytes: win.len,
+                bytes: u128::from(win.len),
                 max: u64::from(u32::MAX),
             })?;
             let read = self.stream.sweep_submit(
@@ -764,12 +954,30 @@ impl<'a> LayerSweep<'a> {
             return Ok(());
         }
         self.finished = true;
+        let windows = self.plan.windows().len();
+        if self.counted < windows {
+            tracing::warn!(
+                layer = self.layer,
+                covered = self.counted,
+                windows,
+                "prefill sweep torn down before it covered the layer; its \
+                 window counters describe what it did, not what it planned"
+            );
+        }
         // Every window still on the wire is writing into the arena, so it has
         // to be reaped before the pool goes back to being a cache.
         let result = self.stream.sweep_await(None);
         self.stream.sweep_clear_reads();
-        self.stream.release_arena();
-        result
+        if self.owns_arena {
+            self.stream.release_arena();
+        }
+        match (result, self.failed.take()) {
+            // The drain's own failure first: it is the newer fact, and the
+            // latched one has already been reported to whoever caused it.
+            (Err(error), _) => Err(error),
+            (Ok(()), Some(reason)) => Err(SweepError::Aborted { reason }),
+            (Ok(()), None) => Ok(()),
+        }
     }
 }
 
@@ -779,15 +987,332 @@ impl Drop for LayerSweep<'_> {
             tracing::error!(
                 layer = self.layer,
                 %error,
-                "prefill sweep torn down with a window read still failing"
+                "prefill sweep torn down without completing the layer"
             );
         }
     }
 }
 
+/// Bytes one window buffer occupies for a layer of `n_experts` experts.
+///
+/// Uniform, so a ragged last window still lands at a buffer base. Never wider
+/// than the layer — a window cannot cover experts that do not exist, and
+/// reserving for them would refuse arenas that are in fact big enough.
+fn window_span(config: SweepConfig, stride: u64, n_experts: u32) -> Result<u64, SweepError> {
+    SweepConfig {
+        experts_per_window: config.experts_per_window.min(n_experts.max(1)),
+        ..config
+    }
+    .window_bytes(stride)
+}
+
+/// Buffers of `window_bytes` that fit in `available` bytes of ring, clamped to
+/// the dial and to the windows there are to put in them.
+///
+/// # Errors
+///
+/// [`SweepError::ArenaTooSmall`] when not even one buffer fits.
+fn fit_buffers(
+    layer: u32,
+    config: SweepConfig,
+    window_bytes: u64,
+    available: u64,
+    windows_to_read: usize,
+) -> Result<usize, SweepError> {
+    if window_bytes > available {
+        return Err(SweepError::ArenaTooSmall {
+            needed: window_bytes,
+            available,
+        });
+    }
+    let buffers = (config.windows_in_flight as usize)
+        .min(windows_to_read.max(1))
+        .min((available / window_bytes) as usize)
+        .max(1);
+    if buffers < config.windows_in_flight as usize {
+        tracing::debug!(
+            layer,
+            asked = config.windows_in_flight,
+            buffers,
+            window_bytes,
+            ring_bytes = available,
+            "fewer prefill windows in flight than asked for"
+        );
+    }
+    Ok(buffers)
+}
+
+/// One chunked prefill: the slot-pool slab carved into driver scratch and a
+/// sweep ring, for as long as the driver needs both at once.
+///
+/// # Why this exists
+///
+/// A layer-major prefill has to do two things *simultaneously*: consume swept
+/// experts, and write each expert's output into an `[n_rows][top_k][hidden]`
+/// f32 staging buffer. Both want to come out of the slot pool, because the
+/// whole point is that prefill costs no bytes against the memory budget beyond
+/// what the decode cache already made resident.
+///
+/// [`ExpertStream::sweep_layer`] cannot serve that: it parks the
+/// `&mut ExpertStream` for the sweep's whole life, so the driver can hold
+/// either the sweep or a scratch span, never both. This owns the `&mut`
+/// instead and hands out the two as a split borrow — [`PrefillSession::split`]
+/// returns a `&mut [u8]` and a [`LayerSweep`] whose byte ranges are disjoint by
+/// construction, which is what makes two `&mut` into one allocation sound.
+///
+/// ```text
+/// let mut session = stream.begin_prefill(staging_bytes, cfg)?;
+/// for layer in 0..n_layers {
+///     let (staging, mut sweep) = session.split(&mut plan, layer, routed)?;
+///     while let Some(expert) = sweep.next_expert()? {
+///         compute(&expert.view, staging);      // both borrows live at once
+///     }
+///     sweep.finish()?;
+/// }
+/// session.finish()?;
+/// ```
+///
+/// # The carve
+///
+/// ```text
+/// slab: [ scratch .. | pad to 4096 | ring: windows_in_flight buffers | unused ]
+///       ^ arena base, 4096-aligned
+/// ```
+///
+/// The scratch leads, so its base is the slab base and therefore
+/// [`SLOT_ALIGN`](crate::io::SLOT_ALIGN)-aligned; the ring starts at the next
+/// 4096 boundary past it, so every window offset stays legal for O_DIRECT. The
+/// ring is sized for the *widest* layer, since one session spans all of them.
+/// At the shipped geometry the slab is ~1,438 MiB against a ~47 MiB ring, so
+/// this is an ownership problem and not a space one.
+///
+/// # The scratch is not zeroed
+///
+/// Taking it is address arithmetic over pages [`SlotPool`](crate::io::SlotPool)
+/// already faulted in; memsetting 1.4 GiB to hand back zeros nobody asked for
+/// would be a real cost on the measured path. **The driver must not assume
+/// zeros**: the bytes are whatever the last expert read or the last prefill
+/// left there. They are always *initialized* — the slab is allocated zeroed —
+/// so the slice is sound, just not blank.
+pub struct PrefillSession<'a> {
+    stream: &'a mut ExpertStream,
+    /// Base of the scratch span. The arena base, which is the slab base.
+    scratch: NonNull<u8>,
+    /// Bytes of scratch the caller asked for.
+    scratch_len: usize,
+    /// Byte offset of the sweep ring within the arena.
+    ring_base: usize,
+    /// Bytes of ring, enough for `windows_in_flight` buffers of the widest
+    /// layer.
+    ring_bytes: u64,
+    /// Dials every layer of this prefill runs with.
+    config: SweepConfig,
+    /// Whether the teardown has run.
+    finished: bool,
+}
+
+impl fmt::Debug for PrefillSession<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrefillSession")
+            .field("scratch_bytes", &self.scratch_len)
+            .field("ring_base", &self.ring_base)
+            .field("ring_bytes", &self.ring_bytes)
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+impl<'a> PrefillSession<'a> {
+    /// Carve the arena and open the session.
+    ///
+    /// Reached through [`ExpertStream::begin_prefill`].
+    pub(super) fn begin(
+        stream: &'a mut ExpertStream,
+        scratch_bytes: usize,
+        config: SweepConfig,
+    ) -> Result<Self, SweepError> {
+        let config = config.validate()?;
+        let ring_bytes = ring_span(stream, config)?;
+        let align = direct::DIO_ALIGN as usize;
+        // The ring starts at the next page past the scratch, so the two spans
+        // cannot overlap and every window offset stays 4096-aligned.
+        let ring_base =
+            scratch_bytes
+                .checked_next_multiple_of(align)
+                .ok_or(SweepError::ArenaTooSmall {
+                    needed: u64::MAX,
+                    available: stream.cache_bytes(),
+                })?;
+        let available = stream.cache_bytes();
+        let total = (ring_base as u64)
+            .checked_add(ring_bytes)
+            .filter(|total| *total <= available)
+            .ok_or(SweepError::ArenaTooSmall {
+                needed: (ring_base as u64).saturating_add(ring_bytes),
+                available,
+            })?;
+        // Narrowing cannot fail: `total <= available`, itself a `usize`.
+        stream.take_arena(total as usize)?;
+        let scratch = stream.arena_base().ok_or(SweepError::NoArena)?;
+        debug_assert!(
+            scratch_bytes <= ring_base,
+            "the scratch span and the sweep ring must not overlap"
+        );
+        tracing::debug!(
+            scratch_bytes,
+            ring_base,
+            ring_bytes,
+            pool_bytes = available,
+            "prefill session open"
+        );
+        Ok(Self {
+            stream,
+            scratch,
+            scratch_len: scratch_bytes,
+            ring_base,
+            ring_bytes,
+            config,
+            finished: false,
+        })
+    }
+
+    /// Bytes of scratch this session carved.
+    pub fn scratch_len(&self) -> usize {
+        self.scratch_len
+    }
+
+    /// Byte offset of the sweep ring within the arena, which is the first byte
+    /// past the scratch span that a window read may ever touch.
+    pub fn ring_offset(&self) -> usize {
+        self.ring_base
+    }
+
+    /// The dials every layer of this prefill runs with.
+    pub fn config(&self) -> SweepConfig {
+        self.config
+    }
+
+    /// The scratch span, with no sweep running.
+    ///
+    /// For the parts of a chunk that happen between layers. Use
+    /// [`split`](Self::split) to hold it *and* a sweep at the same time.
+    ///
+    /// The contents are whatever was there before; see the type's docs.
+    pub fn scratch(&mut self) -> &mut [u8] {
+        // SAFETY: the span is the head of the arena, which is out for this
+        // session's whole life — so no slot guard is reachable and no window
+        // read can target it, the ring starting a page past its end. Every
+        // byte was initialized by `SlotPool::new`. `&mut self` is what rules
+        // out a second view.
+        unsafe { std::slice::from_raw_parts_mut(self.scratch.as_ptr(), self.scratch_len) }
+    }
+
+    /// The split borrow: the scratch span and a sweep of `layer`, live at once.
+    ///
+    /// The two `&mut` name disjoint halves of one allocation — scratch at the
+    /// arena base, window buffers a page past its end — which the borrow
+    /// checker cannot see and [`PrefillSession::begin`] establishes by
+    /// arithmetic.
+    ///
+    /// `plan` is the caller's to reuse across layers, exactly as for
+    /// [`ExpertStream::sweep_layer`]. The returned sweep does **not** give the
+    /// arena back when it is dropped; this session does, at
+    /// [`finish`](Self::finish).
+    ///
+    /// # Errors
+    ///
+    /// Everything [`ExpertStream::sweep_layer`] raises except the arena-taking
+    /// ones, which happened when the session opened:
+    /// [`SweepError::ArenaTooSmall`] when the ring cannot hold one window of
+    /// this layer, [`SweepError::BadDials`] or
+    /// [`SweepError::ExpertOutOfRange`] for bad input, [`SweepError::Io`] when
+    /// the layer file cannot be opened or the first reads cannot be submitted.
+    pub fn split<'s>(
+        &'s mut self,
+        plan: &'s mut SweepPlan,
+        layer: u32,
+        routed: &[u32],
+    ) -> Result<(&'s mut [u8], LayerSweep<'s>), SweepError> {
+        let (scratch, scratch_len) = (self.scratch, self.scratch_len);
+        let (ring_base, ring_bytes, config) = (self.ring_base, self.ring_bytes, self.config);
+        let sweep = LayerSweep::begin_within(
+            &mut *self.stream,
+            plan,
+            layer,
+            routed,
+            config,
+            ring_base,
+            ring_bytes,
+        )?;
+        // SAFETY: as `scratch`, plus the disjointness the split rests on — the
+        // sweep's every destination is at `ring_base + ..`, and `ring_base` is
+        // `scratch_len` rounded up to a page, so no window read and no
+        // `SweepExpert` can name a byte of this slice.
+        let staging = unsafe { std::slice::from_raw_parts_mut(scratch.as_ptr(), scratch_len) };
+        Ok((staging, sweep))
+    }
+
+    /// Drain anything still on the wire and give the arena back.
+    ///
+    /// Dropping does the same thing; this reports what went wrong instead of
+    /// logging it. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// [`SweepError::Io`] when a window read that outlived its sweep failed.
+    pub fn finish(mut self) -> Result<(), SweepError> {
+        self.teardown()
+    }
+
+    /// Drain and release, once.
+    fn teardown(&mut self) -> Result<(), SweepError> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        // Belt and braces: every `LayerSweep` drains its own windows, and this
+        // catches one that was leaked rather than dropped.
+        let result = self.stream.sweep_await(None);
+        self.stream.sweep_clear_reads();
+        self.stream.release_arena();
+        result
+    }
+}
+
+impl Drop for PrefillSession<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.teardown() {
+            tracing::error!(
+                %error,
+                "prefill session torn down with a window read still failing"
+            );
+        }
+    }
+}
+
+/// Bytes of ring one session needs: `windows_in_flight` buffers of the widest
+/// window any layer of this model produces.
+///
+/// One session spans every layer and the strides differ (the shipped model has
+/// two classes, 3,059,712 B and 2,654,208 B), so the ring is sized for the
+/// worst of them rather than re-carved per layer.
+fn ring_span(stream: &ExpertStream, config: SweepConfig) -> Result<u64, SweepError> {
+    let mut widest = 0u64;
+    for layer in 0..stream.n_layers() {
+        let (stride, n_experts) = stream.layer_geometry(layer)?;
+        widest = widest.max(window_span(config, stride, n_experts)?);
+    }
+    widest
+        .checked_mul(u64::from(config.windows_in_flight))
+        .ok_or(SweepError::ArenaTooSmall {
+            needed: u64::MAX,
+            available: stream.cache_bytes(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::testutil::{Fixture, build_install};
+    use super::super::testutil::{Fixture, N_EXPERTS, N_LAYERS, build_install};
     use super::*;
     use crate::io::{ExpertReader, LoadOptions, SLOT_ALIGN};
 
@@ -866,7 +1391,7 @@ mod tests {
             // The windows tile the file exactly.
             assert_eq!(expected_offset, 128 * stride);
             // 16-24 MiB, which is the read size the dial was picked for.
-            let mib = config.window_bytes(stride) as f64 / (1024.0 * 1024.0);
+            let mib = config.window_bytes(stride).unwrap() as f64 / (1024.0 * 1024.0);
             assert!((16.0..=24.0).contains(&mib), "{mib} MiB out of band");
         }
     }
@@ -1448,6 +1973,302 @@ mod tests {
             .expect("a closed step lets the sweep start")
             .finish()
             .unwrap();
+    }
+
+    // ---- failure latching ------------------------------------------------
+
+    /// A window read that fails terminally is final: a retried `next_expert`
+    /// must never hand back arena bytes no read ever filled.
+    #[test]
+    fn a_failed_window_read_latches_instead_of_handing_out_unfilled_bytes() {
+        // The failure this guards: `LayerSweep` latched nothing, so after a
+        // terminal read failure `current` was still `None` and the window was
+        // still in `in_flight`. The next call walked to the same window, asked
+        // `sweep_await` for a read that had already resolved, got `Ok` because
+        // nothing was outstanding any more, and handed out a `SweepExpert`
+        // over bytes holding a *previous* window — or the zeros the slab was
+        // born with. Wrong weights, wrong logits, no error, no log line.
+        let fx = build_install("sweep-latch-read");
+        let mut stream = open(&fx, 4);
+        // Opened and verified before the truncation, so it is the read itself
+        // that has to notice.
+        stream.begin_layer(0, &[0]).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(0);
+
+        let path = fx.root.join(&fx.layout.layers[0].file);
+        let whole = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() / 2]).unwrap();
+
+        let routed = all_experts(&fx, 0);
+        // One window in flight, so which read the failure surfaces on is the
+        // geometry rather than the drive's completion order.
+        let config = SweepConfig {
+            experts_per_window: 1,
+            windows_in_flight: 1,
+        };
+        {
+            let mut plan = SweepPlan::new();
+            let mut sweep = stream.sweep_layer(&mut plan, 0, &routed, config).unwrap();
+            // The half of the file that is still there reads fine.
+            for expert in 0..2u32 {
+                assert_eq!(sweep.next_expert().unwrap().unwrap().expert, expert);
+            }
+            // Expert 2's window is past the truncation: EOF, no retry.
+            let first = sweep.next_expert().unwrap_err();
+            assert!(
+                matches!(first, SweepError::Io(_)),
+                "unexpected error: {first}"
+            );
+            assert!(sweep.is_aborted());
+            // And every later call reports it rather than a blob.
+            for _ in 0..3 {
+                match sweep.next_expert().unwrap_err() {
+                    SweepError::Aborted { reason } => assert_eq!(reason, first.to_string()),
+                    other => panic!("unexpected error: {other}"),
+                }
+            }
+            // The drain is clean — the failed read reached a terminal state —
+            // so what `finish` has left to report is that the sweep never
+            // covered the layer.
+            assert!(matches!(
+                sweep.finish().unwrap_err(),
+                SweepError::Aborted { .. }
+            ));
+        }
+
+        // The arena went back, so the stream is a cache again.
+        std::fs::write(&path, &whole).unwrap();
+        stream.begin_layer(0, &[0, 1]).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(0);
+    }
+
+    /// A sweep whose arena is taken away mid-flight latches too — and there
+    /// the retry would *skip* an expert rather than repeat one.
+    #[test]
+    fn a_lost_arena_latches_instead_of_skipping_an_expert() {
+        let fx = build_install("sweep-latch-arena");
+        let mut stream = open(&fx, 4);
+        let routed = all_experts(&fx, 0);
+        let mut plan = SweepPlan::new();
+        // Every window submitted up front, so the walk reaches the byte view
+        // rather than stopping at a submission.
+        let config = SweepConfig {
+            experts_per_window: 1,
+            windows_in_flight: 4,
+        };
+        let mut sweep = stream.sweep_layer(&mut plan, 0, &routed, config).unwrap();
+        assert_eq!(sweep.next_expert().unwrap().unwrap().expert, 0);
+
+        // Exactly what `strand_arena` leaves behind: no arena, the windows
+        // abandoned, every slot it covered retired.
+        sweep.stream.strand_open_arena();
+        let err = sweep.next_expert().unwrap_err();
+        assert!(
+            matches!(err, SweepError::NoArena),
+            "unexpected error: {err}"
+        );
+
+        // The cursor has already stepped over expert 1. Unlatched, this call
+        // returned expert *2* and the layer quietly lost one.
+        match sweep.next_expert().unwrap_err() {
+            SweepError::Aborted { reason } => assert_eq!(reason, SweepError::NoArena.to_string()),
+            other => panic!("unexpected error: {other}"),
+        }
+        // A clean drain still reports that the sweep did not finish the layer.
+        assert!(matches!(
+            sweep.finish().unwrap_err(),
+            SweepError::Aborted { .. }
+        ));
+    }
+
+    /// The window counters describe what the sweep did, not what it planned.
+    #[test]
+    fn window_counters_follow_the_sweep_rather_than_the_plan() {
+        // Skipped windows used to be counted all at once when the sweep
+        // started and read windows one at a time as they were consumed, so an
+        // aborted sweep reported every skip against a fraction of the reads —
+        // under-reporting coverage on exactly the runs worth investigating.
+        let fx = build_install("sweep-counters-abort");
+        let mut stream = open(&fx, 4);
+        // Four windows of one expert; route the first and the last, so the two
+        // skippable ones sit between them.
+        let config = SweepConfig {
+            experts_per_window: 1,
+            windows_in_flight: 1,
+        };
+
+        let before = stream.stats();
+        {
+            let mut plan = SweepPlan::new();
+            let mut sweep = stream.sweep_layer(&mut plan, 0, &[0, 3], config).unwrap();
+            assert_eq!(sweep.next_expert().unwrap().unwrap().expert, 0);
+            // Walk away with three windows unvisited.
+        }
+        let delta = stream.stats().since(&before);
+        assert_eq!(delta.sweep_windows_read, 1);
+        assert_eq!(
+            delta.sweep_windows_skipped, 0,
+            "windows the sweep never reached were counted as skipped"
+        );
+
+        // Run to the end and every window is accounted for exactly once.
+        let before = stream.stats();
+        assert_eq!(sweep_all(&mut stream, 0, &[0, 3], config).len(), 2);
+        let delta = stream.stats().since(&before);
+        assert_eq!(delta.sweep_windows_read, 2);
+        assert_eq!(delta.sweep_windows_skipped, 2);
+        assert_eq!(delta.sweep_windows(), 4);
+    }
+
+    /// `window_bytes` is `pub` over `pub` fields, so an absurd stride is a
+    /// typed refusal rather than an overflow panic in a debug build.
+    #[test]
+    fn an_overflowing_window_is_refused_rather_than_panicking() {
+        let config = SweepConfig {
+            experts_per_window: 1 << 20,
+            windows_in_flight: 1,
+        };
+        match config.window_bytes(u64::MAX).unwrap_err() {
+            SweepError::WindowTooLarge {
+                experts,
+                stride,
+                bytes,
+                max,
+            } => {
+                assert_eq!(experts, 1 << 20);
+                assert_eq!(stride, u64::MAX);
+                assert_eq!(bytes, u128::from(u64::MAX) << 20);
+                assert_eq!(max, u64::from(u32::MAX));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        // The ordinary case still answers a number.
+        assert_eq!(
+            SweepConfig::default().window_bytes(3_059_712).unwrap(),
+            8 * 3_059_712
+        );
+        // And the plan refuses rather than propagating a half-built geometry.
+        let mut plan = SweepPlan::new();
+        assert!(matches!(
+            plan.build(4, u64::MAX, config, &[0]).unwrap_err(),
+            SweepError::WindowTooLarge { .. }
+        ));
+    }
+
+    // ---- the prefill session ---------------------------------------------
+
+    /// The split borrow: a staging span and a live sweep at the same time,
+    /// both out of the slot pool, neither aliasing the other.
+    #[test]
+    fn a_prefill_session_hands_out_scratch_and_a_sweep_at_once() {
+        let fx = build_install("prefill-session");
+        let mut stream = open(&fx, 4);
+        let reader = ExpertReader::new(&fx.root, &fx.manifest, &fx.layout, LoadOptions::default())
+            .expect("reader opens");
+        let pool_bytes = stream.cache_bytes();
+        const SCRATCH: usize = 8192;
+        let config = SweepConfig {
+            experts_per_window: 2,
+            windows_in_flight: 2,
+        };
+
+        let mut plan = SweepPlan::new();
+        let mut session = stream
+            .begin_prefill(SCRATCH, config)
+            .expect("session opens");
+        assert_eq!(session.scratch_len(), SCRATCH);
+        assert!(
+            session.ring_offset() >= SCRATCH,
+            "the sweep ring overlaps the scratch span"
+        );
+        assert!(direct::is_aligned(session.ring_offset() as u64));
+
+        // Stamp the staging span and let a whole prefill's window reads run
+        // over it: this is the test that says the two spans are disjoint.
+        session.scratch().fill(0xa5);
+        for layer in 0..N_LAYERS {
+            let routed = all_experts(&fx, layer);
+            let (staging, mut sweep) = session
+                .split(&mut plan, layer, &routed)
+                .expect("the layer sweeps");
+            let mut seen = 0u32;
+            let mut buf = Vec::new();
+            while let Some(expert) = sweep.next_expert().expect("window reads") {
+                // Both borrows live at once, which is the whole point.
+                let expected = reader.read_expert(layer, expert.expert, &mut buf).unwrap();
+                assert_eq!(expert.bytes, expected.blob(), "layer {layer}");
+                staging[expert.expert as usize] = expert.expert as u8;
+                seen += 1;
+            }
+            sweep.finish().expect("the sweep finishes");
+            assert_eq!(seen, fx.layout.layers[layer as usize].n_experts);
+        }
+
+        let scratch = session.scratch();
+        for expert in 0..N_EXPERTS {
+            assert_eq!(scratch[expert as usize], expert as u8);
+        }
+        assert!(
+            scratch[N_EXPERTS as usize..].iter().all(|&b| b == 0xa5),
+            "a window read landed in the staging span"
+        );
+        session.finish().expect("the session finishes");
+
+        // The pool is a cache again, exactly as big as it was.
+        assert_eq!(stream.cache_bytes(), pool_bytes);
+        stream.begin_layer(0, &[0, 1]).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(0);
+    }
+
+    /// A carve past the slab is refused, and an unaligned scratch request
+    /// still starts the ring on a page boundary.
+    #[test]
+    fn a_prefill_session_carve_is_bounded_and_page_aligned() {
+        let fx = build_install("prefill-session-size");
+        let mut stream = open(&fx, 4);
+        let pool_bytes = stream.cache_bytes() as usize;
+        let config = SweepConfig {
+            experts_per_window: 1,
+            windows_in_flight: 1,
+        };
+
+        // Scratch alone fills the slab, so there is no room for a ring.
+        let err = stream.begin_prefill(pool_bytes, config).unwrap_err();
+        assert!(
+            matches!(err, SweepError::ArenaTooSmall { .. }),
+            "unexpected error: {err}"
+        );
+        // Nothing was taken: the cache still works.
+        stream.begin_layer(0, &[0, 1]).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(0);
+
+        let widest = fx
+            .layout
+            .layers
+            .iter()
+            .map(|layer| layer.stride)
+            .max()
+            .unwrap();
+        let session = stream.begin_prefill(4097, config).expect("session opens");
+        assert_eq!(session.scratch_len(), 4097);
+        assert_eq!(session.ring_offset(), 8192, "the ring must start on a page");
+        assert_eq!(session.config(), config);
+        session.finish().unwrap();
+
+        // The ring is sized for the widest layer, not the first one.
+        let session = stream.begin_prefill(0, config).expect("session opens");
+        assert_eq!(session.ring_offset(), 0);
+        drop(session);
+        let too_big = pool_bytes - widest as usize + 4096;
+        let err = stream.begin_prefill(too_big, config).unwrap_err();
+        assert!(
+            matches!(err, SweepError::ArenaTooSmall { .. }),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

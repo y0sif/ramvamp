@@ -67,7 +67,7 @@ pub use slots::{MAX_POOL_BYTES, SLOT_ALIGN, SlotError, SlotGuard, SlotPool};
 pub use stream::{ExpertStream, StreamMode, StreamPhase, StreamStats};
 pub use sweep::{
     DEFAULT_EXPERTS_PER_WINDOW, DEFAULT_WINDOWS_IN_FLIGHT, LayerSweep, MAX_WINDOWS_IN_FLIGHT,
-    SweepConfig, SweepError, SweepExpert, SweepPlan, SweepWindow,
+    PrefillSession, SweepConfig, SweepError, SweepExpert, SweepPlan, SweepWindow,
 };
 
 use crate::format::{FormatError, Manifest, sha256_file};

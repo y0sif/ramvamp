@@ -93,8 +93,13 @@
 //! - The pointer is derived from [`SlotPool::slab_base`], the same raw
 //!   allocation base every guard's address is derived from, so no `&mut` slice
 //!   spanning the slab ever has to be conjured out of a guard.
-//! - `take_arena` refuses while anything is in flight, so no kernel write is
-//!   outstanding into the bytes it is about to hand out.
+//! - `take_arena` refuses while anything is in flight, **and** refuses to
+//!   cover any buffer a lost read was allowed to keep writing into. The second
+//!   half is not implied by the first: `Inflight::abandon` drains `outstanding`
+//!   for reads that can never be reaped, so a zero counter says the table is
+//!   empty, not that the drive is idle. What those reads leave is a *retired*
+//!   slot — a buffer leaked in place, still inside the slab — and the carve is
+//!   checked against exactly those.
 //! - Taking the arena **invalidates every layer's slot occupancy**. Sweep bytes
 //!   land in the pool, so any cache entry that survived would name a buffer
 //!   holding somebody else's expert. Only occupancy is dropped; the ghost-LFU
@@ -679,6 +684,13 @@ impl Inflight {
                 );
                 read.remaining += read.filled;
                 read.filled = 0;
+                // A restart is a fresh attempt at the whole blob, so it gets a
+                // fresh retry budget. Without this, a blob that spent its one
+                // retry on an `EIO`, made progress, and then restarted would
+                // have no attempt left for the next transient error — the
+                // failure mode `is_retryable` exists to survive. Still bounded:
+                // one restart x one retry each is two reissues per blob.
+                read.attempts = 0;
                 return Reap::Again(index);
             }
             return Reap::Again(index);
@@ -988,6 +1000,34 @@ impl SlotTable {
         self.pool().padded_layer()
     }
 
+    /// The first retired slot buffer lying inside the first `bytes` of the
+    /// slab, as `(layer, offset from the slab base)`.
+    ///
+    /// A retired slot's guard was leaked *precisely because* a read into it can
+    /// never be reaped, so the kernel may still be writing there — and the
+    /// buffer stays inside the slab, because leaking it in place is what makes
+    /// that write harmless. Retiring strikes the slot from `live`, so
+    /// [`SlotTable::slot_offset`] can no longer name it; `guards` is what still
+    /// records where it was, as the `None` it was replaced by.
+    fn retired_within(&self, bytes: usize) -> Option<(u32, usize)> {
+        let per_layer = self.slots_per_layer as usize;
+        if per_layer == 0 {
+            return None;
+        }
+        self.guards
+            .iter()
+            .enumerate()
+            .filter(|(_, guard)| guard.is_none())
+            .find_map(|(flat, _)| {
+                let layer = (flat / per_layer) as u32;
+                let pool_slot = (flat % per_layer) as u32;
+                self.pool()
+                    .slot_offset(layer, pool_slot)
+                    .filter(|offset| *offset < bytes)
+                    .map(|offset| (layer, offset))
+            })
+    }
+
     /// Base of the whole slab, for the prefill arena.
     ///
     /// # Safety
@@ -1106,6 +1146,12 @@ pub struct ExpertStream {
     /// Set once a sweep read became unreapable. The arena's bytes are then
     /// permanently unsafe to hand out again, so every later take is refused.
     arena_poisoned: bool,
+    /// Experts the model routes per step, floored at 1.
+    ///
+    /// The slot count below which a layer can no longer serve a step, which is
+    /// what makes a retirement's damage reportable at its cause; see
+    /// [`ExpertStream::strand_arena`].
+    top_k: u32,
     mode: StreamMode,
     support: DirectSupport,
     /// Whether layer files are opened with `O_DIRECT`.
@@ -1252,6 +1298,7 @@ impl ExpertStream {
             slots,
             arena: None,
             arena_poisoned: false,
+            top_k: top_k as u32,
             mode: StreamMode::Pread,
             support: DirectSupport::Unusable(DirectFault::Unsupported),
             direct_open: false,
@@ -1440,7 +1487,7 @@ impl ExpertStream {
                 // This one never reached the kernel, so nothing will ever
                 // complete it: resolve it here or the table never drains.
                 self.inflight.abandon(read);
-                failure = Some(self.fail(read, io::Error::other(error.to_string())));
+                failure = Some(self.fail(read, flatten_io(error)));
                 break;
             }
         }
@@ -1569,6 +1616,37 @@ impl ExpertStream {
         super::LayerSweep::begin(self, plan, layer, routed, config)
     }
 
+    /// Open a chunked prefill: `scratch_bytes` of driver staging plus a sweep
+    /// ring, both carved from the idle slot pool.
+    ///
+    /// What [`ExpertStream::sweep_layer`] cannot do. A layer-major prefill
+    /// writes each expert's output into an `[n_rows][top_k][hidden]` staging
+    /// buffer *while* it consumes the sweep, and both have to come out of the
+    /// pool or prefill costs bytes the 3 GB budget does not have. A
+    /// `LayerSweep` parks this stream's `&mut` for its whole life, so a driver
+    /// holding one cannot hold a scratch span too;
+    /// [`PrefillSession::split`](super::PrefillSession::split) hands out both
+    /// at once as disjoint halves of one carve.
+    ///
+    /// The scratch is **not zeroed** — see
+    /// [`PrefillSession`](super::PrefillSession) — and the session owns the
+    /// arena until it is finished or dropped.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`ExpertStream::sweep_layer`] raises for the carve:
+    /// [`SweepError::ReadsInFlight`], [`SweepError::StepOpen`],
+    /// [`SweepError::PaddedSlots`], [`SweepError::ArenaOverRetired`],
+    /// [`SweepError::ArenaPoisoned`], and [`SweepError::ArenaTooSmall`] when
+    /// the scratch plus a ring for the widest layer does not fit the pool.
+    pub fn begin_prefill(
+        &mut self,
+        scratch_bytes: usize,
+        config: super::SweepConfig,
+    ) -> Result<super::PrefillSession<'_>, SweepError> {
+        super::PrefillSession::begin(self, scratch_bytes, config)
+    }
+
     /// Borrow the head of the idle slot-pool slab as `bytes` of prefill
     /// scratch, invalidating the decode cache's slot occupancy.
     ///
@@ -1586,6 +1664,8 @@ impl ExpertStream {
     /// is mid-step; [`SweepError::PaddedSlots`] when some layer's pitch exceeds
     /// its stride, so the slab is not a gapless run of blob-sized buffers;
     /// [`SweepError::ArenaTooSmall`] when the pool is smaller than the carve;
+    /// [`SweepError::ArenaOverRetired`] when the carve would cover a buffer
+    /// some earlier lost read may still be writing into;
     /// [`SweepError::ArenaPoisoned`] once a sweep read has been lost.
     pub(super) fn take_arena(&mut self, bytes: usize) -> Result<(), SweepError> {
         if self.arena_poisoned {
@@ -1615,11 +1695,34 @@ impl ExpertStream {
                 available,
             });
         }
+        // `outstanding == 0` is *not* the same statement as "no kernel write is
+        // outstanding into the slab". `strand_step` and `strand_arena` both
+        // drop reads out of the table with `Inflight::abandon`, whose whole
+        // reason for existing is that those reads can never be reaped — the
+        // counter drains because the read is unknowable, not because it
+        // finished. What they leave behind is a *retired* slot: a buffer leaked
+        // in place, still inside the slab, which the kernel may write into
+        // forever. So the carve is checked against those buffers rather than
+        // against the counter.
+        if let Some((layer, offset)) = self.slots.retired_within(bytes) {
+            tracing::error!(
+                layer,
+                offset,
+                bytes,
+                "refusing a prefill arena over a retired slot buffer"
+            );
+            return Err(SweepError::ArenaOverRetired {
+                layer,
+                offset,
+                bytes,
+            });
+        }
         // SAFETY: the caller of this method parks the `&mut ExpertStream` it
         // borrowed for the whole life of the arena, so no slot guard of this
         // pool is reachable — from safe code or otherwise — until
-        // `release_arena` runs; and nothing is in flight, checked above, so no
-        // kernel write is outstanding into these bytes either.
+        // `release_arena` runs. For the kernel half: nothing is outstanding
+        // *and* nothing the carve covers was ever abandoned, both checked
+        // above, which together are what rule out a live DMA into these bytes.
         let base = unsafe { self.slots.slab_base() };
         debug_assert!(
             base.as_ptr() as usize as u64 % direct::DIO_ALIGN == 0,
@@ -1660,6 +1763,18 @@ impl ExpertStream {
     /// Bytes currently carved, or `0` when no arena is out.
     pub(super) fn arena_len(&self) -> usize {
         self.arena.map_or(0, |arena| arena.len)
+    }
+
+    /// Base address of the arena, or `None` when none is out.
+    ///
+    /// For [`super::PrefillSession`], which needs an address rather than a
+    /// slice: the scratch span and the sweep ring are two `&mut` into one
+    /// carve, so the split has to be made from a pointer. The exclusivity is
+    /// the same borrow every other arena method rests on — the holder parks
+    /// this stream's `&mut` — and the disjointness is the session's own
+    /// arithmetic.
+    pub(super) fn arena_base(&self) -> Option<NonNull<u8>> {
+        self.arena.map(|arena| arena.base)
     }
 
     /// Read-only view of `len` arena bytes at `offset`.
@@ -1729,8 +1844,7 @@ impl ExpertStream {
         if let Err(error) = self.flush() {
             // Whether the kernel took the reads already pushed is unknowable,
             // and they target the arena rather than one slot.
-            self.strand_arena();
-            return Err(error.into());
+            return Err(self.strand_arena_error(error));
         }
         Ok(index)
     }
@@ -1749,8 +1863,8 @@ impl ExpertStream {
     pub(super) fn sweep_await(&mut self, until: Option<usize>) -> Result<(), SweepError> {
         let mut failure = None;
         if let Err(error) = self.drive_reads(until, &mut failure) {
-            self.strand_arena();
-            return Err(failure.unwrap_or(error).into());
+            let source = failure.unwrap_or(error);
+            return Err(self.strand_arena_error(source));
         }
         match failure {
             None => Ok(()),
@@ -1811,13 +1925,13 @@ impl ExpertStream {
     /// runs with nothing in flight.
     fn invalidate_all_slots(&mut self) {
         for cache in &mut self.caches {
-            for slot in 0..cache.n_slots() {
-                // SAFETY: `take_arena` refuses while anything is outstanding,
-                // and `release_arena` runs after the sweep has drained. So no
-                // read is writing into any slot of any layer at either call
-                // site, which is exactly `invalidate`'s obligation.
-                unsafe { cache.invalidate(slot) };
-            }
+            // SAFETY: `take_arena` refuses while anything is outstanding *and*
+            // while the carve covers a buffer a lost read may still be writing
+            // into; `release_arena` runs after the sweep has drained. So no
+            // read is writing into any slot of any layer at either call site,
+            // which is exactly `reset_occupancy`'s obligation — one statement
+            // about one moment, made once per layer rather than once per slot.
+            unsafe { cache.reset_occupancy() };
         }
     }
 
@@ -1832,10 +1946,28 @@ impl ExpertStream {
     /// process — a second arena over the same bytes would be a second read into
     /// a live DMA destination.
     ///
-    /// Expensive (a layer retired below `top_k` reports
-    /// [`CacheError::TooFewSlots`](crate::io::CacheError::TooFewSlots) on its
-    /// next step) and loud, but it terminates and it never aliases.
-    fn strand_arena(&mut self) {
+    /// Loud and expensive, but it terminates and it never aliases.
+    ///
+    /// # The damage, at the shipped dials
+    ///
+    /// The arena is carved from the **head** of the slab, which is where layer
+    /// 0 lives, and it is bigger than one layer's whole slot row: 2 windows of
+    /// 8 experts at the 3,059,712 B stride is 46.7 MiB against layer 0's 11
+    /// slots x 2.92 MiB = 32.1 MiB. So one unreapable window read leaves layer
+    /// 0 with **0** slots and layer 1 with 6 — both under a `top_k` of 8, and
+    /// both dead for the rest of the process.
+    ///
+    /// Carving the arena from the *tail* instead does not fix this; it moves
+    /// the damage to layer 47. Nothing can fix it while the arena is the pool,
+    /// which is the design. What this does instead is say so **here**, at the
+    /// cause, as [`SweepError::CacheStranded`] — the alternative is a
+    /// [`CacheError::TooFewSlots`](crate::io::CacheError::TooFewSlots) three
+    /// decode steps later, which names a symptom and no cause at all.
+    ///
+    /// Returns the first layer left below `top_k` and how many slots it has,
+    /// or `None` when every layer can still serve a step.
+    #[must_use = "a layer left below top_k has to be reported at the cause"]
+    fn strand_arena(&mut self) -> Option<(u32, u32)> {
         let len = self.arena_len();
         for index in 0..self.inflight.reads.len() {
             let read = self.inflight.reads[index];
@@ -1871,6 +2003,33 @@ impl ExpertStream {
             "the prefill arena was lost to an unreapable read; every slot it \
              covered is retired and this process will not sweep again"
         );
+        let stranded = (0..self.n_layers())
+            .map(|layer| (layer, self.slots.usable(layer)))
+            .find(|&(_, slots)| slots < self.top_k);
+        if let Some((layer, slots)) = stranded {
+            tracing::error!(
+                layer,
+                slots,
+                top_k = self.top_k,
+                "the retirement left a layer below top_k; that layer can no \
+                 longer serve a decode step"
+            );
+        }
+        stranded
+    }
+
+    /// Give up the arena and name the damage: the read failure when the cache
+    /// survived it, [`SweepError::CacheStranded`] when it did not.
+    fn strand_arena_error(&mut self, source: IoError) -> SweepError {
+        match self.strand_arena() {
+            Some((layer, slots)) => SweepError::CacheStranded {
+                layer,
+                slots,
+                top_k: self.top_k,
+                source,
+            },
+            None => SweepError::Io(source),
+        }
     }
 
     /// Release every slot the step protected, hits included.
@@ -2339,7 +2498,7 @@ impl ExpertStream {
             // while `io::sweep` holds this stream's `&mut`, so no step exists
             // — but the two recovery paths must not be mixed up if that ever
             // changes.
-            self.strand_arena();
+            let _ = self.strand_arena();
             return;
         }
         let mut retire: Vec<(u32, u32)> = Vec::new();
@@ -2485,6 +2644,21 @@ impl ExpertStream {
     #[cfg(test)]
     fn strand_open_step(&mut self) {
         self.strand_step();
+    }
+
+    /// Give up the open arena as if a window read had become unreapable, which
+    /// needs a ring that can be made to fail. Returns the first layer left
+    /// below `top_k`, as [`ExpertStream::strand_arena`] does. Test-only.
+    #[cfg(test)]
+    pub(super) fn strand_open_arena(&mut self) -> Option<(u32, u32)> {
+        self.strand_arena()
+    }
+
+    /// Turn a read failure into the error a lost window read would report,
+    /// without a device that can be made to fail. Test-only.
+    #[cfg(test)]
+    pub(super) fn strand_open_arena_error(&mut self, source: IoError) -> SweepError {
+        self.strand_arena_error(source)
     }
 
     /// Replace the slot pool with a padded one, so the arena's
@@ -2747,7 +2921,7 @@ impl ExpertStream {
                             // never drains. Its completion *was* reaped, so
                             // the slot is safe to invalidate.
                             self.inflight.abandon(index);
-                            let error = self.fail(index, io::Error::other(error.to_string()));
+                            let error = self.fail(index, flatten_io(error));
                             failure.get_or_insert(error);
                         }
                     }
@@ -2820,6 +2994,22 @@ impl Drop for ExpertStream {
         for (layer, slot) in stranded {
             self.slots.retire(layer, slot);
         }
+    }
+}
+
+/// Unwrap an [`IoError`] back into the `io::Error` it carries, so a
+/// submission failure that is about to be re-reported as a read failure keeps
+/// its errno.
+///
+/// The path context is dropped, not the cause: [`ExpertStream::fail`] puts the
+/// layer file's path back on immediately. Flattening through `to_string`
+/// instead — which is what this replaced — turned every errno into a message,
+/// so a caller could no longer tell `ENOSPC` from `EEXIST` in a failure that
+/// still had one.
+fn flatten_io(error: IoError) -> io::Error {
+    match error {
+        IoError::Io { source, .. } => source,
+        other => io::Error::other(other.to_string()),
     }
 }
 
@@ -3731,22 +3921,12 @@ mod tests {
         assert!(stream.step.protected.capacity() >= top_k);
         assert!(stream.inflight.reads.capacity() >= top_k);
 
-        // `CachePlan` keeps its lists private and exposes them as slices, so
-        // the observable fact is that they have *allocated*: a `Vec` with no
-        // capacity has never allocated and every zero-capacity `Vec<(u32,
-        // u32)>` shares one dangling address, which is what an un-preallocated
-        // plan would compare equal to.
-        let never_used = CachePlan::new();
-        assert_ne!(
-            stream.plan.hits().as_ptr(),
-            never_used.hits().as_ptr(),
-            "CachePlan::hits was left to grow on the first step"
-        );
-        assert_ne!(
-            stream.plan.misses().as_ptr(),
-            never_used.misses().as_ptr(),
-            "CachePlan::misses was left to grow on the first step"
-        );
+        // `CachePlan` keeps its lists private, so it answers for its own
+        // capacity: the smaller of the two, which is what `with_capacity`
+        // promises. Compared against a plan that has never allocated, so this
+        // says "preallocated for this step" rather than "non-zero".
+        assert!(stream.plan.capacity() >= top_k);
+        assert_eq!(CachePlan::new().capacity(), 0);
 
         // And a full-width step does not disturb any of it.
         let request: Vec<u32> = (0..top_k as u32).collect();
@@ -3757,6 +3937,7 @@ mod tests {
             stream.step.protected.capacity(),
             stream.inflight.reads.capacity(),
         );
+        let plan_before = stream.plan.capacity();
         stream.begin_layer(0, &request).unwrap();
         stream.await_misses().unwrap();
         stream.end_layer(0);
@@ -3769,6 +3950,11 @@ mod tests {
                 stream.inflight.reads.capacity(),
             ),
             "a top-k step reallocated a preallocated buffer"
+        );
+        assert_eq!(
+            stream.plan.capacity(),
+            plan_before,
+            "a top-k step regrew the cache plan"
         );
     }
 
@@ -3918,7 +4104,11 @@ mod tests {
         // Two of layer 0's four slots, and none of layer 1's, which start
         // past the whole of layer 0's run.
         stream.take_arena(2 * stride).unwrap();
-        stream.strand_arena();
+        assert_eq!(
+            stream.strand_arena(),
+            None,
+            "two of four slots is still top_k of 2"
+        );
 
         assert_eq!(stream.usable_slots(0), 2, "the arena's slots stayed live");
         assert_eq!(stream.usable_slots(1), 4, "an untouched layer shrank");
@@ -3930,6 +4120,120 @@ mod tests {
             "unexpected error: {err}"
         );
         // What is left still serves steps.
+        stream.begin_layer(0, &[0, 1]).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(0);
+    }
+
+    /// The arena may not be carved over a slot buffer that was leaked to
+    /// protect a read which can never be reaped.
+    #[test]
+    fn the_arena_refuses_to_cover_a_retired_slot_buffer() {
+        // The failure this guards: `strand_step` gives a read up through
+        // `Inflight::abandon`, which drains `outstanding` *because the read
+        // can never be reaped* — not because it finished — leaks the
+        // destination slot in place, and (unlike `strand_arena`) does not
+        // poison the arena. So every guard `take_arena` had still passed, and
+        // the next sweep issued a 23 MiB O_DIRECT read into pages an abandoned
+        // decode read was still writing: two O_DIRECT reads aliased onto one
+        // buffer, which EXP-007 measured as 13-27% spurious btrfs EIO.
+        let fx = build_install("stream-arena-over-retired");
+        let mut stream = open(&fx, 4);
+        let stride0 = fx.layout.layers[0].stride as usize;
+
+        // Layer 1's slots start past the whole of layer 0's run, so a carve
+        // that stops inside layer 0 is still legal: the refusal is about the
+        // bytes the carve covers, not about "something somewhere was retired".
+        stream.begin_layer(1, &[3]).unwrap();
+        stream.strand_open_step();
+        assert_eq!(stream.usable_slots(1), 3);
+        stream
+            .take_arena(2 * stride0)
+            .expect("layer 1's retirement is past this carve");
+        stream.release_arena();
+
+        // A retirement inside the carve is not.
+        stream.begin_layer(0, &[3]).unwrap();
+        stream.strand_open_step();
+        match stream.take_arena(2 * stride0).unwrap_err() {
+            SweepError::ArenaOverRetired {
+                layer,
+                offset,
+                bytes,
+            } => {
+                assert_eq!(layer, 0);
+                assert_eq!(bytes, 2 * stride0);
+                assert!(offset < bytes, "the refusal named a buffer outside it");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        // Permanent — a leaked buffer never becomes safe again — and the two
+        // prefill entry points are refused through the same check.
+        assert!(matches!(
+            stream.take_arena(4096).unwrap_err(),
+            SweepError::ArenaOverRetired { .. }
+        ));
+        let mut plan = crate::io::SweepPlan::new();
+        assert!(matches!(
+            stream
+                .sweep_layer(&mut plan, 0, &[0], super::super::SweepConfig::default())
+                .unwrap_err(),
+            SweepError::ArenaOverRetired { .. }
+        ));
+        let small = super::super::SweepConfig {
+            experts_per_window: 1,
+            windows_in_flight: 1,
+        };
+        assert!(matches!(
+            stream.begin_prefill(4096, small).unwrap_err(),
+            SweepError::ArenaOverRetired { .. }
+        ));
+        // And decode keeps working on what is left, which is the whole reason
+        // retirement is preferred to giving up.
+        stream.begin_layer(0, &[0, 1]).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(0);
+    }
+
+    /// A stranding that drops a layer below `top_k` says so at the cause.
+    #[test]
+    fn stranding_the_arena_below_top_k_is_named_at_its_cause() {
+        // The arena is carved from the head of the slab, where layer 0 lives,
+        // and at the shipped dials it is wider than layer 0's whole slot row
+        // (46.7 MiB against 32.1 MiB). So one unreapable window read leaves
+        // layer 0 with nothing. That used to surface three decode steps later
+        // as `TooFewSlots`, which names a symptom and no cause at all.
+        let fx = build_install("stream-arena-strand-top-k");
+        let top_k = fx.manifest.arch.top_k;
+        let stride0 = fx.layout.layers[0].stride as usize;
+        let lost = || IoError::io(Path::new("layer_00.bin"), io::Error::other("ring failed"));
+
+        let mut stream = open(&fx, 4);
+        stream.take_arena(4 * stride0).unwrap();
+        match stream.strand_open_arena_error(lost()) {
+            SweepError::CacheStranded {
+                layer,
+                slots,
+                top_k: k,
+                ..
+            } => assert_eq!((layer, slots, k), (0, 0, top_k)),
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(stream.usable_slots(0), 0);
+        assert_eq!(stream.usable_slots(1), 4, "an untouched layer shrank");
+        // The old symptom is still what a later step sees; the point is that
+        // it is no longer the first thing anybody hears about.
+        assert!(matches!(
+            stream.begin_layer(0, &[0]).unwrap_err(),
+            IoError::Cache(CacheError::TooFewSlots { .. })
+        ));
+
+        // A stranding every layer survives still reports the read failure.
+        let mut stream = open(&fx, 4);
+        stream.take_arena(2 * stride0).unwrap();
+        let err = stream.strand_open_arena_error(lost());
+        assert!(matches!(err, SweepError::Io(_)), "unexpected error: {err}");
+        assert_eq!(stream.usable_slots(0), 4 - 2);
         stream.begin_layer(0, &[0, 1]).unwrap();
         stream.await_misses().unwrap();
         stream.end_layer(0);
@@ -4098,6 +4402,71 @@ mod tests {
         ));
         assert_eq!(inflight.reads[1].filled, 0, "the window was not restarted");
         assert_eq!(inflight.reads[1].remaining, 4 * 4096);
+    }
+
+    /// A restarted blob gets its retry budget back: it is being read again
+    /// from the beginning, so the attempt the previous try spent is not its.
+    #[test]
+    fn a_restart_gives_the_blob_a_fresh_retry_budget() {
+        let mut io = IoStats::default();
+        let mut inflight = Inflight {
+            align: direct::DIO_ALIGN as u32,
+            ..Inflight::default()
+        };
+        let index = inflight.track(0, 0, 0, 0, 8192);
+        let token = inflight.reads[index].user_data;
+
+        // One transient failure, retried.
+        assert!(matches!(
+            inflight.resolve(token, -libc::EIO, &mut io),
+            Reap::Again(0)
+        ));
+        assert_eq!(inflight.reads[0].attempts, 1);
+
+        // A short read that stopped off a block boundary restarts the blob.
+        let token = inflight.retag(0);
+        assert!(matches!(
+            inflight.resolve(token, 1536, &mut io),
+            Reap::Again(0)
+        ));
+        assert_eq!(inflight.reads[0].restarts, 1);
+        assert_eq!(inflight.reads[0].filled, 0);
+        assert_eq!(
+            inflight.reads[0].attempts, 0,
+            "a restarted blob kept a retry budget it had already spent"
+        );
+
+        // So the next transient error is still worth one more attempt...
+        let token = inflight.retag(0);
+        assert!(matches!(
+            inflight.resolve(token, -libc::EIO, &mut io),
+            Reap::Again(0)
+        ));
+        // ...and it is still bounded: one restart times one retry each.
+        let token = inflight.retag(0);
+        match inflight.resolve(token, -libc::EIO, &mut io) {
+            Reap::Failed(0, error) => assert_eq!(error.raw_os_error(), Some(libc::EIO)),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(inflight.outstanding, 0);
+    }
+
+    /// A submission failure re-reported as a read failure keeps its errno.
+    #[test]
+    fn a_flattened_submission_failure_keeps_its_errno() {
+        let wrapped = IoError::io(
+            Path::new("experts/layer_00.bin"),
+            io::Error::from_raw_os_error(libc::ENOSPC),
+        );
+        let flat = flatten_io(wrapped);
+        assert_eq!(flat.raw_os_error(), Some(libc::ENOSPC));
+        // Anything without an errno still says exactly what it said.
+        let other = IoError::LayerOutOfRange {
+            layer: 9,
+            n_layers: 2,
+        };
+        let text = other.to_string();
+        assert_eq!(flatten_io(other).to_string(), text);
     }
 
     #[test]
