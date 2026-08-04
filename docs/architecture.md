@@ -191,12 +191,20 @@ sub-allocation of the expert slot pool above, borrowed while the pool is
 idle rather than allocated (see "The prefill arena"), so it moves no cell in
 this table. At the default dials, 8 experts per window and 2 windows in
 flight, the ring is `2 x 8 x stride`: 46.7 MiB on a 3,059,712 B layer and
-40.5 MiB on a 2,654,208 B one, all of it already counted in the 1,438.59
-MiB. The wave-2 prefill driver will additionally need staging for a chunk's
-activations and its per-expert row groups. That is either a real addition to
-the runtime-anonymous row or another sub-allocation of the same arena, and
-which one it is has not been decided. **No figure is recorded for it here,
-because the driver is not written.**
+40.5 MiB on a 2,654,208 B one under the per-layer `sweep_layer` carve, and a
+flat 46.7 MiB on every layer under the `PrefillSession` path, which sizes one
+ring for the widest layer of the whole session (see "The prefill arena").
+Either way the bytes are already counted in the 1,438.59 MiB. The wave-2
+prefill driver additionally needs staging for a chunk's expert outputs, an
+`[n_rows][top_k][hidden]` buffer. **Which tenant that comes out of is now
+decided: another sub-allocation of the same arena, not an addition to the
+runtime-anonymous row.** `ExpertStream::begin_prefill` opens a
+`PrefillSession`, which carves one span laid out as `[scratch | pad | ring]`
+(scratch at the slab base, ring at the next 4096 boundary past it) and hands
+the two halves out disjointly, so the driver can write staging while it
+consumes swept experts. **No figure is recorded for the staging here**,
+because the driver is not written and the chunk size that determines it is
+the subject of a planned sweep.
 
 The pool figures are exact arithmetic on the audited strides in
 `experts/layout.json` (3,059,712 B on the 24 Q6_K-down layers, 2,654,208 B on
@@ -460,11 +468,16 @@ layer" no matter how it is scheduled. So:
   ~1,097 MB to ~34 MB (~17.6 GB of expert data over 512 tokens). Both
   figures are exact arithmetic on the audited strides, and the ratio between
   them, ~32x, is the same reuse counted from the other end
-  (`512 tokens x top-8 / 128 experts` = 32 rows per expert per layer). The
-  same amortization is available on RAM bandwidth: dotting one expert weight
-  row against all ~32 of its routed rows while the row is in L1 fetches that
-  row from RAM once instead of once per token. That is what the batched GEMV
-  entry points exist for (EXP-015); they have no caller yet.
+  (`512 tokens x top-8 / 128 experts` = 32 rows per expert per layer).
+  **As reads issued per expert per layer that 32x is exact and structural; as
+  bytes saved it is a ceiling**, because the decode worst case assumes every
+  request misses. Today's prefill runs through the decode cache at 45.3% hit
+  (first bullet), so the bytes a sweep actually displaces are
+  `(1 - 0.453) x 1,097` = ~600 MB/token and the realized reduction is
+  ~17.6x. The same amortization is available on RAM bandwidth: dotting one
+  expert weight row against all ~32 of its routed rows while the row is in L1
+  fetches that row from RAM once instead of once per token. That is what the
+  batched GEMV entry points exist for (EXP-015); they have no caller yet.
 - Read granularity is a **secondary and currently unproven** effect. The
   claim was EXP-008's **+51% at 16 MiB** (2.04 GB/s at 16 MiB and 2.15 at 24
   MiB against ~1.35 at the 2.918 MiB expert stride, provisional). Its
@@ -480,16 +493,23 @@ layer" no matter how it is scheduled. So:
   that 60 tok/s as *the* prefill figure; it is not one, because it says
   nothing about compute. The only measured anchor for the other half is
   EXP-013, where decode wall was 34.20 s with 16.63 s of I/O wait: 17.57 s
-  of non-I/O time over 63 decode steps, so roughly **279 ms/token** (a
-  subtraction
+  of non-I/O time over 63 decode steps, so roughly **279 ms/token** (63, not
+  the 64 that entry's prose names: the step count is recovered from its own
+  decode request count, `24,192 / (48 layers x top-8)` = 63. A subtraction
   inside a single entry, so rule 3 is satisfied; that run was warm and
   uncgrouped, so the figure is provisional, and a prefill row is not a
   decode token, so treat it as an order-of-magnitude anchor rather than a
   prefill number). The sweep does not change compute per token at all, it
   changes the order the bytes arrive in. What changes compute is the batched
-  expert GEMV, which converts the expert FFN from RAM-bandwidth-bound (one
-  MAC per weight byte fetched) to MAC-bound (~32 MACs per weight byte
-  fetched). **No new tok/s prediction is published here.** The measurement
+  expert GEMV, which is **expected** to move the expert FFN from
+  RAM-bandwidth-bound (one MAC per weight fetched) to MAC-bound (~32 MACs per
+  weight fetched). That transition is a mechanism, not a measurement: no
+  roofline, bandwidth or arithmetic-intensity figure for the expert FFN is
+  recorded in this document or the experiment log, so "RAM-bandwidth-bound"
+  is where the bound is expected to sit and not where it was observed. The
+  reuse ratio of ~32 is exact chunk geometry either way, and it is per
+  *weight*, not per byte: at Q4_K/Q6_K a byte holds roughly 1.33 to 2 of
+  them. **No new tok/s prediction is published here.** The measurement
   is owed, and it belongs to the wave-2 driver's entry. The earlier "~4.9 s,
   roughly 100 tok/s" figure assumed the withdrawn 3.6 GB/s number and is
   superseded. TF's design (random tile fetches through the decode cache)
@@ -526,7 +546,25 @@ What that buys:
   provisional) headroom under `memory.max=3G`. At the default dials, 8
   experts per window and 2 windows in flight, the ring is `2 x 8 x stride`,
   which is 46.7 MiB on a 3,059,712 B layer and 40.5 MiB on a 2,654,208 B
-  one, and those bytes are already inside the 1,438.59 MiB pool row.
+  one, and those bytes are already inside the 1,438.59 MiB pool row. Those
+  two figures are the **per-layer** carve, which is what
+  `ExpertStream::sweep_layer` takes: a fresh arena sized for the one layer it
+  is about to sweep. A `PrefillSession` spans every layer on one carve, so
+  `ring_span` sizes its ring for the **widest** layer of the model and it is
+  46.7 MiB throughout; it never shrinks to 40.5 on the narrow-stride layers.
+  Both fit the same pool row, so the memory contract does not care which path
+  runs; a reader reconciling the two numbers against the code does.
+- **One carve serves both the ring and the driver's staging.**
+  `ExpertStream::begin_prefill` returns a `PrefillSession` whose span is laid
+  out `[scratch | pad | ring]`: the scratch leads, so its base is the slab
+  base and inherits the pool's alignment, the ring starts at the next 4096
+  boundary past it so every window offset stays legal for O_DIRECT, and
+  `PrefillSession::split` hands the two out as disjoint `&mut`s. That is what
+  lets a layer-major driver write staging while it consumes swept experts
+  without a second allocation. The scratch is deliberately **not zeroed**:
+  taking it is address arithmetic over pages the pool already faulted, so the
+  bytes are whatever the last expert read or the last prefill left there, and
+  the driver must not assume otherwise.
 - **Alignment and pre-faulting come for free.** Both are O_DIRECT
   requirements the pool already satisfies, and the second one is not
   cosmetic: btrfs runs direct reads with page faults disabled and silently
@@ -550,18 +588,26 @@ What it costs:
   the layer's cache is rebuilt that much smaller. The stream then refuses to
   hand out an arena for the rest of the process. It terminates and it never
   aliases, which is the point, but the arena is carved from the **head** of
-  the slab, so the slots it retires are the low layers' slots, and a layer
-  retired below `top_k` reports `CacheError::TooFewSlots` on its next step.
-  On this model that means layer 0 can be taken below 8 usable slots and
-  decode then fails rather than degrading. **Mitigation is in progress** in
-  `crates/core/src/io/` and is not committed as this is written; its shape
-  is a typed refusal on both edges, so that a carve which would cover an
-  already-retired buffer is rejected up front, and a stranding that leaves a
-  layer below `top_k` says so directly instead of surfacing one step later
-  as a cache error. This document records the fix once it lands. Note the
-  failure is a consequence of the borrow, not of the sweep:
-  a separately allocated ring would have leaked its own pages instead of the
-  cache's.
+  the slab, so the slots it retires are the low layers' slots. The damage at
+  the shipped dials is not a boundary case, and it is exact arithmetic: the
+  46.7 MiB ring is 48,955,392 B, which exceeds layer 0's entire slot row of
+  11 x 3,059,712 = 33,656,832 B, and the 15,298,560 B left over is exactly 5
+  slots of layer 1. So one unreapable window read leaves **layer 0 with 0
+  slots and layer 1 with 6**, both under a `top_k` of 8, and both dead for
+  the life of the process. Carving the arena from the *tail* instead does not
+  fix this, it moves the damage to layer 47. Note the failure is a
+  consequence of the borrow, not of the sweep: a separately allocated ring
+  would have leaked its own pages instead of the cache's.
+- **The mitigation shipped** (`4eb5f2a`), and its shape is a typed refusal on
+  both edges. `SweepError::ArenaOverRetired` rejects up front any carve that
+  would cover a buffer some earlier lost read may still be writing into,
+  naming the layer and its slab offset. `SweepError::CacheStranded` reports a
+  stranding that leaves a layer below `top_k` **at the cause**, carrying the
+  first short layer, the slots it has left, `top_k`, and the read failure
+  that started it as its source. What it replaces is a
+  `CacheError::TooFewSlots` three decode steps later, which names a symptom
+  and no cause at all. Neither error is a repair; nothing can repair this
+  while the arena is the pool, which is the design.
 
 ## Validation protocol vs llama.cpp
 

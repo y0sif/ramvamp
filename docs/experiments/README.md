@@ -483,8 +483,9 @@ provisional.
   possible: the same 1.4 GiB of expert reads measured a 1092.2 MiB
   cgroup peak buffered versus 5.0 MiB with O_DIRECT. That transition
   gets its own entry when it lands. (The *measurement* is now written up
-  as EXP-009. The transition itself has still not landed, so the clean
-  rule-2 baseline this note promises is still outstanding.)
+  as EXP-009. **Both halves of this note have since been discharged:** the
+  transition landed in EXP-013, and the clean rule-2 baseline it promised
+  is EXP-014, 1.88 tok/s decode at a 2,471.1 MiB cgroup peak.)
 
 ## EXP-007: Slot aliasing under concurrent O_DIRECT reads
 
@@ -574,7 +575,12 @@ provisional.
   *shape* of series (a), where QD4 is 87% of QD16, survives the level
   disagreement between the series, and since the decode loop waits on all
   misses the low end is preferred for latency); 16-24 MiB streaming buffers
-  for the phase-6 prefill sweep (+51% at 16 MiB over the expert stride); and
+  for the phase-6 prefill sweep (+51% at 16 MiB over the expert stride,
+  **since demoted**: EXP-013 measured 1.97 GB/s under the real access
+  pattern at the same 2.918 MiB stride, roughly 46% above the ~1.35 GB/s
+  denominator that +51% is computed against, and the harness behind this
+  entry was never committed. The dial range survives as a range to sweep;
+  the +51% does not survive as a reason for it. See EXP-015 Note 5); and
   `ReadFixed` rejected, where the ~70 us is real but small against pinning
   1.4-1.6 GiB with `FOLL_LONGTERM` under an 8 MiB `RLIMIT_MEMLOCK`.
   **Unresolved, and it needs a measurement rather than an edit:** the 1.59
@@ -982,6 +988,27 @@ provisional.
   and a full byte count, which is exactly the failure the 3 GB budget cannot
   survive (EXP-009).
 
+  That table is the **per-layer** carve, which is what
+  `ExpertStream::sweep_layer` takes: one arena sized for the single layer it
+  is about to sweep. The `PrefillSession` path carves once for a whole
+  prefill, so `ring_span` sizes its ring for the **widest** layer of the
+  model, and it is 46.7 MiB on every layer, never 40.5. Both fit the pool
+  row above, so nothing in the memory contract turns on which path runs.
+
+  **The driver's staging comes out of that same carve.** Recorded here
+  because it was an open question when the sweep first landed and was settled
+  in `4eb5f2a`: `ExpertStream::begin_prefill` opens a `PrefillSession` over
+  one span laid out `[scratch | pad | ring]`, the scratch at the slab base
+  and the ring at the next 4096 boundary past it, and
+  `PrefillSession::split` hands the two
+  out as disjoint `&mut`s so a layer-major driver can write a chunk's
+  `[n_rows][top_k][hidden]` staging while it consumes swept experts. So the
+  staging is another sub-allocation of the pool, not an addition to the
+  runtime-anonymous row. The scratch is deliberately not zeroed: taking it is
+  address arithmetic over pages the pool already faulted. **No byte figure is
+  recorded for it**, because the driver is not written and the chunk size
+  that sets it is on the sweep list in Note 4.
+
   **Harness finding 1: systemd rewrites `${VAR}` and `$$` inside
   `ExecStart=` arguments.** Measured on systemd 261 on the reference
   machine:
@@ -1048,13 +1075,22 @@ provisional.
      leaked, the layer's cache is rebuilt smaller, and the stream refuses to
      sweep again for the life of the process. It terminates and it never
      aliases, but the arena is carved from the **head** of the slab, so the
-     retirements fall on the low layers, and a layer retired below `top_k`
-     reports `CacheError::TooFewSlots` on its next step. On this model that
-     means layer 0 can be taken below 8 usable slots and decode then fails
-     rather than degrading. Mitigation is in progress in
-     `crates/core/src/io/` and is uncommitted as this entry is written;
-     `docs/architecture.md` records the failure mode under "The prefill
-     arena" and takes the fix when it lands.
+     retirements fall on the low layers, and the geometry is exact rather
+     than marginal: the 46.7 MiB ring is 48,955,392 B against layer 0's whole
+     slot row of 11 x 3,059,712 = 33,656,832 B, and the 15,298,560 B left
+     over is exactly 5 slots of layer 1. One unreapable read therefore leaves
+     **layer 0 with 0 slots and layer 1 with 6**, both under a `top_k` of 8
+     and both dead for the life of the process. Carving from the tail instead
+     only moves the damage to layer 47. **The mitigation shipped in
+     `4eb5f2a`**, which an earlier revision of this note recorded as still in
+     progress: `ArenaOverRetired` refuses a carve that would cover a buffer a
+     lost read may still be
+     writing into, and `CacheStranded` reports a stranding at the cause,
+     naming the first short layer, its remaining slots and `top_k`, in place
+     of a `CacheError::TooFewSlots` three decode steps later that names a
+     symptom and no cause. Neither is a repair, and none is possible while
+     the arena is the pool. `docs/architecture.md` records the same geometry
+     and the same two errors under "The prefill arena".
   4. **Two dials ship with defaults nobody has measured**: experts per
      window (8, which divides 128 into 16 uniform windows with no ragged
      tail and lands at 23.34/20.25 MiB, inside the 16-24 MiB range EXP-008
