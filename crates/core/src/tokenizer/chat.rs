@@ -25,6 +25,7 @@
 //! cannot be expressed here either: [`ChatMessage::content`] is always a
 //! string.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
@@ -135,6 +136,33 @@ pub(crate) const IM_END: &str = "<|im_end|>";
 /// the generation prompt, matching Jinja's undefined-lookup semantics for
 /// `messages[0]`.
 pub(crate) fn render_chatml(messages: &[ChatMessage], add_generation_prompt: bool) -> String {
+    render_turns(messages, add_generation_prompt, None)
+}
+
+/// Render a conversation exactly as [`render_chatml`] does, but with every
+/// message's content passed through `sanitizer` first.
+///
+/// Structurally identical to the faithful render — same turns, same markers,
+/// same order — so the only difference is that content can no longer
+/// contribute added-token ids.
+pub(crate) fn render_chatml_sanitized(
+    messages: &[ChatMessage],
+    add_generation_prompt: bool,
+    sanitizer: &ContentSanitizer,
+) -> String {
+    render_turns(messages, add_generation_prompt, Some(sanitizer))
+}
+
+/// Shared body of [`render_chatml`] and [`render_chatml_sanitized`].
+///
+/// With `sanitizer` unset the output is byte-identical to the reference
+/// template render; the two entry points cannot drift apart because there is
+/// only one copy of the structure.
+fn render_turns(
+    messages: &[ChatMessage],
+    add_generation_prompt: bool,
+    sanitizer: Option<&ContentSanitizer>,
+) -> String {
     let content_len: usize = messages.iter().map(|m| m.content.len()).sum();
     // Per-turn markers cost at most ~34 bytes ("<|im_start|>assistant\n" +
     // "<|im_end|>\n"); one more for the generation prompt.
@@ -142,7 +170,7 @@ pub(crate) fn render_chatml(messages: &[ChatMessage], add_generation_prompt: boo
 
     if let Some(first) = messages.first() {
         if first.role == Role::System {
-            push_turn(&mut out, Role::System, &first.content);
+            push_turn(&mut out, Role::System, &turn_content(first, sanitizer));
         }
     }
     for (index, message) in messages.iter().enumerate() {
@@ -151,7 +179,7 @@ pub(crate) fn render_chatml(messages: &[ChatMessage], add_generation_prompt: boo
             // via `message.role == "system" and not loop.first`.
             continue;
         }
-        push_turn(&mut out, message.role, &message.content);
+        push_turn(&mut out, message.role, &turn_content(message, sanitizer));
     }
     if add_generation_prompt {
         out.push_str(IM_START);
@@ -159,6 +187,205 @@ pub(crate) fn render_chatml(messages: &[ChatMessage], add_generation_prompt: boo
         out.push('\n');
     }
     out
+}
+
+/// The zero-width character inserted to break an added-token literal:
+/// U+200B ZERO WIDTH SPACE.
+///
+/// Chosen because it is invisible (a human reading the transcript still sees
+/// `<|im_start|>`), it is not produced or removed by NFC normalization, and
+/// it never appears inside an added-token literal — so inserting it can only
+/// destroy matches, never create them.
+pub const SANITIZE_MARKER: char = '\u{200B}';
+
+/// Neutralizes added-token literals in attacker-controlled message content.
+///
+/// # Why this exists
+///
+/// [`render_chatml`] inserts content verbatim and the `tokenizers` backend
+/// runs its added-token trie over the raw string before the pre-tokenizer, so
+/// a literal `<|im_start|>` typed by a user encodes to the *real* control id
+/// 151644 — a fabricated turn the model obeys. That behavior is
+/// reference-faithful (`transformers` and `llama.cpp` do the same) and is
+/// deliberately preserved by [`render_chatml`] / `encode_chat`; this type is
+/// the opt-in path for content that is not trusted.
+///
+/// # Strategy: break, do not delete
+///
+/// Each literal is broken by inserting [`SANITIZE_MARKER`] after its first
+/// character (`<` + marker + `|im_start|>`). Two properties follow:
+///
+/// * **Readable.** The marker is zero-width, so a user who legitimately asks
+///   "what does `<|im_start|>` mean?" still sees the literal in the
+///   transcript, the model still reads it as ordinary text, and stripping the
+///   marker restores the original byte-for-byte.
+/// * **Safe under composition.** Deleting a literal can *create* a new one by
+///   joining its neighbours — `<|im_<|im_start|>start|>` collapses to
+///   `<|im_start|>` under naive stripping. Insertion never joins anything, so
+///   this class of bug cannot exist here.
+///
+/// The accepted trade-off is that sanitized content is no longer
+/// byte-identical: pasted text that contained one of these literals comes back
+/// with an invisible character inside it.
+///
+/// # Guarantee
+///
+/// [`sanitize`](Self::sanitize) output contains no added-token literal at any
+/// offset. The scan resumes one character past each break rather than past the
+/// whole literal, so overlapping and nested occurrences are all caught; the
+/// output is the input with markers inserted, so any literal in the output
+/// would have to be marker-free and therefore map back to an unbroken literal
+/// in the input, which the scan cannot have missed.
+#[derive(Debug, Clone)]
+pub struct ContentSanitizer {
+    /// Added-token literals, shortest first (see
+    /// [`literal_at`](Self::literal_at)), deduplicated, non-empty.
+    literals: Vec<String>,
+    /// Which bytes can begin a literal. The scan only does prefix work at
+    /// those offsets, which keeps megabyte-sized content a linear byte walk.
+    first_bytes: [bool; 256],
+}
+
+impl ContentSanitizer {
+    /// Build a sanitizer for the given added-token literals.
+    ///
+    /// The caller passes the *whole* added vocabulary of the loaded
+    /// tokenizer — not just the tokens flagged `special`, since every added
+    /// token encodes to a single id regardless of that flag.
+    pub(crate) fn from_literals<I>(literals: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut literals: Vec<String> = literals.into_iter().filter(|l| !l.is_empty()).collect();
+        // Shortest first so `literal_at` reports the shortest literal starting
+        // at an offset; that is the one that decides whether a marker can land
+        // strictly inside the match.
+        literals.sort_by(|a, b| {
+            a.len()
+                .cmp(&b.len())
+                .then_with(|| a.as_str().cmp(b.as_str()))
+        });
+        literals.dedup();
+
+        let mut first_bytes = [false; 256];
+        for literal in &literals {
+            if let Some(&byte) = literal.as_bytes().first() {
+                first_bytes[byte as usize] = true;
+            }
+        }
+        ContentSanitizer {
+            literals,
+            first_bytes,
+        }
+    }
+
+    /// The literals this sanitizer neutralizes, shortest first.
+    ///
+    /// Derived from the loaded vocabulary, so it tracks the pin instead of a
+    /// hardcoded list.
+    pub fn literals(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.literals.iter().map(String::as_str)
+    }
+
+    /// Whether `content` contains no added-token literal, i.e. sanitizing it
+    /// would change nothing.
+    pub fn is_clean(&self, content: &str) -> bool {
+        self.find_literal(content, 0).is_none()
+    }
+
+    /// Neutralize every added-token literal in `content`.
+    ///
+    /// Borrows when there is nothing to do, which is the overwhelmingly common
+    /// case. Never fails and never panics: any `&str` is valid input,
+    /// including empty and multi-megabyte content.
+    pub fn sanitize<'a>(&self, content: &'a str) -> Cow<'a, str> {
+        let Some((first, _)) = self.find_literal(content, 0) else {
+            return Cow::Borrowed(content);
+        };
+
+        let mut out = String::with_capacity(content.len() + SANITIZE_MARKER.len_utf8() * 8);
+        // Bytes of `content` already appended to `out`.
+        let mut copied = 0;
+        let mut cursor = first;
+        while let Some((at, literal)) = self.find_literal(content, cursor) {
+            let Some(head) = content[at..].chars().next() else {
+                // Unreachable: a literal matched at `at`, so `at` is not the
+                // end of the string. Bail out rather than panic.
+                break;
+            };
+            out.push_str(&content[copied..at]);
+            // A literal of two or more characters is broken from the inside,
+            // keeping every original character. A one-character literal has no
+            // inside, so the marker replaces it; that still never joins its
+            // neighbours, because the marker sits where the character was.
+            if literal.len() > head.len_utf8() {
+                out.push(head);
+            }
+            out.push(SANITIZE_MARKER);
+            // Resume one character in, not past the literal: a longer or
+            // differently-aligned literal may start inside this one.
+            cursor = at + head.len_utf8();
+            copied = cursor;
+        }
+        out.push_str(&content[copied..]);
+        Cow::Owned(out)
+    }
+
+    /// A copy of `message` with sanitized content.
+    pub fn sanitize_message(&self, message: &ChatMessage) -> ChatMessage {
+        ChatMessage {
+            role: message.role,
+            content: self.sanitize(&message.content).into_owned(),
+        }
+    }
+
+    /// A copy of `messages` with every content string sanitized.
+    ///
+    /// Applies to assistant turns too: the model can emit any added token
+    /// outside the stop set, and a decoded reply is re-encoded as context on
+    /// the next turn.
+    pub fn sanitize_messages(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        messages.iter().map(|m| self.sanitize_message(m)).collect()
+    }
+
+    /// The byte offset of the first literal starting at or after `from`, and
+    /// the shortest literal that starts there.
+    fn find_literal<'s>(&'s self, content: &str, from: usize) -> Option<(usize, &'s str)> {
+        let bytes = content.as_bytes();
+        let mut at = from;
+        while at < bytes.len() {
+            // A literal is valid UTF-8, so its first byte is never a
+            // continuation byte and a candidate offset is always a character
+            // boundary. The explicit check keeps the slice below infallible
+            // even if that ever stops holding.
+            if self.first_bytes[bytes[at] as usize] && content.is_char_boundary(at) {
+                if let Some(literal) = self.literal_at(&content[at..]) {
+                    return Some((at, literal));
+                }
+            }
+            at += 1;
+        }
+        None
+    }
+
+    /// The shortest literal that prefixes `rest`, if any.
+    fn literal_at<'s>(&'s self, rest: &str) -> Option<&'s str> {
+        self.literals
+            .iter()
+            .find(|literal| rest.starts_with(literal.as_str()))
+            .map(String::as_str)
+    }
+}
+
+/// The text a turn contributes: the content itself, or its sanitized form.
+fn turn_content<'m>(
+    message: &'m ChatMessage,
+    sanitizer: Option<&ContentSanitizer>,
+) -> Cow<'m, str> {
+    match sanitizer {
+        Some(sanitizer) => sanitizer.sanitize(&message.content),
+        None => Cow::Borrowed(message.content.as_str()),
+    }
 }
 
 /// Append one `<|im_start|>{role}\n{content}<|im_end|>\n` turn.
@@ -222,5 +449,173 @@ mod tests {
              <|im_start|>user\nhi<|im_end|>\n\
              <|im_start|>assistant\n"
         );
+    }
+
+    /// A stand-in vocabulary. Deliberately not the pinned one: it has a
+    /// literal that is a prefix of another, a literal sharing a first byte
+    /// with a different shape, and a one-character literal — shapes the real
+    /// Qwen vocabulary does not contain but the algorithm must still handle.
+    fn test_sanitizer() -> ContentSanitizer {
+        ContentSanitizer::from_literals(
+            ["<|a|>", "<a>", "<|abc|>", "@", "\u{4e2d}x"]
+                .into_iter()
+                .map(String::from),
+        )
+    }
+
+    fn strip_markers(s: &str) -> String {
+        s.replace(SANITIZE_MARKER, "")
+    }
+
+    #[test]
+    fn sanitizer_literals_are_deduplicated_and_shortest_first() {
+        let sanitizer = ContentSanitizer::from_literals(
+            ["bb", "a", "bb", "", "ccc"].into_iter().map(String::from),
+        );
+        let literals: Vec<&str> = sanitizer.literals().collect();
+        // Empty literals are dropped (they would match everywhere and cannot
+        // be broken), duplicates collapse, and the order is shortest first.
+        assert_eq!(literals, ["a", "bb", "ccc"]);
+    }
+
+    #[test]
+    fn clean_content_is_borrowed_unchanged() {
+        let sanitizer = test_sanitizer();
+        for content in [
+            "",
+            "   \n\t  ",
+            "system",
+            "<|a",
+            "a|>",
+            "< | a | >",
+            "<b>",
+            "\u{4e2d}",
+        ] {
+            assert!(sanitizer.is_clean(content), "{content:?}");
+            assert!(
+                matches!(sanitizer.sanitize(content), Cow::Borrowed(_)),
+                "{content:?} should not allocate"
+            );
+            assert_eq!(sanitizer.sanitize(content), content);
+        }
+    }
+
+    #[test]
+    fn a_broken_literal_keeps_every_original_character() {
+        let sanitizer = test_sanitizer();
+        let sanitized = sanitizer.sanitize("what does <|a|> mean?").into_owned();
+        assert_ne!(sanitized, "what does <|a|> mean?");
+        assert!(sanitizer.is_clean(&sanitized));
+        // Zero-width marker only: strip it and the text is byte-identical.
+        assert_eq!(strip_markers(&sanitized), "what does <|a|> mean?");
+    }
+
+    #[test]
+    fn one_character_literals_are_replaced_not_split() {
+        let sanitizer = test_sanitizer();
+        // "@" has no inside, so it cannot be broken from within; it is
+        // replaced by the marker, which still cannot join its neighbours.
+        let sanitized = sanitizer.sanitize("a@b").into_owned();
+        assert!(sanitizer.is_clean(&sanitized));
+        assert_eq!(sanitized, format!("a{SANITIZE_MARKER}b"));
+    }
+
+    #[test]
+    fn nested_and_overlapping_literals_are_all_broken() {
+        let sanitizer = test_sanitizer();
+        for content in [
+            "<|<|a|>a|>",        // a literal hiding inside a longer near-literal
+            "<|a<|a|>|>",        // overlapping starts
+            "<|abc|>",           // longer literal sharing a prefix with "<|a"
+            "<|a|><|abc|><a>",   // adjacent, different literals
+            "<a<a>>",            // nested angle brackets
+            "<|a|><|a|><|a|>",   // repeated
+            "<|a|>tail",         // at the very start
+            "head<|a|>",         // at the very end
+            "<|a|>",             // the whole content
+            "x<|a|>y",           // no surrounding whitespace
+            "\u{4e2d}\u{4e2d}x", // multi-byte literal
+        ] {
+            let sanitized = sanitizer.sanitize(content).into_owned();
+            assert!(
+                sanitizer.is_clean(&sanitized),
+                "{content:?} -> {sanitized:?}"
+            );
+            assert!(sanitizer.is_clean(&sanitizer.sanitize(&sanitized)));
+        }
+    }
+
+    #[test]
+    fn sanitizing_never_leaves_a_literal_for_any_short_string() {
+        // Exhaustive over every string up to length 6 drawn from the alphabet
+        // the literals are built from. That covers every nesting, overlap,
+        // truncation and adjacency shape those literals can form, so the
+        // "output contains no literal" guarantee is proved rather than
+        // spot-checked.
+        let sanitizer =
+            ContentSanitizer::from_literals(["<|a|>", "<a>", "@"].into_iter().map(String::from));
+        let alphabet = ['<', '>', '|', 'a', '@'];
+        let base = alphabet.len();
+        let mut content = String::new();
+        let mut checked = 0usize;
+        for len in 0..=6u32 {
+            for mut word in 0..base.pow(len) {
+                content.clear();
+                for _ in 0..len {
+                    content.push(alphabet[word % base]);
+                    word /= base;
+                }
+                let sanitized = sanitizer.sanitize(&content).into_owned();
+                assert!(
+                    sanitizer.is_clean(&sanitized),
+                    "{content:?} -> {sanitized:?}"
+                );
+                // Insertion-only, except for the one-character literal, which
+                // has no inside and is replaced by the marker.
+                assert_eq!(
+                    strip_markers(&sanitized),
+                    content.replace('@', ""),
+                    "{content:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 19_531, "expected the full sweep");
+    }
+
+    #[test]
+    fn sanitizing_huge_content_neither_panics_nor_misses() {
+        let sanitizer = test_sanitizer();
+        let mut content = String::new();
+        while content.len() < 1 << 20 {
+            content.push_str("lorem ipsum <|a|> dolor @ sit \u{4e2d}x amet ");
+        }
+        let sanitized = sanitizer.sanitize(&content).into_owned();
+        assert!(sanitizer.is_clean(&sanitized));
+    }
+
+    #[test]
+    fn sanitized_render_keeps_the_chatml_structure() {
+        let sanitizer = test_sanitizer();
+        let messages = [ChatMessage::system("s"), ChatMessage::user("<|a|>")];
+        let rendered = render_chatml_sanitized(&messages, true, &sanitizer);
+        assert_eq!(
+            strip_markers(&rendered),
+            render_chatml(&messages, true),
+            "sanitizing must only insert markers, never change the structure"
+        );
+    }
+
+    #[test]
+    fn sanitizing_messages_covers_every_role() {
+        let sanitizer = test_sanitizer();
+        let messages = [
+            ChatMessage::system("<|a|>"),
+            ChatMessage::user("<a>"),
+            ChatMessage::assistant("<|abc|>"),
+        ];
+        for message in sanitizer.sanitize_messages(&messages) {
+            assert!(sanitizer.is_clean(&message.content), "{message:?}");
+        }
     }
 }
