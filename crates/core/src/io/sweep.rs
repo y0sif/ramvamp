@@ -44,9 +44,16 @@
 //! Two dials, both the subject of a planned experiment:
 //!
 //! - **Experts per window** ([`DEFAULT_EXPERTS_PER_WINDOW`], 8). On the two
-//!   shipped Qwen3-30B-A3B strides that is 23.34 MiB and 20.25 MiB, inside the
-//!   16-24 MiB the drive wants, and `128 / 8 = 16` uniform windows per layer
-//!   with no ragged tail.
+//!   shipped Qwen3-30B-A3B strides that is 23.34 MiB and 20.25 MiB, and
+//!   `128 / 8 = 16` uniform windows per layer with no ragged tail. The size is
+//!   *not* chosen because the drive prefers big blocks: EXP-019 refutes that,
+//!   finding larger blocks neutral on one probed file and 15 to 16 percent
+//!   worse on the other three, which retires the "16-24 MiB the drive wants"
+//!   band this comment used to cite from EXP-008. What the drive tracks is
+//!   total bytes in flight, and 8 experts at the default 2 windows in flight
+//!   is 49.0 MB outstanding, which measured as the **best cell** in EXP-019's
+//!   matrix (1.60 to 2.37 GB/s) and sits well inside the peak plateau that
+//!   ends near 100 MB. So the dial is unchanged and its justification is not.
 //! - **Windows in flight** ([`DEFAULT_WINDOWS_IN_FLIGHT`], 2). Double
 //!   buffering: window `n + 1` is on the wire while the caller computes window
 //!   `n`. [`LayerSweep::next_expert`] waits for one named window rather than
@@ -98,7 +105,11 @@ pub const DEFAULT_WINDOWS_IN_FLIGHT: u32 = 2;
 ///
 /// The in-flight table is a fixed array so a sweep allocates nothing, and this
 /// is its width. Well above anything useful: past a couple of windows the
-/// arena is the cost and the drive saturates at QD4 anyway (EXP-008).
+/// arena is the cost, and extra bytes in flight stop paying. EXP-019 puts the
+/// drive's peak plateau at roughly 100 MB outstanding, which 4 windows of 8
+/// experts (97.9 MB) already reaches, and measures 15 to 18 percent below peak
+/// past about 170 MB, which 8 windows (195.8 MB) is. This replaces an earlier
+/// "the drive saturates at QD4 (EXP-008)" note whose premise EXP-019 retires.
 pub const MAX_WINDOWS_IN_FLIGHT: u32 = 8;
 
 /// Failures from planning or driving a prefill sweep.
@@ -1496,7 +1507,10 @@ mod tests {
             }
             // The windows tile the file exactly.
             assert_eq!(expected_offset, 128 * stride);
-            // 16-24 MiB, which is the read size the dial was picked for.
+            // 16-24 MiB. Not a band the drive requires (EXP-019 refutes the
+            // block-size premise EXP-008 handed this dial); this pins the
+            // window size the shipped dial actually produces, so a change to
+            // either the dial or a stride has to be deliberate.
             let mib = config.window_bytes(stride).unwrap() as f64 / (1024.0 * 1024.0);
             assert!((16.0..=24.0).contains(&mib), "{mib} MiB out of band");
         }

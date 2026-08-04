@@ -13,8 +13,16 @@ large blocks** beats reading **individual experts at the 2.918 MiB stride**,
 on these actual files, and by how much. EXP-008 answered a version of that
 question with two probe series that disagree with each other by 17% at the
 same queue depth, and EXP-013 then measured ~1.97 GB/s at the expert stride
-under the real access pattern against EXP-008's 1.211-1.390 GB/s. If EXP-013
-is right, EXP-008's "+51% at 16 MiB" premise collapses to roughly +9%.
+under the real access pattern against EXP-008's 1.211-1.390 GB/s. The
+prediction written here before the first run was that if EXP-013 is right,
+EXP-008's "+51% at 16 MiB" premise collapses to roughly +9%.
+
+**Measured, it collapsed further than that: see EXP-019.** Sequentially,
+going from one expert blob to eight is neutral on one probed file (1.578 to
+1.553 GB/s) and 15 to 16 percent *worse* on the other three. So +51% does not
+survive as a premise at all, and the block-size curve behind it is refuted
+rather than rescaled. The level is also higher across the board, 1.54 to 2.37
+GB/s, consistent with EXP-013 and not with EXP-008.
 
 EXP-008 also conflated two different variables. "Large blocks" and
 "sequential" are not the same thing, and the win could come from either.
@@ -46,12 +54,19 @@ physically adjacent to their successor. That difference may be the whole
 disagreement between EXP-008 and EXP-013, and a bandwidth number without the
 extent map next to it is not interpretable.
 
-`docs/benchmark-machine.md` also records that per-file fragmentation variance
+`docs/benchmark-machine.md` also records that per-file bandwidth variance
 exceeds run-to-run variance (`layer_00` 1,237 MB/s vs `layer_20` 1,812 MB/s).
 This probe therefore runs a **fixed, recorded** file set spanning both stride
 classes and **always reports per file**. Aggregates are printed only with the
 per-file min and max beside them; an aggregate that hides a 1.46x spread is a
 worse answer than no aggregate.
+
+Measured, that spread reproduces (1.58 vs 2.27 GB/s) and the fragmentation
+hypothesis above is **eliminated as its cause**: EXP-019 finds `layer_00` and
+`layer_20` byte-identical in extent geometry, 398 extents each, mean 984,027
+B, zero physically adjacent successor pairs. The extent map is still worth
+recording, because that is how the hypothesis got eliminated, but what is left
+is physical placement or drive-internal behaviour that this probe cannot see.
 
 ## What "queue depth" means here, and what it does not
 
@@ -186,10 +201,12 @@ BTRFS_COUNTERS = (
 )
 
 # The fixed, recorded file set. layer_00 and layer_20 are the pair
-# docs/benchmark-machine.md names for per-file fragmentation variance (1,237
-# vs 1,812 MB/s) and both carry the 3,059,712 B stride; layer_06 and layer_21
-# carry the 2,654,208 B stride. Changing this list changes what the numbers
-# mean, so it is a default rather than a computed choice.
+# docs/benchmark-machine.md names for per-file bandwidth variance (1,237 vs
+# 1,812 MB/s; EXP-019 reproduces it and rules out fragmentation as the cause,
+# since the two have identical extent geometry) and both carry the 3,059,712 B
+# stride; layer_06 and layer_21 carry the 2,654,208 B stride. Changing this
+# list changes what the numbers mean, so it is a default rather than a
+# computed choice.
 DEFAULT_FILES = ("layer_00", "layer_20", "layer_06", "layer_21")
 
 # Block sizes are chosen by **expert count**, not by round binary sizes, so
@@ -1481,7 +1498,7 @@ def main() -> int:
     parser.add_argument("--files", default=",".join(DEFAULT_FILES),
                         help="comma-separated layer stems to probe. The "
                              "default set is fixed and recorded because "
-                             "per-file fragmentation variance exceeds "
+                             "per-file bandwidth variance exceeds "
                              "run-to-run variance (default: %(default)s)")
     parser.add_argument("--block-ks", default=",".join(str(k) for k in DEFAULT_KS),
                         help="block sizes as expert counts, so reads land on "

@@ -19,9 +19,20 @@ guessed at. Update this file when any of it changes.
 | `RLIMIT_MEMLOCK` | 8 MiB soft **and** hard (systemd default; the hard limit needs `CAP_SYS_RESOURCE`) |
 | earlyoom | active |
 
-The drive is not the one the design doc originally assumed. See EXP-008 for
-what it actually sustains; the short version is that block size dominates and
-queue depth saturates by QD4-8.
+The drive is not the one the design doc originally assumed. **EXP-019** is what
+it actually sustains, measured cold and in-cgroup on the installed layer files:
+**1.54 to 2.37 GB/s**, and the variable that predicts throughput is **total
+bytes in flight**, not block size. Block size and queue depth move that one
+quantity and are interchangeable at matched bytes, so neither dominates on its
+own; the drive holds peak up to roughly **100 MB outstanding** and loses 15 to
+18 percent past about 170 MB.
+
+EXP-008's older reading, "block size dominates and queue depth saturates by
+QD4-8", is superseded on both counts. Its block-size curve is refuted (bigger
+blocks are neutral on one probed file and 15 to 16 percent worse on three
+others), and its levels of 1.211 to 1.390 GB/s were measured on a contended
+machine, exactly as its own Method warned. Read EXP-019 before deriving
+anything from a bandwidth number on this box.
 
 ## btrfs error counters
 
@@ -70,7 +81,19 @@ btrfs device stats /home
   instead.
 - `cgroup v2` memory accounting works rootless via
   `systemd-run --user --scope`; `memory.swap.peak` needs kernel 6.5 or newer.
-- Concurrent readers cost roughly 3.5x read amplification, and per-file
-  fragmentation variance exceeds run-to-run variance (`layer_00` 1,237 MB/s vs
-  `layer_20` 1,812 MB/s), so benchmarks must pin the same file set and run on a
-  quiet machine.
+- Concurrent readers cost roughly 3.5x read amplification, and **per-file
+  bandwidth variance exceeds run-to-run variance** (`layer_00` 1,237 MB/s vs
+  `layer_20` 1,812 MB/s, a 1.46x spread), so benchmarks must pin the same file
+  set and run on a quiet machine. That advice stands and the spread is
+  reproducible: EXP-019 measures the same two files at 1.58 and 2.27 GB/s, a
+  1.44x spread, far above its 1.4% run-to-run median.
+
+  **It is not fragmentation.** This file used to attribute the spread to
+  fragmentation; EXP-019 eliminates that hypothesis. The two files have
+  byte-identical extent geometry, 398 extents each, mean 984,027 B, median
+  884,736 B, and zero extents physically adjacent to their successor. What is
+  left is physical placement on the drive or QLC-internal behaviour such as
+  SLC-cache residency or block wear, none of which a filesystem-level probe
+  can see. Consequence for benchmarking: an aggregate bandwidth figure that
+  hides this spread is worse than no aggregate, and any run that changes which
+  files it touches has changed its own baseline.

@@ -22,7 +22,9 @@ machine with an NVMe SSD, CPU only. The tok/s target is under review; see
 v0 success criterion: coherent chat, decode throughput at or above the
 agreed floor (**OPEN**, currently written as >= 3 tok/s and pending the
 user's decision; the derived I/O-only ceiling on the reference drive is
-~2.2-2.7 tok/s, see "Performance model"), inside a cgroup with `memory.max=3G`
+~2.8-3.4 tok/s at EXP-019's measured bandwidths, up from the ~2.2-2.7 that
+EXP-008's provisional ones gave, see "Performance model"), inside a cgroup
+with `memory.max=3G`
 and `memory.swap.max=0` (zram counts as swap), cold page cache,
 KL-divergence vs llama.cpp within accepted tolerance on identical weights.
 
@@ -33,38 +35,71 @@ AVX-512), 16 GB LPDDR5X-7467, **Micron 2400 DRAM-less QLC** NVMe
 2450 Gen4 NVMe (~3.6 GB/s sequential)": wrong device, and a spec-sheet figure
 rather than a measurement. Both are withdrawn.
 
-Measured O_DIRECT random reads on that drive (all **provisional**: taken on a
-machine that was not quiet, so they fail rule 2 and need re-measuring inside
-the benchmark cgroup before publication):
+Measured O_DIRECT reads on that drive, **cold inside the benchmark cgroup on a
+quiet machine, hygiene PASS** (EXP-019, `scripts/io_probe.py`, three scored
+runs over four real installed layer files spanning both stride classes). These
+supersede on level the provisional EXP-008 figures this section used to carry:
 
-- At the real 2.918 MiB expert stride: 1.211 GB/s at QD4, 1.349 at QD8,
-  1.390 at QD16.
-- Block-size sweep: 2.918 MiB ~1.35 GB/s, 8 MiB 1.86, 16 MiB 2.04, 24 MiB
-  2.15.
+| geometry | pattern | GB/s |
+| --- | --- | --- |
+| one expert blob (2.918 / 2.531 MiB), 8 outstanding, as decode reads | random | 1.55-1.69 |
+| one expert blob, 8 outstanding | sequential | 1.58-2.37 |
+| 8-expert window (23.34 / 20.25 MiB), 2 outstanding, as the prefill sweep reads | sequential | 1.60-2.37 |
+| whole matrix, every cell | both | 1.54-2.37 |
 
-Throughput is dominated by block size, not queue depth. Queue depth saturates
-by QD4-8 (QD4 is already 87% of QD16), while raising the block size from
-2.9 to 24 MiB buys +59%. This is a DRAM-less QLC drive, not a high-end Gen4
-part, and the whole performance model below inherits that fact.
+**Queue depth in that probe is emulated with N OS threads issuing blocking
+`preadv`, not io_uring.** So it characterises the drive and the filesystem,
+not `crates/core/src/io`'s submission path, and no dial in the runtime may be
+set from it without a measurement of its own.
 
-Two provenance facts about these numbers that the performance model has to
-live with. Both are recorded in EXP-008 rather than smoothed over:
+Three findings, and the first two retire what this section used to say:
 
-- **This table is one probe series, and the per-blob latency figures quoted
-  later are another.** They were not run together and they disagree on
-  level, not on shape: the QD8 latency figure implies 1.57 GB/s aggregate
-  against the 1.349 GB/s tabulated here at the same depth.
-- **1.59 GB/s, the constant `scripts/lfu_sim.py` and EXP-005 build the
-  performance model on, does not appear in this table and cannot be
-  sourced.** It is described three incompatible ways: as a sequential
-  ceiling (in the simulator), as random reads at the expert stride on a
-  non-quiet machine with a concurrent reader (in EXP-005), and it sits
-  between this table's random-read numbers and its large-block numbers, so
-  it can be neither. EXP-005 also records a quiet run of the same probe at
-  1.35 GB/s while this section says the whole table came from a machine that
-  was not quiet; that contradiction is unresolved and needs the probe re-run
-  rather than an edit. Until then the performance model below is derived
-  from the tabulated 1.211-1.349 GB/s at the chosen QD4-8 operating point.
+- **Block size does not dominate. It barely matters.** Going from one expert
+  blob to an 8-blob block is neutral on one probed file and 15 to 16 percent
+  *worse* on the other three when the read is sequential. EXP-008's "+51% at
+  16 MiB", which the prefill section below leaned on, is **refuted**, and
+  under either reading of what EXP-008 measured: read randomly, the same
+  change gains 15 to 25 percent, which is also not +51%.
+- **What predicts throughput is total bytes in flight**, which queue depth and
+  block size both move and move interchangeably: at matched bytes outstanding,
+  K=4/QD8 and K=8/QD4 land within noise of each other. The drive holds its
+  peak up to roughly **100 MB outstanding** and gives up 15 to 18 percent past
+  ~170 MB. Both shipped dials sit under that ceiling: the decode ring is at
+  most 24.5 MB outstanding, the prefill sweep 49.0 MB. It is a constraint on
+  *raising* them, not a reason to change them.
+- **Per-file variance persists and is unexplained.** `layer_00` at 1.578 GB/s
+  against `layer_20` at 2.271 in the same sweep, with byte-identical extent
+  geometry (both 398 extents, mean 984,027 B, zero physically adjacent
+  successor pairs), so fragmentation as `filefrag` reports it does not predict
+  it. `docs/benchmark-machine.md` records a 1.46x spread between the same two
+  files from an earlier measurement, so it reproduces.
+
+Sequentiality is worth restating precisely, because it is easy to get
+backwards. At the single-blob size, reading in order is worth 1.34x to 1.50x
+on three of the four files. At an 8-blob block it is worth nothing (0.99x to
+1.01x), because the block has already captured the same locality. The two
+effects substitute for each other rather than adding.
+
+This is a DRAM-less QLC drive, not a high-end Gen4 part, and the whole
+performance model below inherits that fact.
+
+Two provenance facts the performance model still has to live with:
+
+- **EXP-008's two probe series disagreed with each other**, not only with this
+  one: its QD8 per-blob latency figure implies 1.57 GB/s aggregate against the
+  1.349 GB/s its own throughput table gives at the same depth. Both series are
+  superseded on level by the table above. The per-blob latency figures quoted
+  later in this document are still EXP-008's and still provisional, because
+  EXP-019 timed whole blocks rather than individual blobs at the decode
+  geometry.
+- **1.59 GB/s, the constant `scripts/lfu_sim.py` and EXP-005 build on, is
+  still unsourced.** EXP-019 does not find it either. It was described three
+  incompatible ways (a sequential ceiling, in the simulator; random reads at
+  the expert stride on a non-quiet machine, in EXP-005; and it sat between
+  EXP-008's random-read and large-block numbers, so it could be neither), and
+  nothing has since sourced it. It does fall inside EXP-019's measured range,
+  which makes it a lucky guess rather than a measurement. No derived figure in
+  this document uses it.
 
 ## Model pin (v0)
 
@@ -293,21 +328,30 @@ slots/layer), fewer slots/layer. A global slot pool shared across layers is
      works after the user edits a systemd unit is not a design.
   3. The measured benefit is small: ~70 us of CPU per 3 MiB read at our block
      size, about 4.5% of one core out of 22 (provisional, EXP-008).
-- Queue depth: small, QD4-8, now chosen on measured grounds rather than
-  assumed, but on the *shape* of the throughput sweep rather than its
-  absolute level. Queue depth saturates early (1.211 GB/s at QD4 vs 1.390 at
-  QD16 at the expert stride, so QD4 is 87% of QD16), and deeper queues buy
-  latency rather than bandwidth: measured per-blob p50 is 2.34 ms at QD1 and
-  15.56 ms at QD8 (provisional). The earlier "~1 ms per blob when the queue
-  is fed" figure was an estimate and is withdrawn; real per-blob latency is
-  worse than that at every depth. Since the decode loop waits on all misses
-  (see "Decode loop"), latency is the quantity that matters, which argues for
-  the low end of the range. **Caveat, unresolved:** those latency figures
-  come from a different probe series than the throughput sweep and the two
-  disagree on level. 2.34 ms for one 2.918 MiB blob is 1.31 GB/s at QD1,
-  which is *above* the tabulated 1.211 GB/s at QD4, so as written the latency
-  data contradicts "the drive saturates by QD4" as a claim about absolute
-  throughput. Both series are provisional; see EXP-008.
+- Queue depth: small, QD4-8, and `RING_ENTRIES` in
+  `crates/core/src/io/stream.rs` is 8. **The measured justification is now
+  EXP-019, not EXP-008.** The decode ring issues at most 8 single-blob reads
+  at once, which is 24.5 MB outstanding, and EXP-019 puts that inside the flat
+  part of the drive's curve: throughput turns on total bytes in flight, holds
+  its peak to roughly 100 MB, and falls 15 to 18 percent past ~170 MB. So the
+  shipped depth is at the peak rather than past it. Two limits on that
+  reassurance, both worth stating: EXP-019 swept queue depth only at the
+  8-blob block size, so the decode geometry has **no queue-depth curve of its
+  own** and its QD2 and QD4 points are unmeasured; and its queue is threaded
+  `preadv`, not io_uring, so it says nothing about `SINGLE_ISSUER` /
+  `DEFER_TASKRUN` submission behaviour. An io_uring queue-depth experiment
+  inside the runtime is on the backlog for exactly those two gaps.
+  Deeper queues also buy latency rather than bandwidth: measured per-blob p50
+  is 2.34 ms at QD1 and 15.56 ms at QD8 (**still provisional, still EXP-008**;
+  EXP-019 timed whole blocks, not individual blobs, so it does not replace
+  these). The earlier "~1 ms per blob when the queue is fed" figure was an
+  estimate and is withdrawn; real per-blob latency is worse than that at every
+  depth. Since the decode loop waits on all misses (see "Decode loop"),
+  latency is the quantity that matters, which independently argues for the low
+  end of the range. EXP-008's internal contradiction on this point (2.34 ms
+  for one 2.918 MiB blob is 1.31 GB/s at QD1, above its own tabulated 1.211
+  GB/s at QD4) is resolved in the direction the latency series pointed:
+  EXP-019 measures 1.55 to 1.69 GB/s at that geometry, above both.
 - O_DIRECT is a budget-correctness requirement, and this is now measured
   rather than argued: reading the same 1.4 GiB of experts inside the same
   cgroup peaked at **1,092.2 MiB** buffered versus **5.0 MiB** with O_DIRECT
@@ -480,25 +524,46 @@ layer" no matter how it is scheduled. So:
   request misses. The token-major prefill the sweep replaced ran through the
   decode cache at 45.3% hit (EXP-013), so measured against that baseline the
   bytes the sweep displaces are `(1 - 0.453) x 1,097` = ~600 MB/token and the
-  realized reduction is ~17.6x. The same amortization is available on RAM
+  realized reduction is ~17.6x. **That prediction is now measured, cold, and
+  it holds**: on the same 512-token prompt in the same session, process
+  `read_bytes` fell from 239.33 GB token-major to 20.72 GB swept, a factor of
+  **11.55x** (EXP-018). The swept figure is 1.11x the whole installed model,
+  which is what reading each expert exactly once looks like. The measured
+  ratio is below the ~17.6x predicted because the token-major arm hit its
+  cache harder over 512 prompt tokens than the 45.3% EXP-013 measured over 25,
+  and because `read_bytes` counts the mmap-faulted common core and the decode
+  tail on both arms. The same amortization is available on RAM
   bandwidth: dotting one expert weight row against all ~32 of its routed rows
   while the row is in L1 fetches that row from RAM once instead of once per
   token. That is what the batched GEMV entry points exist for (EXP-015), and
   the prefill driver is now their caller (EXP-016).
-- Read granularity is a **secondary and currently unproven** effect. The
-  claim was EXP-008's **+51% at 16 MiB** (2.04 GB/s at 16 MiB and 2.15 at 24
-  MiB against ~1.35 at the 2.918 MiB expert stride, provisional). Its
-  denominator is the weak part: EXP-013 measured **1.97 GB/s** under the
-  real access pattern at that same stride, contradicting EXP-008's 1.35 by
-  roughly 46%, and EXP-008's harness was never committed. So window size
-  stays a tuned dial in the phase-6 backlog (the sweep exposes it, default 8
-  experts per window) rather than a load-bearing reason for the design.
+- Read granularity is a **dead effect, not a secondary one.** The claim was
+  EXP-008's **+51% at 16 MiB** (2.04 GB/s at 16 MiB and 2.15 at 24 MiB against
+  ~1.35 at the 2.918 MiB expert stride, provisional). EXP-017 demoted it,
+  because its denominator was contradicted by EXP-013's 1.97 GB/s under the
+  real access pattern at the same stride and because EXP-008's harness was
+  never committed. **EXP-019 retires it.** Measured cold under rule 2 on the
+  real installed files, going from one expert blob to an 8-blob block is
+  neutral on one file and 15 to 16 percent *worse* on three, sequentially; the
+  whole read-pattern change from the runtime's random single-blob decode read
+  to a front-to-back 8-blob sweep read is 0.97x to 1.26x by file, against the
+  1.51x EXP-008 implied. **Nothing in this design may be justified by read
+  granularity.** Window size stays a tuned dial (the sweep exposes it, default
+  8 experts per window), and EXP-019 gives that sweep an upper bound it did
+  not have: window bytes times windows in flight should stay under ~100 MB
+  outstanding, which the shipped 49.0 MB does with room for a doubling.
 - **The sweep's ceiling is `max(I/O, compute)` per chunk, not I/O alone.**
-  The I/O half: ~8.2-8.6 s per 512-token chunk sweep (~17.6 GB) at
-  2.04-2.15 GB/s, which is roughly **60 tok/s of I/O-only prefill**
-  (estimate derived from provisional bandwidth). Earlier revisions quoted
-  that 60 tok/s as *the* prefill figure; it is not one, because it says
-  nothing about compute. **Measured, the I/O half is not the binding one at
+  The I/O half, re-derived from EXP-019 where EXP-008's numbers used to sit:
+  17,553,162,240 B of expert files per 512-token chunk sweep at the 1.60-2.37
+  GB/s the drive gives at the sweep's own geometry is **7.4 to 11.0 s**, which
+  is roughly **47 to 69 tok/s of I/O-only prefill**. That band is wide for one
+  reason, the unexplained per-file variance EXP-019 records, and it happens to
+  bracket the ~60 tok/s the previous revision derived from EXP-008's 2.04-2.15
+  GB/s. So the estimate barely moved, but it now rests on a measurement that
+  satisfies rule 2 instead of one that did not, and it is a range rather than
+  a point. Earlier revisions quoted that 60 tok/s as *the* prefill figure; it
+  is not one, because it says nothing about compute. **Measured, the I/O half
+  is not the binding one at
   all**: expert I/O is 1.7% of a 512-token sweep prefill and 0.5% of a
   1891-token one, of which 1.76 s and 5.06 s were blocked on the drive
   (EXP-017). Those runs were warm and uncgrouped, so the shares are what to
@@ -528,14 +593,18 @@ layer" no matter how it is scheduled. So:
   is refuted. That is a time, not an arithmetic intensity, so the roofline
   framing above stays a mechanism. The reuse ratio of ~32 is exact chunk
   geometry either way, and it is per *weight*, not per byte: at Q4_K/Q6_K a
-  byte holds roughly 1.33 to 2 of them. **No new tok/s prediction is
-  published here.** The measurement is still owed: the driver landed without
-  one (EXP-016), and EXP-017 measured the phase split rather than a rule-2
-  throughput number, so the cold cgroup prefill figure is still outstanding.
-  The earlier "~4.9 s, roughly 100 tok/s" figure assumed the withdrawn 3.6
-  GB/s number and is superseded. TF's design (random tile fetches through the
-  decode cache) achieved ~28 tok/s, so the sequential sweep is still the
-  right call.
+  byte holds roughly 1.33 to 2 of them. **No new tok/s prediction is published
+  here, and none is needed now: the measurement has been taken.** EXP-018 pairs
+  the swept path against the token-major path on one 512-token prompt, cold
+  inside `memory.max=3G` with swap off, hygiene PASS on both arms, and gets
+  **4.23 tok/s prefill against 1.65, a 2.56x speedup**, with process
+  `read_bytes` down 11.55x and `memory.peak` at 2,570.1 MiB of 3,072. That is
+  what EXP-015, EXP-016 and EXP-017 each recorded as owed. It is a single run
+  per arm rather than a median of five, so read the third significant figure
+  with suspicion. The earlier "~4.9 s, roughly 100 tok/s" figure assumed the
+  withdrawn 3.6 GB/s number and is superseded. TF's design (random tile
+  fetches through the decode cache) achieved ~28 tok/s, so the sequential
+  sweep is still the right call.
 - **The third term the ceiling above leaves out is attention, and it is now
   measured to be the largest one (EXP-017).** The shipped driver batches the
   projections and the expert FFN across a chunk's rows, but it runs
@@ -551,8 +620,16 @@ layer" no matter how it is scheduled. So:
   *estimate* for the 512-token case. **Those runs were warm, uncgrouped and
   on a machine that was not quiet, so under rule 2 none of their seconds is
   publishable**; the shape of the split and the ratios inside a single run
-  are what this finding rests on, and the cold cgroup measurement is still
-  owed (backlog, below). Parallelizing over rows is bit-neutral, since rows
+  are what this finding rests on. The cold cgroup end-to-end number has since
+  been taken (EXP-018, prefill 2.56x), but **not** the cold phase split, so
+  attention's share cold is still inferred from warm runs. EXP-018's own
+  arithmetic is at least consistent with it: 17.55 GB of expert reads at
+  EXP-019's 1.60-2.37 GB/s is 7.4 to 11.0 s of drive time inside a 120.96 s
+  cold prefill, or 6 to 9 percent, which leaves attention as the only
+  candidate for the rest. That crosses two entries, so it is a derivation and
+  not a measurement, and it is only defensible at all because both batches
+  were taken minutes apart in one session on one machine.
+  Parallelizing over rows is bit-neutral, since rows
   are independent, but it needs one score buffer per shard and the arena
   carve does not have one (EXP-016); vectorizing the f16 conversion and the
   dot is a second and independent lever. **No speedup figure is predicted
@@ -561,7 +638,21 @@ layer" no matter how it is scheduled. So:
   against it.
 - Decode cache starts cold after prefill; acceptable, first tokens warm it.
   Replaying the prompt into the cache during prefill is closed as a "no",
-  see "Recorded decisions from phase-5 measurement".
+  see "Recorded decisions from phase-5 measurement". **This line predicted a
+  real cost and EXP-018 saw it**: taking the prefill arena invalidates every
+  layer's slot occupancy (`crates/core/src/io/stream.rs`), so decode after a
+  swept prefill starts with nothing resident, where the token-major path left
+  the cache warmed by the whole prompt. On a 4-token generation that is
+  essentially all that is measured, and decode reads 1.38 tok/s swept against
+  1.88 token-major. Steady-state decode code is unchanged and bit-identical
+  between the two arms, so this is a cold-start transient rather than a
+  throughput regression, but that is a **hypothesis with supporting arithmetic
+  and not a measurement**: EXP-005 found cold start reaching within 2 points
+  of steady state only by token 48, and 725 ms/token sits just under the 649
+  to 708 ms/token of I/O alone that an empty cache implies at EXP-019's
+  bandwidths. A longer `--max-new` on the same paired prompt is what would
+  settle it, and it is on the backlog. "Acceptable" is still the right verdict
+  and it now has a price attached.
 
 ## The prefill arena (the sweep ring is borrowed, not allocated)
 
@@ -754,27 +845,42 @@ withdrawn.
   `(1 - hit) x 1,097 MB`, which assumes misses are spread across the two
   stride classes in proportion to accesses; on the one point where EXP-005
   reports both, that assumption is within 1% of the simulator's exact byte
-  count. At the tabulated QD4-8 bandwidths (1.211-1.349 GB/s):
+  count. **Re-derived 2026-08-04 at EXP-019's measured bandwidth**, taken at
+  the decode geometry the runtime actually issues (one expert blob, random
+  order, up to 8 outstanding): **1.55-1.69 GB/s**, cold, in-cgroup, hygiene
+  PASS. The table this replaces used EXP-008's 1.211-1.349 GB/s and this
+  section used to say, in these words, "re-derive the whole table once the
+  bandwidth probe is redone under rule 2". It has been.
 
   | dial | hit % | miss MB/token | ms/token | io-only tok/s |
   | --- | ---: | ---: | ---: | ---: |
-  | 10 slots, batch-pinned | 50.02 | 548 | 406-453 | 2.21-2.46 |
-  | 12 slots, batch-pinned | 54.48 | 499 | 370-412 | 2.42-2.70 |
-  | no cache | 0 | 1,097 | 813-906 | 1.10-1.23 |
+  | 10 slots, batch-pinned | 50.02 | 548 | 324-354 | 2.83-3.08 |
+  | 12 slots, batch-pinned | 54.48 | 499 | 295-322 | 3.11-3.39 |
+  | no cache | 0 | 1,097 | 649-708 | 1.41-1.54 |
 
-  So the current I/O-only band at the shipped dial is roughly **2.2-2.7
-  tok/s**, bracketed by the 10- and 12-slot rows. Every input to that band is
-  provisional: the bandwidths are EXP-008's non-quiet probe, and the hit
-  rates are a trace replay rather than a decode run. Note this band replaces
-  the earlier "2.4-2.9 tok/s", which was derived at the 1.59 GB/s constant
-  that EXP-008 records as unsourced; at 1.59 GB/s these same volumes give
-  2.90-3.18 tok/s. Re-derive the whole table once the bandwidth probe is
-  redone under rule 2.
+  So the current I/O-only band at the shipped dial is roughly **2.8-3.4
+  tok/s**, bracketed by the 10- and 12-slot rows, up from the 2.2-2.7 the
+  EXP-008 bandwidths gave. **What is and is not now measured**: the bandwidth
+  is measured and rule-2 clean, but through a threaded-`preadv` queue rather
+  than io_uring (EXP-019), so it characterises the drive and not the runtime's
+  submission path. The hit rates are still a trace replay rather than a decode
+  run, and the shipped 11-slot dial still has no point of its own. The 1,097
+  MB/token is still exact arithmetic. So the table is one grade less
+  provisional than it was, not measured end to end.
+
+  The width of the band is per-file bandwidth variance, not measurement noise:
+  EXP-019 finds a 1.44x spread between two layer files with identical extent
+  geometry, and a real decode touches all 48, so the true aggregate sits
+  somewhere inside rather than at either end.
 - **This band is drive-dependent and must never be published without the
   device.** The same design and the same ~500 MB/token on a 3.5 GB/s drive
   computes to roughly 7 tok/s. The reference machine has a DRAM-less QLC
   part; a mainstream TLC Gen4 drive would roughly double these numbers. Any
-  headline tok/s figure ships next to the drive it was measured on.
+  headline tok/s figure ships next to the drive it was measured on. EXP-019
+  adds a second reason the device matters and it is finer-grained than
+  "which drive": bandwidth varies 1.44x **between files on the same drive**
+  with identical extent geometry, so even the same drive does not give one
+  number.
 - **I/O is probably not the binding constraint yet, but no single
   measurement says so.** The two figures that suggest it come from different
   machine states and must not be subtracted from each other (experiment log,
@@ -782,21 +888,27 @@ withdrawn.
   warm cache, single thread, uncgrouped, and the expert reads in it are
   buffered `pread` served largely from that warm cache), while the 690 ms of
   uncached expert I/O is a *simulated* figure at an unsourced bandwidth
-  constant (EXP-005, no cache). What can be said without combining them is
+  constant (EXP-005, no cache; the same volume re-derived at EXP-019's
+  measured bandwidth is 649-708 ms, so the figure survives its constant).
+  What can be said without combining them is
   that a single-threaded decode step measured in seconds sits an order of
   magnitude above an I/O budget estimated in hundreds of milliseconds, so
   compute-parallelism work matters at least as much as the cache does.
   Neither the cache dial nor the bandwidth probe can be evaluated against
   tok/s until the compute side is threaded and one run produces both halves
   under rule 2.
-- **Floor for success: OPEN.** The criterion is currently written as 3 tok/s,
-  which is above the derived I/O-only ceiling on the reference drive at the
-  tabulated bandwidths (2.2-2.7 tok/s). Only the unsourced 1.59 GB/s
-  constant puts 3 tok/s within reach at all, and then only at a slot count
-  that no longer fits the memory budget. This needs the user's decision, not
-  a silent edit. The three options are: keep 3 and accept it is unreachable on
-  this drive, restate the floor per-drive, or lower it. Recorded here as
-  unresolved.
+- **Floor for success: OPEN, and the arithmetic against it has changed.** The
+  criterion is written as 3 tok/s. At EXP-008's bandwidths that sat *above*
+  the derived I/O-only ceiling of 2.2-2.7 tok/s, so it was unreachable on this
+  drive by construction. At EXP-019's measured bandwidths the derived ceiling
+  is 2.8-3.4 tok/s, so **3 tok/s now sits inside the band rather than above
+  it**, at the shipped 11-slot dial and without appealing to the unsourced
+  1.59 GB/s constant. That does not make the floor met: an I/O-only ceiling is
+  a ceiling, compute is a real term on top of it, and no cold decode run at a
+  useful token count exists yet to say where the sum lands. It only means the
+  floor is no longer arithmetically impossible. The decision is still the
+  user's rather than a silent edit, and the three options are unchanged: keep
+  3, restate the floor per-drive, or lower it. Recorded here as unresolved.
 
 Prior-art anchors, with the qualifiers that were previously missing:
 
@@ -876,13 +988,35 @@ are neither now, and they should not come back without new evidence.
   has a hit rate of its own instead of a bracket (EXP-012).
 - Re-measure peak `anon` at 4K context with the slot pool wired in, to prove
   or disprove the 111.0 MiB of headroom the 11-slot dial leaves (EXP-012).
+  **Still open, and now with a better starting point.** EXP-018 records
+  `memory.peak` at 512 tokens of context on both prefill paths, 2,576.0 MiB
+  token-major and 2,570.1 MiB swept against the 3,072 MiB ceiling. That is not
+  the 4K run: extrapolating the FP16 KV cache from 512 to 4096 tokens adds
+  ~336 MiB and lands near 2,906 MiB, which still fits and is still
+  arithmetic. It also does not explain itself cleanly, since EXP-018 sits 99
+  to 105 MiB above EXP-014's 2,471.1 MiB while KV alone accounts for ~42 MiB
+  of the gap. The 4K run is what closes both questions.
 - Dedicated E-core io_uring reactor thread vs inline on the coordinator
   (evidence upstream is mixed both ways; see "Thread topology")
 - The two sweep dials, experts per window (default 8, which is 23.3/20.3 MiB
   on the two strides) and windows in flight (default 2). The +51% at 16 MiB
-  that motivated the range is provisional and its denominator is contested
-  by EXP-013, so this sweep now measures the granularity effect rather than
-  assuming it (EXP-008, EXP-013, EXP-015)
+  that motivated the range is **refuted** (EXP-019), so the granularity
+  motivation is gone entirely and this sweep is now about finding the cost of
+  the dials rather than their benefit. EXP-019 also gives it a bound worth
+  respecting: the product of the two dials is bytes outstanding, the drive
+  holds peak to ~100 MB and loses 15 to 18 percent past ~170 MB, so the useful
+  region is `windows_in_flight` up to 4 at 8 experts, or `experts_per_window`
+  up to 16 at 2 windows (EXP-008, EXP-013, EXP-015, EXP-019)
+- **An io_uring queue-depth experiment inside the runtime.** EXP-019 measured
+  the drive through a threaded-`preadv` queue, not io_uring, and swept queue
+  depth only at the 8-blob block size, so the decode geometry (single blobs
+  through `RING_ENTRIES = 8`) has no queue-depth curve of its own on either
+  the drive side or the submission side. What EXP-019 does establish is that
+  the shipped depth sits inside the flat part of the drive's curve at 24.5 MB
+  outstanding, so this experiment is about confirming that through
+  `SINGLE_ISSUER` / `DEFER_TASKRUN` rather than about an expected win.
+  `RING_ENTRIES` must not be changed on the strength of EXP-019 alone
+  (EXP-019)
 - E-cores in compute pool for non-barrier expert GEMVs
 - `fadvise`/`readahead` tuning for the prefill sequential sweep
 - Prefill chunk size sweep: 128 vs 256 vs 512 vs 1024. 512 is the point
@@ -903,21 +1037,39 @@ are neither now, and they should not come back without new evidence.
   vectorizing the conversion and the dot is a second lever and is subject to
   rule 4. No speedup is predicted, and the levers should be measured
   separately
-- Prefill throughput and peak memory for the shipped sweep, cold inside the
-  3G cgroup, against the token-major path on the same prompt. The driver
-  landed with correctness gates only (EXP-016), and EXP-017 measured the
-  phase split on warm uncgrouped runs rather than paying this, so it is still
-  the number the whole phase exists for. Best taken *after* the attention
-  work above, since a figure taken today describes a term that is about to
-  move
-- Re-measure the O_DIRECT bandwidth probe under rule 2 (cold, inside the
-  benchmark cgroup, quiet machine) and re-derive the performance model. This
-  is the highest-value item on the list: the 1.59 GB/s constant the model
-  was built on cannot be sourced, and the two existing probe series disagree
-  by 17% at the same queue depth (EXP-008)
+- **A longer `--max-new` on EXP-018's paired prompt**, to settle whether the
+  decode drop it measured (1.88 to 1.38 tok/s) is the cold-start transient it
+  looks like. EXP-018 generated 4 tokens, and the swept prefill leaves the
+  expert cache empty where the token-major path left it warm, so at that
+  length the transient is essentially the whole measurement. EXP-005 puts cold
+  start within 2 points of steady state only by token 48, so 64 decode tokens
+  on both arms of the same pair would separate the transient from steady
+  state. This is the one place the sweep is currently known to cost a user
+  something, so it is worth measuring rather than reasoning about (EXP-018)
+- The **cold phase split**. EXP-017's attribution of prefill time to attention
+  is warm and uncgrouped; EXP-018 is cold but has no per-phase counters in it.
+  Neither says what attention's share is cold, which is the number phase 7
+  should be judged against
 
 Dropped from the backlog:
 
+- ~~Prefill throughput and peak memory for the shipped sweep, cold inside the
+  3G cgroup, against the token-major path on the same prompt~~: **done,
+  EXP-018.** Prefill 4.23 tok/s against 1.65, a 2.56x paired ratio, cold in
+  the 3G cgroup with hygiene PASS on both arms, `memory.peak` 2,570.1 MiB.
+  This item asked to be taken *after* the attention work; it was taken before
+  instead, which is fine because it is a paired A/B rather than an absolute
+  figure, and a ratio between two builds does not go stale when a third
+  changes attention. What is still owed from it is `--repeats 5` rather than
+  1, plus the decode question listed above.
+- ~~Re-measure the O_DIRECT bandwidth probe under rule 2 and re-derive the
+  performance model~~: **done, EXP-019.** `scripts/io_probe.py` is the
+  committed harness EXP-008 never had; the drive gives 1.54-2.37 GB/s cold
+  in-cgroup; EXP-008's block-size premise is refuted; and the decode I/O table
+  in "Performance model" is re-derived at 1.55-1.69 GB/s. Two things it did
+  **not** close: the 1.59 GB/s constant is still unsourced, since EXP-019 does
+  not find it either, and the probe's queue is threaded `preadv` rather than
+  io_uring, which is why the io_uring queue-depth item above exists.
 - ~~Slot budget sweep: 8 vs 10 vs 12 vs 16 slots/layer~~: done, EXP-005 (as
   a simulated lower bound; the shipped dial's own point is back on the
   backlog above, see EXP-012).

@@ -138,13 +138,36 @@ use super::{
 
 /// Submission queue depth.
 ///
-/// The drive saturates early — 1.211 GB/s at QD4 against 1.390 at QD16 at the
-/// expert stride, so QD4 is 87% of QD16 — and deeper queues buy latency
-/// rather than bandwidth (per-blob p50 2.34 ms at QD1 against 15.56 ms at
-/// QD8, provisional, EXP-008). The decode loop waits on *all* misses, so
-/// latency is the quantity that matters and the queue stays at the low end of
-/// the useful range. It is also charged against `RLIMIT_MEMLOCK`, which is
-/// 8 MiB soft *and* hard under systemd defaults since kernel 6.14.
+/// What predicts throughput on the reference drive is **total bytes in
+/// flight**, not queue depth on its own. Block size and queue depth move that
+/// same quantity and are interchangeable at matched bytes, the drive holds its
+/// peak up to roughly 100 MB outstanding, and it gives back 15 to 18 percent
+/// past about 170 MB (EXP-019, cold and in-cgroup on the installed layer
+/// files). Decode reads **one expert blob per miss**, so 8 outstanding is at
+/// most 24.5 MB in flight, which is inside that plateau. The slow 1.92 to 1.98
+/// GB/s cells in EXP-019's matrix are the large-block *and* deep-queue corner,
+/// which this path never issues. Hence 8.
+///
+/// This supersedes the previous justification, which read "the drive saturates
+/// early, 1.211 GB/s at QD4 against 1.390 at QD16" from EXP-008. EXP-019
+/// retires that on level (it measures 1.54 to 2.37 GB/s on a quiet machine)
+/// and on mechanism (queue depth was never the variable). The conclusion is
+/// unchanged; the reason for it is not. EXP-008's per-blob latency series
+/// (p50 2.34 ms at QD1 against 15.56 ms at QD8) was never re-taken, so the
+/// "decode waits on all misses, prefer the low end for latency" argument is
+/// context here rather than a second measurement.
+///
+/// **Two gaps this does not close**, both open work in `docs/architecture.md`.
+/// EXP-019 swept queue depth only at 8 experts per read, so the decode
+/// geometry has no measured queue-depth curve of its own: its QD8 point is
+/// measured, its QD2 and QD4 points are not. And the probe emulated depth with
+/// threaded `preadv`, not io_uring, so it characterises the drive and the
+/// filesystem rather than this submission path. An io_uring confirmation
+/// inside the runtime is still owed, and this constant should not move before
+/// that lands.
+///
+/// The ring is also charged against `RLIMIT_MEMLOCK`, which is 8 MiB soft
+/// *and* hard under systemd defaults since kernel 6.14.
 #[cfg(feature = "io-uring")]
 const RING_ENTRIES: u32 = 8;
 

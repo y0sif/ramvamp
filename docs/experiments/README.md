@@ -54,6 +54,8 @@ which is the reason their claims are credible.
 - [EXP-015: Phase-6 building blocks, landed and unmeasured](#exp-015-phase-6-building-blocks-landed-and-unmeasured) — KEEP
 - [EXP-016: Chunked layer-major prefill lands as the default path](#exp-016-chunked-layer-major-prefill-lands-as-the-default-path) — KEEP
 - [EXP-017: The prefill phase split, and attention is the wall](#exp-017-the-prefill-phase-split-and-attention-is-the-wall) — NEUTRAL
+- [EXP-018: Cold paired prefill, the swept path against the token-major path at 512 tokens](#exp-018-cold-paired-prefill-the-swept-path-against-the-token-major-path-at-512-tokens) — KEEP
+- [EXP-019: O_DIRECT bandwidth under rule 2, and EXP-008 refuted](#exp-019-o_direct-bandwidth-under-rule-2-and-exp-008-refuted) — NEUTRAL
 
 Entries EXP-007 through EXP-013 were measured on a machine that was not
 quiet, and most are microbenchmarks rather than end-to-end runs. Under rule 2
@@ -62,7 +64,10 @@ decisions they drove are traceable, and each states the re-measurement it
 needs. EXP-013 is the exception worth naming: its **numerics** result
 (byte-identical logits) is a correctness measurement that rule 2 does not
 govern and that does stand as reported; only its throughput figures are
-provisional.
+provisional. EXP-008's re-measurement has since been taken: EXP-019 redoes
+that characterisation under rule 2 with a committed harness and refutes the
+block-size premise EXP-008 handed the design. EXP-008's own numbers stay where
+they are, as the record of what was believed when phase 5 was designed.
 
 ## EXP-001: AVX2 K-quant dot kernels vs scalar reference
 
@@ -573,6 +578,33 @@ provisional.
      is not from series (a).
 - Verdict: NEUTRAL (characterisation; three decisions rest on it, and one
   widely used constant turns out to be unsourced)
+- **Superseded on the throughput question (2026-08-04, EXP-019).** The
+  re-measurement this entry's Notes asked for has been taken, under rule 2,
+  with a committed harness (`scripts/io_probe.py`), on the real installed
+  layer files. It does not agree with series (a), and the disagreement is not
+  only in level:
+  - **The block-size curve is refuted.** EXP-019 finds bigger blocks neutral
+    on one probed file and 15 to 16 percent *worse* on the other three when
+    the read is sequential. The "+51% at 16 MiB" that this entry handed the
+    phase-6 window dial does not survive under either reading of what series
+    (a)'s block sweep did, sequential or random.
+  - **The absolute level here is too low.** EXP-019 measures 1.54 to 2.37
+    GB/s across its whole matrix, above this entry's 1.211 to 1.390 and
+    consistent with EXP-013's ~1.97 under the real access pattern. That is
+    what this entry's own Method predicted a quiet machine would show, so it
+    is a confirmation of the caveat rather than a surprise.
+  - **The shape survives, restated.** Queue depth alone was never the
+    variable: EXP-019 finds that throughput turns on total *bytes in flight*,
+    which both queue depth and block size move, and that the drive holds its
+    peak up to roughly 100 MB outstanding and loses 15 to 18 percent past it.
+    "QD4-8 rather than deeper" is still the right dial at the block sizes the
+    runtime uses, but for that reason and not this one.
+  - **The 1.59 GB/s constant stays unsourced.** EXP-019 does not find it
+    either, and nothing below should be read as sourcing it.
+
+  This entry's Method and Result are left exactly as written. They record what
+  was measured and believed when phase 5 was designed, and the corrections
+  belong next to them rather than inside them.
 - Notes: decisions leaning on this entry are QD4-8 rather than deeper (the
   *shape* of series (a), where QD4 is 87% of QD16, survives the level
   disagreement between the series, and since the decode loop waits on all
@@ -1477,3 +1509,360 @@ provisional.
      should be taken after the attention work rather than before it, since
      the number it would produce today describes a term phase 7 is about to
      move.
+
+## EXP-018: Cold paired prefill, the swept path against the token-major path at 512 tokens
+
+- Date / commit: 2026-08-04 / phase-6 side `7201d6b` (`feat/prefill-sweep`),
+  phase-5 side `c3572fd` (the phase-5 merge on `main`), banked as a binary at
+  `scratch/phase5-ref/ramvamp` with its commit and sha256 recorded beside it.
+- Hypothesis: the chunked layer-major prefill that landed in EXP-016 beats the
+  token-major path it displaced, measured cold inside `memory.max=3G` on the
+  same prompt in the same session, and the memory contract survives a
+  512-token prompt.
+- Method: `scripts/cold_bench.py --prompt-file
+  models/llamacpp-ref/llamacpp_ref/long_00.txt --max-new 4 --warmup 0
+  --repeats 1`, run twice back to back in one session on the reference
+  machine (`docs/benchmark-machine.md`), once against the banked phase-5
+  binary and once against the phase-6 release build. Per run the harness
+  evicts all 53 model files with `posix_fadvise(POSIX_FADV_DONTNEED)` and
+  proves the eviction with `mincore`, launches under `systemd-run --user
+  --wait -p MemoryMax=3G -p MemorySwapMax=0 -p MemoryAccounting=yes`, and
+  reads `memory.peak`, `memory.events`, `memory.stat` and `/proc/self/io`
+  `read_bytes` from inside the cgroup before exit. Both runs report
+  **hygiene PASS**: `pgsteal` 0, every `memory.events` counter 0,
+  `memory.swap.peak` 0, both return codes 0. The prompt goes to `systemd-run`
+  out of band as JSON (EXP-015 harness finding 1) and both runs record the
+  same delivered sha256 `d1b6c407c55a...` over the same 2,002 bytes, so this
+  is one workload measured twice: every ratio below is paired, on one machine,
+  in one session, and rule 3 is satisfied. Raw results are
+  `scratch/cold-bench/p5-512.json` and `p6-512.json`.
+
+  Two provenance facts worth stating rather than assuming. The phase-6 build
+  commit is **not** recorded in the JSON; it is inferred from
+  `target/release/ramvamp`'s mtime (19:30:23) landing 31 s before `7201d6b`
+  (19:30:54), so the binary is that commit's tree and nothing stronger says
+  so. And `--repeats 1` means each side is a **single run**, not EXP-014's
+  median of five, so run-to-run spread is unbounded here; the JSON's `median`
+  block is that one run. EXP-017 saw roughly 5% between two 512-token sweeps
+  on this machine warm, which is far below the prefill ratio and is the same
+  size as the load-time and `memory.peak` differences below, so read those two
+  rows as "unchanged" rather than as differences.
+- Baseline: the phase-5 arm of the same pair, which is the token-major prefill
+  EXP-016 displaced and deliberately kept selectable for exactly this
+  comparison (EXP-016 Note 4). EXP-014's cold medians (decode 1.88 tok/s,
+  prefill 1.33 tok/s, `memory.peak` 2,471.1 MiB) are the last published
+  numbers before this entry, but they were taken at a 5-token prompt with 64
+  decode tokens. That is a different workload, so they are context and not the
+  baseline.
+- Result:
+
+  | metric | phase 5 | phase 6 | ratio |
+  | --- | ---: | ---: | ---: |
+  | prefill | 1.65 tok/s | **4.23 tok/s** | **2.56x** |
+  | prefill time | 310.98 s | 120.96 s | 2.57x |
+  | decode | 1.88 tok/s | 1.38 tok/s | 0.73x |
+  | decode time (4 tokens) | 2.12 s | 2.89 s | |
+  | model load | 1.31 s | 1.32 s | 0.99x |
+  | wall | 315.05 s | 125.86 s | 2.50x |
+  | cgroup `memory.peak` | 2,576.0 MiB | 2,570.1 MiB | |
+  | process `read_bytes` | 239.33 GB | 20.72 GB | **11.55x fewer** |
+
+  **Headline: prefill 2.56x, cold, inside `memory.max=3G` with swap off,
+  hygiene PASS on both arms.** This is the measurement EXP-015 Note 1,
+  EXP-016 Note 1 and EXP-017 Note 7 each recorded as owed, and it discharges
+  that debt. It is also the **first paired A/B this project has that satisfies
+  rule 2**: EXP-014 was a single arm with no baseline available to it at all.
+
+  **The bytes moved are the mechanism, and they are the larger ratio.** Phase 6
+  read **20.72 GB** against an installed model of 18,626,213,888 B, that is
+  **1.11x the whole model**, which is the exact signature of a sweep that
+  reads each expert once: 17,553,162,240 B of expert files plus 1,073,051,648
+  B of mmap-faulted common weights is 18.63 GB of it, leaving ~2.1 GB for four
+  decode tokens. Phase 5 read **239.33 GB**, 12.85x the model, or 465 MB of
+  expert bytes per prompt token against the ~1,097 MB/token decode worst case,
+  which implies a token-major prefill hit rate near 58% if every miss reads
+  one whole blob. EXP-013 measured 45.3% on a 25-token prompt and a 512-token
+  prompt should sit higher, so the two agree in direction; they were not
+  measured the same way and no claim here rests on the 58%.
+
+  **Bytes fell 11.55x and prefill time fell 2.57x**, which is the same
+  statement as EXP-017's phase split from the other side: once the sweep has
+  taken expert I/O out of the critical path, prefill is bounded by attention
+  and the remaining bytes buy progressively less. Nothing in this entry
+  measures the split; EXP-017 did, warm.
+
+  **Decode fell, from 1.88 to 1.38 tok/s, and that is not smoothed over.**
+  See Note 1: the most likely cause is a cold-start transient that the
+  workload is too short to escape, it is a hypothesis and not a measurement,
+  and it needs its own run.
+
+  **Memory: both arms fit with about 500 MiB spare**, 2,576.0 MiB and 2,570.1
+  MiB against the 3,072 MiB ceiling, with zero reclaim on either. The swept
+  path is 5.9 MiB *below* the token-major path despite carrying an 80,935,940
+  B chunk scratch and a 48,955,392 B sweep ring, which is the arena borrow
+  behaving as EXP-015 and EXP-016 said it would: both spans are
+  sub-allocations of the already-faulted expert slot pool, so they cost the
+  contract nothing.
+- Verdict: KEEP
+- Notes:
+  1. **The decode regression is a cold-start transient, as a hypothesis that
+     needs its own measurement.** The swept prefill bypasses the expert cache
+     by design (EXP-005 closed prompt replay as worth +0.09 points) and
+     `crates/core/src/io/stream.rs` documents that taking the prefill arena
+     **invalidates every layer's slot occupancy**, because the arena is carved
+     out of the slot pool itself. So phase-6 decode begins with an empty
+     cache. Phase 5's token-major prefill did the opposite: it ran 512 tokens
+     of routing through the decode cache and left it warm. At `--max-new 4`
+     almost everything measured is that difference. Three things support the
+     reading and none of them settles it:
+     - EXP-005 measured cold start reaching within 2 points of steady state
+       only **by token 48**, and an infinite-cache ceiling of 97.7% after 32
+       tokens. Four tokens is entirely inside the transient.
+     - The arithmetic lands where an empty cache predicts. Phase-6 decode is
+       725 ms/token; the no-cache row of the performance model re-derived at
+       EXP-019's bandwidths is 649 to 708 ms/token of I/O alone. A measurement
+       sitting just under an I/O-only ceiling is what a decode step doing
+       nothing but cold misses looks like. That combines two entries, so it is
+       a derivation and not a measurement; the two batches were taken minutes
+       apart in one session on one machine, which is the strongest rule-3
+       footing a cross-entry derivation can have and is still not a paired
+       measurement.
+     - Steady-state decode code is unchanged between the two arms and the
+       cache, its policy and its dial are untouched, so this is **not**
+       evidence of a throughput regression.
+
+     It is still a real user-visible effect on the first tokens after a
+     prompt, and it is a genuine cost of the sweep rather than an artifact of
+     the harness. `docs/architecture.md` predicted it in one line ("Decode
+     cache starts cold after prefill; acceptable, first tokens warm it"), and
+     EXP-005 closed prompt-replay-into-cache as worth +0.09 points, but
+     EXP-005 measured hit **rate** over 556 decode tokens and says nothing
+     about the size of the transient at token 1. So neither settles it. **What
+     would settle it is the same paired run at a longer `--max-new`** on the
+     same prompt, where the transient is amortized and steady state is
+     visible; that is recorded as owed in the backlog in
+     `docs/architecture.md`.
+  2. **EXP-014's 1.88 tok/s and this entry's 1.38 are not comparable, and the
+     coincidence that phase 5 also reports 1.88 here is not evidence of
+     anything.** EXP-014 measured 64 decode tokens after a 5-token prefill;
+     this measures 4 decode tokens after a 512-token prefill. Different cache
+     state, different context length, different token count. Rule 3 forbids
+     putting them on one curve, and the phase-5 arm above is the only
+     baseline this entry's decode ratio may be read against.
+  3. **`memory.peak` is recorded, and the 4K question is still open.** Both
+     arms carry ~2,570 to 2,576 MiB at 516 tokens of context. That is 99 to
+     105 MiB above EXP-014's 2,471.1 MiB at 69 tokens, while the FP16 KV
+     arithmetic (96 KiB per token across 48 layers) accounts for only ~42 MiB
+     of it; the residual is **not explained here**, and since the two numbers
+     come from different entries and different builds they must not be
+     subtracted as though they were one series anyway. What this entry does
+     settle is that the contract holds at 512 tokens with ~500 MiB spare.
+     What it does not settle is 4K: EXP-014 named a 4K-context run as the
+     remaining open item on the 11-slot dial, and this is not that run. From
+     this starting point the same KV arithmetic puts a 4K run near 2,906 MiB,
+     which still fits, and is still an extrapolation rather than a
+     measurement.
+  4. **Load time is unmoved**, 1.31 s against 1.32 s, which is the control
+     this pair happens to carry: the two binaries mmap the same common
+     weights the same way, so a ratio near 1.00 on a phase neither change
+     touches is weak evidence that the two arms saw the same machine.
+  5. **`--repeats 1` is the weakest part of this entry.** EXP-014 used five
+     scored runs and a median for exactly this reason. The prefill ratio is
+     2.56x against a run-to-run spread that EXP-017 put at roughly 5% warm,
+     so the sign and the order of magnitude are safe; the third significant
+     figure is not. A repeat of this pair at `--repeats 5` would cost about 40
+     minutes and is worth taking before the number is quoted anywhere that
+     matters.
+
+## EXP-019: O_DIRECT bandwidth under rule 2, and EXP-008 refuted
+
+- Date / commit: 2026-08-04 / `7201d6b` (`feat/prefill-sweep`), harness
+  `scripts/io_probe.py`
+- Hypothesis: EXP-008's characterisation of the reference drive is wrong in
+  level because the machine was contended, and its "+51% at 16 MiB over the
+  expert stride" conflates two variables, block size and read order, that can
+  be separated at matched bytes. EXP-008 is the highest-value item on the
+  backlog and cannot be re-run, because its harness was never committed.
+- Method: `scripts/io_probe.py --repeats 3 --warmup 1`, one warmup run
+  discarded and three scored, on the reference machine
+  (`docs/benchmark-machine.md`), started 18:13:36 UTC and finishing
+  immediately before EXP-018's two runs on the same quiet machine (result
+  files timestamped 21:14:56, 21:20:12 and 21:22:20 local). That adjacency is
+  why the one derivation in EXP-018 that crosses the two entries is defensible
+  at all. Raw results are `scratch/io-probe/summary.json` and
+  `scratch/io-probe/tables.md`.
+
+  **Queue depth is emulated with N OS threads each issuing blocking `preadv`,
+  not io_uring.** That bounds what this entry licenses: it characterises the
+  drive and the filesystem, not `crates/core/src/io`'s submission path, which
+  is io_uring with `SINGLE_ISSUER` and `DEFER_TASKRUN`. Every table below
+  carries `queue = threaded-pread` in the JSON for that reason. A stdlib-only
+  script cannot drive io_uring, and the repo's scripts staying stdlib-only was
+  judged worth the label.
+
+  What is measured: four **real installed** layer files, never a freshly
+  written contiguous scratch file, spanning both stride classes (`layer_00`
+  and `layer_20` at 3,059,712 B, `layer_06` and `layer_21` at 2,654,208 B).
+  A block is `K` consecutive expert blobs read by one `preadv`, so every read
+  lands on an exact blob boundary and every offset is a 4096 multiple. `seq`
+  is a front-to-back pass; `rand` is a uniform permutation of **the same
+  blocks and the same bytes**, which is what separates granularity from
+  sequentiality. Two sweeps: block size `K` in 1, 2, 4, 6, 8 at QD 8, and
+  queue depth in 1, 2, 4, 8, 16 at K 8. GB/s is 10^9 B/s, matching EXP-008's
+  units.
+
+  Hygiene, verified rather than assumed, all four runs **CLEAN**: `pgsteal` 0
+  and every `memory.events` counter 0 inside a `memory.max=3G`,
+  `memory.swap.max=0` cgroup; every probed file proven evicted by
+  `mmap` + `mincore` before each run and proven **zero resident** after, with a
+  positive control (one buffered 4 KiB read must then show as resident) so the
+  zero means something; per-thread buffers, page-aligned and pre-faulted
+  before the timer starts, never a shared pool indexed by arithmetic
+  (EXP-007); `btrfs device stats` sampled around every run with
+  `corruption_errs` unchanged at its 138,407 baseline and all four other
+  counters at 0; zero short reads and zero errors across all 288 timed cases.
+  `filefrag` reports **zero compressed extents** on all four files, closing
+  one of the documented silent O_DIRECT fallback paths.
+- Baseline: EXP-008 series (a). This is characterisation, so there is no
+  change being gated, but unlike EXP-008 this entry does have a prior it
+  contradicts.
+- Result, medians of 3 scored runs. Run-to-run spread was 1.4% at the median
+  case and 8.5% at the worst, so differences below ~3% are noise.
+
+  **Block-size sweep at QD 8**
+
+  | K | block MiB | layer_00 | layer_20 | layer_06 | layer_21 |
+  |---|---|---:|---:|---:|---:|
+  | 1 | 2.92 / 2.53 | 1.578 | 2.271 | 2.368 | 2.317 |
+  | 2 | 5.84 / 5.06 | 1.579 | 2.308 | 2.369 | 2.349 |
+  | 4 | 11.67 / 10.12 | 1.564 | 2.287 | 2.345 | 2.349 |
+  | 6 | 17.51 / 15.19 | 1.570 | 2.002 | 2.095 | 2.081 |
+  | 8 | 23.34 / 20.25 | 1.553 | 1.924 | 1.984 | 1.951 |
+
+  Sequential GB/s. Paired values like `2.92 / 2.53` are the 3,059,712 B stride
+  class and the 2,654,208 B stride class, in that order, here and below.
+
+  **Queue-depth sweep at K 8**, sequential GB/s
+
+  | QD | bytes in flight | layer_00 | layer_20 | layer_06 | layer_21 |
+  |---|---|---:|---:|---:|---:|
+  | 1 | 24.5 / 21.2 MB | 1.551 | 2.166 | 2.199 | 2.188 |
+  | 2 | 49.0 / 42.5 MB | 1.597 | 2.294 | 2.371 | 2.321 |
+  | 4 | 97.9 / 84.9 MB | 1.585 | 2.290 | 2.362 | 2.322 |
+  | 8 | 195.8 / 169.9 MB | 1.553 | 1.924 | 1.984 | 1.951 |
+  | 16 | 391.6 / 339.7 MB | 1.542 | 1.940 | 1.953 | 1.955 |
+
+  **Headline decomposition at QD 8**, what a front-to-back K=8 prefill read
+  buys over the runtime's random single-expert read, split into the part from
+  bigger blocks and the part from order
+
+  | file | rand K=1 | rand K=8 | seq K=8 | granularity | sequentiality | combined |
+  |---|---:|---:|---:|---:|---:|---:|
+  | layer_00 | 1.594 | 1.543 | 1.553 | 0.97x | 1.01x | 0.97x |
+  | layer_20 | 1.688 | 1.948 | 1.924 | 1.15x | 0.99x | 1.14x |
+  | layer_06 | 1.627 | 1.967 | 1.984 | 1.21x | 1.01x | 1.22x |
+  | layer_21 | 1.550 | 1.942 | 1.951 | 1.25x | 1.00x | 1.26x |
+
+  **Extent geometry** (`filefrag -v`); the installer writes each projection
+  slab as its own CoW extent, so a "sequential" read is physically scattered
+
+  | file | bytes | extents | mean extent B | adjacent pairs | compressed |
+  |---|---:|---:|---:|---:|---:|
+  | layer_00 | 391,643,136 | 398 | 984,027 | 0 | 0 |
+  | layer_20 | 391,643,136 | 398 | 984,027 | 0 | 0 |
+  | layer_06 | 339,738,624 | 398 | 853,614 | 0 | 0 |
+  | layer_21 | 339,738,624 | 390 | 871,124 | 0 | 0 |
+
+- Verdict: NEUTRAL (characterisation; it retires a premise the architecture
+  doc leaned on, and rule 5 is why it gets an entry)
+- Notes:
+  1. **EXP-008's "+51% at 16 MiB over the expert stride" is refuted, and it
+     is refuted under either reading of what EXP-008 measured.** Sequentially,
+     going from one expert blob to eight leaves `layer_00` unchanged within
+     noise (1.578 to 1.553, 1.6% down) and costs the other three 15 to 16
+     percent (2.271 to 1.924, 2.368 to 1.984, 2.317 to 1.951). Randomly, the
+     same change *gains* 15 to 25 percent on three files and loses 3% on the
+     fourth. Neither is +51%, and neither is close. EXP-008's harness is gone
+     so its read order cannot be recovered, which is exactly why this entry
+     reports both columns.
+  2. **Sequentiality and granularity trade against each other, and the
+     decomposition is only the K=8 slice of that.** At the single-blob size
+     order matters a great deal: `seq/rand` at K=1 is 1.34x, 1.46x and 1.50x
+     on `layer_20`, `layer_06` and `layer_21` (and 0.99x on `layer_00`). By
+     K=6 it is 1.00x to 1.04x and by K=8 it is 0.99x to 1.01x. So it is **not**
+     true that sequentiality buys nothing; it buys a great deal at small
+     blocks, and a big block has already captured the same locality, which is
+     why the two columns converge. Read the decomposition table as "at the
+     8-expert window the runtime's sweep actually issues, order is worth
+     nothing extra", not as a statement about the drive in general.
+  3. **What actually predicts throughput is bytes in flight, and both sweeps
+     agree on it.** This is derived from the two tables above rather than
+     swept directly, and the derivation is only sound because block size and
+     queue depth move the same quantity from opposite directions and land on
+     the same curve. At matched bytes outstanding the two are
+     interchangeable: `layer_20` reads 2.287 at K=4/QD8 and 2.290 at K=8/QD4,
+     both 97.9 MB; 2.308 at K=2/QD8 and 2.294 at K=8/QD2, both 49.0 MB. The
+     curve is flat at its peak up to roughly **100 MB outstanding**, drops
+     about 12% by 127 to 147 MB, and settles 15 to 18 percent down past 170
+     MB. A single outstanding request is 3 to 7 percent below peak, so the
+     useful range is narrow but real. `layer_00` is the exception: flat at
+     1.54 to 1.60 across the entire matrix, never reaching the regime where a
+     knee could appear.
+  4. **The shipped dials are at the peak, not past it, on both paths.** This
+     corrects the obvious first reading of the queue-depth table. The prefill
+     sweep issues one read per window of 8 experts with 2 windows in flight
+     (`crates/core/src/io/sweep.rs`), which is 49.0 MB outstanding (46.7 MiB,
+     the ring figure EXP-016 records) and is the K=8/QD2 row: 1.597 to 2.371
+     GB/s, the best cell in the matrix. The decode ring is `RING_ENTRIES = 8`
+     in `crates/core/src/io/stream.rs` over single-blob reads, at most 24.5 MB
+     outstanding, which is the K=1/QD8 row and also at peak. The 1.92 to 1.98
+     GB/s in the QD8 and QD16 rows is a large-block-*and*-deep-queue
+     combination that **neither path issues**. The honest statement is
+     therefore not "20% is left on the table" but "there is a ceiling near 100
+     MB outstanding, both dials sit under it, and raising either of them is
+     where the 15 to 18 percent would be lost": `windows_in_flight` 4 and
+     `experts_per_window` 16 both stay inside it at 97.9 MB, while
+     `windows_in_flight` 8 (195.8 MB) and `experts_per_window` 24 (146.9 MB)
+     do not.
+  5. **What this does not measure, and what it therefore licenses.** The
+     queue-depth sweep was run at K=8 only, so the decode operating point
+     (single blobs) has **no queue-depth curve of its own**; its QD8 point is
+     measured and its QD2 and QD4 points are not. And the queue is threaded
+     `preadv`, not io_uring, so none of this transfers to the runtime's
+     submission path without a measurement. Those two gaps together are what
+     justifies **an io_uring queue-depth experiment inside the runtime**, and
+     they are why `RING_ENTRIES` should not be changed on the strength of this
+     entry. It is a reason to run something, not a constant to copy. Backlog
+     item recorded in `docs/architecture.md`.
+  6. **Absolute bandwidth is 1.54 to 2.37 GB/s across the whole matrix**,
+     against EXP-008's tabulated 1.211 to 1.390, and consistent with EXP-013's
+     ~1.97 GB/s under the real access pattern at the real block size. The
+     decode-shaped cell (K=1, random, QD 8) is **1.55 to 1.69 GB/s** and the
+     prefill-sweep-shaped cell (K=8, sequential, QD 2) is **1.60 to 2.37
+     GB/s**; those two are what the performance model in
+     `docs/architecture.md` is now re-derived from. So EXP-008 was measuring a
+     contended machine, exactly as its own Method warned it might be, and the
+     performance model built on 1.211 to 1.349 GB/s was pessimistic by roughly
+     25 percent at the decode block size.
+  7. **Per-file variance persists, exceeds run-to-run variance by a wide
+     margin, and is still unexplained.** `layer_00` at 1.578 against
+     `layer_20` at 2.271 in the same sweep, a 1.44x spread, with **identical**
+     extent geometry: both 398 extents, both mean 984,027 B and median 884,736
+     B, both with zero extents physically adjacent to their successor. So
+     fragmentation as `filefrag` reports it does **not** predict it, which is
+     a real finding and a negative one: the obvious hypothesis is eliminated.
+     What is left is physical placement on the drive, or QLC-internal
+     behaviour such as SLC-cache residency or block wear, and this probe
+     cannot see either. `docs/benchmark-machine.md` already records a 1.46x
+     spread between these same two files from an earlier measurement, so this
+     is reproducible rather than a one-off. **Consequence for every future
+     benchmark: a bandwidth aggregate that hides this spread is worse than no
+     aggregate**, and any run that changes which files it touches has changed
+     its own baseline.
+  8. **Zero compressed extents on all four files**, so the btrfs
+     `compress=zstd:3` mount option is not silently downgrading these reads to
+     buffered I/O through the encoded-extent path. Combined with zero resident
+     pages after every run and a passing positive control, O_DIRECT was
+     honoured. That is worth recording because it is a precondition for every
+     number in this entry, and because EXP-009 established that a silent
+     fallback is the one failure the 3 GB budget cannot survive.
