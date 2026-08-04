@@ -49,11 +49,15 @@
 //! against `n_acts` activation rows in one pass. Phase 6's prefill sweep
 //! groups a chunk's rows by routed expert and wants every routed row dotted
 //! against that expert while its bytes are resident. Token-at-a-time, every
-//! expert weight byte is fetched from RAM for exactly one MAC, which pins
-//! the expert FFN at RAM bandwidth (~3.9 GB/s measured) rather than the
+//! expert weight byte is fetched from RAM for exactly one MAC, so the expert
+//! FFN is bound by the rate RAM delivers those bytes rather than by the
 //! 10-12 GB/s a single AVX2 thread sustains on dots (EXP-001). Hoisting the
 //! weight row out of the activation loop keeps it (1152 B for a Q4_K
-//! gate/up row) in L1 across all `n_acts` dots of that row.
+//! gate/up row) in L1 across all `n_acts` dots of that row, so one fetch of
+//! a weight byte feeds `n_acts` MACs instead of one. No effective-bandwidth
+//! figure is quoted here on purpose: the argument is a ratio, and this repo
+//! has no cold, cgroup-bounded measurement of expert-GEMV bandwidth to cite
+//! (see `docs/experiments/README.md` for what is and is not measured).
 //!
 //! **No arithmetic changes.** The batched path issues the *same* per-row
 //! `vec_dot` call, on the same `(weight_row, activation_row)` bytes, as the
@@ -1003,6 +1007,17 @@ mod tests {
         .unwrap();
     }
 
+    /// The public entry point walks the rows of the matrix the same way a
+    /// hand-written loop of per-row dots does.
+    ///
+    /// The reference dot takes `force_scalar()`, not a hardcoded `false`,
+    /// because that is the flag `gemv_q8_k` itself passes down: under
+    /// `RAMVAMP_FORCE_SCALAR` the call under test runs the scalar kernels, and
+    /// a reference pinned to AVX2 would be asserting scalar-vs-AVX2 bit
+    /// equality — a different (and false) claim. What is asserted is unchanged
+    /// either way: same kernel, same bytes, bit-identical results, on whichever
+    /// path the process is configured for. `k_quant_row_partitions_are_bit_identical`
+    /// is where both paths are swept in one process.
     #[test]
     fn gemv_q8_k_matches_per_row_dots() {
         // Audited-shape slices (out_dim trimmed to keep the test fast; the
@@ -1024,12 +1039,19 @@ mod tests {
             };
             let row_bytes = format.row_bytes(in_dim).unwrap();
             for (r, &o) in out.iter().enumerate() {
-                let want = dot(&w[r * row_bytes..(r + 1) * row_bytes], &acts, false).unwrap();
+                let want = dot(
+                    &w[r * row_bytes..(r + 1) * row_bytes],
+                    &acts,
+                    force_scalar(),
+                )
+                .unwrap();
                 assert_eq!(o.to_bits(), want.to_bits(), "{format:?} row {r}");
             }
         }
     }
 
+    /// [`gemv_q8_0`]'s row walk, against per-row dots on the same kernel path
+    /// the call under test takes (see `gemv_q8_k_matches_per_row_dots`).
     #[test]
     fn gemv_q8_0_matches_per_row_dots() {
         let (in_dim, out_dim) = (2048, 64);
@@ -1042,9 +1064,12 @@ mod tests {
         gemv_q8_0(&w, in_dim, out_dim, &acts, &mut out).unwrap();
         let row_bytes = QuantFormat::Q8_0.row_bytes(in_dim).unwrap();
         for (r, &o) in out.iter().enumerate() {
-            let want =
-                avx2::vec_dot_q8_0_q8_0(&w[r * row_bytes..(r + 1) * row_bytes], &acts, false)
-                    .unwrap();
+            let want = avx2::vec_dot_q8_0_q8_0(
+                &w[r * row_bytes..(r + 1) * row_bytes],
+                &acts,
+                force_scalar(),
+            )
+            .unwrap();
             assert_eq!(o.to_bits(), want.to_bits(), "row {r}");
         }
     }

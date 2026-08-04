@@ -6,17 +6,16 @@
 //! allocates nothing.
 //!
 //! The qualifier is load-bearing rather than decorative. Everything this
-//! module owns is sized once in [`ForwardState::new`] and never grows, but
-//! the streamer's per-step bookkeeping is not: [`ExpertStream::new`] builds
-//! its `CachePlan` hit/miss lists, the open step's hit/miss/protected lists
-//! and the in-flight read table **empty**, and they grow to their top-k
-//! working size the first time each layer is planned — i.e. five small `Vec`
-//! growths per layer, on token 0 only. After that they are cleared and
-//! reused, and the layer loop's only remaining allocations are
-//! [`Model::embed`]'s dequant `Vec` and, above this module, the stream
-//! decoder's `String`. Preallocating them (`CachePlan::with_capacity` exists
-//! for exactly this) would make the claim unconditional; until then it holds
-//! from token 1 on.
+//! module owns is sized once in [`ForwardState::new`] and never grows, and
+//! so is the streamer's per-step bookkeeping: the six `Vec`s that would
+//! otherwise grow on first use — `CachePlan`'s hit and miss lists, the open
+//! step's hit, miss and protected lists, and the in-flight read table — are
+//! all preallocated to `top_k` in [`ExpertStream::new`]. They live on the
+//! streamer, one set per process, not on anything the layer loop rebuilds
+//! per layer, so this is six allocations at construction and none after.
+//! Every step clears and reuses them, and the layer loop's only remaining
+//! allocations are [`Model::embed`]'s dequant `Vec` and, above this module,
+//! the stream decoder's `String`. The claim holds from token 0.
 //!
 //! # Decode loop shape
 //!

@@ -293,14 +293,17 @@ const STREAM_WINDOW_KEEP: usize = 8;
 
 /// Hard cap on [`StreamDecoder`]'s window.
 ///
-/// Reaching it means the window decode has ended in U+FFFD — or refused to
-/// split cleanly — for this many ids in a row, which well-formed UTF-8
-/// cannot do (see [`STREAM_WINDOW_KEEP`]); only a run of undecodable bytes
-/// gets here. The decoder then stops withholding, emits the replacement
-/// characters verbatim, and restarts with an empty window: visibly broken
-/// text for input that is already broken, instead of a window that grows
-/// with the generation. Well above the four ids real text needs, so no
-/// legitimate sequence trips it.
+/// Reaching it means [`trim`](StreamDecoder::trim) has refused to split for
+/// `STREAM_WINDOW_MAX - STREAM_WINDOW_KEEP` pushes in a row, which
+/// well-formed UTF-8 cannot do (see [`STREAM_WINDOW_KEEP`]): only a run of
+/// undecodable bytes, or a token stream whose every id boundary lands
+/// strictly inside a character, gets this far. The push that reaches the cap
+/// therefore stops waiting for a clean split and forces one — see
+/// [`force_cut`](StreamDecoder::force_cut), which drops straight back to
+/// [`STREAM_WINDOW_KEEP`] ids **without emitting anything
+/// `decode(all_ids, false)` does not**, so the window is bounded here
+/// unconditionally and the decoder's contract survives it. Well above the
+/// four ids real text needs, so no legitimate sequence trips it.
 const STREAM_WINDOW_MAX: usize = 64;
 
 /// Incremental detokenizer: decodes a bounded trailing window of the
@@ -312,12 +315,20 @@ const STREAM_WINDOW_MAX: usize = 64;
 /// # Cost
 ///
 /// [`push`](Self::push) decodes the window once and then searches for a
-/// clean cut (see [`trim`](Self::trim)), all of it bounded by
-/// [`STREAM_WINDOW_MAX`] ids and in practice a little over
-/// [`STREAM_WINDOW_KEEP`]. Nothing it does — decoded ids, bytes allocated,
-/// bytes copied — depends on how many tokens have already been generated,
-/// so a whole generation is O(n) rather than the O(n^2) of re-decoding the
-/// accumulated sequence once per token.
+/// clean cut (see [`trim`](Self::trim)); the push that reaches
+/// [`STREAM_WINDOW_MAX`] decodes the retained tail once more. Everything is
+/// bounded by the window, never by the sequence. The **bound** is the trim
+/// search, which decodes `cut` ids for every cut it tries and so costs at
+/// most `(MAX - KEEP)(MAX - KEEP + 1) / 2` = 1,596 decoded ids in a push, on
+/// top of the window's own decode. Approaching that takes a pathological id
+/// run — one where no leading run ever splits cleanly, which is what drives
+/// the window to the cap in the first place. Separately **measured** on
+/// mixed real text (ASCII, CJK, an emoji ZWJ cluster, added tokens): a worst
+/// case of 14 decoded ids per push, and the scaling test pins it under
+/// `STREAM_WINDOW_KEEP * 3`. Either way nothing here — decoded ids, bytes
+/// allocated, bytes copied — depends on how many tokens have already been
+/// generated, so a whole generation is O(n) rather than the O(n^2) of
+/// re-decoding the accumulated sequence once per token.
 ///
 /// # Why sliding is sound
 ///
@@ -371,15 +382,17 @@ impl StreamDecoder {
         let len = self.window.len();
         let text = self.decode_range(tokenizer, 0, len)?;
 
+        // At the cap the search for a clean split has failed for long
+        // enough; cut regardless (see STREAM_WINDOW_MAX).
+        if len >= STREAM_WINDOW_MAX {
+            return self.force_cut(tokenizer, &text);
+        }
+
         // Withhold a trailing run of replacement characters: those are a
-        // character whose remaining bytes live in ids not pushed yet. At
-        // the cap that withholding is abandoned (see STREAM_WINDOW_MAX).
-        let capped = len >= STREAM_WINDOW_MAX;
+        // character whose remaining bytes live in ids not pushed yet.
         let mut safe = text.len();
-        if !capped {
-            while text[..safe].ends_with('\u{FFFD}') {
-                safe -= '\u{FFFD}'.len_utf8();
-            }
+        while text[..safe].ends_with('\u{FFFD}') {
+            safe -= '\u{FFFD}'.len_utf8();
         }
         let mut out = String::new();
         if safe > self.emitted {
@@ -389,15 +402,65 @@ impl StreamDecoder {
             self.emitted = safe;
         }
 
-        if capped {
-            // The whole window has now been emitted, replacement
-            // characters and all, so it carries no debt: start over
-            // rather than keep growing.
-            self.window.clear();
-            self.emitted = 0;
-        } else {
-            self.trim(tokenizer, &text)?;
+        self.trim(tokenizer, &text)?;
+        Ok(out)
+    }
+
+    /// Force the window back down to [`STREAM_WINDOW_KEEP`] ids, emitting
+    /// everything in `text` that can no longer change.
+    ///
+    /// Runs when the window reaches [`STREAM_WINDOW_MAX`], i.e. when
+    /// [`trim`](Self::trim) has found no clean split for
+    /// `MAX - KEEP` pushes running. It has to cut anyway, and it must do so
+    /// without breaking the contract the rest of the decoder keeps: every
+    /// `push` concatenated with the final [`flush`](Self::flush) equals
+    /// `decode(all_ids, false)`. Two facts make that possible.
+    ///
+    /// **Only the last replacement character is provisional.** Lossy UTF-8
+    /// decoding is greedy and left to right: each maximal invalid subpart is
+    /// terminated by a byte that cannot extend it, and appending bytes never
+    /// revisits that decision. The one exception is a subpart still open at
+    /// the end of the input — the split character this decoder exists to
+    /// withhold — and an open subpart renders as exactly one U+FFFD. So the
+    /// whole-trailing-run withholding [`push`](Self::push) does is merely
+    /// conservative: holding back the final replacement character alone is
+    /// sufficient, and unlike the run it always leaves something emittable.
+    /// That is what breaks the deadlock, because the id runs that reach the
+    /// cap are exactly the ones whose decode is *all* replacement characters.
+    ///
+    /// **The cut need not be a character boundary.** The retained tail is
+    /// re-decoded on its own, so its leading bytes may be the back half of a
+    /// character whose front half is being dropped and decode to replacement
+    /// characters the whole window's decode did not have. That is harmless:
+    /// those bytes were already emitted correctly, out of the whole window's
+    /// decode, where the character was intact. So [`emitted`](Self::emitted)
+    /// is re-anchored from the *back* — the tail's last `withheld` bytes are
+    /// the same open subpart the whole window ended on (an open subpart is at
+    /// most four bytes and every id carries at least one, so it cannot reach
+    /// past the retained ids), and everything before them counts as emitted.
+    /// Dropping a prefix can only make the tail's decode *begin* with more
+    /// replacement characters, and those come from permanently invalid bytes,
+    /// so the tail's decode stays prefix-stable as the window grows again and
+    /// `emitted` keeps indexing what it did before the cut.
+    fn force_cut(
+        &mut self,
+        tokenizer: &RvmpTokenizer,
+        text: &str,
+    ) -> Result<String, TokenizerError> {
+        let mut safe = text.len();
+        if text.ends_with('\u{FFFD}') {
+            safe -= '\u{FFFD}'.len_utf8();
         }
+        let withheld = text.len() - safe;
+        // `get`, as in `push`: never panic on a decode that is not
+        // prefix-stable, just emit nothing this push.
+        let out = text.get(self.emitted..safe).unwrap_or("").to_owned();
+
+        let len = self.window.len();
+        let cut = len.saturating_sub(STREAM_WINDOW_KEEP);
+        let tail = self.decode_range(tokenizer, cut, len)?;
+        self.window.drain(..cut);
+        self.emitted = tail.len().saturating_sub(withheld);
         Ok(out)
     }
 
@@ -888,6 +951,120 @@ mod tests {
 
         let all: Vec<u32> = prefix.iter().chain(split.iter()).copied().collect();
         assert_eq!(assembled, tokenizer.decode(&all, false).unwrap());
+    }
+
+    /// An id whose decode is a lone U+FFFD, and stays one U+FFFD per id when
+    /// repeated. Byte-level BPE has a single-byte token for every byte, so
+    /// the byte alphabet (ids 0..256 in this vocabulary) holds stray
+    /// continuation bytes; a run of them is a real id sequence that `trim`
+    /// can never cut (every candidate head ends in U+FFFD) and `push` can
+    /// never emit (every window decode is nothing but withheld replacement
+    /// characters), so the window grows one id per push to the cap.
+    fn undecodable_filler(tokenizer: &RvmpTokenizer) -> u32 {
+        const FFFD: &str = "\u{FFFD}";
+        (0u32..256)
+            .find(|&id| {
+                let one = tokenizer.decode(&[id], false).unwrap_or_default();
+                let two = tokenizer.decode(&[id, id], false).unwrap_or_default();
+                one == FFFD && two == FFFD.repeat(2)
+            })
+            .expect("the byte alphabet has a stray continuation byte")
+    }
+
+    /// Drive a decoder over `ids` without `drive_stream`'s "no push leaks a
+    /// replacement character" rule: the sequences below really are
+    /// undecodable in part, so replacement characters are the *correct*
+    /// output and withholding them forever is not an option. Returns the
+    /// assembled text and the window length after each push.
+    fn drive_past_the_cap(tokenizer: &RvmpTokenizer, ids: &[u32]) -> (String, Vec<usize>) {
+        let mut stream = StreamDecoder::new();
+        let mut assembled = String::new();
+        let mut lens = Vec::with_capacity(ids.len());
+        for (i, &id) in ids.iter().enumerate() {
+            assembled.push_str(&stream.push(tokenizer, id).unwrap());
+            assert!(
+                stream.window.len() <= STREAM_WINDOW_MAX,
+                "window past the cap at push {i}: {}",
+                stream.window.len()
+            );
+            lens.push(stream.window.len());
+        }
+        assembled.push_str(&stream.flush(tokenizer).unwrap());
+        (assembled, lens)
+    }
+
+    /// The cap branch owes the same promise as every other path through the
+    /// decoder: push-by-push output plus `flush` is `decode(all_ids, false)`,
+    /// byte for byte. Nothing else in this module reaches
+    /// [`STREAM_WINDOW_MAX`] — `drive_stream` only asserts the window stays
+    /// under it, and the scaling test deliberately stays far below — so both
+    /// sequences here are built to land exactly on it, from the two
+    /// directions that can:
+    ///
+    /// 1. **Undecodable bytes, then a character split across ids.** 63 stray
+    ///    continuation bytes grow the window to one short of the cap with
+    ///    nothing emitted, and the 64th push is the *first* id of a multi-id
+    ///    character, so the cap lands with that character half arrived. The
+    ///    branch this replaced emitted the whole window verbatim — including
+    ///    the half character's U+FFFD — and cleared, so the ids completing
+    ///    the character then decoded to a second U+FFFD: two replacement
+    ///    characters where `decode` yields the character itself.
+    /// 2. **A token whose bytes are a rotation of a character's.** Repeated,
+    ///    it puts *every* id boundary strictly inside a character, so no cut
+    ///    is a clean split at all. The forced cut has to sever a character
+    ///    and re-anchor across it, and the character still has to come out
+    ///    whole and exactly once.
+    #[test]
+    fn stream_decoder_cap_matches_the_full_decode() {
+        let tokenizer = fixture_tokenizer();
+
+        let filler = undecodable_filler(&tokenizer);
+        let split = ["\u{13000}", "\u{1D518}", "\u{10348}", "\u{1F30D}"]
+            .iter()
+            .map(|s| tokenizer.encode(s).unwrap())
+            .find(|ids| ids.len() >= 2)
+            .expect("some exotic character splits into multiple ids");
+        let mut half_char = vec![filler; STREAM_WINDOW_MAX - 1];
+        half_char.extend(split.iter().copied());
+
+        // Bytes `92 E1 9E`, and `E1 9E 92` is U+17B2: the only token in the
+        // pinned vocabulary whose own repetition never lands an id boundary
+        // on a character boundary. Pinned by assertion, so a vocabulary
+        // change fails loudly instead of quietly weakening the case.
+        const ROTATION: u32 = 72_496;
+        let once = tokenizer.decode(&[ROTATION], false).unwrap();
+        let twice = tokenizer.decode(&[ROTATION, ROTATION], false).unwrap();
+        assert_ne!(
+            twice,
+            once.repeat(2),
+            "id {ROTATION} no longer straddles a character boundary"
+        );
+        let rotated = vec![ROTATION; STREAM_WINDOW_MAX + STREAM_WINDOW_KEEP];
+
+        for (name, ids) in [
+            ("split character at the cap", half_char),
+            ("rotated token, no clean cut anywhere", rotated),
+        ] {
+            let (assembled, lens) = drive_past_the_cap(&tokenizer, &ids);
+            assert_eq!(
+                assembled,
+                tokenizer.decode(&ids, false).unwrap(),
+                "case {name}"
+            );
+            // And the cap really is what was exercised: the window grew to
+            // one id short of it, and the next push dropped it straight back
+            // to the keep bound instead of clearing or growing.
+            assert_eq!(
+                lens[STREAM_WINDOW_MAX - 2],
+                STREAM_WINDOW_MAX - 1,
+                "case {name}: window did not reach the cap"
+            );
+            assert_eq!(
+                lens[STREAM_WINDOW_MAX - 1],
+                STREAM_WINDOW_KEEP,
+                "case {name}: forced cut did not land on the keep bound"
+            );
+        }
     }
 
     /// `generate` calls `on_token` once per generated token, plus one more
