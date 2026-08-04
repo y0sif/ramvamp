@@ -81,6 +81,24 @@
 //! (keyed by `user_data`) for the lifetime of the read and drops them after
 //! the completion is consumed.
 //!
+//! # Borrowing the whole slab as an arena
+//!
+//! [`SlotPool::slab_base`] hands out the base of the single owning
+//! allocation, which is how the prefill sweep borrows the *idle* pool as
+//! scratch for its large layer-major reads (see `io::sweep`). It is
+//! `pub(crate)` and `unsafe` because it steps around the lease discipline
+//! above: the returned address covers bytes that live [`SlotGuard`]s also
+//! name, so the caller owes the exclusivity the guards would otherwise have
+//! proved. `crate::io::stream` discharges that by tying the borrow to a
+//! `&mut ExpertStream`, which makes every cache operation unreachable for as
+//! long as the arena is live.
+//!
+//! [`SlotPool::padded_layer`] exists for the same caller: an arena is only a
+//! gapless run of blob-sized buffers when every layer's pitch equals its
+//! stride, which holds for any 4096-aligned layout (both shipped Qwen3
+//! strides are) but is an emergent property of the geometry rather than a
+//! contract, so it is checked rather than assumed.
+//!
 //! # Allocation
 //!
 //! Everything is allocated in [`SlotPool::new`]: the slab, the per-slot
@@ -476,6 +494,50 @@ impl SlotPool {
     /// Total resident bytes owned by the pool.
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
+    }
+
+    /// Byte offset of one slot from the slab base, or `None` for an index out
+    /// of range. Always a multiple of [`SLOT_ALIGN`].
+    pub(crate) fn slot_offset(&self, layer: u32, slot: u32) -> Option<usize> {
+        let geom = self.layers.get(layer as usize)?;
+        if slot >= self.slots_per_layer {
+            return None;
+        }
+        // No overflow: `base_offset + pitch * slots_per_layer` was summed into
+        // `total_bytes` in `new`, in 128-bit, against a cap of `isize::MAX`.
+        Some(geom.base_offset + geom.pitch * slot as usize)
+    }
+
+    /// The first layer whose slots are padded — pitch strictly greater than
+    /// stride — as `(layer, stride, pitch)`, or `None` when every layer's
+    /// blob stride is already [`SLOT_ALIGN`]-aligned.
+    ///
+    /// A padded layer means the slab is *not* a gapless run of blob-sized
+    /// buffers, so a caller carving it into one (the prefill sweep) has to
+    /// refuse rather than read blobs into addresses that drift by a page per
+    /// slot. Both shipped Qwen3-30B-A3B strides are exact 4096 multiples, so
+    /// this answers `None` on the model the runtime targets; a future layout
+    /// that is not gets a typed refusal instead of silent corruption.
+    pub(crate) fn padded_layer(&self) -> Option<(u32, usize, usize)> {
+        self.layers
+            .iter()
+            .enumerate()
+            .find(|(_, geom)| geom.pitch != geom.stride)
+            .map(|(index, geom)| (index as u32, geom.stride, geom.pitch))
+    }
+
+    /// Base address of the single owning allocation, [`SLOT_ALIGN`]-aligned
+    /// and valid for [`SlotPool::total_bytes`] bytes.
+    ///
+    /// # Safety
+    ///
+    /// This is the one accessor that reaches past the lease discipline: the
+    /// range it covers includes every slot, and live [`SlotGuard`]s name those
+    /// same bytes. Until the returned pointer and everything derived from it
+    /// is dead, the caller must ensure no guard of this pool is read, written,
+    /// or handed to the kernel, from any thread. See the module docs.
+    pub(crate) unsafe fn slab_base(&self) -> NonNull<u8> {
+        self.base
     }
 
     /// Slots currently free in `layer`, or `None` past the last layer.
@@ -979,6 +1041,63 @@ mod tests {
                 guard.as_ptr()
             );
         }
+    }
+
+    /// The arena surface: a gapless slab reports no padded layer, its base is
+    /// page-aligned, and every slot offset lands where `acquire` puts it.
+    ///
+    /// This is what the prefill sweep carves, so "no padded layer" is not a
+    /// diagnostic — it is the precondition for the carve being a run of
+    /// blob-sized buffers rather than one with a hole every slot.
+    #[test]
+    fn a_gapless_pool_reports_no_padding_and_offsets_that_match_its_guards() {
+        for strides in [&[8192u64, 4096][..], &REAL_STRIDES[..]] {
+            let pool = SlotPool::new(3, strides).unwrap();
+            assert_eq!(
+                pool.padded_layer(),
+                None,
+                "{strides:?} is 4096-aligned throughout"
+            );
+            // SAFETY: nothing is leased, so no guard can be aliased.
+            let base = unsafe { pool.slab_base() }.as_ptr() as usize;
+            assert_eq!(base % SLOT_ALIGN, 0);
+
+            let mut expected = 0usize;
+            for (layer, &stride) in strides.iter().enumerate() {
+                for slot in 0..3 {
+                    assert_eq!(
+                        pool.slot_offset(layer as u32, slot),
+                        Some(expected),
+                        "layer {layer} slot {slot}"
+                    );
+                    // The guard the pool hands out sits at exactly that offset.
+                    let guard = pool.acquire(layer as u32).unwrap();
+                    assert_eq!(
+                        guard.as_ptr() as usize - base,
+                        pool.slot_offset(layer as u32, guard.index()).unwrap()
+                    );
+                    expected += stride as usize;
+                }
+            }
+            // Gapless: the offsets tile the whole slab.
+            assert_eq!(expected, pool.total_bytes());
+            assert_eq!(pool.slot_offset(strides.len() as u32, 0), None);
+            assert_eq!(pool.slot_offset(0, 3), None);
+        }
+    }
+
+    /// A stride that is not a 4096 multiple pads every slot, which is exactly
+    /// the geometry an arena carve must refuse.
+    #[test]
+    fn a_padded_layer_is_named_with_its_stride_and_pitch() {
+        let pool = SlotPool::new(2, &[4096, 5000, 8192]).unwrap();
+        assert_eq!(pool.padded_layer(), Some((1, 5000, 8192)));
+        // The gap is real: consecutive slots of layer 1 are a pitch apart, not
+        // a stride apart, so a blob written at `base + 2 * stride` would land
+        // inside the wrong slot.
+        assert_eq!(pool.slot_offset(1, 0), Some(8192));
+        assert_eq!(pool.slot_offset(1, 1), Some(8192 + 8192));
+        assert_ne!(pool.slot_offset(1, 1), Some(8192 + 5000));
     }
 
     #[test]

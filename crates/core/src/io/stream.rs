@@ -67,6 +67,46 @@
 //!   slot again. The layer keeps serving steps on what is left, and once too
 //!   little is left it says so ([`super::CacheError::TooFewSlots`]) rather
 //!   than failing every read forever.
+//!
+//! # The prefill arena
+//!
+//! Prefill does not use this cache at all. [`super::sweep`] streams a layer's
+//! expert file front to back in large windows and computes each expert against
+//! every routed row as it arrives, which needs one big scratch buffer rather
+//! than a slot per expert — and the pool is *idle* at that moment, because the
+//! decode cache is cold by design (replaying the prompt into it measured +0.09
+//! points, EXP-005).
+//!
+//! So the pool doubles as that scratch: [`ExpertStream::take_arena`] carves the
+//! head of the slab into a [`Arena`] and hands it to the sweep.
+//!
+//! **The soundness argument is a borrow, not a comment.** [`SlotTable`]
+//! believes it owns every slot, so an arena that coexisted with live slot views
+//! would alias `&mut`. It cannot:
+//!
+//! - `take_arena` takes `&mut self`, and every caller of it
+//!   ([`super::sweep::LayerSweep`]) parks that `&mut ExpertStream` for the
+//!   whole life of the arena. No cache operation — `begin_layer`, `view`,
+//!   `end_layer`, or anything else that reaches a [`SlotGuard`] — is callable
+//!   while the arena exists, because they all need the stream and the stream is
+//!   exclusively borrowed.
+//! - The pointer is derived from [`SlotPool::slab_base`], the same raw
+//!   allocation base every guard's address is derived from, so no `&mut` slice
+//!   spanning the slab ever has to be conjured out of a guard.
+//! - `take_arena` refuses while anything is in flight, so no kernel write is
+//!   outstanding into the bytes it is about to hand out.
+//! - Taking the arena **invalidates every layer's slot occupancy**. Sweep bytes
+//!   land in the pool, so any cache entry that survived would name a buffer
+//!   holding somebody else's expert. Only occupancy is dropped; the ghost-LFU
+//!   frequency counters are indexed by expert id and survive on purpose.
+//! - Every layer's pitch must equal its stride, or the arena is refused: a
+//!   padded layer makes the slab something other than a gapless run of
+//!   blob-sized buffers.
+//!
+//! A sweep read that can never be reaped is the one case that outlives the
+//! borrow. Its bytes may land anywhere in the arena, so every slot the arena
+//! overlaps is retired and the stream refuses to hand out an arena ever again
+//! ([`ExpertStream::strand_arena`]).
 
 use std::fmt;
 use std::fs::File;
@@ -85,6 +125,7 @@ use io_uring::{IoUring, opcode, types};
 use crate::format::{ExpertsLayout, FormatError, Manifest, sha256_file};
 
 use super::direct::{self, DirectFault, DirectSupport};
+use super::sweep::{SweepError, check_aligned};
 use super::{
     CachePlan, CacheStats, ExpertReader, ExpertView, IoError, LayerCache, LoadOptions, MAX_SLOTS,
     SLOT_ALIGN, SlotError, SlotGuard, SlotPool,
@@ -231,12 +272,51 @@ pub struct StreamStats {
     pub read_retries: u64,
     /// Wall time blocked in [`ExpertStream::await_misses`].
     pub io_wait: Duration,
+
+    /// Bytes transferred into the prefill arena by [`super::sweep`].
+    ///
+    /// Counted apart from [`StreamStats::bytes_read`] rather than added to it,
+    /// because the sweep bypasses the cache entirely: mixing the two would
+    /// make "bytes read" mean "bytes read into slots" for one phase and
+    /// something else for the other.
+    pub sweep_bytes_read: u64,
+    /// Window reads the sweep handed to the kernel, retries and short-read
+    /// continuations included. A 23 MiB O_DIRECT read coming back in pieces is
+    /// ordinary, so this comfortably exceeds `sweep_windows_read`.
+    pub sweep_reads_submitted: u64,
+    /// Sweep reads that came back failed or short and were reissued.
+    pub sweep_read_retries: u64,
+    /// Wall time the sweep spent blocked on a window read.
+    pub sweep_io_wait: Duration,
+    /// Windows the sweep actually read.
+    pub sweep_windows_read: u64,
+    /// Windows the sweep skipped because the chunk routed none of their
+    /// experts. Zero at 512-token chunks (coverage is ~100%); the dial that
+    /// matters at 128.
+    pub sweep_windows_skipped: u64,
 }
 
 impl StreamStats {
     /// Routed experts resolved: hits, pending hits, and misses.
+    ///
+    /// **Cache traffic only.** A phase served entirely by [`super::sweep`]
+    /// reports zero here and is still a phase that did work; ask
+    /// [`StreamStats::sweep_windows`] before concluding a phase was idle.
     pub fn accesses(&self) -> u64 {
         self.hits + self.pending_hits + self.misses
+    }
+
+    /// Windows the sweep looked at, read and skipped together.
+    ///
+    /// The "did this phase do anything?" question for a cache-bypassing
+    /// prefill, which [`StreamStats::accesses`] cannot answer.
+    pub fn sweep_windows(&self) -> u64 {
+        self.sweep_windows_read + self.sweep_windows_skipped
+    }
+
+    /// Whether this phase did any work at all, through either path.
+    pub fn is_idle(&self) -> bool {
+        self.accesses() == 0 && self.sweep_windows() == 0
     }
 
     /// Fraction of routed experts served without waiting on a read; `0.0`
@@ -270,11 +350,27 @@ impl StreamStats {
             reads_submitted: self.reads_submitted.saturating_sub(earlier.reads_submitted),
             read_retries: self.read_retries.saturating_sub(earlier.read_retries),
             io_wait: self.io_wait.saturating_sub(earlier.io_wait),
+            sweep_bytes_read: self
+                .sweep_bytes_read
+                .saturating_sub(earlier.sweep_bytes_read),
+            sweep_reads_submitted: self
+                .sweep_reads_submitted
+                .saturating_sub(earlier.sweep_reads_submitted),
+            sweep_read_retries: self
+                .sweep_read_retries
+                .saturating_sub(earlier.sweep_read_retries),
+            sweep_io_wait: self.sweep_io_wait.saturating_sub(earlier.sweep_io_wait),
+            sweep_windows_read: self
+                .sweep_windows_read
+                .saturating_sub(earlier.sweep_windows_read),
+            sweep_windows_skipped: self
+                .sweep_windows_skipped
+                .saturating_sub(earlier.sweep_windows_skipped),
         }
     }
 
     /// Two disjoint spans of the same stream, added together.
-    fn plus(&self, other: &Self) -> Self {
+    pub(super) fn plus(&self, other: &Self) -> Self {
         Self {
             hits: self.hits + other.hits,
             pending_hits: self.pending_hits + other.pending_hits,
@@ -285,11 +381,23 @@ impl StreamStats {
             reads_submitted: self.reads_submitted + other.reads_submitted,
             read_retries: self.read_retries + other.read_retries,
             io_wait: self.io_wait + other.io_wait,
+            sweep_bytes_read: self.sweep_bytes_read + other.sweep_bytes_read,
+            sweep_reads_submitted: self.sweep_reads_submitted + other.sweep_reads_submitted,
+            sweep_read_retries: self.sweep_read_retries + other.sweep_read_retries,
+            sweep_io_wait: self.sweep_io_wait + other.sweep_io_wait,
+            sweep_windows_read: self.sweep_windows_read + other.sweep_windows_read,
+            sweep_windows_skipped: self.sweep_windows_skipped + other.sweep_windows_skipped,
         }
     }
 }
 
 /// I/O counters kept by the stream itself.
+///
+/// Every read-path counter has a cache half and a sweep half, and which one a
+/// read lands in is decided by `in_sweep` rather than per call site: the two
+/// paths are mutually exclusive in time (an arena is refused while anything is
+/// in flight, and the sweep holds the stream's `&mut` for its whole life), so
+/// a mode flag cannot mis-attribute a read.
 #[derive(Debug, Clone, Copy, Default)]
 struct IoStats {
     bytes_read: u64,
@@ -297,6 +405,53 @@ struct IoStats {
     read_retries: u64,
     io_wait: Duration,
     stale_completions: u64,
+    sweep_bytes_read: u64,
+    sweep_reads_submitted: u64,
+    sweep_read_retries: u64,
+    sweep_io_wait: Duration,
+    sweep_windows_read: u64,
+    sweep_windows_skipped: u64,
+    /// Whether a prefill arena is currently out, which is what decides the
+    /// bucket every counter below goes into.
+    in_sweep: bool,
+}
+
+impl IoStats {
+    /// Credit transferred bytes to the phase that is running.
+    fn add_bytes(&mut self, bytes: u64) {
+        if self.in_sweep {
+            self.sweep_bytes_read += bytes;
+        } else {
+            self.bytes_read += bytes;
+        }
+    }
+
+    /// Credit one read handed to the kernel.
+    fn add_submit(&mut self) {
+        if self.in_sweep {
+            self.sweep_reads_submitted += 1;
+        } else {
+            self.reads_submitted += 1;
+        }
+    }
+
+    /// Credit one reissue: a short read continued, or a failure retried.
+    fn add_retry(&mut self) {
+        if self.in_sweep {
+            self.sweep_read_retries += 1;
+        } else {
+            self.read_retries += 1;
+        }
+    }
+
+    /// Credit time spent blocked on the drive.
+    fn add_wait(&mut self, elapsed: Duration) {
+        if self.in_sweep {
+            self.sweep_io_wait += elapsed;
+        } else {
+            self.io_wait += elapsed;
+        }
+    }
 }
 
 /// Per-layer file state: geometry resolved at construction, handle opened and
@@ -315,12 +470,28 @@ struct LayerState {
     file: Option<File>,
 }
 
+/// Where a read's bytes land.
+///
+/// The one thing [`Inflight`] would otherwise have to know about destinations.
+/// Deliberately an offset rather than a pointer: it keeps [`Read`] `Copy` and
+/// `Send`, so the whole table stays as trivially movable as it was when the
+/// cache was the only consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dest {
+    /// The cache slot named by [`Read::layer`] and [`Read::slot`].
+    Slot,
+    /// A byte offset into the prefill arena, for a [`super::sweep`] window.
+    Arena(usize),
+}
+
 /// One outstanding blob read.
 #[derive(Debug, Clone, Copy)]
 struct Read {
     /// Token this read was submitted with. A completion carrying anything
     /// else names a read that no longer exists.
     user_data: u64,
+    /// Where the bytes go.
+    dst: Dest,
     layer: u32,
     slot: u32,
     expert: u32,
@@ -377,12 +548,52 @@ struct Inflight {
 }
 
 impl Inflight {
-    /// Record a read about to be submitted and return its index.
+    /// An empty table preallocated for `top_k` reads per step, which is the
+    /// most one layer of one token can have outstanding.
+    fn with_capacity(top_k: usize) -> Self {
+        Self {
+            reads: Vec::with_capacity(top_k),
+            ..Self::default()
+        }
+    }
+
+    /// Record a read into a cache slot and return its index.
     fn track(&mut self, layer: u32, slot: u32, expert: u32, base: u64, len: u32) -> usize {
+        self.push(Dest::Slot, layer, slot, expert, base, len)
+    }
+
+    /// Record a read into the prefill arena at `offset` and return its index.
+    ///
+    /// `expert` is the window's first expert and `slot` its buffer index;
+    /// neither means anything to this table, they are payload for the log
+    /// lines the retry paths emit.
+    fn track_arena(
+        &mut self,
+        layer: u32,
+        buffer: u32,
+        first_expert: u32,
+        base: u64,
+        len: u32,
+        offset: usize,
+    ) -> usize {
+        self.push(Dest::Arena(offset), layer, buffer, first_expert, base, len)
+    }
+
+    /// Record a read about to be submitted and return its index.
+    fn push(
+        &mut self,
+        dst: Dest,
+        layer: u32,
+        slot: u32,
+        expert: u32,
+        base: u64,
+        len: u32,
+    ) -> usize {
         let index = self.reads.len();
         let user_data = self.token(index);
         self.reads.push(Read {
             user_data,
+            dst,
             layer,
             slot,
             expert,
@@ -431,13 +642,13 @@ impl Inflight {
             let got = (result as u32).min(read.remaining);
             read.filled += got;
             read.remaining -= got;
-            io.bytes_read += u64::from(got);
+            io.add_bytes(u64::from(got));
             if read.remaining == 0 {
                 read.done = true;
                 self.outstanding -= 1;
                 return Reap::Done(index);
             }
-            io.read_retries += 1;
+            io.add_retry();
             if align != 0 && read.filled % align != 0 {
                 // Off a block boundary, so `base + filled` is an offset
                 // O_DIRECT will refuse. Start the blob again rather than
@@ -492,7 +703,7 @@ impl Inflight {
         let error = io::Error::from_raw_os_error(errno);
         if is_retryable(errno) && read.attempts == 0 {
             read.attempts += 1;
-            io.read_retries += 1;
+            io.add_retry();
             tracing::warn!(
                 layer = read.layer,
                 expert = read.expert,
@@ -758,7 +969,62 @@ impl SlotTable {
     fn total_bytes(&self) -> u64 {
         self.pool().total_bytes() as u64
     }
+
+    /// Byte offset of `(layer, cache slot)` from the slab base, or `None` when
+    /// either index is out of range or the slot has been retired.
+    ///
+    /// Goes through `live`, so it answers for the layer as it is *now*: a
+    /// retirement renumbers cache slots and this follows the renumbering.
+    fn slot_offset(&self, layer: u32, slot: u32) -> Option<usize> {
+        let pool_slot = *self.live.get(layer as usize)?.get(slot as usize)?;
+        self.pool().slot_offset(layer, pool_slot)
+    }
+
+    /// The first layer whose slots are padded, as `(layer, stride, pitch)`.
+    ///
+    /// `None` means the slab is a gapless run of blob-sized buffers, which is
+    /// what an arena carve needs. See [`SlotPool::padded_layer`].
+    fn padded_layer(&self) -> Option<(u32, usize, usize)> {
+        self.pool().padded_layer()
+    }
+
+    /// Base of the whole slab, for the prefill arena.
+    ///
+    /// # Safety
+    ///
+    /// Inherits [`SlotPool::slab_base`]'s contract: no guard of this pool may
+    /// be read, written, or handed to the kernel while the returned pointer or
+    /// anything derived from it is live. `&mut self` proves it for Rust
+    /// references; the caller owes it for the kernel.
+    unsafe fn slab_base(&mut self) -> NonNull<u8> {
+        // SAFETY: forwarded to this function's own caller.
+        unsafe { self.pool().slab_base() }
+    }
 }
+
+/// The head of the idle slot-pool slab, borrowed as prefill scratch.
+///
+/// Not an allocation and not a copy: every byte is already resident and
+/// pre-faulted by [`SlotPool::new`], and carving this touches none of them.
+///
+/// Deliberately lifetime-free. The natural spelling — `Arena<'a>` tied to the
+/// `&'a mut ExpertStream` it came from — cannot be stored *beside* that same
+/// `&mut` in [`super::sweep::LayerSweep`], so the exclusivity is carried by the
+/// borrow the sweep already holds and this type stays a plain address. It is
+/// private to the crate's io layer and never escapes a `&mut ExpertStream`; see
+/// the module docs for the full argument.
+#[derive(Debug, Clone, Copy)]
+struct Arena {
+    /// Slab base. [`SLOT_ALIGN`]-aligned, because the allocation is.
+    base: NonNull<u8>,
+    /// Bytes carved. A multiple of [`SLOT_ALIGN`].
+    len: usize,
+}
+
+// SAFETY: an `Arena` is an address into a slab the `ExpertStream` that made it
+// owns, and it never leaves that stream. Moving the stream to another thread
+// moves the slab and the arena together, exactly as `SlotTable` already does.
+unsafe impl Send for Arena {}
 
 /// The step [`ExpertStream::begin_layer`] opened.
 #[derive(Debug, Default)]
@@ -774,6 +1040,17 @@ struct Step {
 }
 
 impl Step {
+    /// An idle step preallocated for `top_k` experts, which is the widest one
+    /// the model can plan.
+    fn with_capacity(top_k: usize) -> Self {
+        Self {
+            hits: Vec::with_capacity(top_k),
+            misses: Vec::with_capacity(top_k),
+            protected: Vec::with_capacity(top_k),
+            ..Self::default()
+        }
+    }
+
     fn reset(&mut self, layer: u32) {
         self.active = true;
         self.layer = layer;
@@ -822,6 +1099,13 @@ pub struct ExpertStream {
     #[cfg(feature = "io-uring")]
     ring_rebinds: u32,
     slots: SlotTable,
+    /// The prefill arena, while [`super::sweep`] holds this stream's `&mut`.
+    /// `None` at every other moment, which is what makes a cache operation and
+    /// an arena read unable to coexist.
+    arena: Option<Arena>,
+    /// Set once a sweep read became unreapable. The arena's bytes are then
+    /// permanently unsafe to hand out again, so every later take is refused.
+    arena_poisoned: bool,
     mode: StreamMode,
     support: DirectSupport,
     /// Whether layer files are opened with `O_DIRECT`.
@@ -937,6 +1221,14 @@ impl ExpertStream {
             caches.push(LayerCache::new(slots_per_layer, layer.n_experts)?);
         }
 
+        // Every per-step buffer is sized for `top_k` here rather than grown on
+        // token 0. Six `Vec`s reach exactly `top_k` and never more — the plan's
+        // hit/miss lists, the open step's hit/miss/protected lists, and the
+        // in-flight table — and they are per *process*, not per layer, so this
+        // is six allocations once instead of six growths inside the first
+        // token's layer loop.
+        let top_k = manifest.arch.top_k.max(1) as usize;
+
         // Direct I/O needs a 4096 multiple on the offset *and* the length,
         // and both come from the layout's stride. A layout that does not
         // supply one cannot use O_DIRECT at all.
@@ -944,9 +1236,9 @@ impl ExpertStream {
             reader,
             layers: layers.into_boxed_slice(),
             caches: caches.into_boxed_slice(),
-            plan: CachePlan::new(),
-            step: Step::default(),
-            inflight: Inflight::default(),
+            plan: CachePlan::with_capacity(top_k),
+            step: Step::with_capacity(top_k),
+            inflight: Inflight::with_capacity(top_k),
             #[cfg(feature = "io-uring")]
             completions: Vec::with_capacity(completion_capacity(slots_per_layer)),
             #[cfg(feature = "io-uring")]
@@ -958,6 +1250,8 @@ impl ExpertStream {
             #[cfg(feature = "io-uring")]
             ring_rebinds: 0,
             slots,
+            arena: None,
+            arena_poisoned: false,
             mode: StreamMode::Pread,
             support: DirectSupport::Unusable(DirectFault::Unsupported),
             direct_open: false,
@@ -1196,22 +1490,13 @@ impl ExpertStream {
             return Ok(());
         }
         let mut failure = None;
-
-        #[cfg(feature = "io-uring")]
-        if self.ring.is_some() {
-            if let Err(error) = self.await_ring(&mut failure) {
-                // The ring itself failed, so nothing will ever reap what is
-                // still in flight: those slots are given up rather than
-                // recycled under a write we cannot see.
-                self.strand_step();
-                return Err(failure.unwrap_or(error));
-            }
-        } else {
-            self.await_pread(&mut failure);
+        if let Err(error) = self.drive_reads(None, &mut failure) {
+            // The ring itself failed, so nothing will ever reap what is still
+            // in flight: those slots are given up rather than recycled under a
+            // write we cannot see.
+            self.strand_step();
+            return Err(failure.unwrap_or(error));
         }
-        #[cfg(not(feature = "io-uring"))]
-        self.await_pread(&mut failure);
-
         match failure {
             None => Ok(()),
             Some(error) => {
@@ -1241,6 +1526,351 @@ impl ExpertStream {
             self.protocol_error(layer, &format!("slot {slot} is not in the pool"))
         })?;
         self.reader.view_over(layer, bytes)
+    }
+
+    // ---------------------------------------------------------------------
+    // The prefill arena. See the module docs for why borrowing the pool is
+    // sound; everything below is `pub(super)` because `io::sweep` is the only
+    // legitimate caller and the borrow it holds is half the argument.
+    // ---------------------------------------------------------------------
+
+    /// Stream one layer's expert file front to back, bypassing the cache.
+    ///
+    /// This is prefill. The returned [`LayerSweep`] holds this stream
+    /// exclusively until it is finished or dropped, which is what lets it
+    /// borrow the idle slot pool as scratch for its large reads; see
+    /// [`super::sweep`] for the shape of the loop and `io::stream`'s module
+    /// docs for why the borrow is sound.
+    ///
+    /// `plan` is the caller's to reuse across layers and chunks — it is
+    /// rebuilt here, so passing the same one every time means only the first
+    /// layer allocates. `routed` is the set of experts the chunk sends any row
+    /// to, in any order; a window none of them fall in is never read.
+    ///
+    /// **Taking a sweep empties the decode cache**, deliberately: its buffers
+    /// are what the sweep reads into. The ghost-LFU frequency counters survive.
+    ///
+    /// # Errors
+    ///
+    /// [`SweepError::ReadsInFlight`] or [`SweepError::StepOpen`] when the
+    /// decode path is mid-step; [`SweepError::ArenaTooSmall`] when the expert
+    /// cache budget cannot hold one window; [`SweepError::PaddedSlots`] for a
+    /// layout whose blob stride is not 4096-aligned; [`SweepError::BadDials`]
+    /// or [`SweepError::ExpertOutOfRange`] for bad input; [`SweepError::Io`]
+    /// when the layer file cannot be opened or the first reads cannot be
+    /// submitted.
+    pub fn sweep_layer<'a>(
+        &'a mut self,
+        plan: &'a mut super::SweepPlan,
+        layer: u32,
+        routed: &[u32],
+        config: super::SweepConfig,
+    ) -> Result<super::LayerSweep<'a>, SweepError> {
+        super::LayerSweep::begin(self, plan, layer, routed, config)
+    }
+
+    /// Borrow the head of the idle slot-pool slab as `bytes` of prefill
+    /// scratch, invalidating the decode cache's slot occupancy.
+    ///
+    /// Nothing is allocated and nothing is faulted: every byte was made
+    /// resident by [`SlotPool::new`] and the carve is address arithmetic. The
+    /// occupancy reset is not a side effect but the point — sweep bytes land in
+    /// those buffers, so any surviving cache entry would name an expert that is
+    /// no longer there. The ghost-LFU frequency counters and the fetched flags
+    /// are indexed by expert id and survive, exactly as they survive an
+    /// eviction.
+    ///
+    /// # Errors
+    ///
+    /// [`SweepError::ReadsInFlight`] / [`SweepError::StepOpen`] when the cache
+    /// is mid-step; [`SweepError::PaddedSlots`] when some layer's pitch exceeds
+    /// its stride, so the slab is not a gapless run of blob-sized buffers;
+    /// [`SweepError::ArenaTooSmall`] when the pool is smaller than the carve;
+    /// [`SweepError::ArenaPoisoned`] once a sweep read has been lost.
+    pub(super) fn take_arena(&mut self, bytes: usize) -> Result<(), SweepError> {
+        if self.arena_poisoned {
+            return Err(SweepError::ArenaPoisoned);
+        }
+        if self.inflight.outstanding > 0 {
+            return Err(SweepError::ReadsInFlight {
+                outstanding: self.inflight.outstanding,
+            });
+        }
+        if self.step.active {
+            return Err(SweepError::StepOpen {
+                layer: self.step.layer,
+            });
+        }
+        if let Some((layer, stride, pitch)) = self.slots.padded_layer() {
+            return Err(SweepError::PaddedSlots {
+                layer,
+                stride,
+                pitch,
+            });
+        }
+        let available = self.slots.total_bytes();
+        if bytes as u64 > available {
+            return Err(SweepError::ArenaTooSmall {
+                needed: bytes as u64,
+                available,
+            });
+        }
+        // SAFETY: the caller of this method parks the `&mut ExpertStream` it
+        // borrowed for the whole life of the arena, so no slot guard of this
+        // pool is reachable — from safe code or otherwise — until
+        // `release_arena` runs; and nothing is in flight, checked above, so no
+        // kernel write is outstanding into these bytes either.
+        let base = unsafe { self.slots.slab_base() };
+        debug_assert!(
+            base.as_ptr() as usize as u64 % direct::DIO_ALIGN == 0,
+            "the slot pool slab is allocated 4096-aligned"
+        );
+        self.invalidate_all_slots();
+        self.inflight.clear();
+        #[cfg(feature = "io-uring")]
+        self.completions.clear();
+        self.arena = Some(Arena { base, len: bytes });
+        self.io.in_sweep = true;
+        tracing::debug!(
+            arena_bytes = bytes,
+            pool_bytes = available,
+            "prefill arena taken; the expert cache is now empty"
+        );
+        Ok(())
+    }
+
+    /// Give the arena back and leave the cache empty.
+    ///
+    /// Invalidates occupancy a second time. Redundant while the borrow holds —
+    /// nothing could have populated a slot with the stream exclusively borrowed
+    /// — and it is one pass over a few hundred slot records, which is the
+    /// cheapest possible way to keep "no slot ever reports ready with sweep
+    /// bytes in it" true by construction rather than by argument.
+    pub(super) fn release_arena(&mut self) {
+        if self.arena.take().is_none() {
+            return;
+        }
+        self.invalidate_all_slots();
+        if self.inflight.outstanding == 0 {
+            self.inflight.clear();
+        }
+        self.io.in_sweep = false;
+    }
+
+    /// Bytes currently carved, or `0` when no arena is out.
+    pub(super) fn arena_len(&self) -> usize {
+        self.arena.map_or(0, |arena| arena.len)
+    }
+
+    /// Read-only view of `len` arena bytes at `offset`.
+    ///
+    /// # Safety
+    ///
+    /// Every read targeting this range must have reached a terminal state —
+    /// its completion reaped, or its `pread` returned. The type system cannot
+    /// see a kernel write, so this is the caller's to prove;
+    /// [`super::sweep::LayerSweep`] proves it by only calling this for a window
+    /// it has already awaited.
+    pub(super) unsafe fn arena_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let arena = self.arena?;
+        if offset.checked_add(len)? > arena.len {
+            return None;
+        }
+        // SAFETY: the range is inside the slab, every byte of which was
+        // initialized by `SlotPool::new`, and the arena only exists while its
+        // holder has this stream exclusively borrowed — so no `&mut` view of
+        // the same bytes can exist. The kernel half is the caller's promise.
+        Some(unsafe { std::slice::from_raw_parts(arena.base.as_ptr().add(offset), len) })
+    }
+
+    /// Submit one arena-destined window read and return its in-flight index.
+    ///
+    /// Alignment is the caller's to establish — `sweep::check_window` does it
+    /// from the geometry — and asserted here as well, because
+    /// [`is_retryable`] deliberately excludes `EINVAL`, so an unaligned
+    /// O_DIRECT read is a hard mid-prefill failure with no retry behind it.
+    ///
+    /// # Errors
+    ///
+    /// [`SweepError::Misaligned`] when offset, length or destination is not a
+    /// [`direct::DIO_ALIGN`] multiple; [`SweepError::Io`] when the read cannot
+    /// be handed to the kernel.
+    pub(super) fn sweep_submit(
+        &mut self,
+        layer: u32,
+        buffer: u32,
+        first_expert: u32,
+        file_offset: u64,
+        len: u32,
+        arena_offset: usize,
+    ) -> Result<usize, SweepError> {
+        let Some(arena) = self.arena else {
+            return Err(SweepError::NoArena);
+        };
+        // Unconditionally, not only when the handle is O_DIRECT: the startup
+        // probe answers for the geometry as it was at open time, and this is
+        // the read that would die of an un-retryable `EINVAL`.
+        check_aligned("sweep read offset", file_offset)?;
+        check_aligned("sweep read length", u64::from(len))?;
+        check_aligned(
+            "sweep read destination",
+            arena.base.as_ptr() as usize as u64 + arena_offset as u64,
+        )?;
+        self.ensure_open(self.layer_index(layer)?)?;
+        let index =
+            self.inflight
+                .track_arena(layer, buffer, first_expert, file_offset, len, arena_offset);
+        if let Err(error) = self.submit(index) {
+            // Never reached the kernel, so nothing will ever write into the
+            // arena for it: resolve it here or the table never drains.
+            self.inflight.abandon(index);
+            return Err(error.into());
+        }
+        if let Err(error) = self.flush() {
+            // Whether the kernel took the reads already pushed is unknowable,
+            // and they target the arena rather than one slot.
+            self.strand_arena();
+            return Err(error.into());
+        }
+        Ok(index)
+    }
+
+    /// Block until the window read `until` has landed, or until every
+    /// outstanding window has if it is `None`.
+    ///
+    /// Stopping at one window is what keeps the double buffer double: the
+    /// windows behind it stay in flight against the caller's compute.
+    ///
+    /// # Errors
+    ///
+    /// [`SweepError::Io`] wrapping the read's errno after its retry, an
+    /// unexpected EOF, or a submission failure. A failure that leaves reads
+    /// unreapable retires every slot the arena covers first.
+    pub(super) fn sweep_await(&mut self, until: Option<usize>) -> Result<(), SweepError> {
+        let mut failure = None;
+        if let Err(error) = self.drive_reads(until, &mut failure) {
+            self.strand_arena();
+            return Err(failure.unwrap_or(error).into());
+        }
+        match failure {
+            None => Ok(()),
+            Some(error) => Err(error.into()),
+        }
+    }
+
+    /// Forget every resolved read, so one sweep's window indices do not
+    /// accumulate across layers. Only valid with nothing outstanding.
+    pub(super) fn sweep_clear_reads(&mut self) {
+        if self.inflight.outstanding == 0 {
+            self.inflight.clear();
+        }
+    }
+
+    /// Count one window the sweep looked at.
+    pub(super) fn count_window(&mut self, read: bool) {
+        if read {
+            self.io.sweep_windows_read += 1;
+        } else {
+            self.io.sweep_windows_skipped += 1;
+        }
+    }
+
+    /// Open and verify a layer's expert file, the same first-use path
+    /// `begin_layer` takes. Shared rather than duplicated: one O_DIRECT open,
+    /// one size check, one optional hash, per layer per process.
+    ///
+    /// # Errors
+    ///
+    /// [`IoError::LayerOutOfRange`]; [`IoError::Format`] on the size or hash
+    /// check; [`IoError::Io`] when the file cannot be opened.
+    pub(super) fn open_layer(&mut self, layer: u32) -> Result<(), IoError> {
+        let index = self.layer_index(layer)?;
+        self.ensure_open(index)
+    }
+
+    /// A layer's blob stride and expert count.
+    ///
+    /// # Errors
+    ///
+    /// [`IoError::LayerOutOfRange`] past the last layer.
+    pub(super) fn layer_geometry(&self, layer: u32) -> Result<(u64, u32), IoError> {
+        let index = self.layer_index(layer)?;
+        let state = &self.layers[index];
+        Ok((state.stride, state.n_experts))
+    }
+
+    /// The resolved gate/up/down geometry, for slicing arena bytes.
+    pub(super) fn expert_reader(&self) -> &ExpertReader {
+        &self.reader
+    }
+
+    /// Drop every layer's slot occupancy, keeping the ghost history.
+    ///
+    /// `invalidate` is `unsafe` because it unprotects a slot without proving
+    /// its read is over; here that proof is the caller's — every path into this
+    /// runs with nothing in flight.
+    fn invalidate_all_slots(&mut self) {
+        for cache in &mut self.caches {
+            for slot in 0..cache.n_slots() {
+                // SAFETY: `take_arena` refuses while anything is outstanding,
+                // and `release_arena` runs after the sweep has drained. So no
+                // read is writing into any slot of any layer at either call
+                // site, which is exactly `invalidate`'s obligation.
+                unsafe { cache.invalidate(slot) };
+            }
+        }
+    }
+
+    /// Give up the arena for good, after a window read that can never be
+    /// reaped.
+    ///
+    /// The one failure the borrow cannot contain. A lost sweep read may land
+    /// anywhere in the arena, and the arena is the head of the slot pool, so
+    /// every slot it overlaps is **retired**: the buffer is leaked, and the
+    /// layer's cache is rebuilt that much smaller so nothing can ever be handed
+    /// the address again. The stream then refuses to sweep for the rest of the
+    /// process — a second arena over the same bytes would be a second read into
+    /// a live DMA destination.
+    ///
+    /// Expensive (a layer retired below `top_k` reports
+    /// [`CacheError::TooFewSlots`](crate::io::CacheError::TooFewSlots) on its
+    /// next step) and loud, but it terminates and it never aliases.
+    fn strand_arena(&mut self) {
+        let len = self.arena_len();
+        for index in 0..self.inflight.reads.len() {
+            let read = self.inflight.reads[index];
+            if read.done {
+                continue;
+            }
+            tracing::error!(
+                layer = read.layer,
+                window = read.slot,
+                first_expert = read.expert,
+                "prefill window read cannot be reaped; the arena is given up"
+            );
+            self.inflight.abandon(index);
+        }
+        self.arena = None;
+        self.arena_poisoned = true;
+        self.io.in_sweep = false;
+        // Descending in both indices: retiring one slot renumbers every higher
+        // slot of the same layer.
+        for layer in (0..self.n_layers()).rev() {
+            for slot in (0..self.slots.usable(layer)).rev() {
+                if self
+                    .slots
+                    .slot_offset(layer, slot)
+                    .is_some_and(|offset| offset < len)
+                {
+                    self.retire_slot(layer, slot);
+                }
+            }
+        }
+        tracing::error!(
+            arena_bytes = len,
+            "the prefill arena was lost to an unreapable read; every slot it \
+             covered is retired and this process will not sweep again"
+        );
     }
 
     /// Release every slot the step protected, hits included.
@@ -1302,6 +1932,12 @@ impl ExpertStream {
             reads_submitted: self.io.reads_submitted,
             read_retries: self.io.read_retries,
             io_wait: self.io.io_wait,
+            sweep_bytes_read: self.io.sweep_bytes_read,
+            sweep_reads_submitted: self.io.sweep_reads_submitted,
+            sweep_read_retries: self.io.sweep_read_retries,
+            sweep_io_wait: self.io.sweep_io_wait,
+            sweep_windows_read: self.io.sweep_windows_read,
+            sweep_windows_skipped: self.io.sweep_windows_skipped,
             ..StreamStats::default()
         };
         let mut fold = |cache: CacheStats| {
@@ -1518,10 +2154,49 @@ impl ExpertStream {
         Ok(())
     }
 
+    /// Drive every in-flight read, or just enough of them to finish `until`.
+    ///
+    /// The shared body of [`ExpertStream::await_misses`] and the sweep's
+    /// window wait; the two differ only in what they do with a failure, and in
+    /// that the sweep stops as soon as the window it wants has landed so the
+    /// windows behind it keep overlapping compute.
+    ///
+    /// `Err` means the submission path itself failed and nothing still in
+    /// flight can ever be reaped; the caller owes those destinations whatever
+    /// protection they need. A read that failed terminally is reported through
+    /// `failure` instead, and is safe to clean up.
+    fn drive_reads(
+        &mut self,
+        until: Option<usize>,
+        failure: &mut Option<IoError>,
+    ) -> Result<(), IoError> {
+        if self.inflight.outstanding == 0 {
+            return Ok(());
+        }
+        #[cfg(feature = "io-uring")]
+        if self.ring.is_some() {
+            self.await_ring(until, failure)?;
+        } else {
+            self.await_pread(until, failure);
+        }
+        #[cfg(not(feature = "io-uring"))]
+        self.await_pread(until, failure);
+        Ok(())
+    }
+
+    /// Whether the read the caller is waiting for has reached a terminal
+    /// state. `false` for `None`, which means "wait for everything".
+    fn reached(&self, until: Option<usize>) -> bool {
+        until.is_some_and(|index| self.inflight.reads[index].done)
+    }
+
     /// Drive the synchronous read path to completion.
-    fn await_pread(&mut self, failure: &mut Option<IoError>) {
+    fn await_pread(&mut self, until: Option<usize>, failure: &mut Option<IoError>) {
         let start = Instant::now();
         for index in 0..self.inflight.reads.len() {
+            if self.reached(until) {
+                break;
+            }
             while !self.inflight.reads[index].done {
                 let result = self.pread_once(index);
                 let user_data = self.inflight.reads[index].user_data;
@@ -1546,7 +2221,7 @@ impl ExpertStream {
                 }
             }
         }
-        self.io.io_wait += start.elapsed();
+        self.io.add_wait(start.elapsed());
     }
 
     /// One positioned read of read `index`'s remaining bytes, in the
@@ -1556,24 +2231,54 @@ impl ExpertStream {
         let Some(file) = self.layers[read.layer as usize].file.as_ref() else {
             return -libc::EBADF;
         };
-        let Some(slot) = self.slots.bytes_mut(read.layer, read.slot) else {
-            return -libc::EFAULT;
-        };
         let from = read.filled as usize;
         let to = from + read.remaining as usize;
-        let Some(dst) = slot.get_mut(from..to) else {
-            return -libc::EFAULT;
-        };
-        self.io.reads_submitted += 1;
-        match file.read_at(dst, read.base + u64::from(read.filled)) {
-            Ok(got) => i32::try_from(got).unwrap_or(i32::MAX),
-            Err(error) => -error.raw_os_error().unwrap_or(libc::EIO),
+        let offset = read.base + u64::from(read.filled);
+        match read.dst {
+            Dest::Slot => {
+                let Some(slot) = self.slots.bytes_mut(read.layer, read.slot) else {
+                    return -libc::EFAULT;
+                };
+                let Some(dst) = slot.get_mut(from..to) else {
+                    return -libc::EFAULT;
+                };
+                self.io.add_submit();
+                pread_result(file, dst, offset)
+            }
+            Dest::Arena(base) => {
+                let Some(arena) = self.arena else {
+                    return -libc::EFAULT;
+                };
+                if base.checked_add(to).is_none_or(|end| end > arena.len) {
+                    return -libc::EFAULT;
+                }
+                // SAFETY: `base + filled + remaining <= arena.len` was just
+                // checked, so the window stays inside the slab the arena was
+                // carved from. The arena is only `Some` while the sweep holds
+                // this stream's `&mut`, which rules out every other view of
+                // those bytes — no slot guard is reachable meanwhile.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        arena.base.as_ptr().add(base + from),
+                        read.remaining as usize,
+                    )
+                };
+                self.io.add_submit();
+                pread_result(file, dst, offset)
+            }
         }
     }
 
     /// A read completed: its bytes are valid and its expert is resident.
+    ///
+    /// A sweep window has no cache entry to promote — that is the point of the
+    /// sweep — so it is only the arithmetic in [`Inflight::resolve`] that
+    /// mattered for it.
     fn mark_ready(&mut self, index: usize) {
         let read = self.inflight.reads[index];
+        if read.dst != Dest::Slot {
+            return;
+        }
         if let Some(cache) = self.caches.get_mut(read.layer as usize) {
             cache.mark_ready(read.slot);
         }
@@ -1590,15 +2295,17 @@ impl ExpertStream {
             %error,
             "expert blob read failed"
         );
-        if let Some(cache) = self.caches.get_mut(read.layer as usize) {
-            // SAFETY: this read reached a terminal state, so its completion
-            // has been reaped (ring) or the call has returned (pread), and no
-            // reissue was made. Nothing is writing into the slot.
-            unsafe { cache.invalidate(read.slot) };
+        if read.dst == Dest::Slot {
+            if let Some(cache) = self.caches.get_mut(read.layer as usize) {
+                // SAFETY: this read reached a terminal state, so its completion
+                // has been reaped (ring) or the call has returned (pread), and
+                // no reissue was made. Nothing is writing into the slot.
+                unsafe { cache.invalidate(read.slot) };
+            }
+            // An invalidated slot is unassigned, so it is not this step's to
+            // release any more.
+            self.step.protected.retain(|slot| *slot != read.slot);
         }
-        // An invalidated slot is unassigned, so it is not this step's to
-        // release any more.
-        self.step.protected.retain(|slot| *slot != read.slot);
         let path = self
             .layers
             .get(read.layer as usize)
@@ -1626,6 +2333,15 @@ impl ExpertStream {
     /// assigned the leaked slot, fail to find a buffer, invalidate it back to
     /// `Empty`, and be assigned it again for as long as the process lives.
     fn strand_step(&mut self) {
+        if self.arena.is_some() {
+            // A lost read into the arena is not one slot's problem; see
+            // `strand_arena`. Unreachable in practice — an arena is out only
+            // while `io::sweep` holds this stream's `&mut`, so no step exists
+            // — but the two recovery paths must not be mixed up if that ever
+            // changes.
+            self.strand_arena();
+            return;
+        }
         let mut retire: Vec<(u32, u32)> = Vec::new();
         for index in 0..self.inflight.reads.len() {
             let read = self.inflight.reads[index];
@@ -1771,6 +2487,19 @@ impl ExpertStream {
         self.strand_step();
     }
 
+    /// Replace the slot pool with a padded one, so the arena's
+    /// gapless-slab contract can be exercised.
+    ///
+    /// Every real layout the runtime targets is 4096-aligned throughout — both
+    /// shipped Qwen3 strides are — so a padded pool cannot be built from a
+    /// fixture install; it is substituted instead. The stream cannot serve a
+    /// read afterwards, which is fine for the one thing this is for.
+    /// Test-only.
+    #[cfg(test)]
+    fn force_padded_slots(&mut self) {
+        self.slots = SlotTable::new(2, &[4096, 5000]).expect("a tiny pool builds");
+    }
+
     /// Answer the next `count` submits the way `enter` answers `EBUSY`:
     /// submitted nothing, reap and come back. Test-only.
     ///
@@ -1829,18 +2558,45 @@ impl ExpertStream {
             return Err(self.protocol_error(read.layer, "layer file is not open"));
         };
         let fd = file.as_raw_fd();
-        // SAFETY: the read is parked in the in-flight table until its
-        // completion is reaped, the guard behind this pointer is held for the
-        // life of the stream, no other read targets this slot (the cache
-        // keeps it `Filling`), and no slice view of it is taken meanwhile:
-        // `view` refuses a slot that is not ready. `Drop` leaks the slot if a
-        // teardown cannot reap.
-        let Some(base) = (unsafe { self.slots.write_ptr(read.layer, read.slot) }) else {
-            return Err(self.protocol_error(read.layer, "slot is not in the pool"));
+        let base = match read.dst {
+            // SAFETY: the read is parked in the in-flight table until its
+            // completion is reaped, the guard behind this pointer is held for
+            // the life of the stream, no other read targets this slot (the
+            // cache keeps it `Filling`), and no slice view of it is taken
+            // meanwhile: `view` refuses a slot that is not ready. `Drop` leaks
+            // the slot if a teardown cannot reap.
+            Dest::Slot => match unsafe { self.slots.write_ptr(read.layer, read.slot) } {
+                Some(base) => base,
+                None => return Err(self.protocol_error(read.layer, "slot is not in the pool")),
+            },
+            Dest::Arena(offset) => {
+                let Some(arena) = self.arena else {
+                    return Err(self.protocol_error(read.layer, "no prefill arena is out"));
+                };
+                if offset
+                    .checked_add(read.filled as usize + read.remaining as usize)
+                    .is_none_or(|end| end > arena.len)
+                {
+                    return Err(self.protocol_error(read.layer, "window is outside the arena"));
+                }
+                // SAFETY: bounds-checked above, so the window stays inside the
+                // slab. The arena exists only while the sweep holds this
+                // stream's `&mut`, so no slot guard is reachable meanwhile and
+                // no second read can target these bytes; `strand_arena` retires
+                // every slot the arena covers if a completion is ever lost.
+                unsafe { arena.base.as_ptr().add(offset) }
+            }
         };
-        // SAFETY: `filled < stride` and the slot is `stride` bytes, so this
-        // stays inside the slot.
+        // SAFETY: `filled + remaining` is the length checked against the slot
+        // stride or the arena length above, so this stays inside it.
         let dst = unsafe { base.add(read.filled as usize) };
+        debug_assert!(
+            read.dst == Dest::Slot
+                || (dst as usize as u64 % direct::DIO_ALIGN == 0
+                    && (read.base + u64::from(read.filled)) % direct::DIO_ALIGN == 0
+                    && u64::from(read.remaining) % direct::DIO_ALIGN == 0),
+            "a sweep read must be 4096-aligned in offset, length and destination"
+        );
         let entry = opcode::Read::new(types::Fd(fd), dst, read.remaining)
             .offset(read.base + u64::from(read.filled))
             .build()
@@ -1855,7 +2611,7 @@ impl ExpertStream {
                 None => return Err(self.protocol_error(read.layer, "the io_uring ring is gone")),
             };
             if pushed {
-                self.io.reads_submitted += 1;
+                self.io.add_submit();
                 return Ok(());
             }
             // A full SQ is a submit-and-retry, never a dropped read. The
@@ -1947,9 +2703,13 @@ impl ExpertStream {
     /// Wait for every submitted read, reissuing short reads and one retry per
     /// failed blob.
     #[cfg(feature = "io-uring")]
-    fn await_ring(&mut self, failure: &mut Option<IoError>) -> Result<(), IoError> {
+    fn await_ring(
+        &mut self,
+        until: Option<usize>,
+        failure: &mut Option<IoError>,
+    ) -> Result<(), IoError> {
         let mut idle = 0;
-        while self.inflight.outstanding > 0 {
+        while self.inflight.outstanding > 0 && !self.reached(until) {
             // `push_sqe` may already have reaped some of what is owed while
             // making room in the submission queue; waiting on the ring before
             // acting on those would block for completions that have already
@@ -1957,7 +2717,7 @@ impl ExpertStream {
             if self.completions.is_empty() {
                 let start = Instant::now();
                 self.enter(1)?;
-                self.io.io_wait += start.elapsed();
+                self.io.add_wait(start.elapsed());
                 self.drain_cq();
             }
             if self.completions.is_empty() {
@@ -2018,25 +2778,57 @@ impl Drop for ExpertStream {
             return;
         }
         // An unwind tore the stream down mid-read. The kernel may still write
-        // into those slots after the ring's descriptor closes, so their
+        // into those buffers after the ring's descriptor closes, so their
         // leases are given up rather than returned: `SlotPool::drop` then
         // leaks the slab instead of freeing memory under a live DMA.
         tracing::error!(
             outstanding = self.inflight.outstanding,
             "expert stream dropped with reads in flight; leaking their slots"
         );
+        // A window read lands somewhere in the arena rather than in one slot,
+        // so every slot the arena covers is given up.
+        let arena = self.arena_len();
+        let sweeping = arena > 0
+            && self
+                .inflight
+                .reads
+                .iter()
+                .any(|read| !read.done && matches!(read.dst, Dest::Arena(_)));
         // Descending, so retiring one slot does not renumber the next.
         let mut stranded: Vec<(u32, u32)> = self
             .inflight
             .reads
             .iter()
-            .filter(|read| !read.done)
+            .filter(|read| !read.done && read.dst == Dest::Slot)
             .map(|read| (read.layer, read.slot))
             .collect();
+        if sweeping {
+            for layer in 0..self.slots.live.len() as u32 {
+                for slot in 0..self.slots.usable(layer) {
+                    if self
+                        .slots
+                        .slot_offset(layer, slot)
+                        .is_some_and(|offset| offset < arena)
+                    {
+                        stranded.push((layer, slot));
+                    }
+                }
+            }
+        }
         stranded.sort_unstable_by(|a, b| b.cmp(a));
+        stranded.dedup();
         for (layer, slot) in stranded {
             self.slots.retire(layer, slot);
         }
+    }
+}
+
+/// One positioned read, in the kernel's `result` convention: bytes
+/// transferred, `0` for EOF, or a negative errno.
+fn pread_result(file: &File, dst: &mut [u8], offset: u64) -> i32 {
+    match file.read_at(dst, offset) {
+        Ok(got) => i32::try_from(got).unwrap_or(i32::MAX),
+        Err(error) => -error.raw_os_error().unwrap_or(libc::EIO),
     }
 }
 
@@ -2921,6 +3713,228 @@ mod tests {
         assert_eq!(stream.stale_completions(), 0);
     }
 
+    /// Every per-step buffer is sized at construction, not grown on token 0.
+    ///
+    /// Six `Vec`s used to reach their working size the first time a layer was
+    /// planned — `CachePlan`'s two lists, the open step's three, and the
+    /// in-flight table — and they are per *process*, not per layer, so it was
+    /// six growths inside the first token's layer loop and none after.
+    #[test]
+    fn the_per_step_buffers_are_preallocated() {
+        let fx = build_install("stream-prealloc");
+        let stream = open(&fx, 4);
+        let top_k = fx.manifest.arch.top_k as usize;
+        assert!(top_k >= 2, "the fixture must route more than one expert");
+
+        assert!(stream.step.hits.capacity() >= top_k);
+        assert!(stream.step.misses.capacity() >= top_k);
+        assert!(stream.step.protected.capacity() >= top_k);
+        assert!(stream.inflight.reads.capacity() >= top_k);
+
+        // `CachePlan` keeps its lists private and exposes them as slices, so
+        // the observable fact is that they have *allocated*: a `Vec` with no
+        // capacity has never allocated and every zero-capacity `Vec<(u32,
+        // u32)>` shares one dangling address, which is what an un-preallocated
+        // plan would compare equal to.
+        let never_used = CachePlan::new();
+        assert_ne!(
+            stream.plan.hits().as_ptr(),
+            never_used.hits().as_ptr(),
+            "CachePlan::hits was left to grow on the first step"
+        );
+        assert_ne!(
+            stream.plan.misses().as_ptr(),
+            never_used.misses().as_ptr(),
+            "CachePlan::misses was left to grow on the first step"
+        );
+
+        // And a full-width step does not disturb any of it.
+        let request: Vec<u32> = (0..top_k as u32).collect();
+        let mut stream = stream;
+        let before = (
+            stream.step.hits.capacity(),
+            stream.step.misses.capacity(),
+            stream.step.protected.capacity(),
+            stream.inflight.reads.capacity(),
+        );
+        stream.begin_layer(0, &request).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(0);
+        assert_eq!(
+            before,
+            (
+                stream.step.hits.capacity(),
+                stream.step.misses.capacity(),
+                stream.step.protected.capacity(),
+                stream.inflight.reads.capacity(),
+            ),
+            "a top-k step reallocated a preallocated buffer"
+        );
+    }
+
+    // ---- the prefill arena -----------------------------------------------
+
+    #[test]
+    fn the_arena_carve_is_page_aligned_and_allocates_nothing() {
+        let fx = build_install("stream-arena-carve");
+        let mut stream = open(&fx, 4);
+        let pool_bytes = stream.cache_bytes();
+        let want = 2 * fx.layout.layers[0].stride as usize;
+
+        stream.take_arena(want).unwrap();
+        let arena = stream.arena.expect("the arena is out");
+        assert_eq!(arena.len, want);
+        assert!(direct::is_aligned(arena.base.as_ptr() as usize as u64));
+        assert!(direct::is_aligned(arena.len as u64));
+        assert!(arena.len as u64 <= pool_bytes, "the carve left the slab");
+        // The slab is what it was: the carve is arithmetic, not an allocation.
+        assert_eq!(stream.cache_bytes(), pool_bytes);
+        assert_eq!(stream.arena_len(), want);
+
+        stream.release_arena();
+        assert!(stream.arena.is_none());
+        assert_eq!(stream.arena_len(), 0);
+        // And the cache is usable the moment the arena is back.
+        stream.begin_layer(0, &[0, 1]).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(0);
+
+        // A carve past the slab is a typed refusal.
+        let err = stream.take_arena(pool_bytes as usize + 4096).unwrap_err();
+        assert!(
+            matches!(err, SweepError::ArenaTooSmall { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The arena may not be taken while the cache is mid-step: those reads are
+    /// writing into the very buffers it would hand out.
+    #[test]
+    fn the_arena_is_refused_while_the_cache_is_busy() {
+        let fx = build_install("stream-arena-busy");
+        let mut stream = open(&fx, 4);
+        stream.begin_layer(0, &[0, 1]).unwrap();
+        assert_eq!(stream.misses().len(), 2, "the fixture must miss cold");
+        let err = stream.take_arena(4096).unwrap_err();
+        assert!(
+            matches!(err, SweepError::ReadsInFlight { outstanding: 2 }),
+            "unexpected error: {err}"
+        );
+
+        stream.await_misses().unwrap();
+        let err = stream.take_arena(4096).unwrap_err();
+        assert!(
+            matches!(err, SweepError::StepOpen { layer: 0 }),
+            "unexpected error: {err}"
+        );
+
+        stream.end_layer(0);
+        stream
+            .take_arena(4096)
+            .expect("a closed step lets it through");
+        stream.release_arena();
+    }
+
+    /// Taking the arena empties every layer's occupancy, because sweep bytes
+    /// land in those buffers — and keeps the ghost history, because that is
+    /// indexed by expert id and survives eviction on purpose.
+    #[test]
+    fn taking_the_arena_empties_every_layers_occupancy() {
+        let fx = build_install("stream-arena-invalidate");
+        let mut stream = open(&fx, 4);
+        for layer in 0..2u32 {
+            stream.begin_layer(layer, &[0, 1]).unwrap();
+            stream.await_misses().unwrap();
+            stream.end_layer(layer);
+        }
+        for layer in 0..2u32 {
+            assert!(
+                (0..stream.usable_slots(layer))
+                    .any(|slot| stream.caches[layer as usize].is_ready(slot)),
+                "layer {layer} should hold something before the arena"
+            );
+        }
+        let hits_before = stream.stats().hits;
+
+        // One page is enough: the invalidation is not scoped to the carve.
+        stream.take_arena(4096).unwrap();
+        for layer in 0..2u32 {
+            for slot in 0..stream.usable_slots(layer) {
+                assert!(
+                    !stream.caches[layer as usize].is_ready(slot),
+                    "layer {layer} slot {slot} survived the arena"
+                );
+            }
+        }
+        stream.release_arena();
+
+        // The counters are untouched, so the ghost history and the totals both
+        // carried across.
+        assert_eq!(stream.stats().hits, hits_before);
+        // Every expert now misses, and it is an *eviction* miss: the layer had
+        // fetched it, which is what the surviving `fetched` flags record.
+        stream.begin_layer(0, &[0, 1]).unwrap();
+        assert!(stream.hits().is_empty());
+        stream.await_misses().unwrap();
+        stream.end_layer(0);
+        assert_eq!(stream.stats().eviction_misses, 2);
+    }
+
+    /// A layout whose blob stride is not 4096-aligned pads every slot, so the
+    /// slab is not a gapless run of blob-sized buffers and the arena is
+    /// refused rather than silently handed out with holes in it.
+    #[test]
+    fn a_padded_slot_pool_refuses_the_arena() {
+        let fx = build_install("stream-arena-padded");
+        let mut stream = open(&fx, 4);
+        stream.take_arena(4096).expect("the fixture is gapless");
+        stream.release_arena();
+
+        stream.force_padded_slots();
+        let err = stream.take_arena(4096).unwrap_err();
+        match err {
+            SweepError::PaddedSlots {
+                layer,
+                stride,
+                pitch,
+            } => {
+                assert_eq!((layer, stride, pitch), (1, 5000, 8192));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    /// A window read that can never be reaped gives up every slot the arena
+    /// covered — the bytes may land anywhere in it — and the process never
+    /// sweeps again.
+    #[test]
+    fn a_lost_window_read_retires_the_slots_the_arena_covered() {
+        let fx = build_install("stream-arena-strand");
+        let mut stream = open(&fx, 4);
+        let stride = fx.layout.layers[0].stride as usize;
+        assert_eq!(stream.usable_slots(0), 4);
+        assert_eq!(stream.usable_slots(1), 4);
+
+        // Two of layer 0's four slots, and none of layer 1's, which start
+        // past the whole of layer 0's run.
+        stream.take_arena(2 * stride).unwrap();
+        stream.strand_arena();
+
+        assert_eq!(stream.usable_slots(0), 2, "the arena's slots stayed live");
+        assert_eq!(stream.usable_slots(1), 4, "an untouched layer shrank");
+        assert!(stream.arena.is_none());
+
+        let err = stream.take_arena(4096).unwrap_err();
+        assert!(
+            matches!(err, SweepError::ArenaPoisoned),
+            "unexpected error: {err}"
+        );
+        // What is left still serves steps.
+        stream.begin_layer(0, &[0, 1]).unwrap();
+        stream.await_misses().unwrap();
+        stream.end_layer(0);
+    }
+
     // ---- in-flight bookkeeping -------------------------------------------
     //
     // Completion handling is where out-of-order arrival, stale tags, short
@@ -3024,6 +4038,66 @@ mod tests {
         assert_eq!(io.read_retries, 1, "the second failure was retried too");
         assert_eq!(inflight.outstanding, 0);
         assert_eq!(io.bytes_read, 0);
+    }
+
+    /// A sweep window goes through the same table as a cache miss — the short
+    /// read, the one `EIO` retry, the restart rule — and lands in the sweep
+    /// half of the counters rather than the cache half.
+    ///
+    /// This is the whole reason [`Inflight`] is destination-agnostic: the
+    /// retry logic is the part that is hard to get right, and it is not worth
+    /// having two of.
+    #[test]
+    fn a_window_read_retries_like_a_blob_and_counts_in_the_sweep_half() {
+        let mut io = IoStats {
+            in_sweep: true,
+            ..IoStats::default()
+        };
+        let mut inflight = Inflight {
+            align: direct::DIO_ALIGN as u32,
+            ..Inflight::default()
+        };
+        // One 4-page window of layer 0, buffer 1, starting at expert 8.
+        let index = inflight.track_arena(0, 1, 8, 8 * 4096, 4 * 4096, 3 * 4096);
+        assert_eq!(inflight.reads[index].dst, Dest::Arena(3 * 4096));
+        let token = inflight.reads[index].user_data;
+
+        // A short read that stopped on a block boundary continues.
+        assert!(matches!(
+            inflight.resolve(token, 2 * 4096, &mut io),
+            Reap::Again(0)
+        ));
+        assert_eq!(inflight.reads[0].filled, 2 * 4096);
+        assert_eq!(inflight.reads[0].remaining, 2 * 4096);
+
+        // `EIO` on the continuation is retried exactly once.
+        let second = inflight.retag(0);
+        assert!(matches!(
+            inflight.resolve(second, -libc::EIO, &mut io),
+            Reap::Again(0)
+        ));
+        let third = inflight.retag(0);
+        assert!(matches!(
+            inflight.resolve(third, 2 * 4096, &mut io),
+            Reap::Done(0)
+        ));
+        assert_eq!(inflight.outstanding, 0);
+
+        assert_eq!(io.sweep_bytes_read, 4 * 4096);
+        assert_eq!(io.sweep_read_retries, 2, "short read plus one EIO");
+        assert_eq!(io.bytes_read, 0, "sweep bytes leaked into the cache half");
+        assert_eq!(io.read_retries, 0);
+
+        // A short read that stopped *off* a boundary restarts the window,
+        // because O_DIRECT cannot resume from an unaligned offset.
+        let index = inflight.track_arena(0, 0, 0, 0, 4 * 4096, 0);
+        let token = inflight.reads[index].user_data;
+        assert!(matches!(
+            inflight.resolve(token, 4096 + 512, &mut io),
+            Reap::Again(1)
+        ));
+        assert_eq!(inflight.reads[1].filled, 0, "the window was not restarted");
+        assert_eq!(inflight.reads[1].remaining, 4 * 4096);
     }
 
     #[test]
