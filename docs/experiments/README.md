@@ -51,6 +51,7 @@ which is the reason their claims are credible.
 - [EXP-012: Anonymous runtime memory is missing from the memory contract](#exp-012-anonymous-runtime-memory-is-missing-from-the-memory-contract) — KEEP
 - [EXP-013: io_uring + O_DIRECT streaming and the two-phase decode loop](#exp-013-io_uring--o_direct-streaming-and-the-two-phase-decode-loop) — KEEP
 - [EXP-014: First clean cold measurement inside the 3G cgroup](#exp-014-first-clean-cold-measurement-inside-the-3g-cgroup) — KEEP
+- [EXP-015: Phase-6 building blocks, landed and unmeasured](#exp-015-phase-6-building-blocks-landed-and-unmeasured) — KEEP
 
 Entries EXP-007 through EXP-013 were measured on a machine that was not
 quiet, and most are microbenchmarks rather than end-to-end runs. Under rule 2
@@ -917,3 +918,170 @@ provisional.
   the equivalent uncgrouped runs, so I/O and compute are now close to
   balanced; further gains need either a higher hit rate (more slots, which
   the budget does not allow) or a faster device.
+
+## EXP-015: Phase-6 building blocks, landed and unmeasured
+
+- Date / commit: 2026-08-04 / 867461f (`feat/prefill-sweep`); the runtime
+  half is bbb0e8d on the same branch.
+- Hypothesis: chunked prefill can read each expert **once per layer instead
+  of once per token**, and dot each expert's weight rows against every row
+  routed to it while those bytes are in L1, without changing a single output
+  bit and without taking a byte from the memory contract.
+- Method: **nothing was measured.** No cold run, no cgroup, no timing, no
+  generated token. The entry exists because CLAUDE.md requires one for every
+  performance-motivated change, and because EXP-011 set the precedent for
+  logging a structural restructure before its number exists. What gates the
+  change is the in-tree unit suite (rule 4, identical output) plus the
+  structural argument in Note 2, not a rule-2 run.
+- Baseline: EXP-014's cold 3G-cgroup medians (decode 1.88 tok/s, prefill
+  1.33 tok/s, `memory.peak` 2,471.1 MiB) are still the last publishable
+  numbers, and this branch is not expected to move them, because three of
+  the four changes have no caller in the forward pass:
+
+  | change | where | in the running build? |
+  |---|---|---|
+  | Batched GEMV entry points | `kernels/gemv.rs` | exported, **no caller** |
+  | Layer-major prefill sweep over a slot-pool arena | `io/sweep.rs`, `io/stream.rs`, `io/slots.rs` | **no caller** |
+  | Position-limited attention (`attention_at`) | `kernels/attention.rs` | **no caller**; `decode_attention` now delegates to the same private body |
+  | Six preallocated hot-path `Vec`s | `io/stream.rs` | yes, one-off at `ExpertStream::new` |
+
+- Result:
+
+  **What the sweep is for, as arithmetic.** The byte figures are exact on
+  the audited strides in `experts/layout.json` and the reuse counts are
+  chunk geometry. Nothing in this table is a measurement:
+
+  | quantity | decode, worst case | 512-token chunk sweep |
+  |---|---:|---:|
+  | expert bytes per token | ~1,097 MB | ~34 MB (~17.6 GB / 512) |
+  | reads of one expert per layer | one per token | one per chunk |
+  | rows dotted per weight-row fetch from RAM | 1 | ~32 |
+
+  The ~32 is the same number twice: `512 tokens x top-8 / 128 experts`.
+  That is the amortization the sweep and the batched GEMV exist for; read
+  granularity is a separate and much weaker claim (Note 5).
+
+  **The ring costs zero bytes**, because it is a borrow of the expert slot
+  pool rather than an allocation. The pool is one contiguous 4096-aligned
+  slab with every page faulted at construction, it is idle whenever the
+  sweep runs (prefill bypasses the decode cache by design, EXP-005; today
+  that bypass has no caller, so the pool is only idle in the intended
+  arrangement, not in the shipped one), and `pitch == stride` on
+  this model because both strides are exact 4096 multiples, so the slab is a
+  gapless run of blob-sized buffers. At the shipped dials:
+
+  | layer stride | window, 8 experts | ring, 2 windows in flight |
+  |---:|---:|---:|
+  | 3,059,712 B (24 layers) | 23.34 MiB | 46.7 MiB |
+  | 2,654,208 B (24 layers) | 20.25 MiB | 40.5 MiB |
+
+  All of it is already inside the 1,438.59 MiB expert-pool row of the memory
+  contract. The borrow also inherits the alignment and pre-faulting that
+  btrfs requires, which is not cosmetic: an un-faulted destination makes
+  btrfs complete an O_DIRECT read through the buffered path with no error
+  and a full byte count, which is exactly the failure the 3 GB budget cannot
+  survive (EXP-009).
+
+  **Harness finding 1: systemd rewrites `${VAR}` and `$$` inside
+  `ExecStart=` arguments.** Measured on systemd 261 on the reference
+  machine:
+
+  | argument as written | what the process received |
+  |---|---|
+  | `A ${HOME} B` | `A /home/y0sif B` |
+  | `A ${UNSET} B` | `A  B` (the token vanishes) |
+  | `A $$VAR B` | `A $VAR B` |
+  | `A $VAR B` | unchanged |
+  | `%` specifiers, newlines, tabs, quotes, backslashes | unchanged |
+
+  `cold_bench.py` passed the prompt to `systemd-run` this way, so any
+  measurement whose prompt contained those sequences was silently truncated
+  or rewritten, with `systemd-run` exiting 0 and nothing to notice.
+  **No recorded measurement is invalidated**, and that was checked rather
+  than assumed: `scratch/ctx4k/p4k.txt` and
+  `models/llamacpp-ref/llamacpp_ref/long_00/01/02.txt` contain zero `${`,
+  `$$` or `%`, and EXP-014's prompt was `The capital of France is`.
+  The harness now passes argv out of band as JSON, and records the sha256 of
+  both the prompt file and the delivered text.
+
+  **Harness finding 2: `bitident.py` could report PASS while ignoring most
+  of the fingerprint.** An "all" capture compared against a "singles"
+  baseline reported **PASS 8/8** and silently skipped the long prompts,
+  because `compare` adopted the baseline's prompt set the way it already
+  adopts `--top`. A prompt-set mismatch is now **exit 2**.
+
+- Verdict: KEEP (enablers plus two harness fixes; correctness preserved,
+  **nothing measured and nothing claimed**)
+- Notes:
+  1. **Under rule 2 this entry publishes nothing.** There is no cold cgroup
+     run behind it. Every figure above is either exact arithmetic on the
+     audited strides, a restatement of an earlier entry, or a property of
+     the harness measured directly (the systemd table). The measurement this
+     work is for is **owed**, and it belongs to the wave-2 prefill driver,
+     which is what wires the sweep and the batched GEMV into the forward
+     pass. Until that lands, the sweep is code that compiles and is tested,
+     not a speedup.
+  2. **Bit identity is structural for the batched GEMV, and tested on top.**
+     The batched path issues the same `dot()` call on the same
+     `(weight_row, activation_row)` bytes as the single-vector path; only
+     the loop nesting and the destination index changed, and no weight row
+     is dequantized once into scratch and reused (that would break the
+     per-super-block accumulation order the kernels fix, and float addition
+     is not associative). The six entry points now share one `gemv_impl`
+     with the non-batched four passing `n_acts == 1`, so there is one code
+     path and nothing to drift, exactly as EXP-011 did for row ranges. The
+     tests assert it anyway, bit for bit
+     (`k_quant_batched_matches_single_vector_bitwise`,
+     `q8_0_batched_matches_single_vector_bitwise`,
+     `public_batched_entry_points_match_single_vector`,
+     `batched_misaligned_weight_slab_is_bit_identical`). Position-limited
+     attention has the same shape: masked positions are *absent* from the
+     score buffer, the f64 softmax normalizer and the V sum rather than
+     zero-weighted or `-inf`-biased, so the masked form is the unmasked form
+     over a shorter cache, and `decode_attention` delegates to the same body
+     (`attention_at_is_bit_identical_to_truncated_decode`,
+     `decode_attention_matches_attention_at_at_full_length`). No online or
+     flash-style rescaled softmax, which would have reordered the reduction.
+  3. **The arena borrow has one failure mode worth carrying forward.** A
+     sweep window read that can never be reaped may have landed anywhere in
+     the arena, so every slot the arena overlaps is retired: the buffer is
+     leaked, the layer's cache is rebuilt smaller, and the stream refuses to
+     sweep again for the life of the process. It terminates and it never
+     aliases, but the arena is carved from the **head** of the slab, so the
+     retirements fall on the low layers, and a layer retired below `top_k`
+     reports `CacheError::TooFewSlots` on its next step. On this model that
+     means layer 0 can be taken below 8 usable slots and decode then fails
+     rather than degrading. Mitigation is in progress in
+     `crates/core/src/io/` and is uncommitted as this entry is written;
+     `docs/architecture.md` records the failure mode under "The prefill
+     arena" and takes the fix when it lands.
+  4. **Two dials ship with defaults nobody has measured**: experts per
+     window (8, which divides 128 into 16 uniform windows with no ragged
+     tail and lands at 23.34/20.25 MiB, inside the 16-24 MiB range EXP-008
+     pointed at) and windows in flight (2, double
+     buffering, so window `n + 1` is on the wire while the caller computes
+     window `n`). Both are the subject of a planned sweep, alongside the
+     chunk-size sweep (128 / 256 / 512 / 1024). 512 is where coverage
+     reaches ~100% of a layer's experts, so it is the smallest chunk that
+     fully amortizes a sweep; the shorter chunks trade coverage for a
+     smaller activation working set and nothing here says which wins.
+  5. **The read-granularity motivation for large windows is weaker than it
+     looks, and the sweep should not be justified with it.** EXP-008's
+     "+51% at 16 MiB" is measured against ~1.35 GB/s at the expert stride,
+     and EXP-013 measured **1.97 GB/s** under the real access pattern at
+     that same stride, roughly 46% above EXP-008's denominator. EXP-008's
+     harness was also never committed. The amortization argument in the
+     Result table does not depend on the drive's block-size curve at all,
+     which is why it is the one this entry leans on. `scripts/io_probe.py`
+     landed on this branch as a rule-2 compliant replacement harness
+     (cgroup, proven page-cache eviction, `pgsteal` hygiene gate, and it
+     separates granularity from sequentiality by comparing front-to-back
+     against a permutation of the same blocks); **no run of it is recorded
+     here**, and re-measuring EXP-008 stays open.
+  6. **Why the long prompts were adopted as the chunk-seam gate**, for
+     context and without overclaiming: the long reference prompts are 512,
+     1891 and 3492 tokens, and 512 is exactly one chunk at the default chunk
+     size. Nothing in-tree proved prefill correctness at chunked length
+     before, and finding 2 meant the fingerprint could pass while covering
+     only the eight short singles. Neither fact is a measurement of the
+     sweep; they are what makes a future measurement of it trustworthy.

@@ -186,6 +186,18 @@ exact count depends on its blob stride and has not been computed.
 | Runtime anonymous memory | 115.1 MiB (**provisional**, EXP-012) | activations and scratch, tokenizer, thread stacks, allocator arenas; peak `anon` sampled from inside the cgroup on a live decode run whose context length, token count and page-cache state were not recorded — it fails rule 2, so it is a floor for this tenant, not a ceiling. See Open risk below |
 | Subtotal | **2,961.0 MiB** (**provisional**) | 111.0 MiB headroom under `memory.max=3G` (3,072 MiB), also provisional: both cells inherit the provenance of the anon row above, and neither may be published until that row is re-measured |
 
+**The prefill sweep is not a fifth row.** Its streaming ring is a
+sub-allocation of the expert slot pool above, borrowed while the pool is
+idle rather than allocated (see "The prefill arena"), so it moves no cell in
+this table. At the default dials, 8 experts per window and 2 windows in
+flight, the ring is `2 x 8 x stride`: 46.7 MiB on a 3,059,712 B layer and
+40.5 MiB on a 2,654,208 B one, all of it already counted in the 1,438.59
+MiB. The wave-2 prefill driver will additionally need staging for a chunk's
+activations and its per-expert row groups. That is either a real addition to
+the runtime-anonymous row or another sub-allocation of the same arena, and
+which one it is has not been decided. **No figure is recorded for it here,
+because the driver is not written.**
+
 The pool figures are exact arithmetic on the audited strides in
 `experts/layout.json` (3,059,712 B on the 24 Q6_K-down layers, 2,654,208 B on
 the other 24), not estimates. Against 1,522.44 MiB of fixed tenants
@@ -427,26 +439,129 @@ Measured coverage for this model (Layered Prefill, arXiv 2510.08055): a
 Chunked prefill therefore approaches "read every expert once per chunk per
 layer" no matter how it is scheduled. So:
 
-- Prefill bypasses the expert cache entirely.
+- **Prefill bypasses the expert cache entirely. That is intent, not current
+  fact.** The sweep reader is landed (`crates/core/src/io/sweep.rs`,
+  EXP-015) but nothing calls it: the forward pass still prefills through the
+  decode cache, one token at a time, and EXP-013's phase-split table
+  measured exactly that (9,600 prefill cache requests at 45.3% hit, against
+  24,192 decode requests at 52.7%). The wave-2 prefill driver is what makes
+  this bullet true. Until it lands, read every "prefill bypasses the cache"
+  sentence in this document as a plan.
 - Layer-major chunks of up to 512 tokens. Per layer: group rows by expert
   (mul_mat_id style), then stream the layer's expert file front-to-back
-  through a small ring of streaming buffers, computing each expert against
-  all its routed rows as it arrives.
-- The win is read granularity, not sequentiality per se. On the reference
-  drive, large blocks measured 2.04 GB/s at 16 MiB and 2.15 at 24 MiB versus
-  ~1.35 at the 2.918 MiB expert stride: **+51% at 16 MiB** (provisional,
-  EXP-008).
-  Buffer size for the streaming ring is therefore a tuned parameter, in the
-  phase-6 backlog.
-- Expected: ~8.2-8.6 s per 512-token chunk sweep (~17.6 GB of expert data)
-  at 2.04-2.15 GB/s, roughly 60 tok/s prefill (estimate derived from
-  provisional bandwidth; measured entry required). The earlier "~4.9 s,
+  through a ring of large window reads, computing each expert against all
+  its routed rows as it arrives. The ring is a **borrow of the expert slot
+  pool, not a new allocation**; see "The prefill arena".
+- **The dominant win is amortization, not read granularity.** An earlier
+  revision of this section said the opposite ("the win is read granularity,
+  not sequentiality per se"), and it was steering design decisions. A
+  512-token chunk reads each expert **once per layer instead of once per
+  token**, so expert bytes per token fall from the decode worst case of
+  ~1,097 MB to ~34 MB (~17.6 GB of expert data over 512 tokens). Both
+  figures are exact arithmetic on the audited strides, and the ratio between
+  them, ~32x, is the same reuse counted from the other end
+  (`512 tokens x top-8 / 128 experts` = 32 rows per expert per layer). The
+  same amortization is available on RAM bandwidth: dotting one expert weight
+  row against all ~32 of its routed rows while the row is in L1 fetches that
+  row from RAM once instead of once per token. That is what the batched GEMV
+  entry points exist for (EXP-015); they have no caller yet.
+- Read granularity is a **secondary and currently unproven** effect. The
+  claim was EXP-008's **+51% at 16 MiB** (2.04 GB/s at 16 MiB and 2.15 at 24
+  MiB against ~1.35 at the 2.918 MiB expert stride, provisional). Its
+  denominator is the weak part: EXP-013 measured **1.97 GB/s** under the
+  real access pattern at that same stride, contradicting EXP-008's 1.35 by
+  roughly 46%, and EXP-008's harness was never committed. So window size
+  stays a tuned dial in the phase-6 backlog (the sweep exposes it, default 8
+  experts per window) rather than a load-bearing reason for the design.
+- **The sweep's ceiling is `max(I/O, compute)` per chunk, not I/O alone.**
+  The I/O half: ~8.2-8.6 s per 512-token chunk sweep (~17.6 GB) at
+  2.04-2.15 GB/s, which is roughly **60 tok/s of I/O-only prefill**
+  (estimate derived from provisional bandwidth). Earlier revisions quoted
+  that 60 tok/s as *the* prefill figure; it is not one, because it says
+  nothing about compute. The only measured anchor for the other half is
+  EXP-013, where decode wall was 34.20 s with 16.63 s of I/O wait: 17.57 s
+  of non-I/O time over 63 decode steps, so roughly **279 ms/token** (a
+  subtraction
+  inside a single entry, so rule 3 is satisfied; that run was warm and
+  uncgrouped, so the figure is provisional, and a prefill row is not a
+  decode token, so treat it as an order-of-magnitude anchor rather than a
+  prefill number). The sweep does not change compute per token at all, it
+  changes the order the bytes arrive in. What changes compute is the batched
+  expert GEMV, which converts the expert FFN from RAM-bandwidth-bound (one
+  MAC per weight byte fetched) to MAC-bound (~32 MACs per weight byte
+  fetched). **No new tok/s prediction is published here.** The measurement
+  is owed, and it belongs to the wave-2 driver's entry. The earlier "~4.9 s,
   roughly 100 tok/s" figure assumed the withdrawn 3.6 GB/s number and is
   superseded. TF's design (random tile fetches through the decode cache)
   achieved ~28 tok/s, so the sequential sweep is still the right call.
 - Decode cache starts cold after prefill; acceptable, first tokens warm it.
   Replaying the prompt into the cache during prefill is closed as a "no",
   see "Recorded decisions from phase-5 measurement".
+
+## The prefill arena (the sweep ring is borrowed, not allocated)
+
+The streaming ring the sweep reads through is carved out of the expert slot
+pool. It is not a fifth memory tenant and not a new allocation, and that is
+the load-bearing half of why chunked prefill costs zero bytes of the memory
+contract.
+
+What makes it possible:
+
+- The slot pool is **one contiguous allocation**, 4096-aligned, with every
+  page faulted at construction (~1,438.6 MiB at the shipped 11 slots/layer).
+- Slot addresses inside it are `base + base_offset + pitch * slot`, and
+  `pitch == stride` for this model, so the slab is a **gapless run of
+  blob-sized buffers**. That holds because both Qwen3 strides are exact
+  4096 multiples (3,059,712 B = 747 pages, 2,654,208 B = 648 pages). It is
+  an emergent property of the installed geometry rather than a contract, so
+  the carve checks it per layer and refuses a padded layout instead of
+  assuming.
+- The pool is **idle during prefill**, because prefill bypasses the decode
+  cache. That is a recorded decision rather than a convenience: replaying
+  the prompt into the cache is worth +0.09 points (EXP-005).
+
+What that buys:
+
+- **Zero additional bytes** against the ~111 MiB of documented (and
+  provisional) headroom under `memory.max=3G`. At the default dials, 8
+  experts per window and 2 windows in flight, the ring is `2 x 8 x stride`,
+  which is 46.7 MiB on a 3,059,712 B layer and 40.5 MiB on a 2,654,208 B
+  one, and those bytes are already inside the 1,438.59 MiB pool row.
+- **Alignment and pre-faulting come for free.** Both are O_DIRECT
+  requirements the pool already satisfies, and the second one is not
+  cosmetic: btrfs runs direct reads with page faults disabled and silently
+  degrades a read to the buffered path when the destination pages are not
+  faulted in, with no error and a full byte count (see "Expert streaming and
+  cache"). A freshly allocated prefill buffer would have had to repeat that
+  work, and a bug in repeating it would have shown up as page-cache growth
+  inside the cgroup rather than as a failure.
+
+What it costs:
+
+- **Taking the arena invalidates every layer's slot occupancy.** Sweep bytes
+  land in those buffers, so no cache entry may survive claiming to hold an
+  expert. The ghost-LFU frequency counters do survive, deliberately: they
+  are indexed by expert id, and surviving eviction is the policy (see
+  "Expert streaming and cache").
+- **Known failure mode: an unreapable window read strands the arena.** If
+  the ring itself fails in a way that leaves a submitted read unreapable,
+  its bytes may land anywhere in the arena, so every slot the arena overlaps
+  is *retired*: the buffer is leaked so a late kernel write is harmless, and
+  the layer's cache is rebuilt that much smaller. The stream then refuses to
+  hand out an arena for the rest of the process. It terminates and it never
+  aliases, which is the point, but the arena is carved from the **head** of
+  the slab, so the slots it retires are the low layers' slots, and a layer
+  retired below `top_k` reports `CacheError::TooFewSlots` on its next step.
+  On this model that means layer 0 can be taken below 8 usable slots and
+  decode then fails rather than degrading. **Mitigation is in progress** in
+  `crates/core/src/io/` and is not committed as this is written; its shape
+  is a typed refusal on both edges, so that a carve which would cover an
+  already-retired buffer is rejected up front, and a stranding that leaves a
+  layer below `top_k` says so directly instead of surfacing one step later
+  as a cache error. This document records the fix once it lands. Note the
+  failure is a consequence of the borrow, not of the sweep:
+  a separately allocated ring would have leaked its own pages instead of the
+  cache's.
 
 ## Validation protocol vs llama.cpp
 
@@ -647,7 +762,11 @@ are neither now, and they should not come back without new evidence.
   rate at the operating point (EXP-005). Not worth the loss of fixed-stride
   simplicity.
 - **Replaying the prompt into the expert cache during prefill: no.** Worth
-  **+0.09 points** (EXP-005). Prefill continues to bypass the cache.
+  **+0.09 points** (EXP-005). The decision stands, but state it honestly:
+  the current build has not implemented the bypass, so prefill still runs
+  through the cache and populates it, which is the behaviour this decision
+  rejects. The sweep that does the bypassing is landed and uncalled
+  (EXP-015); the wave-2 driver is what removes the replay.
 - **Per-expert progressive execution as reads land: no.** See "Decode loop";
   measured and rejected upstream, with divergent output.
 - **Registered io_uring buffers (`ReadFixed`): no.** See "Expert streaming
@@ -667,12 +786,18 @@ are neither now, and they should not come back without new evidence.
   or disprove the 111.0 MiB of headroom the 11-slot dial leaves (EXP-012).
 - Dedicated E-core io_uring reactor thread vs inline on the coordinator
   (evidence upstream is mixed both ways; see "Thread topology")
-- Larger read granularity for the phase-6 prefill sweep (16-24 MiB buffers;
-  measured +51% at 16 MiB over the 2.918 MiB expert stride, provisional,
-  EXP-008)
+- The two sweep dials, experts per window (default 8, which is 23.3/20.3 MiB
+  on the two strides) and windows in flight (default 2). The +51% at 16 MiB
+  that motivated the range is provisional and its denominator is contested
+  by EXP-013, so this sweep now measures the granularity effect rather than
+  assuming it (EXP-008, EXP-013, EXP-015)
 - E-cores in compute pool for non-barrier expert GEMVs
 - `fadvise`/`readahead` tuning for the prefill sequential sweep
-- Prefill chunk size sweep: 128 vs 256 vs 512
+- Prefill chunk size sweep: 128 vs 256 vs 512 vs 1024. 512 is the point
+  where coverage reaches ~100% of each layer's experts, so it is the
+  smallest chunk that fully amortizes a sweep; the sweep is what decides
+  whether the shorter chunks' lower coverage pays for their smaller
+  activation working set (EXP-015)
 - Re-measure the O_DIRECT bandwidth probe under rule 2 (cold, inside the
   benchmark cgroup, quiet machine) and re-derive the performance model. This
   is the highest-value item on the list: the 1.59 GB/s constant the model
