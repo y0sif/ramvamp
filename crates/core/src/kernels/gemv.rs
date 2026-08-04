@@ -350,6 +350,8 @@ pub fn gemv_q8_0_rows(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::super::quants::{quantize_row_q8_0, quantize_row_q8_k};
     use super::*;
 
@@ -550,6 +552,95 @@ mod tests {
         ]
     }
 
+    /// Which kernel paths the running host can actually exercise.
+    ///
+    /// The bit-identity tests sweep `scalar` over both values, but that only
+    /// selects between two implementations when the host has AVX2+FMA:
+    /// `quants::avx2` dispatches on [`avx2::avx2_fma_available`], so on a
+    /// host without it `scalar = false` runs the very same scalar kernel as
+    /// `scalar = true`, and both iterations prove nothing while still looking
+    /// like a two-path proof.
+    ///
+    /// So the sweep is narrowed to the paths that exist and the shortfall is
+    /// announced. It is not asserted away: `cargo fmt`/`clippy`/`test` are
+    /// the pre-push gate for this repo, and the module supports "scalar
+    /// otherwise" as a real configuration, so a bare
+    /// `assert!(avx2_fma_available())` turns a portable gate into one that
+    /// cannot pass on an ARM, macOS, or pre-Haswell box. What must never
+    /// happen is a *silent* collapse to one path, and that is what
+    /// [`kernel_paths`] prevents.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum KernelPaths {
+        /// AVX2+FMA is live: `[false, true]` really is two kernels, so a pass
+        /// is evidence for the AVX2-vs-scalar claim.
+        Both,
+        /// Scalar only. The row-partition logic is still exercised in full;
+        /// the AVX2-vs-scalar half of the claim is not tested here.
+        ScalarOnly,
+    }
+
+    impl KernelPaths {
+        /// The `scalar` flags to sweep. Sweeping `[false, true]` on a
+        /// scalar-only host runs one kernel twice and reports it as two.
+        fn flags(self) -> &'static [bool] {
+            match self {
+                KernelPaths::Both => &[false, true],
+                KernelPaths::ScalarOnly => &[true],
+            }
+        }
+    }
+
+    /// Resolve [`KernelPaths`] for this host, announcing `claim` as untested
+    /// when only one path exists.
+    ///
+    /// The notice is written straight to `stderr` rather than through
+    /// `eprintln!` because libtest captures the print macros and replays them
+    /// only for *failing* tests. A skip nobody can see on a green run is
+    /// precisely the silent single-path pass this exists to prevent, so it
+    /// has to bypass the capture.
+    ///
+    /// # Panics
+    ///
+    /// On an x86_64 host whose CPU reports AVX2 and FMA while
+    /// [`avx2::avx2_fma_available`] does not. That is a dispatch bug rather
+    /// than an unsupported host: every GEMV would quietly run the scalar
+    /// kernel on a machine that has the vector one, and no test would say so.
+    fn kernel_paths(claim: &str) -> KernelPaths {
+        let dispatch = avx2::avx2_fma_available();
+        #[cfg(target_arch = "x86_64")]
+        {
+            let cpu = std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma");
+            assert_eq!(
+                dispatch, cpu,
+                "kernel dispatch disagrees with this x86_64 CPU: CPUID reports \
+                 avx2+fma = {cpu}, `avx2::avx2_fma_available()` reports \
+                 {dispatch}. Every GEMV dispatches on the latter, so this is a \
+                 live mis-dispatch, not an unsupported host."
+            );
+        }
+        if dispatch {
+            return KernelPaths::Both;
+        }
+        let mut err = std::io::stderr();
+        let _ = writeln!(
+            err,
+            "\n\
+             ##########################################################\n\
+             # NOT PROVEN ON THIS HOST: {claim}\n\
+             #\n\
+             # This host has no AVX2+FMA, so `scalar = false` dispatches to\n\
+             # the same scalar kernel as `scalar = true`. The row-partition\n\
+             # logic was exercised on the scalar path only; the\n\
+             # AVX2-vs-scalar half of phase 5's bit-identity gate was NOT\n\
+             # tested. A green run here is not evidence for it. Re-run the\n\
+             # kernel tests on an AVX2+FMA machine before relying on it.\n\
+             ##########################################################\n"
+        );
+        let _ = err.flush();
+        KernelPaths::ScalarOnly
+    }
+
     /// Replay every partition through `run` and assert bit-identity against
     /// the whole-matrix result.
     ///
@@ -664,9 +755,13 @@ mod tests {
     /// the AVX2 and the scalar kernel path, at the real projection shapes.
     #[test]
     fn k_quant_row_partitions_are_bit_identical() {
+        let paths = kernel_paths(
+            "k-quant row partitions are bit-identical on both the AVX2 and the \
+             scalar kernel path",
+        );
         for f in k_quant_fixtures() {
             let acts = q8_k_acts(f.in_dim, 0xAC ^ f.in_dim as u64);
-            for scalar in [false, true] {
+            for &scalar in paths.flags() {
                 assert_partitions_bit_identical(&f, scalar, |f, rows, out, scalar| {
                     run_k(f, &acts, rows, out, scalar)
                 });
@@ -677,9 +772,13 @@ mod tests {
     /// Same property for the Q8_0 x Q8_0 path (`attn_k`, 2048 -> 512).
     #[test]
     fn q8_0_row_partitions_are_bit_identical() {
+        let paths = kernel_paths(
+            "Q8_0 row partitions are bit-identical on both the AVX2 and the \
+             scalar kernel path",
+        );
         let f = Fixture::new("attn_k (Q8_0)", QuantFormat::Q8_0, 2048, 512);
         let acts = q8_0_acts(f.in_dim, 0xAC7);
-        for scalar in [false, true] {
+        for &scalar in paths.flags() {
             assert_partitions_bit_identical(&f, scalar, |f, rows, out, scalar| {
                 run_0(f, &acts, rows, out, scalar)
             });

@@ -47,15 +47,37 @@ What it checks, and why each check exists:
    discards `--warmup` runs (default 1) and reports the median of the
    rest.
 
+7. Every counter has three states, not two: clean, dirty and *unknown*,
+   and unknown is DIRTY. `/proc/self/cgroup` can fail to resolve, the
+   memory controller can be undelegated, `memory.max` can be unreadable —
+   each of which leaves the harness with no evidence at all, which is
+   precisely the state an unconfined run produces. A check that exempts
+   its own unreadable input is not a check, so a missing counter is
+   reported as a hard problem with the counter named. The one counter that
+   is systematically rather than diagnostically absent —
+   `memory.swap.peak`, which does not exist before Linux 6.5 — is caught
+   by `preflight()` instead, because "DIRTY forever, no remedy" is a
+   broken harness rather than a failing measurement.
+
 Usage:
 
   scripts/cold_bench.py --ramvamp target/release/ramvamp --max-new 8
   scripts/cold_bench.py --ramvamp target/release/ramvamp \\
       --max-new 64 --repeats 5 --json scratch/cold.json
 
-Exit 0 = every scored run was CLEAN. Exit 1 = at least one scored run was
-DIRTY (numbers still printed, clearly marked). Exit 2 = harness error
-(eviction failed, no cgroup, a ramvamp process was running, ...).
+Exit codes, shared with the repo's other gate scripts (`bitident.py`,
+`greedy_regression.py`, `kl_vs_reference.py`, `lfu_sim.py`):
+
+  0  every scored run was CLEAN
+  1  at least one scored run was DIRTY. This is a real result about the
+     run, so the numbers are still printed and clearly marked. **An
+     unreadable counter lands here, not on 2**: the harness ran fine, it
+     simply cannot show the run was clean, and unknown is DIRTY (see 7
+     above)
+  2  the harness could not take the measurement at all — eviction failed,
+     no cgroup v2, no `systemd-run --user`, a kernel older than 6.5, a
+     `ramvamp` process was already running, the inner run produced no
+     result file
 
 ## First run on phase-4 code (2026-08-03, commit 650b5ea + scripts, 185H)
 
@@ -70,16 +92,28 @@ came back **DIRTY**, reproducibly:
 
 That is not a harness failure — it is the measurement. Phase 4 reads
 experts with buffered `pread`, so ~7.8 GiB of expert bytes land in the
-page cache, the cgroup pins at its 3 GiB ceiling, and ~4.9 GiB is
-reclaimed *inside a 13-token run*. Nothing OOMs (oom=0, oom_kill=0) and
+page cache, the cgroup pins at its 3 GiB ceiling, and ~4.82 GiB is
+reclaimed *inside a 13-token run* (1,264,370 x 4 KiB pages; EXP-006's own
+run reclaimed 1,263,046 pages, which is the same ~4.82 GiB — the two runs
+differ, the figure does not). Nothing OOMs (oom=0, oom_kill=0) and
 `memory.events max` is nonzero here, but note it would not have to be:
-the `pgsteal` check is the one that cannot be fooled. So no phase-4
+`pgsteal` is the check that catches reclaim `memory.events` misses. It
+is not unfoolable — it is only as good as `memory.stat` being readable,
+which is why an unreadable `memory.stat` is itself a hard problem (see 7
+above) rather than a pgsteal of 0. So no phase-4
 number from this harness is publishable under the docs rule, and phase 5
 (O_DIRECT, which keeps expert bytes out of the page cache entirely)
 should be the thing that first turns this verdict CLEAN. That transition
 is itself a result worth recording in `docs/experiments/README.md`.
 
-Python stdlib only. Linux + cgroup v2 + systemd --user only, by design.
+Python stdlib only. Linux **>= 6.5** + cgroup v2 + systemd --user only, by
+design. The kernel floor is `memory.swap.peak`, which first appears in
+6.5: rule 7 makes an unreadable counter DIRTY, and on an older kernel
+that one counter is *always* unreadable, so every run would be reported
+DIRTY with nothing the user could do about it. `preflight()` refuses up
+front instead. (`memory.peak` arrived in the same release and is read
+here, but nothing classifies on it, so only `memory.swap.peak` sets the
+floor.)
 """
 
 from __future__ import annotations
@@ -323,7 +357,43 @@ def inner(args) -> int:
 # ---------------------------------------------------------------------------
 
 
+# cgroup v2 `memory.swap.peak` (and `memory.peak`) first appear in Linux
+# 6.5. `classify` treats an unreadable counter as DIRTY, so below 6.5 this
+# harness cannot produce a CLEAN verdict on any run, ever.
+SWAP_PEAK_MIN_KERNEL = (6, 5)
+
+
+def kernel_version() -> tuple[int, int] | None:
+    """`(major, minor)` from `uname -r`, or None if it does not parse."""
+    m = re.match(r"(\d+)\.(\d+)", os.uname().release)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def preflight(args) -> None:
+    # Checked here rather than left to `classify`, because it is the one
+    # DIRTY cause with no remedy: `memory.swap.peak` does not exist before
+    # Linux 6.5, `read_int` returns None for it, unknown-is-DIRTY fires, and
+    # every run on Debian 12 (6.1), Ubuntu 22.04 (5.15) or RHEL 9 (5.14)
+    # comes back dirty no matter how clean it actually was. A harness that
+    # cannot pass is a broken harness, not a failing measurement, so it is
+    # exit 2 up front instead of exit 1 forever.
+    kernel = kernel_version()
+    if kernel is None:
+        fail(f"cannot parse a kernel version out of {os.uname().release!r}; "
+             f"this harness needs Linux >= "
+             f"{SWAP_PEAK_MIN_KERNEL[0]}.{SWAP_PEAK_MIN_KERNEL[1]} for the "
+             f"cgroup v2 `memory.swap.peak` counter its hygiene verdict "
+             f"depends on")
+    if kernel < SWAP_PEAK_MIN_KERNEL:
+        fail(f"Linux {kernel[0]}.{kernel[1]} is too old: cgroup v2 "
+             f"`memory.swap.peak` first appears in "
+             f"{SWAP_PEAK_MIN_KERNEL[0]}.{SWAP_PEAK_MIN_KERNEL[1]}, this "
+             f"harness classifies an unreadable counter as DIRTY, and that "
+             f"counter is unreadable on every run here — so every run would "
+             f"be DIRTY with no remedy. Debian 12 (6.1), Ubuntu 22.04 (5.15) "
+             f"and RHEL 9 (5.14) are all below the floor. Take the "
+             f"measurement on a >= "
+             f"{SWAP_PEAK_MIN_KERNEL[0]}.{SWAP_PEAK_MIN_KERNEL[1]} kernel.")
     found = subprocess.run(["pgrep", "-a", "ramvamp"],
                            capture_output=True, text=True, check=False)
     if found.returncode == 0 and found.stdout.strip():
@@ -349,41 +419,99 @@ def pg_total(pg: dict[str, int], prefix: str) -> int:
     return sum(v for k, v in pg.items() if k.startswith(prefix + "_"))
 
 
-def classify(run: dict, want_max: int) -> tuple[str, list[str]]:
-    """CLEAN or DIRTY, with the reasons. Reclaim beats every other signal."""
-    problems = []
-    steal = pg_total(run.get("pg", {}), "pgsteal")
-    scan = pg_total(run.get("pg", {}), "pgscan")
-    if steal:
-        problems.append(
-            f"pgsteal {steal} pages ({mib(steal * PAGE)}) reclaimed under "
-            f"pressure — the working set did not fit, the timing is not a "
-            f"clean {want_max // 2**30} GB measurement")
-    elif scan:
-        problems.append(f"pgscan {scan} pages with no steal (pressure, no loss)")
-    events = run.get("memory_events") or {}
-    for key in ("max", "oom", "oom_kill", "oom_group_kill", "high"):
-        if events.get(key):
-            problems.append(f"memory.events {key}={events[key]}")
-    if run.get("memory_max") not in (want_max, None):
-        problems.append(
-            f"memory.max is {run.get('memory_max')}, expected {want_max} — "
-            f"the memory controller may not be delegated to the user slice")
-    if run.get("memory_swap_max") not in (0, None):
-        problems.append(f"memory.swap.max is {run.get('memory_swap_max')}, "
-                        f"expected 0 (zram counts as swap)")
-    if run.get("memory_swap_peak"):
-        problems.append(f"swapped {mib(run['memory_swap_peak'])}")
+# Problem severities. HARD invalidates the measurement; SOFT is reported
+# but survivable. The severity travels with the problem as a field, so
+# rewording a message can never change a verdict — the previous version
+# decided this by `str.startswith("pgscan ")`.
+HARD, SOFT = "hard", "soft"
+
+
+def classify(run: dict, want_max: int) -> tuple[str, list[dict]]:
+    """CLEAN or DIRTY, with the reasons. Reclaim beats every other signal.
+
+    Every counter below has three states, not two: confirmed good,
+    confirmed bad, and *unknown*. Unknown is DIRTY. `read_int` and
+    `read_kv` return `None`/`{}` for an unreadable file, and an unreadable
+    file is the normal outcome when the memory controller is not delegated
+    or the cgroup path does not resolve — i.e. exactly when the run was not
+    confined at all. Exempting `None` would make an unconfined run the
+    cleanest run this harness can report.
+    """
+    problems: list[dict] = []
+
+    def note(severity: str, message: str) -> None:
+        problems.append({"severity": severity, "message": message})
+
+    if not run.get("cgroup"):
+        note(HARD, "the inner wrapper could not resolve its own cgroup from "
+                   "/proc/self/cgroup — the run was not measurably confined "
+                   "and no cgroup counter below could be read")
+
+    pg = run.get("pg") or {}
+    if not pg:
+        note(HARD, "memory.stat exposed no pgscan/pgsteal counters — reclaim "
+                   "could not be measured, so this run is not verified "
+                   "clean (this is the unknown state, not a clean one)")
+        steal = scan = 0
+    else:
+        steal = pg_total(pg, "pgsteal")
+        scan = pg_total(pg, "pgscan")
+        if steal:
+            note(HARD,
+                 f"pgsteal {steal} pages ({mib(steal * PAGE)}) reclaimed "
+                 f"under pressure — the working set did not fit, the timing "
+                 f"is not a clean {want_max // 2**30} GB measurement")
+        elif scan:
+            # Pressure the kernel survived: worth reporting, but it did not
+            # cost the run any resident page, so the timing still stands.
+            note(SOFT, f"pgscan {scan} pages with no steal (pressure, no loss)")
+
+    events = run.get("memory_events")
+    if not events:
+        note(HARD, "memory.events was unreadable or empty — OOM and limit "
+                   "hits could not be ruled out")
+    else:
+        for key in ("max", "oom", "oom_kill", "oom_group_kill", "high"):
+            if events.get(key):
+                note(HARD, f"memory.events {key}={events[key]}")
+
+    if run.get("memory_max") is None:
+        note(HARD, f"memory.max is unreadable, so a {want_max}-byte limit "
+                   f"could not be confirmed — the memory controller is "
+                   f"probably not delegated to the user slice, which means "
+                   f"the run was unconfined")
+    elif run.get("memory_max") != want_max:
+        note(HARD,
+             f"memory.max is {run.get('memory_max')}, expected {want_max} — "
+             f"the memory controller may not be delegated to the user slice")
+
+    if run.get("memory_swap_max") is None:
+        note(HARD, "memory.swap.max is unreadable, so swap could not be "
+                   "confirmed off (zram counts as swap)")
+    elif run.get("memory_swap_max") != 0:
+        note(HARD, f"memory.swap.max is {run.get('memory_swap_max')}, "
+                   f"expected 0 (zram counts as swap)")
+
+    if run.get("memory_swap_peak") is None:
+        note(HARD, "memory.swap.peak is unreadable, so it cannot be shown "
+                   "that the run never swapped")
+    elif run["memory_swap_peak"]:
+        note(HARD, f"swapped {mib(run['memory_swap_peak'])}")
+
     read = max(run.get("read_bytes_child_sampled", 0),
                run.get("read_bytes_rusage_children", 0))
     if read == 0:
-        problems.append("read_bytes delta is 0 — nothing came from the block "
-                        "layer, so the page cache was not actually cold")
+        note(HARD, "read_bytes delta is 0 — nothing came from the block "
+                   "layer, so the page cache was not actually cold")
+
     if run.get("returncode"):
-        problems.append(f"ramvamp exited {run['returncode']}")
-    # pgscan without pgsteal is pressure the kernel survived; it is worth
-    # reporting but does not by itself invalidate the timing.
-    hard = [p for p in problems if not p.startswith("pgscan ")]
+        note(HARD, f"ramvamp exited {run['returncode']}")
+    if run.get("systemd_run_returncode"):
+        note(HARD, f"systemd-run exited {run['systemd_run_returncode']} — the "
+                   f"confined run did not complete normally, so whatever "
+                   f"result file was classified is not this run's")
+
+    hard = [p for p in problems if p["severity"] == HARD]
     return ("CLEAN" if not hard else "DIRTY"), problems
 
 
@@ -393,6 +521,17 @@ def one_run(args, index: int, label: str) -> dict:
 
     result_file = os.path.join(
         args.workdir, f"run{index:02d}.json")
+    # Remove any file from an earlier invocation *before* launching. The
+    # `--workdir` default is stable across runs, so a systemd-run that fails
+    # to start would otherwise leave the previous run's JSON in place and
+    # the harness would happily classify it as this run's result.
+    for stale in (result_file, result_file + ".stdout", result_file + ".stderr"):
+        try:
+            os.unlink(stale)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            fail(f"cannot remove the stale result file {stale}: {e}")
     unit = f"ramvamp-cold-{os.getpid()}-{index}"
     inner_cmd = [
         sys.executable, os.path.abspath(__file__),
@@ -446,7 +585,7 @@ def one_run(args, index: int, label: str) -> dict:
           f"{run.get('read_bytes_rusage_children')}]")
     print(f"  hygiene: {verdict}")
     for problem in problems:
-        print(f"    - {problem}")
+        print(f"    - [{problem['severity']}] {problem['message']}")
     if run.get("stdout"):
         preview = run["stdout"].strip().replace("\n", " ")[:160]
         print(f"  output: {preview!r}")
@@ -503,6 +642,12 @@ def main() -> int:
             fail("--inner needs --result-file and --command")
         return inner(args)
 
+    if args.repeats < 1:
+        fail(f"--repeats {args.repeats} scores nothing; a run that measures "
+             f"zero runs cannot pass a hygiene gate. Use --repeats >= 1.")
+    if args.warmup < 0:
+        fail(f"--warmup {args.warmup} is negative")
+
     args.rvmp = os.path.abspath(args.rvmp)
     args.ramvamp = os.path.abspath(args.ramvamp)
     os.makedirs(args.workdir, exist_ok=True)
@@ -529,6 +674,9 @@ def main() -> int:
         runs.append(one_run(args, i, label))
 
     scored = [r for r in runs if r["label"] == "scored"]
+    if not scored:
+        fail(f"no scored runs out of {len(runs)} — nothing was measured, so "
+             f"there is no hygiene verdict to give")
     dirty = [r for r in scored if r["hygiene"] != "CLEAN"]
 
     print("\n=== summary ===")
@@ -552,8 +700,10 @@ def main() -> int:
     verdict = "PASS" if not dirty else "DIRTY"
     print(f"\nmeasurement hygiene: {verdict}"
           + ("" if not dirty else
-             f" — {len(dirty)}/{len(scored)} scored runs hit reclaim or a "
-             f"cgroup limit; do not publish these numbers"))
+             f" — {len(dirty)}/{len(scored)} scored runs hit reclaim, hit a "
+             f"cgroup limit, or left a counter the verdict depends on "
+             f"unreadable (unknown is DIRTY, not clean); see the [hard] "
+             f"lines above for which. Do not publish these numbers"))
 
     summary = {
         "workload": args.workload,

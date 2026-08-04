@@ -16,11 +16,16 @@
 //! overlaps only with compute that is guaranteed to run (cache-hit experts,
 //! shared expert when the model has one).
 //!
-//! Two claims that follow from our own measurements rather than theirs
-//! (EXP-005): the cache dial is a total byte budget rather than a slot count,
-//! and the eviction policy is LFU over frequency counters indexed by expert
-//! id whose counts survive eviction, which is where the win over LRU actually
-//! comes from.
+//! Two things that follow from our own measurements rather than theirs. The
+//! eviction policy is LFU over frequency counters indexed by expert id whose
+//! counts survive eviction, which is where the entire win over LRU comes from
+//! (EXP-005: without ghost history, per-slot LFU is worth -1.7 to 0.0 points
+//! against LRU). And the cache dial is specified as a total byte budget
+//! rather than a slot count, so that one config stays meaningful across
+//! models: 1,438.6 MiB of expert pool, which is 11 slots/layer on
+//! Qwen3-30B-A3B (EXP-012). That last one is **design intent, not current
+//! fact** - `SlotPool::new` and `LayerCache::new` take slot counts today, and
+//! wave 2 is where the configured quantity becomes bytes.
 
 pub mod format;
 pub mod generate;

@@ -33,12 +33,28 @@ ULPs. That distinction matters: a reordered JSON key or a new field is a
 harness artifact; a 1-ULP logit move at rank 3000 is a real regression.
 
 `--new DIR` compares an already-captured directory instead of re-running,
-so two baselines taken at different commits can be diffed offline.
+so two baselines taken at different commits can be diffed offline. Both
+sides are re-hashed from the files on disk in either mode — the recorded
+digests are only cross-checked against them, never substituted for them,
+because a capture directory can be regenerated without its manifest.
+
+An empty manifest is a failed capture and is rejected, not reported as
+`PASS 0/0`.
 
 Baseline captured 2026-08-03 on d80cc84 + scripts (phase-4 code, release
 build, 185H): 8/8 prompts, --top 4096, and an immediate second run
 compared byte-clean — the fingerprint is reproducible run to run, so a
 future mismatch is a code change and not harness noise.
+
+Exit codes, shared with the repo's other gate scripts (`cold_bench.py`,
+`greedy_regression.py`, `kl_vs_reference.py`, `lfu_sim.py`):
+
+  0  the gate ran and passed (or `capture` wrote a baseline)
+  1  the gate ran and failed — bytes differ, the forward pass changed
+  2  the gate could not run: the directory is not a capture, its manifest
+     lists no prompts, a listed payload is missing, a payload and its
+     manifest disagree, the capture directory exists and is not empty
+     without --force, ramvamp failed to start or timed out
 
 Python stdlib only.
 """
@@ -187,7 +203,38 @@ def load_manifest(d: str) -> dict:
     if not os.path.isfile(path):
         fail(f"{d} is not a bitident capture (no {MANIFEST})")
     with open(path) as f:
-        return json.load(f)
+        manifest = json.load(f)
+    if not manifest.get("prompts"):
+        fail(f"{path} lists no prompts; there is nothing to fingerprint. "
+             f"A capture that recorded 0 prompts is a failed capture, not a "
+             f"passing comparison — re-run `bitident.py capture`.")
+    return manifest
+
+
+def actual_digests(d: str, manifest: dict, what: str) -> dict[str, str]:
+    """Re-hash the capture's files. Never trust the recorded digest.
+
+    The manifest is just a file next to the payloads: a directory whose
+    `single_*.json` were regenerated but whose `manifest.json` was not would
+    otherwise compare as identical. Digests are cheap (8 x ~0.5 MB), the
+    whole point of the tool is byte-identity, so they are recomputed on
+    every side of every comparison and cross-checked against what the
+    manifest claims.
+    """
+    out: dict[str, str] = {}
+    for rec in manifest["prompts"]:
+        name = rec["file"]
+        path = os.path.join(d, f"{name}.json")
+        if not os.path.isfile(path):
+            fail(f"{what}: {path} is listed in {MANIFEST} but does not exist")
+        digest = sha256_file(path)
+        if digest != rec.get("sha256"):
+            fail(f"{what}: {path} hashes to {digest[:16]}... but {MANIFEST} "
+                 f"records {str(rec.get('sha256'))[:16]}... — the capture "
+                 f"directory and its manifest disagree, so neither can be "
+                 f"used as evidence. Re-capture it.")
+        out[name] = digest
+    return out
 
 
 def ulps(a: float, b: float) -> int:
@@ -272,6 +319,14 @@ def compare(args, base_dir: str) -> int:
         print(f"WARNING: model dir changed ({base['model']} -> "
               f"{new_manifest['model']})", file=sys.stderr)
 
+    # Both sides are re-hashed from the files on disk; the manifests only
+    # say which files to look at. In `--new DIR` mode nothing was run here,
+    # so the recorded digests are the *only* thing a naive comparison would
+    # look at, and a directory holding changed payloads under a stale
+    # manifest would report identical.
+    base_digests = actual_digests(base_dir, base, f"baseline {base_dir}")
+    new_digests = actual_digests(new_dir, new_manifest, f"comparand {new_dir}")
+
     new_by_file = {r["file"]: r for r in new_manifest["prompts"]}
     differing = []
     for rec in base["prompts"]:
@@ -281,8 +336,8 @@ def compare(args, base_dir: str) -> int:
             print(f"[{name}] MISSING in the new capture")
             differing.append((name, {"kind": "missing"}))
             continue
-        if got["sha256"] == rec["sha256"]:
-            print(f"[{name}] identical  {rec['sha256'][:16]}...")
+        if new_digests[name] == base_digests[name]:
+            print(f"[{name}] identical  {base_digests[name][:16]}...")
             continue
         detail = diff_prompt(os.path.join(base_dir, f"{name}.json"),
                              os.path.join(new_dir, f"{name}.json"))

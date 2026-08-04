@@ -19,16 +19,20 @@ Pre-push: all four must pass.
 ## Workspace
 
 - `crates/core` (`ramvamp-core`): runtime. Modules: `format` (packed .rvmp
-  model), `io` (io_uring streamer + LFU cache), `kernels` (CPU backend behind
-  a trait), `model` (arch config + forward pass), `kv`, `generate`.
+  model), `io` (io_uring streamer + slot pool + LFU cache), `kernels` (CPU
+  backend behind a trait), `threads` (CPU topology, affinity pinning, pinned
+  compute pool), `model` (arch config + forward pass), `kv`, `tokenizer`,
+  `generate`.
 - `crates/repack` (`ramvamp-repack`): streaming HF-to-.rvmp installer.
 - `crates/cli` (`ramvamp`): user-facing binary.
 
 ## Hard rules
 
-- Explicit reads for experts, never mmap demand paging (measured 3.54x
-  slower per cold read upstream, ~8x end to end in their simulator).
-  Common weights are mmap'd; experts are pread/io_uring'd.
+- Explicit reads for experts, never mmap demand paging (TurboFieldfare
+  measured mmap 3.54x slower per cold expert read, and ~8x slower end to end
+  in their full-token simulator; two separate measurements, see
+  `docs/landscape.md`). Common weights are mmap'd; experts are
+  pread/io_uring'd.
 - No speculative cross-layer expert prefetch (measured ~7% predictability).
 - No full model, shard, or tensor may ever be materialized in heap memory,
   in the runtime or the repacker.

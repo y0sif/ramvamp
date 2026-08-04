@@ -41,6 +41,18 @@ which is the reason their claims are credible.
 - [EXP-004: Full-vocab KL vs llama.cpp reference dumps; scalar/AVX2 noise floor](#exp-004-full-vocab-kl-vs-llamacpp-reference-dumps-scalaravx2-noise-floor) — KEEP
 - [EXP-005: Expert cache hit rate on measured routing traces (policy and slot sweep)](#exp-005-expert-cache-hit-rate-on-measured-routing-traces-policy-and-slot-sweep) — KEEP
 - [EXP-006: The phase-4 baseline cannot be measured cleanly in a 3G cgroup](#exp-006-the-phase-4-baseline-cannot-be-measured-cleanly-in-a-3g-cgroup) — NEUTRAL
+- [EXP-007: Slot aliasing under concurrent O_DIRECT reads](#exp-007-slot-aliasing-under-concurrent-o_direct-reads) — KEEP
+- [EXP-008: Reference-drive characterisation under O_DIRECT (queue depth, block size, per-blob latency, ReadFixed)](#exp-008-reference-drive-characterisation-under-o_direct-queue-depth-block-size-per-blob-latency-readfixed) — NEUTRAL
+- [EXP-009: Buffered vs O_DIRECT expert reads, page-cache charge inside the cgroup](#exp-009-buffered-vs-o_direct-expert-reads-page-cache-charge-inside-the-cgroup) — KEEP
+- [EXP-010: Compute-pool signalling: bounded spin then futex](#exp-010-compute-pool-signalling-bounded-spin-then-futex) — KEEP
+- [EXP-011: Row-range GEMV as the single code path](#exp-011-row-range-gemv-as-the-single-code-path) — KEEP
+- [EXP-012: Anonymous runtime memory is missing from the memory contract](#exp-012-anonymous-runtime-memory-is-missing-from-the-memory-contract) — KEEP
+
+Entries EXP-007 through EXP-012 were measured on a machine that was not
+quiet, and most are microbenchmarks rather than end-to-end runs. Under rule 2
+none of their numbers is publishable; they are recorded so that the design
+decisions they drove are traceable, and each states the re-measurement it
+needs.
 
 ## EXP-001: AVX2 K-quant dot kernels vs scalar reference
 
@@ -194,14 +206,57 @@ which is the reason their claims are credible.
   (near the 4K cap). A RoPE / KV-indexing / attention bug would compound
   with position; none does. The 512-token point (8e-6) is an unusually
   low-entropy continuation, not a depth trend.
-- Verdict: KEEP (measurement stands; no bug indicated)
+- Verdict: KEEP (measurement stands; no bug indicated; gate 3 revised, see
+  the recorded decision below)
 - Notes: per-position full-vocab KL of O(1e-2) is the floor for any two
   implementations of this 48-layer quantized stack that do not replicate
   arithmetic operation-for-operation; a 1e-3 mean is unachievable without
-  operation-identical kernels. Recommendation (decision pending): revise
-  gate 3 to mean full-vocab KL <= 3e-2 with the intra-engine scalar/AVX2
-  A/B recorded alongside as the noise floor; perplexity (gate 5) remains
-  the quality backstop. Reference capture also produced per-position
+  operation-identical kernels. **Recorded decision (2026-08-03):** gate 3
+  becomes mean full-vocab KL <= 3e-2, with the intra-engine scalar/AVX2 A/B
+  reported alongside as the noise floor; perplexity (gate 5) remains the
+  quality backstop. The 1e-3 target as written is recorded FAILED (mean
+  1.04e-2) and withdrawn; the revised gate is PASSED on the same data. The
+  decision is implemented as `KL_TARGET` in `scripts/kl_vs_reference.py` and
+  written into gate 3 of `docs/architecture.md`.
+
+  **Recorded decision (2026-08-04): gate 3 gains three more conditions.**
+  The 2026-08-03 decision above left gate 3 as a single mean, and
+  `scripts/kl_vs_reference.py` had since grown three further conditions
+  that were never written down anywhere. They are now stated in gate 3 of
+  `docs/architecture.md`, and recorded here as the decision that put them
+  there. Gate 3 passes only when all four hold: (i) mean full-vocab KL
+  <= 3e-2, unchanged; (ii) **every individual prompt <= 6e-2**
+  (`KL_PROMPT_CEILING`), because a mean over 8 prompts hides one blown
+  prompt behind seven good ones; (iii) **top-1 agreement on every prompt,
+  gated rather than reported**, because a flipped argmax is a behavioural
+  change at a KL the mean tolerates; (iv) **all 8 prompts actually
+  scored**, because a prompt dropped for a tokenizer mismatch or a short
+  reference dump shrinks the gate's denominator rather than the gate.
+
+  Evidence for the 6e-2 ceiling, which the original change did not cite:
+  the scalar/AVX2 A/B in this entry is the largest float-reordering
+  perturbation this codebase can produce short of an algorithmic change,
+  and it moved the worst per-prompt *cross-engine* KL to 3.4e-2. 6e-2 is
+  therefore 1.76x above the largest perturbation ever measured here and
+  2.2x above the worst status-quo prompt (2.72e-2, single_00). A single
+  blown prompt trips it; reordering every dot product in the engine does
+  not.
+
+  Honest caveat, and it is condition (iii) rather than the ceiling: **the
+  newly-gated top-1 agreement had no recorded margin.** This entry reports
+  top-1 8/8 but never how close any prompt came to flipping, and it
+  reports top-1 for the AVX2 side only, so a near-tie would fail
+  condition (iii) on pure float noise. Mitigation shipped with the
+  decision: `kl_vs_reference.py` now records the per-prompt top1-vs-top2
+  gap on both sides in `kl_results.json` and prints the tightest. First
+  measurement (2026-08-04, phase-4 build, same 8 prompts, `--skip-longs`):
+  tightest gap **0.228 nats** on single_05 (`def fibonacci(n):`) on the
+  ramvamp side, 0.494 nats on the llama.cpp side, with the full run at
+  mean KL 1.039e-2, worst prompt 2.721e-2, top-1 8/8, 8/8 scored, PASS.
+  No prompt is near a tie, so condition (iii) is not currently fragile -
+  and that is now measured rather than assumed.
+
+  Reference capture also produced per-position
   top-5000 dumps along 64-token paths (`path_*.npz`) and 128-token
   greedy texts (`greedy_texts.json`) for phase-5/6 regression fixtures.
   **Correction (2026-08-03, found while wiring these fixtures into
@@ -246,7 +301,14 @@ which is the reason their claims are credible.
   NOT quiet (a concurrent reader was active); it needs re-measuring under
   rule 2 before any tok/s figure derived from it is published, and the
   same probe on a quiet run gave 1.35 GB/s, so treat the io ms/token
-  column as optimistic by roughly 15%. Policies compared on identical traces:
+  column as optimistic by roughly 15%. (**The 1.59 GB/s constant is now
+  recorded as unsourced.** EXP-008 tabulates the drive probes and none of
+  them is 1.59; `scripts/lfu_sim.py` describes the same constant as a
+  *sequential* ceiling rather than as random reads at the expert stride;
+  and the value sits between EXP-008's random-read and large-block
+  numbers, so it can be neither. The three descriptions cannot all be
+  true. See EXP-008's Notes.)
+  Policies compared on identical traces:
   per-slot LFU, expert-indexed LFU with counters surviving eviction
   ("ghost"), LRU, aged LFU, windowed LFU, and Belady offline-optimal.
 - Baseline: the architecture doc's estimate of 40-60% hit rate at 10
@@ -262,6 +324,12 @@ which is the reason their claims are credible.
   | 16    | 58.1  | 2092     | 3500      | no      | 291         | 3.43          |
   | 24    | 70.3  | 3139     | 4546      | no      | 207         | 4.84          |
   | none  | 0     | 0        | 1407      | yes     | 690         | 1.45          |
+
+  The `total MiB` and `fits 3G` columns are **superseded by EXP-012**: they
+  add only the mmap'd common core and the KV cache to the pool, and omit the
+  115.1 MiB of anonymous runtime memory that EXP-012 measured. With that
+  tenant counted, 12 slots/layer does not fit. The `hit %` column is
+  superseded by the Correction below.
 
   Policy deltas at 10 / 16 slots (hit %): ghost-LFU 44.8 / 58.1,
   windowed LFU 44.7 / 58.0, aged LFU 43.0 / 56.6, per-slot LFU 42.6 /
@@ -296,22 +364,43 @@ which is the reason their claims are credible.
   12 slots/layer**, the largest pool that fits `memory.max=3G`, worth
   +5.1 points and -35 io ms/token over 10 for 261 MiB; there is no knee,
   marginal value falls monotonically, so the cgroup is the binding
-  constraint rather than diminishing returns. (2) **The LFU win comes
+  constraint rather than diminishing returns. **Superseded by EXP-012:**
+  that fit arithmetic omitted anonymous runtime memory, 12 slots/layer
+  does not fit once it is counted, and the dial is now a pool byte budget
+  of 1,438.6 MiB, which is 11 slots/layer on this model. The corrected
+  marginal value of 12 slots over 10 is **+4.46 points** (50.02 to
+  54.48), not +5.1; see the Correction above. (2) **The LFU win comes
   from ghost history, not from LFU.** Counters must be indexed by expert
   id over all `n_experts` and survive eviction (128 x u32 = 512 B per
-  layer, 24 KiB total); per-slot LFU beats LRU by only 0.0-1.7 points at
-  usable slot counts and loses at 48. `docs/architecture.md` said "LFU
-  eviction with recency tie-break", which reads as per-slot counters and
-  is the weaker policy. (3) **A global slot pool and prefill cache
-  warming are both closed as "no"** - the best static per-layer split
-  buys +0.53 points at the operating point, and replaying the prompt
-  into the cache buys +0.09. Upstream's 66.6% at 16 slots does not
-  reproduce here (58.1%, 8.5 points low) though the 16->24 and 16->32
-  deltas match their published shape, so no published claim should lean
-  on their absolute number. The doc's 4-8 tok/s band assumed 3.6 GB/s;
-  at the measured bandwidth the I/O-only ceiling at 12 slots is 2.87
-  tok/s, and I/O is not yet the binding constraint (phase-4 decode is
-  ~2 s/token, of which uncached I/O is 690 ms). Trace capture verified
+  layer, 24 KiB total); per-slot LFU is worth **-1.7 to 0.0 points
+  against LRU** at the slot counts measured here (tied at 42.6% at 10
+  slots; 55.4% against LRU's 57.1% at 16). `docs/architecture.md` said
+  "LFU eviction with recency tie-break", which reads as per-slot counters
+  and is the weaker policy, so the conclusion is stronger than the
+  original wording of this note made it: without ghost history, LFU is
+  not a small win over LRU, it is a small loss. (An earlier version of
+  this note, and of `docs/architecture.md`, also said per-slot LFU
+  "loses at 48" slots. No 48-slot row was ever recorded here.
+  `scripts/lfu_sim.py` can sweep 48, so the claim is checkable, but until
+  the row is in this log it is withdrawn.) (3) **A global slot pool and
+  prefill cache warming are both closed as "no"** - the best static
+  per-layer split buys +0.53 points at the operating point, and replaying
+  the prompt into the cache buys +0.09. Upstream's 66.6% at 16 slots does
+  not reproduce here: this simulation gives 58.1% at 16 slots, 8.5 points
+  low, but that is **not a like-for-like comparison**. 58.1% is the
+  sequential lower bound described in the Correction, and the
+  batch-pinned figure at 16 slots has never been computed, so the honest
+  statement is that the absolute levels disagree by at most 8.5 points
+  and by an unknown amount in truth. The 16->24 and 16->32 deltas match
+  their published shape either way, so no published claim should lean on
+  their absolute number. The doc's 4-8 tok/s band assumed 3.6 GB/s; the
+  2.87 tok/s I/O-only ceiling this entry derives at 12 slots inherits the
+  unsourced 1.59 GB/s constant and is re-derived in
+  `docs/architecture.md`. I/O is not yet the binding constraint, but the
+  two numbers that say so come from different machine states and must not
+  be combined per rule 3: phase-4 decode is ~2 s/token warm-cache and
+  uncgrouped (EXP-004), while the 690 ms of uncached expert I/O is a
+  simulation, not a measurement. Trace capture verified
   numerically inert: `ramvamp logits --top 1000` output is SHA-256
   identical with and without `--trace-experts`.
 
@@ -344,7 +433,7 @@ which is the reason their claims are credible.
   | wall / decode | 18.56 s, 0.81 tok/s |
   | `MemoryPeak` | 3072.0 MiB (pinned at the 3072.0 MiB ceiling) |
   | `memory.events max` | 6203 |
-  | `pgscan` / `pgsteal` | 1,263,046 / 1,263,046 (~4.8 GiB reclaimed) |
+  | `pgscan` / `pgsteal` | 1,263,046 / 1,263,046 (~4.82 GiB reclaimed) |
   | `read_bytes` | 8,217,182,208 (7836.5 MiB) |
 
   A 13-token generation pulled **7.8 GiB** through the block layer and
@@ -361,9 +450,307 @@ which is the reason their claims are credible.
   while `pgsteal` revealed 2.4 GiB had been silently reclaimed; clean
   page cache is dropped well before the hard limit trips. `cold_bench.py`
   therefore gates on `pgsteal == 0` and prints an explicit
-  CLEAN/DIRTY verdict separate from the performance figures. (3) The
+  CLEAN/DIRTY verdict separate from the performance figures. `pgsteal` is
+  the check this entry motivated, but quoting it alone understates what a
+  CLEAN verdict now asserts. A run is CLEAN only if **all** of the
+  following hold, each of them a hard problem on its own: the inner
+  wrapper resolved its own cgroup; `memory.stat` exposed
+  `pgscan`/`pgsteal` at all, and `pgsteal == 0`; `memory.events` was
+  readable and its `max`, `oom`, `oom_kill`, `oom_group_kill` and `high`
+  are all zero; `memory.max` was readable and equals the requested limit;
+  `memory.swap.max` was readable and is 0; `memory.swap.peak` was readable
+  and is 0; `read_bytes` from the block layer is nonzero (a zero delta
+  means eviction failed and the run was warm after all); and both
+  `ramvamp` and `systemd-run` exited 0. Each of those counters has three
+  states rather than two, and **unknown is DIRTY** - an unreadable counter
+  is exactly what an unconfined run produces, so a check that exempted its
+  own missing input would make the least-confined run the cleanest one the
+  harness can report. The single counter that is *systematically* missing
+  rather than diagnostic is `memory.swap.peak`, which does not exist
+  before Linux 6.5; on an older kernel every run would be DIRTY with no
+  remedy, so `preflight()` refuses to start there (exit 2) instead of
+  reporting a dirty measurement forever. (3) The
   first clean 3G measurement this project produces will be phase 5's,
   and the buffered-to-O_DIRECT transition is precisely what makes it
   possible: the same 1.4 GiB of expert reads measured a 1092.2 MiB
   cgroup peak buffered versus 5.0 MiB with O_DIRECT. That transition
-  gets its own entry when it lands.
+  gets its own entry when it lands. (The *measurement* is now written up
+  as EXP-009. The transition itself has still not landed, so the clean
+  rule-2 baseline this note promises is still outstanding.)
+
+## EXP-007: Slot aliasing under concurrent O_DIRECT reads
+
+- Date / commit: 2026-08-03 / probe predates c7f4870
+  (`feat/expert-streaming`); it is what `crates/core/src/io/slots.rs` was
+  written against.
+- Hypothesis: two concurrent O_DIRECT reads may share one destination
+  buffer as long as their byte ranges do not overlap, so slot ownership can
+  be expressed as index arithmetic rather than as an explicit free list.
+- Method: ad-hoc probe on the reference 185H against the installed expert
+  files on the btrfs volume, issuing concurrent O_DIRECT reads at QD
+  4/8/16/32 into (a) aliased and (b) exclusively leased destination buffers,
+  counting `EIO` returns and reading the volume's `corruption_errs` counter
+  before and after. Counts, not timings. **The probe harness is not in the
+  repo**, the machine was not quiet, and the run was not cgrouped: a
+  provisional microbenchmark under rule 2, and none of its numbers is
+  publishable.
+- Baseline: aliased destinations, which is the index-arithmetic design.
+- Result: aliasing two in-flight reads onto one buffer makes btrfs fail
+  checksum verification, measured at **13-27% spurious `EIO`** across
+  repeats, with matching increments to the filesystem's persistent
+  `corruption_errs` counter. An explicit free list handing out exclusive
+  leases measured **0 `EIO` across 4,000 reads** at QD 4/8/16/32. Second
+  finding from the same session: btrfs runs direct reads with page faults
+  disabled (`fs/btrfs/direct-io.c`) and silently completes through the
+  buffered path when it cannot fault the destination, with no error and a
+  full byte count returned, so the pool must fault every page at
+  construction.
+- Verdict: KEEP
+- Notes: this is why `SlotPool::acquire` returns an owning `SlotGuard` and
+  there is no by-index accessor: the aliasing bug is not expressible. Index
+  arithmetic is not sufficient because completions arrive out of order. The
+  13-27% spread is across repeats on an unquiet machine and should be read
+  as "frequently, not always" rather than as a rate to quote; re-measurement
+  under rule 2 is required before that rate appears anywhere outside this
+  log. The qualitative result, that aliasing corrupts and exclusive leases
+  do not, is what the design rests on and does not depend on the rate. The
+  consequence of the second finding is untested end to end: nothing yet
+  asserts at runtime that expert reads really are bypassing the page cache
+  (see EXP-009's Notes).
+
+## EXP-008: Reference-drive characterisation under O_DIRECT (queue depth, block size, per-blob latency, ReadFixed)
+
+- Date / commit: 2026-08-03 / phase-5 design pass, before c7f4870
+- Hypothesis: at the real 2.918 MiB expert stride, queue depth rather than
+  block size sets throughput, and registered buffers (`ReadFixed`) are worth
+  their pinning cost.
+- Method: ad-hoc O_DIRECT probes on the reference machine (Core Ultra 9
+  185H, Micron 2400 DRAM-less QLC, btrfs). **Harness not in the repo**,
+  machine not quiet, no cgroup, page-cache state not controlled: provisional
+  under rule 2 and not publishable. Two distinct probe series were run, and
+  the distinction matters because they disagree: (a) a throughput series
+  (queue depth swept at the expert stride, then block size swept), and (b) a
+  per-blob latency series plus a `ReadFixed`-versus-`Read` CPU comparison.
+  The two series were not run together.
+- Baseline: none. This is characterisation, not a change.
+- Result, series (a), throughput:
+
+  | probe | value |
+  |---|---|
+  | 2.918 MiB blobs, QD4 | 1.211 GB/s |
+  | 2.918 MiB blobs, QD8 | 1.349 GB/s |
+  | 2.918 MiB blobs, QD16 | 1.390 GB/s |
+  | block size 2.918 MiB | ~1.35 GB/s |
+  | block size 8 MiB | 1.86 GB/s |
+  | block size 16 MiB | 2.04 GB/s |
+  | block size 24 MiB | 2.15 GB/s |
+
+  Series (b), latency and CPU: per-blob **p50 2.34 ms at QD1** and **15.56
+  ms at QD8**; `ReadFixed` saves **~70 us of CPU per 3 MiB read** against
+  plain `Read`, about 4.5% of one core out of 22 at the decode read rate.
+
+  Two internal contradictions, recorded rather than smoothed over:
+
+  1. 2.34 ms for one 3,059,712 B blob is **1.31 GB/s at QD1**, above series
+     (a)'s 1.211 GB/s at QD4. Taken together, the two series say the drive
+     reaches series (a)'s QD4 number with no queue at all, which is not
+     consistent with "the drive saturates by QD4" as a claim about absolute
+     level.
+  2. 15.56 ms p50 with 8 blobs in flight is **1.57 GB/s aggregate**, 17%
+     above series (a)'s 1.349 GB/s at the same depth, and within 2% of the
+     1.59 GB/s constant `scripts/lfu_sim.py` uses. Whatever 1.59 GB/s is, it
+     is not from series (a).
+- Verdict: NEUTRAL (characterisation; three decisions rest on it, and one
+  widely used constant turns out to be unsourced)
+- Notes: decisions leaning on this entry are QD4-8 rather than deeper (the
+  *shape* of series (a), where QD4 is 87% of QD16, survives the level
+  disagreement between the series, and since the decode loop waits on all
+  misses the low end is preferred for latency); 16-24 MiB streaming buffers
+  for the phase-6 prefill sweep (+51% at 16 MiB over the expert stride); and
+  `ReadFixed` rejected, where the ~70 us is real but small against pinning
+  1.4-1.6 GiB with `FOLL_LONGTERM` under an 8 MiB `RLIMIT_MEMLOCK`.
+  **Unresolved, and it needs a measurement rather than an edit:** the 1.59
+  GB/s constant that the whole performance model is built on has three
+  mutually incompatible descriptions. `scripts/lfu_sim.py` calls it a
+  measured *sequential* ceiling; EXP-005 calls it *random reads at the
+  expert stride on a non-quiet machine with a concurrent reader* and says a
+  quiet run of the same probe gave 1.35 GB/s; `docs/architecture.md`
+  simultaneously described the whole table above, 1.35 included, as taken on
+  a machine that was not quiet. The value also sits between this table's
+  random-read numbers (1.211-1.390) and its large-block numbers (1.86-2.15),
+  so it cannot be either. Until the probe is redone under rule 2 with a
+  recorded run log, derive the performance model from the tabulated
+  1.211-1.349 GB/s at the chosen QD4-8 operating point and treat 1.59 GB/s
+  as unsourced.
+
+## EXP-009: Buffered vs O_DIRECT expert reads, page-cache charge inside the cgroup
+
+- Date / commit: 2026-08-03 / measured alongside the EXP-006 harness work
+- Hypothesis: O_DIRECT is a performance preference, and buffered `pread` is
+  acceptable inside a 3 GB cgroup because the expert working set per token
+  is small.
+- Method: the same 1.4 GiB of expert reads issued inside a `memory.max=3G`
+  cgroup twice, once buffered and once with O_DIRECT, reading `memory.peak`
+  from inside the cgroup. A read-volume probe, not a decode run; machine not
+  quiet; provisional under rule 2. This is a memory measurement rather than
+  a timing, so page-cache state matters less here than it would for a
+  throughput number, but it is still uncontrolled.
+- Baseline: buffered `pread`, which is what phase 4 ships.
+- Result: cgroup peak **1,092.2 MiB buffered** versus **5.0 MiB with
+  O_DIRECT** for the identical read volume. Buffered reads charge every
+  expert byte to our cgroup as page cache, and the kernel then reclaims
+  continuously against everything else in the budget. Consistent in
+  direction with EXP-006, where a 13-token generation pulled 7.8 GiB through
+  the block layer and held the cgroup at its 3,072 MiB ceiling for the whole
+  run.
+- Verdict: KEEP (O_DIRECT is a budget-correctness requirement, not a
+  performance preference)
+- Notes: this is the measurement EXP-006 promised an entry for. The
+  **transition itself has not landed**: the decode loop still reads experts
+  with buffered `pread`, so EXP-006's actual promise, a clean rule-2
+  baseline once experts go through io_uring plus O_DIRECT, is still
+  outstanding and gets its own entry when the loop is wired. Two things this
+  entry does not measure. First, whether O_DIRECT is honoured at runtime:
+  btrfs, tmpfs and loop-backed filesystems all accept the open and silently
+  fall back to buffered under the conditions listed in
+  `docs/architecture.md`, and `statx(STATX_DIOALIGN)` cannot be trusted to
+  report it, so the runtime owes an empirical page-cache-residency assertion
+  at startup that does not exist yet. Second, what O_DIRECT costs in
+  throughput: the 5.0 MiB side was not timed against the 1,092.2 MiB side.
+
+## EXP-010: Compute-pool signalling: bounded spin then futex
+
+- Date / commit: 2026-08-03 / c7f4870 (`crates/core/src/threads.rs`)
+- Hypothesis: a per-GEMV handoff between the coordinator and the compute
+  workers can afford a sleeping primitive, and `std::sync::mpsc` is the
+  convenient one.
+- Method: two probes, which are not comparable to each other. (a) An ad-hoc
+  handoff microbenchmark on the reference 185H comparing a futex wake/wait
+  pair, pure atomic spinning, and `std::sync::mpsc`, recording latency
+  percentiles and steady-state CPU occupancy in cores; **harness not in the
+  repo**. (b) A whole-pool round-trip probe that is in the repo and
+  rerunnable: `cargo test -p ramvamp-core -- --ignored wake_latency
+  --nocapture` (`threads::tests::wake_latency_probe`), release build, 20,000
+  timed `ComputePool::run` calls after 2,000 warmup, measuring publish ->
+  wake -> all workers -> barrier. Both warm, uncgrouped, on a machine that
+  was not quiet: provisional and diagnostic under rule 2, not publishable.
+- Baseline: `std::sync::mpsc`, the default choice.
+- Result, probe (a): a futex wake/wait pair is **p50 3.1 us** at **0.07
+  cores** of steady-state overhead; pure atomic spinning is **502 ns** but
+  burns **1.03 cores**; `std::sync::mpsc` is **p99 237 us**, which is
+  disqualifying for a per-GEMV barrier. Spinning buys ~2.6 us of latency in
+  exchange for a whole core, which is one of the six the GEMVs need.
+
+  Probe (b): the shipped compromise, a bounded spin of 64 `pause` rounds
+  followed by a futex wait, measures **p50 1.71 us** for the full round
+  trip.
+- Verdict: KEEP (bounded spin then futex)
+- Notes: 1.71 us is a whole-pool round trip across N workers, and the 3.1 us
+  and 502 ns figures are single wake/wait pairs from a different probe on a
+  different harness. They must not be put on one curve (rule 3), and in
+  particular 1.71 us is **not** evidence that the pool beats a bare futex:
+  probe (b) warms up for 2,000 iterations precisely so that the workers are
+  inside the spin window, which is the mid-token state, so it measures the
+  spin path and not the futex path. What the futex path costs when the pool
+  has gone idle between tokens has not been measured. Only probe (b) is
+  reproducible from the repo. This cost model also feeds the open
+  dedicated-E-core-reactor experiment; with the reactor inline on the
+  coordinator in v0, the choice is smaller than it looks.
+
+## EXP-011: Row-range GEMV as the single code path
+
+- Date / commit: 2026-08-03 / c7f4870 (`crates/core/src/kernels/gemv.rs`)
+- Hypothesis: GEMV can be split into contiguous row ranges for the compute
+  pool without changing a single output bit, so the whole-matrix entry
+  points can become thin wrappers over the row-range ones and there is one
+  code path rather than two that can drift.
+- Method: a rule-4 identical-output test, not a performance measurement.
+  Row-partitioned results compared bit for bit (`f32::to_bits`) against the
+  unpartitioned result over 8 partition schemes on 10 real model shapes, on
+  both the AVX2 and the scalar path (`cargo test -p ramvamp-core`).
+- Baseline: the whole-matrix GEMV entry points.
+- Result: bit-identical on every shape and every scheme, on both paths. Each
+  output row is an independent dot product, so partitioning by rows cannot
+  reorder any accumulation; the test confirms the implementation matches
+  that argument. **No speed measurement**: the pool is not wired into the
+  forward pass yet, so there is no end-to-end number and none is claimed.
+- Verdict: KEEP (enabler; correctness gate passed, performance not yet
+  measured)
+- Notes: the parallel-decode speedup this exists for is a phase-5 wave-2
+  measurement, and it is the one that decides whether compute or I/O is the
+  binding constraint (see EXP-005's Notes and the performance model in
+  `docs/architecture.md`). Nothing in this entry supports a tok/s claim.
+
+## EXP-012: Anonymous runtime memory is missing from the memory contract
+
+- Date / commit: 2026-08-03 / on top of c7f4870 (`feat/expert-streaming`)
+- Hypothesis: the memory contract's three tenants, the mmap'd common core,
+  the KV cache and the expert slot pool, account for everything charged to
+  the benchmark cgroup.
+- Method: peak anonymous memory sampled from inside the cgroup during a live
+  decode run. `common.bin` is mmap'd, so it is charged as `file` rather than
+  `anon`; the figure is therefore everything the runtime allocates rather
+  than maps, which is activations and scratch, tokenizer structures, thread
+  stacks, allocator arenas, and whatever KV pages the run actually touched.
+  **The run's context length, token count and page-cache state are not
+  recorded**, so this is provisional under rule 2 and has to be retaken
+  alongside a wired-in slot pool at the 4K context the contract budgets for.
+- Baseline: the memory contract as written, which budgets zero for this
+  tenant.
+- Result: **115.1 MiB** of peak anonymous memory. Added to the audited
+  tenants (common core 1,023.34 MiB, FP16 KV at 4K 384 MiB, and the expert
+  slot pool at the real per-layer strides from `experts/layout.json`):
+
+  | slots/layer | pool MiB | subtotal MiB | vs 3,072 MiB |
+  |---:|---:|---:|---:|
+  | 10 | 1,307.81 | 2,830.25 | 241.75 spare |
+  | 11 | 1,438.59 | 2,961.03 | 111.0 spare |
+  | 12 | 1,569.38 | 3,091.82 | **19.8 over** |
+  | 16, FP16 KV | 2,092.50 | 3,614.94 | 542.9 over |
+  | 16, Q8 KV | 2,092.50 | 3,422.94 | 350.9 over |
+
+  The 12 slots/layer that EXP-005 chose does not fit. 11 slots/layer does,
+  with 111.0 MiB spare.
+- Verdict: KEEP (dial revised from 12 to 11 slots/layer, that is, an expert
+  pool byte budget of 1,438.6 MiB on this model)
+- Notes: (1) The dial `docs/architecture.md` always specified is a **byte
+  budget** divided by layer count, and this is the measurement that makes
+  the distinction bite: 1,438.6 MiB of pool is 11 slots/layer on
+  Qwen3-30B-A3B, the byte figure is the portable one, and the slot count is
+  its consequence on this model. Today's APIs,
+  `SlotPool::new(slots_per_layer, layer_strides)` and
+  `LayerCache::new(n_slots, n_experts)`, both take slot counts, so the byte
+  budget is design intent that wave 2 implements and not current fact.
+  (2) **The hit rate at 11 slots/layer has not been measured.** It is
+  bracketed by the batch-pinned replay figures at 10 and 12 slots (50.02%
+  and 54.48%, EXP-005 Correction); interpolating between them is not a
+  measurement, and the sweep should be re-run at 11 before any hit rate is
+  attached to the shipped dial. (3) 16 slots/layer no longer closes under
+  any single saving: it needs a **4G cgroup** (3,614.9 MiB, or 3,422.9 MiB
+  even with a Q8 KV cache). It is an experiment about larger machines rather
+  than a tuning step on this one, and the backlog item is restated that way.
+  (4) Double-counting caveat: the KV cache is allocated zeroed at full
+  context capacity and faulted lazily, so a short decode run charges only
+  the KV rows it actually touched, and the 115.1 MiB therefore includes a
+  small, unquantified slice of the 384 MiB KV line. The slot pool is not
+  double-counted: it faults every page at construction, but it is not yet
+  wired into decode, so none of it was resident when this was sampled. Both
+  facts point the same way, which is that 115.1 MiB is a floor for this
+  tenant and the 111.0 MiB of spare at 11 slots/layer is not yet proven.
+  (5) This partly answers and partly supersedes the backlog item "peak RSS
+  of scratch + program + tokenizer against the headroom the dial leaves":
+  the tenant to budget is `anon`, program text is file-backed and lands with
+  the mmap'd core rather than here, and the number is now measured rather
+  than guessed.
+  (6) **Provenance correction (2026-08-04).** `docs/architecture.md`
+  labelled the 115.1 MiB cell "(measured, EXP-012)" in its memory-contract
+  table, which contradicted this entry: the Method above records that the
+  run's context length, token count and page-cache state were not captured,
+  so the figure fails rule 2 and is *provisional*, not measured, under that
+  document's own three-way provenance rule. The cell now reads provisional,
+  and so do the Subtotal, the 111.0 MiB headroom, and the `subtotal MiB` /
+  `vs 3,072 MiB` columns of the slot table, all of which are arithmetic on
+  it — including the 19.8 MiB overshoot that moved the dial from 12 to 11.
+  The doc's Open-risk paragraph already explained this 35 lines further
+  down; the headline row is the one most likely to be quoted without it.
+  Nothing about the numbers changed, only what may be published.

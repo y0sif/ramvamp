@@ -33,8 +33,21 @@ Trace format `RVMPTRC1`, written by `TraceWriter` in `crates/cli/src/main.rs`
       n_layers   u32      layers per record
       n_experts  u32      routed experts per layer (the id space)
       top_k      u32      routed experts per layer per token
-      n_records  u32      complete records
-    record, 8 + n_layers * top_k * 4 bytes, repeated n_records times
+      n_records  u32      cross-check only, NOT authoritative: 0 means
+                          "never closed cleanly" (an interrupted capture,
+                          and also what a legitimately empty capture
+                          writes), anything else must equal the count
+                          derived from the file length
+    record, 8 + n_layers * top_k * 4 bytes, repeated to the end of the file
+
+The record count is derived from the file length, not read from the
+header: `TraceWriter::finish()` is the only thing that stamps
+`n_records` and it never runs on an error path or on Ctrl-C, so an
+interrupted capture leaves a full body behind a zero header. Deriving
+makes such a capture usable; a trailing partial record is ignored, and a
+nonzero header count that disagrees with the derived one means the file
+changed after it was stamped - short of the header means lost bytes,
+longer means appended or spliced - and is rejected either way.
       phase      u8       0 = prefill, 1 = decode
       _pad       [u8; 3]  zero
       position   u32      sequence position of the token
@@ -44,6 +57,17 @@ Trace format `RVMPTRC1`, written by `TraceWriter` in `crates/cli/src/main.rs`
                           router probability
 
 Python stdlib only, like the repo's other scripts.
+
+Exit codes, shared with the repo's gate scripts (`bitident.py`,
+`cold_bench.py`, `greedy_regression.py`, `kl_vs_reference.py`):
+
+  0  the run completed
+  1  unused here. Across the other scripts it means "the gate ran and
+     the thing under test failed"; this one reports a sweep and has no
+     pass/fail verdict of its own, so it never returns 1
+  2  the simulation could not run (unreadable or damaged trace, unknown
+     policy, geometry that does not match the layout, a trace with no
+     decode records)
 
 Example:
 
@@ -101,9 +125,15 @@ PHASE_DECODE = 1
 
 
 def fail(message: str) -> None:
-    """Abort with a message on stderr."""
+    """Abort with a message on stderr.
+
+    Exit 2, not 1, to match the repo's other gate scripts: 1 means "the
+    gate ran and the thing under test regressed", and nothing here can
+    produce that verdict. Reaching this function always means the
+    simulation could not run at all.
+    """
     print(f"lfu_sim: {message}", file=sys.stderr)
-    sys.exit(1)
+    sys.exit(2)
 
 
 # --------------------------------------------------------------------------
@@ -160,7 +190,9 @@ def read_trace(path: str) -> Trace:
         fail(f"{path}: {len(blob)} bytes, shorter than the {HEADER_BYTES}-byte header")
     if blob[:8] != TRACE_MAGIC:
         fail(f"{path}: bad magic {blob[:8]!r}, expected {TRACE_MAGIC!r}")
-    version, n_layers, n_experts, top_k, n_records = struct.unpack_from("<5I", blob, 8)
+    version, n_layers, n_experts, top_k, n_records_hdr = struct.unpack_from(
+        "<5I", blob, 8
+    )
     if version != TRACE_VERSION:
         fail(f"{path}: trace version {version}, this reader speaks {TRACE_VERSION}")
     if n_layers == 0 or top_k == 0:
@@ -168,9 +200,33 @@ def read_trace(path: str) -> Trace:
 
     ids_per_record = n_layers * top_k
     record_bytes = 8 + ids_per_record * 4
-    want = HEADER_BYTES + n_records * record_bytes
-    if len(blob) < want:
-        fail(f"{path}: header claims {n_records} records ({want} B), file is {len(blob)} B")
+    # The count is derived from the file length, never taken from the header,
+    # and matches the Rust reader for the same format. `TraceWriter::finish()`
+    # is the only thing that stamps `n_records`, and it never runs on an error
+    # path or on Ctrl-C, so an interrupted capture is a full body behind a zero
+    # header - deriving the count makes it usable instead of silently
+    # analysing zero records of it.
+    body = len(blob) - HEADER_BYTES
+    n_records, tail = divmod(body, record_bytes)  # tail = half-written record
+    # Header count is a cross-check: 0 = never closed cleanly, else it must
+    # match. Any other value means the file is not the capture its header
+    # describes - the body can disagree in either direction, and a prefix of
+    # a trace and a splice of two traces are equally not the trace.
+    if n_records_hdr not in (0, n_records):
+        direction = (
+            "fewer records than the header stamped, so the body lost bytes "
+            "after it was written"
+            if n_records < n_records_hdr
+            else "more records than the header stamped, so bytes were "
+            "appended to or spliced into the body after it was written"
+        )
+        fail(
+            f"{path}: header claims {n_records_hdr} records, the {body}-byte "
+            f"body holds {n_records} ({record_bytes} B each"
+            + (f" plus a {tail} B partial record" if tail else "")
+            + f"): {direction}. Either way this file is not one complete "
+            f"capture and replaying it would measure the damage."
+        )
 
     phases = array.array("B", bytes(n_records))
     positions = array.array("I", bytes(4 * n_records))
@@ -633,7 +689,11 @@ def simulate(
 
 
 def layer_curves(
-    traces: list[Trace], slots_max: int, policy: str, age_period: int
+    traces: list[Trace],
+    slots_max: int,
+    policy: str,
+    age_period: int,
+    window_tokens: int = DEFAULT_WINDOW_TOKENS,
 ) -> tuple[list[list[int]], int]:
     """Per-layer hit counts for every slot count in `1..=slots_max`.
 
@@ -667,6 +727,7 @@ def layer_curves(
                         age_period=age_period,
                         n_experts=n_experts,
                         top_k=trace.top_k,
+                        window_tokens=window_tokens,
                     )
                 clock = 0
                 hits = 0
@@ -1412,6 +1473,37 @@ def main(argv: list[str]) -> int:
     if len(strides) != traces[0].n_layers:
         fail(f"layout has {len(strides)} layers, traces have {traces[0].n_layers}")
 
+    # Geometry preconditions, checked here rather than as a crash tens of
+    # minutes into the sweep.
+    if not slots_list:
+        fail("--slots is empty; give at least one slots-per-layer value")
+    if min(slots_list) < 1:
+        fail(f"--slots must be >= 1, got {min(slots_list)}")
+    if max(slots_list) > traces[0].n_experts:
+        fail(
+            f"--slots max is {max(slots_list)} but the traces only have "
+            f"{traces[0].n_experts} experts per layer; a slot array larger "
+            f"than the id space cannot be filled, and the per-layer hit "
+            f"curves are only defined up to {traces[0].n_experts} slots"
+        )
+    if traces[0].n_layers < 4:
+        fail(
+            f"traces have {traces[0].n_layers} layers; the per-layer profile "
+            f"compares the first and last quarter of the layers and needs at "
+            f"least 4"
+        )
+    # A header-only file is a valid RVMPTRC1 capture (n_records 0, empty
+    # body) but has nothing to replay. Say so, rather than reporting a
+    # 0.0%-hit-rate sweep and then dying in the cold-start table.
+    for t in traces:
+        if not t.records_of(PHASE_DECODE):
+            fail(
+                f"{t.name}: {t.n_records} records, none of them decode. The "
+                f"cache is only exercised during decode, so there is nothing "
+                f"to simulate - capture a trace that generates at least one "
+                f"token."
+            )
+
     print("=" * 96)
     print("EXPERT CACHE SIMULATION")
     print("=" * 96)
@@ -1497,7 +1589,13 @@ def main(argv: list[str]) -> int:
     if "lfu-aged" in policies:
         for period in (32, 64, 128, 256, 512, 1024):
             r = simulate(
-                traces, strides, args.profile_slots, "lfu-aged", period, False
+                traces,
+                strides,
+                args.profile_slots,
+                "lfu-aged",
+                period,
+                False,
+                args.window_tokens,
             )
             r["age_period"] = period
             aging.append(
@@ -1513,7 +1611,9 @@ def main(argv: list[str]) -> int:
     if args.pool_analysis:
         # Headroom above the sweep so the allocator can actually skew.
         slots_max = min(2 * max(slots_list), traces[0].n_experts)
-        curves, accesses = layer_curves(traces, slots_max, knee_policy, args.age_period)
+        curves, accesses = layer_curves(
+            traces, slots_max, knee_policy, args.age_period, args.window_tokens
+        )
         n_layers = traces[0].n_layers
         for slots in slots_list:
             alloc, hits = greedy_pool(curves, slots * n_layers)

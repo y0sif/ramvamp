@@ -6,7 +6,10 @@
 //! destination buffers that io_uring + `O_DIRECT` reads land in and that the
 //! expert GEMVs then read from.
 //!
-//! Two hard requirements, both measured rather than assumed:
+//! Two hard requirements. Both follow from the kernel source cited below;
+//! the percentages attached to them come from bring-up runs on btrfs that
+//! are **not yet an entry in `docs/experiments/README.md`**, so treat every
+//! number here as provisional until they are.
 //!
 //! - The backing pages must be touched before any O_DIRECT read targets
 //!   them. btrfs runs direct reads with page faults disabled
@@ -15,7 +18,7 @@
 //!   no error, full byte count, and the page cache grows inside our cgroup.
 //! - A slot backing an in-flight read is never handed to a second reader.
 //!   Aliasing two concurrent O_DIRECT reads onto one buffer makes btrfs
-//!   fail checksum verification (measured 13-27% spurious EIO, and it
+//!   fail checksum verification (provisional: 13-27% spurious EIO, and it
 //!   increments the filesystem's persistent `corruption_errs`). Index
 //!   arithmetic is not sufficient, because completions arrive out of order.
 //!
@@ -43,10 +46,40 @@
 //! [`SlotPool::acquire`] is the only way to obtain a slot and it yields an
 //! owning [`SlotGuard`]. A guard is the unique lease on its slot: the slot
 //! index leaves the layer's free stack on acquire and only returns on the
-//! guard's `Drop`. There is no by-index accessor, so two concurrent readers
-//! aliasing one buffer is not expressible. Guards are `Send`, so the io_uring
-//! path parks them in its in-flight table (keyed by `user_data`) for the
-//! lifetime of the read and drops them after the completion is consumed.
+//! guard's `Drop`, and there is no by-index accessor. So *while a guard is
+//! alive*, no second reader can name its bytes.
+//!
+//! That is a lease, and a lease is not a statement about in-flight DMA. The
+//! difference is the whole risk in this file: dropping a guard and acquiring
+//! again hands back the same slot at the same address, entirely from safe
+//! code, so a caller that drops a guard while its read is still in flight
+//! aliases the buffer exactly as if it had duplicated the pointer. Holding
+//! the guard until the completion has been reaped is therefore a **caller
+//! obligation**, not a structural guarantee. Two things make it visible:
+//!
+//! - [`SlotGuard::as_mut_ptr`] is `unsafe`, so every site that can create
+//!   in-flight DMA has to acknowledge the contract in writing.
+//! - [`SlotGuard::leak`] discharges the one case the obligation cannot cover
+//!   on its own — an unwind that tears down an in-flight table before its
+//!   completions can be reaped. Dropping those parked guards would recycle
+//!   buffers the kernel is still writing into; leaking them costs one slot
+//!   each and keeps the invariant.
+//!
+//! Recycling the address is only half of what a live read needs protected
+//! from, though: the bytes have to keep *existing*. A guard borrows the pool,
+//! so no live guard can outlive the slab — but `leak` consumes the guard and
+//! ends that borrow, and the same unwind that forced the leak normally drops
+//! the [`SlotPool`] a few frames further up. `Drop for SlotPool` therefore
+//! refuses to `dealloc` while any slot is still leased and leaks the whole
+//! slab instead, so a leaked slot's address stays owned by this process for
+//! good. That is deliberate and it is not cheap — the slab is the byte budget,
+//! up to 1438 MiB today — but it is bounded, it only happens on a teardown
+//! that has already given up on reaping a completion, and the alternative is
+//! the kernel writing into freed heap.
+//!
+//! Guards are `Send`, so the io_uring path parks them in its in-flight table
+//! (keyed by `user_data`) for the lifetime of the read and drops them after
+//! the completion is consumed.
 //!
 //! # Allocation
 //!
@@ -56,8 +89,8 @@
 //! `Vec::pop` and release is a `Vec::push` within that capacity, so the
 //! decode loop never allocates.
 
-
 use std::alloc::{Layout, alloc, dealloc};
+use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::slice;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -71,12 +104,31 @@ use thiserror::Error;
 /// unimplemented there), so it is fixed rather than discovered.
 pub const SLOT_ALIGN: usize = 4096;
 
-/// Largest slab [`SlotPool::new`] will attempt, in bytes (64 GiB).
+/// Largest slab [`SlotPool::new`] will attempt, in bytes (4 GiB).
 ///
-/// The design target is 12 slots/layer over 48 layers = 1569 MiB. The cap
-/// exists so that a corrupt or hostile layout turns into a typed error
-/// instead of an allocator abort.
-pub const MAX_POOL_BYTES: u64 = 64 << 30;
+/// The expert-cache dial is a byte budget rather than a slot count: 1438 MiB
+/// at the time of writing, which is 11 slots/layer over 48 layers at the
+/// installed Qwen3-30B-A3B strides. This cap sits about 2.8x above that, so
+/// every pool that could fit the 3 GB budget is still expressible, while a
+/// corrupt or hostile layout is not.
+///
+/// It is *not* the constraint that decides the top of EXP-005's sweep, and
+/// this cap being generous enough for 24 slots/layer does not mean the
+/// project can build one. 24 slots/layer is 3,291,217,920 B, over the
+/// 3,221,225,472 B of the `memory.max=3G` cgroup published numbers come from,
+/// so `check_resident_budget` refuses it there — before the mmap'd common
+/// core and the KV cache have taken their share. Under that cgroup the last
+/// expressible sweep point is **23 slots/layer**, at 3,154,083,840 B.
+///
+/// A cap alone would not be worth much. Under default Linux overcommit a
+/// multi-GiB `alloc` succeeds and returns non-null, so
+/// [`SlotError::AllocFailed`] never fires; it is the pre-fault pass touching
+/// every page that would then get the process OOM-killed inside its cgroup —
+/// no error at all, which is strictly worse than an abort. So
+/// [`SlotPool::new`] also refuses, before faulting anything, a slab that
+/// cannot fit in the memory this process is allowed to make resident
+/// ([`SlotError::ExceedsMemoryBudget`]).
+pub const MAX_POOL_BYTES: u64 = 4 << 30;
 
 /// Failures from sizing, allocating, or leasing expert slots.
 ///
@@ -115,6 +167,24 @@ pub enum SlotError {
         requested: u128,
         /// The cap that was exceeded.
         limit: u128,
+    },
+
+    /// The slab is at or over the memory this process may make resident, so
+    /// pre-faulting it would be an OOM kill rather than an error.
+    ///
+    /// Distinct from [`SlotError::AllocFailed`], which under default
+    /// overcommit is nearly unreachable: the allocation succeeds and it is
+    /// the touching of the pages that fails, fatally and silently. Checked
+    /// before a single page is touched.
+    #[error(
+        "slot pool needs {requested} bytes, at or over this process's {limit}-byte memory limit"
+    )]
+    ExceedsMemoryBudget {
+        /// Bytes the geometry asked for.
+        requested: u128,
+        /// Tightest limit found: a cgroup v2 `memory.max` on this process's
+        /// path, else `MemTotal`.
+        limit: u64,
     },
 
     /// The allocator refused the slab.
@@ -179,10 +249,12 @@ struct PoolState {
 /// `io/mod.rs`):
 ///
 /// ```text
-/// // 48 layers with the real Qwen3-30B-A3B strides, 12 slots each.
-/// let pool = SlotPool::new(12, &layer_strides)?;
+/// // 48 layers with the real Qwen3-30B-A3B strides. The dial is a byte
+/// // budget; 11 slots/layer is what 1438 MiB buys on this model today.
+/// let pool = SlotPool::new(11, &layer_strides)?;
 /// let mut slot = pool.acquire(layer)?;
-/// let dst: *mut u8 = slot.as_mut_ptr();   // io_uring read destination
+/// // SAFETY: `slot` is parked below and not touched until the CQE lands.
+/// let dst: *mut u8 = unsafe { slot.as_mut_ptr() };
 /// // ... submit, park `slot` in the in-flight table, wait for the CQE ...
 /// let filled: &[u8] = slot.as_slice();    // compute reads the filled blob
 /// // dropping `slot` returns it to that layer's free stack
@@ -219,10 +291,11 @@ impl SlotPool {
     /// each stride in `layer_strides`.
     ///
     /// Sizing arithmetic runs in 128-bit, so an absurd geometry is reported
-    /// rather than wrapped, and the slab is allocated with a null check so a
-    /// refusal is an error rather than an abort. Construction touches every
-    /// page, which for the 1569 MiB target configuration is the dominant
-    /// cost of this call.
+    /// rather than wrapped; the slab is checked against this process's memory
+    /// limit before it is faulted, so an absurd geometry is an error rather
+    /// than an OOM kill; and it is allocated with a null check, so a refusal
+    /// is an error rather than an abort. Construction touches every page,
+    /// which at the 1438 MiB budget is the dominant cost of this call.
     ///
     /// # Errors
     ///
@@ -230,8 +303,20 @@ impl SlotPool {
     /// [`SlotError::TooManyLayers`], or [`SlotError::ZeroStride`] for a
     /// degenerate geometry; [`SlotError::PoolTooLarge`] when the slab would
     /// exceed [`MAX_POOL_BYTES`] (or this platform's `isize::MAX`);
-    /// [`SlotError::AllocFailed`] when the allocator returns null.
+    /// [`SlotError::ExceedsMemoryBudget`] when it would not fit in the memory
+    /// this process may make resident; [`SlotError::AllocFailed`] when the
+    /// allocator returns null.
     pub fn new(slots_per_layer: u32, layer_strides: &[u64]) -> Result<Self, SlotError> {
+        Self::new_within(slots_per_layer, layer_strides, resident_limit())
+    }
+
+    /// [`SlotPool::new`] with the resident-memory limit supplied rather than
+    /// probed, so the budget path is testable on any host.
+    fn new_within(
+        slots_per_layer: u32,
+        layer_strides: &[u64],
+        limit: Option<u64>,
+    ) -> Result<Self, SlotError> {
         if slots_per_layer == 0 {
             return Err(SlotError::ZeroSlotsPerLayer);
         }
@@ -281,6 +366,10 @@ impl SlotPool {
         }
         // In range for the same reason.
         let total_bytes = total as usize;
+
+        // Before the allocator, because under overcommit the allocator is not
+        // the thing that says no: `prefault` below makes every byte resident.
+        check_resident_budget(total, limit)?;
 
         let alloc_layout = Layout::from_size_align(total_bytes, SLOT_ALIGN).map_err(|_| {
             SlotError::PoolTooLarge {
@@ -470,6 +559,16 @@ impl SlotPool {
         layer as usize * self.slots_per_layer as usize + slot as usize
     }
 
+    /// Whether any slot is still leased.
+    ///
+    /// Only [`SlotGuard::leak`] can make this true at drop time: every live
+    /// guard borrows the pool, so the borrow checker already proves none of
+    /// them outlives it. A leaked slot may still be an in-flight O_DIRECT
+    /// destination, which is what [`Drop`] consults this for.
+    fn any_slot_leased(&self) -> bool {
+        self.lock().leased.iter().any(|&leased| leased)
+    }
+
     /// Lock the bookkeeping, recovering from a poisoned mutex.
     ///
     /// A panic elsewhere while the lock was held cannot leave the free stacks
@@ -483,10 +582,26 @@ impl SlotPool {
 
 impl Drop for SlotPool {
     fn drop(&mut self) {
+        if self.any_slot_leased() {
+            // The other half of `SlotGuard::leak`. A leaked slot exists
+            // because its read could not be reaped, so the kernel may still
+            // be writing into it; freeing the slab here would hand those
+            // bytes back to the allocator under a live DMA, which is strictly
+            // worse than the recycled address `leak` was called to avoid.
+            // Leaking the whole slab is the only way to keep the address
+            // owned once the guard that borrowed this pool is gone.
+            tracing::error!(
+                total_bytes = self.total_bytes,
+                "expert slot pool dropped with slots still leased; leaking the \
+                 slab so an unreaped O_DIRECT read cannot land in freed memory"
+            );
+            return;
+        }
         // SAFETY: `base` came from `alloc(self.alloc_layout)` in `new` and was
         // never reallocated, so this is the same block with the identical
-        // layout. Every `SlotGuard` borrows the pool, so none can outlive it
-        // and no live view into the slab exists here.
+        // layout. Every `SlotGuard` borrows the pool, so none can outlive it;
+        // the branch above rules out the one case a borrow cannot — a slot
+        // whose guard was `leak`ed — so no live view into the slab exists here.
         unsafe { dealloc(self.base.as_ptr(), self.alloc_layout) };
     }
 }
@@ -496,9 +611,12 @@ impl Drop for SlotPool {
 /// While this value exists it is the only handle to its slot's bytes: no
 /// other `acquire` can return the same slot, and there is no by-index
 /// accessor on [`SlotPool`]. Dropping it returns the slot to the free stack,
+/// and the next `acquire` for that layer may hand out the identical address,
 /// so it must be held for the entire time a read is in flight — for io_uring
 /// that means parking it in the in-flight table, not dropping it at
-/// submission.
+/// submission, and [`SlotGuard::leak`]ing it if an unwind makes the
+/// completion unreapable. See [`SlotGuard::as_mut_ptr`] for the full
+/// contract.
 #[derive(Debug)]
 pub struct SlotGuard<'pool> {
     pool: &'pool SlotPool,
@@ -513,7 +631,11 @@ pub struct SlotGuard<'pool> {
 // SAFETY: the guard is the unique lease on a disjoint sub-range of the slab,
 // so moving it to another thread cannot create aliasing. It is only not
 // automatically `Send`/`Sync` because of the raw pointer; `&SlotGuard` grants
-// shared immutable reads and `&mut SlotGuard` is required for every write.
+// shared immutable reads and `&mut SlotGuard` is required for every write
+// *by Rust*. Writes by the kernel are outside that argument and are excluded
+// instead by the `unsafe` contract on `as_mut_ptr`, which forbids any slice
+// view while a read is in flight — including from a thread holding a shared
+// `&SlotGuard`, which is what this `Sync` impl makes possible.
 unsafe impl Send for SlotGuard<'_> {}
 // SAFETY: see the `Send` impl.
 unsafe impl Sync for SlotGuard<'_> {}
@@ -543,19 +665,32 @@ impl SlotGuard<'_> {
     ///
     /// Every byte was initialized to zero in [`SlotPool::new`], so this is
     /// defined even before the slot has been filled; it just reads zeros.
+    ///
+    /// **Not while a read is in flight.** A kernel write through the pointer
+    /// from [`SlotGuard::as_mut_ptr`] races any reference this returns, which
+    /// no `&self`/`&mut self` distinction can rule out. That obligation is
+    /// part of `as_mut_ptr`'s `unsafe` contract; it is restated here because
+    /// this function is safe and `SlotGuard` is `Sync`, so a `&SlotGuard`
+    /// shared with another thread can reach it.
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr` starts `len` initialized bytes inside the pool slab,
         // which outlives `self` via `pool`. This guard is the unique lease on
         // that range, and `&self` rules out a concurrent `&mut` view of it.
+        // That covers conflicting *Rust* references only; the caller of
+        // `as_mut_ptr` separately promised no kernel write is outstanding.
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     /// Mutable view of the slot, for a synchronous read destination
     /// (`read_exact_at`) or for tests.
+    ///
+    /// Carries the same "not while a read is in flight" obligation as
+    /// [`SlotGuard::as_slice`], for the same reason.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: as `as_slice`, plus `&mut self` proves no other reference
         // into this range exists. Ranges of distinct guards are disjoint by
-        // construction.
+        // construction. The kernel is not a Rust reference and is excluded by
+        // `as_mut_ptr`'s contract, not by this borrow.
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
@@ -565,13 +700,67 @@ impl SlotGuard<'_> {
     /// The pointer is valid for `len()` bytes for as long as this guard is
     /// alive, and it is 4096-aligned as btrfs's O_DIRECT path requires.
     ///
-    /// The kernel writing through it while no Rust reference exists is sound;
-    /// the caller's obligation is only to keep the guard alive until the
-    /// completion has been reaped, and not to hand the same pointer to two
-    /// concurrent reads (which would require duplicating it by hand — the
-    /// pool will not do it).
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+    /// # Safety
+    ///
+    /// Handing this pointer to the kernel starts a write that Rust cannot
+    /// see. Until the completion for that write has been reaped, the caller
+    /// must ensure that:
+    ///
+    /// - this guard stays alive and is not dropped. Dropping it returns the
+    ///   slot to the free stack, and the next [`SlotPool::acquire`] for that
+    ///   layer can hand the identical address to a second reader — from
+    ///   entirely safe code. This is the one way the pool's exclusivity can
+    ///   be lost, and it is on the caller;
+    /// - the [`SlotPool`] itself stays alive. Holding the guard is not
+    ///   enough on its own to say this, because [`SlotGuard::leak`] ends the
+    ///   guard's borrow of the pool: the bytes have to keep existing, not
+    ///   just keep their lease. A live guard already proves this through the
+    ///   borrow; a leaked one relies on `Drop for SlotPool` leaking the slab
+    ///   rather than freeing it while any slot is still leased;
+    /// - no second read is submitted against this pointer;
+    /// - no [`as_slice`](SlotGuard::as_slice),
+    ///   [`as_mut_slice`](SlotGuard::as_mut_slice), or
+    ///   [`as_ptr`](SlotGuard::as_ptr) view of the range is created,
+    ///   dereferenced, or held, from any thread — the guard is `Sync`, and a
+    ///   shared reference over bytes the kernel is writing is a data race.
+    ///   `as_ptr` is safe to *call* (it only computes an address), but
+    ///   reading through it while a read is in flight is the same race as
+    ///   `as_slice`.
+    ///
+    /// On an unwind that cannot reap the completion, [`SlotGuard::leak`] is
+    /// the correct way to satisfy the first two obligations at once.
+    pub unsafe fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr.as_ptr()
+    }
+
+    /// Give up this lease permanently: the slot never returns to its layer's
+    /// free stack, so nothing can ever be handed its address again.
+    ///
+    /// The escape hatch for the case a guard alone cannot cover — an unwind
+    /// that tears down an in-flight table before its completions have been
+    /// reaped. Dropping those guards would recycle buffers the kernel is
+    /// still writing into, which is the btrfs checksum failure this module
+    /// exists to prevent; leaking them costs one slot of capacity each and
+    /// keeps the invariant.
+    ///
+    /// The bytes are *not* freed with the rest of the slab afterwards. This
+    /// consumes the guard, which ends its borrow of the pool, and the same
+    /// unwind that made a completion unreapable will usually drop the
+    /// [`SlotPool`] a few frames up — so `Drop for SlotPool` refuses to
+    /// `dealloc` while any slot is still leased and leaks the slab instead.
+    /// Recycling the address and freeing the address are the same bug at
+    /// different scales, and `leak` has to answer both or it answers neither.
+    /// The cost is the whole slab rather than one slot, paid only on a
+    /// teardown that has already given up on the read.
+    pub fn leak(self) {
+        // Skipping `Drop` leaves `leased` set and the free stack short by
+        // one, which is exactly the intent.
+        let guard = ManuallyDrop::new(self);
+        tracing::warn!(
+            layer = guard.layer,
+            slot = guard.slot,
+            "expert slot leaked to protect an unreaped read; it will not be reused"
+        );
     }
 
     /// Read-only raw pointer to the slot base, 4096-aligned.
@@ -583,6 +772,106 @@ impl SlotGuard<'_> {
 impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
         self.pool.release(self.layer, self.slot);
+    }
+}
+
+/// Reject a slab that cannot be made resident at all.
+///
+/// Necessary, not sufficient: a pool under the process's limit can still be
+/// far too big next to the mmap'd common core and the KV cache, and sizing it
+/// inside the budget stays the caller's job. What this rules out is the case
+/// with no error path at all — a geometry so large that the allocation
+/// succeeds under overcommit and the pre-fault pass then gets the process
+/// killed, which reports nothing to anyone.
+fn check_resident_budget(requested: u128, limit: Option<u64>) -> Result<(), SlotError> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    // At the limit is already hopeless: the process's own text and stack, the
+    // mmap'd common core and the KV cache all have to fit under it too.
+    if requested >= u128::from(limit) {
+        return Err(SlotError::ExceedsMemoryBudget { requested, limit });
+    }
+    Ok(())
+}
+
+/// Bytes this process could hold resident at most, or `None` when the kernel
+/// will not say.
+///
+/// The tightest of `MemTotal` and every cgroup v2 `memory.max` on this
+/// process's path — published numbers come from a `memory.max=3G` cgroup, so
+/// the cgroup limit is the one that actually binds. cgroup v1 is not
+/// consulted; a host old enough to lack v2 falls back to `MemTotal`, which is
+/// still enough to catch a corrupt layout.
+#[cfg(target_os = "linux")]
+fn resident_limit() -> Option<u64> {
+    let mut limit = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|meminfo| parse_mem_total(&meminfo));
+    if let Ok(contents) = std::fs::read_to_string("/proc/self/cgroup")
+        && let Some(path) = parse_cgroup_v2_path(&contents)
+    {
+        for dir in cgroup_ancestors(path) {
+            let max = std::fs::read_to_string(format!("/sys/fs/cgroup{dir}/memory.max"))
+                .ok()
+                .and_then(|contents| parse_memory_max(&contents));
+            if let Some(max) = max {
+                limit = Some(limit.map_or(max, |current| current.min(max)));
+            }
+        }
+    }
+    limit
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resident_limit() -> Option<u64> {
+    None
+}
+
+/// This process's cgroup v2 path from `/proc/self/cgroup`: the `0::` line.
+#[cfg(target_os = "linux")]
+fn parse_cgroup_v2_path(contents: &str) -> Option<&str> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(str::trim_end)
+}
+
+/// A cgroup path and every ancestor up to the root, because the limit that
+/// binds this process is often set on a parent slice rather than the leaf.
+#[cfg(target_os = "linux")]
+fn cgroup_ancestors(path: &str) -> Vec<&str> {
+    let mut out = vec![path];
+    let mut rest = path;
+    while let Some(cut) = rest.rfind('/') {
+        rest = &rest[..cut];
+        out.push(rest);
+    }
+    out
+}
+
+/// A cgroup v2 `memory.max`, or `None` for the literal `max` (no limit).
+#[cfg(target_os = "linux")]
+fn parse_memory_max(contents: &str) -> Option<u64> {
+    let value = contents.trim();
+    if value == "max" {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// `MemTotal` from `/proc/meminfo`, in bytes. The kernel writes it in kB.
+#[cfg(target_os = "linux")]
+fn parse_mem_total(contents: &str) -> Option<u64> {
+    let line = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?;
+    let mut fields = line.split_whitespace();
+    let value: u64 = fields.next()?.parse().ok()?;
+    match fields.next() {
+        Some("kB") => value.checked_mul(1024),
+        None => Some(value),
+        _ => None,
     }
 }
 
@@ -703,15 +992,17 @@ mod tests {
         let expected_total: usize = strides.iter().map(|&s| s as usize).sum();
         assert_eq!(pool.total_bytes(), expected_total);
 
-        // The target configuration's accounting, checked without allocating
-        // it: 24 layers of each stride, 12 slots each.
-        let target_bytes = 24 * 12 * (3_059_712usize + 2_654_208);
-        assert_eq!(target_bytes, 1_645_608_960);
-        assert_eq!(
-            target_bytes / (1024 * 1024),
-            1569,
-            "target pool is 1569 MiB"
-        );
+        // The dial is a byte budget, so the arithmetic that matters is bytes
+        // per slot per model; the slot count is what a budget buys. Checked
+        // without allocating any of it: 24 layers of each stride.
+        let per_slot_per_model = 24 * (3_059_712usize + 2_654_208);
+        assert_eq!(per_slot_per_model, 137_134_080);
+        // 1438 MiB, the current default, is 11 slots/layer.
+        assert_eq!(11 * per_slot_per_model / (1024 * 1024), 1438);
+        // The next slot up costs 131 MiB more, and every configuration that
+        // could fit the 3 GB budget stays under the policy cap.
+        assert_eq!(12 * per_slot_per_model / (1024 * 1024), 1569);
+        assert!(24 * per_slot_per_model < MAX_POOL_BYTES as usize);
     }
 
     #[test]
@@ -1016,6 +1307,235 @@ mod tests {
                 "layer {layer} leaked slots"
             );
         }
+    }
+
+    /// The module's aliasing claim, stated as precisely as it is true: a
+    /// *live* guard is exclusive, but dropping one recycles its address from
+    /// entirely safe code. That is why holding the guard across an in-flight
+    /// read is a caller obligation and [`SlotGuard::as_mut_ptr`] is `unsafe`
+    /// rather than safe.
+    #[test]
+    fn a_dropped_guard_recycles_the_same_address() {
+        let pool = SlotPool::new(1, &[8192]).unwrap();
+        let first = pool.acquire(0).unwrap();
+        let addr = first.as_ptr() as usize;
+        drop(first);
+        let second = pool.acquire(0).unwrap();
+        assert_eq!(
+            second.as_ptr() as usize,
+            addr,
+            "a released slot comes back at the same address, so a guard \
+             dropped under a live read would alias it"
+        );
+    }
+
+    /// The other half: `leak` is how the unwind path keeps that from
+    /// happening when the completion cannot be reaped.
+    #[test]
+    fn a_leaked_guard_never_returns_to_the_free_stack() {
+        let pool = small_pool(2);
+        let leaked = pool.acquire(0).unwrap();
+        let addr = leaked.as_ptr() as usize;
+        leaked.leak();
+        assert_eq!(pool.free_slots(0), Some(1), "the slot stays leased");
+
+        let other = pool.acquire(0).unwrap();
+        assert_ne!(
+            other.as_ptr() as usize,
+            addr,
+            "the leaked slot was handed out again"
+        );
+        assert_eq!(
+            pool.acquire(0).unwrap_err(),
+            SlotError::Exhausted {
+                layer: 0,
+                slots_per_layer: 2
+            }
+        );
+        // Dropping the pool with a slot still leased must not free the slab:
+        // the point of the leak is that a read may still be landing in it.
+        drop(other);
+        assert!(
+            pool.any_slot_leased(),
+            "the leaked slot is what makes Drop keep the slab"
+        );
+        drop(pool);
+    }
+
+    /// The half of `leak` a guard cannot express: `leak` consumes the guard,
+    /// which ends its borrow of the pool, so nothing in the type system stops
+    /// the pool — and the slab — from being dropped out from under a read
+    /// that is still in flight. `Drop for SlotPool` closes that by refusing
+    /// to `dealloc` while any slot is leased.
+    ///
+    /// The `dealloc` itself is not observable from a test; what is observable
+    /// is the decision it branches on, so that is what this pins.
+    #[test]
+    fn a_pool_with_a_leaked_slot_does_not_free_its_slab() {
+        let pool = small_pool(2);
+        assert!(
+            !pool.any_slot_leased(),
+            "a fresh pool owes nothing to anyone"
+        );
+
+        // An ordinary lease, taken and returned, still leaves nothing owed:
+        // the slab is freed normally in that case.
+        let ordinary = pool.acquire(0).unwrap();
+        assert!(pool.any_slot_leased(), "a live guard holds its lease");
+        drop(ordinary);
+        assert!(
+            !pool.any_slot_leased(),
+            "a dropped guard hands its lease back"
+        );
+
+        // A leaked one does, forever, and that is what keeps the slab alive.
+        pool.acquire(0).unwrap().leak();
+        assert!(pool.any_slot_leased());
+        // Every other slot going home does not change that: one unreaped
+        // read is enough to make freeing the whole slab unsafe.
+        let mut rest = vec![pool.acquire(0).unwrap()];
+        for layer in 1..pool.n_layers() {
+            for _ in 0..pool.slots_per_layer() {
+                rest.push(pool.acquire(layer).unwrap());
+            }
+        }
+        drop(rest);
+        assert!(
+            pool.any_slot_leased(),
+            "the leaked slot must still pin the slab after every other guard \
+             has been returned"
+        );
+        drop(pool);
+    }
+
+    #[test]
+    fn the_raw_write_destination_is_the_slot_itself() {
+        let pool = SlotPool::new(1, &[8192]).unwrap();
+        let mut guard = pool.acquire(0).unwrap();
+        // SAFETY: no read is in flight, no slice view is live, and the guard
+        // outlives the pointer's use — the contract, discharged by hand.
+        let ptr = unsafe { guard.as_mut_ptr() };
+        assert_eq!(ptr as usize % SLOT_ALIGN, 0);
+        // SAFETY: `ptr` is the base of `guard.len()` owned writable bytes.
+        unsafe {
+            ptr.write(0xa5);
+            ptr.add(8191).write(0x5a);
+        }
+        assert_eq!(guard.as_slice()[0], 0xa5);
+        assert_eq!(guard.as_slice()[8191], 0x5a);
+    }
+
+    #[test]
+    fn a_slab_over_the_resident_budget_is_a_typed_error() {
+        // The decision, exactly: at or over the limit is refused, under it is
+        // allowed, and an unknown limit never refuses.
+        assert_eq!(check_resident_budget(1 << 20, None), Ok(()));
+        assert_eq!(check_resident_budget(1 << 20, Some(2 << 20)), Ok(()));
+        assert_eq!(
+            check_resident_budget(u128::from(3u64 << 30), Some(3 << 30)),
+            Err(SlotError::ExceedsMemoryBudget {
+                requested: u128::from(3u64 << 30),
+                limit: 3 << 30,
+            })
+        );
+        assert!(check_resident_budget(u128::from(MAX_POOL_BYTES), Some(3 << 30)).is_err());
+
+        // And end to end, with the limit injected so the test reads the same
+        // on every host: a geometry under `MAX_POOL_BYTES` that a 3 GB cgroup
+        // could never hold is refused *before* anything is allocated or
+        // faulted. Default overcommit would otherwise let the allocation
+        // succeed and turn the pre-fault pass into a silent OOM kill.
+        // 3.375 GiB: comfortably under the 4 GiB policy cap, so the cap does
+        // not get to answer this one.
+        let strides = vec![6 << 20; 48];
+        let err = SlotPool::new_within(12, &strides, Some(3 << 30)).unwrap_err();
+        assert_eq!(
+            err,
+            SlotError::ExceedsMemoryBudget {
+                requested: 48 * 12 * (6 << 20),
+                limit: 3 << 30,
+            }
+        );
+        const { assert!(48 * 12 * (6u64 << 20) < MAX_POOL_BYTES) };
+
+        // The same call is fine when the process may hold the slab.
+        SlotPool::new_within(1, &[4096], Some(3 << 30)).expect("4 KiB fits in 3 GiB");
+        SlotPool::new_within(1, &[4096], None).expect("an unknown limit is not a refusal");
+    }
+
+    /// [`MAX_POOL_BYTES`] is not the constraint that decides how many slots
+    /// this project can actually build. Published numbers come from a
+    /// `memory.max=3G` cgroup, which is tighter than the 4 GiB policy cap for
+    /// every slot count above 23 — so quoting the cap as evidence that the
+    /// whole EXP-005 sweep is reachable is wrong at the top of the sweep.
+    #[test]
+    fn the_benchmark_cgroup_binds_before_the_policy_cap() {
+        // The 3 GB benchmark cgroup, exactly as `memory.max` spells it.
+        const CGROUP_3G: u64 = 3 << 30;
+        assert_eq!(CGROUP_3G, 3_221_225_472);
+        // 24 layers of each real stride, one slot per layer.
+        let per_slot: u128 = 24 * (3_059_712 + 2_654_208);
+        assert_eq!(per_slot, 137_134_080);
+
+        // The top of the EXP-005 sweep is under the policy cap...
+        assert_eq!(24 * per_slot, 3_291_217_920);
+        assert!(24 * per_slot < u128::from(MAX_POOL_BYTES));
+        // ...and over the budget the benchmark actually runs in.
+        assert_eq!(
+            check_resident_budget(24 * per_slot, Some(CGROUP_3G)),
+            Err(SlotError::ExceedsMemoryBudget {
+                requested: 24 * per_slot,
+                limit: CGROUP_3G,
+            }),
+            "24 slots/layer does not fit a memory.max=3G cgroup"
+        );
+
+        // 23 is the real boundary, and it already claims 97.9% of the cgroup
+        // on its own.
+        assert_eq!(23 * per_slot, 3_154_083_840);
+        assert_eq!(
+            check_resident_budget(23 * per_slot, Some(CGROUP_3G)),
+            Ok(())
+        );
+        assert!(23 * per_slot * 100 / u128::from(CGROUP_3G) >= 97);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_resident_limit_probe_reports_something_plausible() {
+        let limit = resident_limit().expect("Linux always reports MemTotal");
+        assert!(
+            limit >= 64 << 20,
+            "implausible resident limit {limit}; the probe is misreading the kernel"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn budget_probe_parsers_read_the_kernel_formats() {
+        assert_eq!(parse_memory_max("3221225472\n"), Some(3 << 30));
+        assert_eq!(parse_memory_max("max\n"), None);
+        assert_eq!(parse_memory_max("garbage"), None);
+
+        assert_eq!(
+            parse_mem_total("MemTotal:       15914637 kB\nMemFree: 12 kB\n"),
+            Some(16_296_588_288)
+        );
+        assert_eq!(parse_mem_total("MemFree: 12 kB\n"), None);
+        assert_eq!(parse_mem_total("MemTotal:\n"), None);
+
+        assert_eq!(
+            parse_cgroup_v2_path("0::/user.slice/session.scope\n"),
+            Some("/user.slice/session.scope")
+        );
+        // A cgroup v1 line is not a v2 path.
+        assert_eq!(parse_cgroup_v2_path("7:memory:/foo\n"), None);
+
+        assert_eq!(
+            cgroup_ancestors("/user.slice/session.scope"),
+            ["/user.slice/session.scope", "/user.slice", ""]
+        );
+        assert_eq!(cgroup_ancestors("/"), ["/", ""]);
     }
 
     #[test]

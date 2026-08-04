@@ -21,8 +21,8 @@ machine with an NVMe SSD, CPU only. The tok/s target is under review; see
 
 v0 success criterion: coherent chat, decode throughput at or above the
 agreed floor (**OPEN**, currently written as >= 3 tok/s and pending the
-user's decision; the measured I/O-only ceiling on the reference drive is
-~2.9 tok/s, see "Performance model"), inside a cgroup with `memory.max=3G`
+user's decision; the derived I/O-only ceiling on the reference drive is
+~2.2-2.7 tok/s, see "Performance model"), inside a cgroup with `memory.max=3G`
 and `memory.swap.max=0` (zram counts as swap), cold page cache,
 KL-divergence vs llama.cpp within accepted tolerance on identical weights.
 
@@ -46,6 +46,25 @@ Throughput is dominated by block size, not queue depth. Queue depth saturates
 by QD4-8 (QD4 is already 87% of QD16), while raising the block size from
 2.9 to 24 MiB buys +59%. This is a DRAM-less QLC drive, not a high-end Gen4
 part, and the whole performance model below inherits that fact.
+
+Two provenance facts about these numbers that the performance model has to
+live with. Both are recorded in EXP-008 rather than smoothed over:
+
+- **This table is one probe series, and the per-blob latency figures quoted
+  later are another.** They were not run together and they disagree on
+  level, not on shape: the QD8 latency figure implies 1.57 GB/s aggregate
+  against the 1.349 GB/s tabulated here at the same depth.
+- **1.59 GB/s, the constant `scripts/lfu_sim.py` and EXP-005 build the
+  performance model on, does not appear in this table and cannot be
+  sourced.** It is described three incompatible ways: as a sequential
+  ceiling (in the simulator), as random reads at the expert stride on a
+  non-quiet machine with a concurrent reader (in EXP-005), and it sits
+  between this table's random-read numbers and its large-block numbers, so
+  it can be neither. EXP-005 also records a quiet run of the same probe at
+  1.35 GB/s while this section says the whole table came from a machine that
+  was not quiet; that contradiction is unresolved and needs the probe re-run
+  rather than an edit. Until then the performance model below is derived
+  from the tabulated 1.211-1.349 GB/s at the chosen QD4-8 operating point.
 
 ## Model pin (v0)
 
@@ -144,47 +163,85 @@ small scratch, quantized bytes copied unchanged, resumable, `manifest.json`
 validates before atomic promotion. The runtime hashes `manifest.json`,
 `common.bin`, and `layout.json` at load and each layer file on first use.
 
-## Memory contract (option B, agreed; dial revised 2026-08-03)
+## Memory contract (option B, agreed; dial revised 2026-08-03, twice)
 
 The expert-cache dial is a total memory budget, divided by layer count to get
-slots per layer. This keeps one config meaningful across models. For Qwen3
-(48 layers) the dial is **12 slots/layer**, revised up from 10 by EXP-005:
-12 is the largest pool that fits `memory.max=3G`. Gemma 4 (30 layers) gets
-proportionally more slots under the same byte budget; the exact count depends
-on its blob stride and has not been computed.
+slots per layer. This keeps one config meaningful across models. **That is
+design intent, not current fact:** `SlotPool::new(slots_per_layer,
+layer_strides)` and `LayerCache::new(n_slots, n_experts)` both take slot
+counts today, and wave 2 is where the configured quantity becomes bytes.
+
+For Qwen3 (48 layers) the budget is **1,438.6 MiB of expert pool, which is
+11 slots/layer**. The dial was 10 in the original design, revised up to 12 by
+EXP-005 as the largest pool that fits `memory.max=3G`, and back to 11 by
+EXP-012, which measured the tenant this table used to omit entirely. Gemma 4
+(30 layers) gets proportionally more slots under the same byte budget; the
+exact count depends on its blob stride and has not been computed.
 
 | Tenant | Qwen3 v0 | Notes |
 | --- | ---: | --- |
-| Common core (mmap, read-only) | 1,023.34 MiB (audited) | touched every token, page cache keeps it resident; counts toward cgroup |
-| KV cache FP16 | 384 MiB @ 4K | 96 KiB/token; linear append, 48 layers |
-| Expert slot pool | 1,569 MiB | 12 slots x 48 layers at the real per-layer strides (EXP-005), page-aligned, allocated once |
-| Subtotal | **2,977 MiB** | 95 MiB headroom under `memory.max=3G` (3,072 MiB) |
+| Common core (mmap, read-only) | 1,023.34 MiB (audited) | touched every token, page cache keeps it resident; charged to the cgroup as `file` |
+| KV cache FP16 | 384 MiB @ 4K | 96 KiB/token; linear append, 48 layers; allocated zeroed at full capacity and faulted lazily |
+| Expert slot pool | 1,438.59 MiB | 11 slots x 48 layers at the real per-layer strides, page-aligned, allocated once, every page faulted at construction |
+| Runtime anonymous memory | 115.1 MiB (**provisional**, EXP-012) | activations and scratch, tokenizer, thread stacks, allocator arenas; peak `anon` sampled from inside the cgroup on a live decode run whose context length, token count and page-cache state were not recorded — it fails rule 2, so it is a floor for this tenant, not a ceiling. See Open risk below |
+| Subtotal | **2,961.0 MiB** (**provisional**) | 111.0 MiB headroom under `memory.max=3G` (3,072 MiB), also provisional: both cells inherit the provenance of the anon row above, and neither may be published until that row is re-measured |
 
-Measured by simulation against the real `experts/layout.json` strides
-(EXP-005); the pool figure is exact arithmetic on audited strides, not an
-estimate. Hit rate at 12 slots/layer is 49.9% on 556 decode tokens of real
-routing traces, worth +5.1 points over the 44.8% at 10 slots in exchange for
-261 MiB. There is no knee in the curve: marginal value falls monotonically,
-so the cgroup ceiling is the binding constraint, not diminishing returns.
+The pool figures are exact arithmetic on the audited strides in
+`experts/layout.json` (3,059,712 B on the 24 Q6_K-down layers, 2,654,208 B on
+the other 24), not estimates. Against 1,522.44 MiB of fixed tenants
+(1,023.34 + 384 + 115.1). Only the `pool MiB` column is exact: 115.1 of
+those 1,522.44 MiB is provisional, so the `subtotal MiB` and
+`vs 3,072 MiB` columns below are **provisional** too, including the 19.8
+MiB overshoot that moved the dial.
 
-**Open risk:** scratch, program text, and the tokenizer must now fit in the
-95 MiB of headroom. Earlier revisions budgeted ~150 MiB for them against a
-~2.8 GiB subtotal. Peak RSS of those tenants has not been measured; if it
-exceeds 95 MiB the dial drops back a slot per layer, or the KV cache goes Q8.
-Needs a measurement before the 12-slot dial is treated as settled.
+| slots/layer | pool MiB | subtotal MiB | vs 3,072 MiB |
+| ---: | ---: | ---: | ---: |
+| 10 | 1,307.81 | 2,830.25 | 241.75 spare |
+| 11 | 1,438.59 | 2,961.03 | 111.0 spare |
+| 12 | 1,569.38 | 3,091.82 | **19.8 over** |
 
-16 slots/layer is the next real step (58.1% hit, +8.2 points over 12) but its
-2,092 MiB pool puts the subtotal at 3,499 MiB, which does **not** fit. Halving
-the KV cache to Q8 is a necessary condition but not a sufficient one: 2,092 +
-1,023 + 192 = 3,307 MiB, still 235 MiB over the 3,072 MiB ceiling with nothing
-left for scratch. So 16 slots needs Q8 KV *and* a second saving (shorter
-context, or a smaller resident common core). Filed as an experiment with that
-gap stated, not shipped.
+That 19.8 MiB is why the dial moved back: **12 slots/layer does not fit**
+once anonymous runtime memory is counted, and EXP-005's fit arithmetic
+counted only the mmap'd core and the KV cache.
+
+Hit-rate provenance matters more here than the hit rates themselves.
+`scripts/lfu_sim.py` resolves a routing step one expert at a time, so it
+protects only the experts already fetched within that step and can evict an
+expert the same token is about to request. `LayerCache::plan` receives all
+`top_k` ids in one call and pins the whole step, which cannot happen.
+Replaying the shipped cache over the same four traces gives **50.02% at 10
+slots and 54.48% at 12** against the simulator's 44.8% and 49.9% (EXP-005
+Correction), so the simulated sweep is a **lower bound**, and batch-pinned 10
+slots beats sequential 12. The corrected marginal value of 12 slots over 10
+is **+4.46 points for 261 MiB**, not the +5.1 the simulator suggested. There
+is still no knee: marginal value falls monotonically, so the cgroup ceiling
+is the binding constraint rather than diminishing returns.
+
+**The hit rate at the shipped 11 slots/layer has not been measured.** It is
+bracketed by 50.02% and 54.48%; interpolation is not a measurement, and the
+sweep is re-run at 11 before any hit rate is attached to the dial.
+
+**Open risk:** the 115.1 MiB was sampled on a decode run whose context length
+and token count are not recorded, and the KV cache faults lazily, so that
+figure includes only the KV rows the run actually touched. It is a floor for
+this tenant, not a ceiling, and the 111.0 MiB of spare is not yet proven at
+4K context with the slot pool wired in. If the real figure exceeds 226 MiB
+the dial drops to 10 slots/layer, or the KV cache goes Q8. Needs the
+re-measurement EXP-012 asks for before the 11-slot dial is treated as
+settled.
+
+16 slots/layer is the next real step (simulated 58.1% hit; the batch-pinned
+figure at 16 has never been computed) but its 2,092.5 MiB pool puts the
+subtotal at **3,614.9 MiB**. Halving the KV cache to Q8 is not enough either:
+3,422.9 MiB, still 350.9 MiB over the 3,072 MiB ceiling with nothing spare.
+**16 slots/layer needs a 4G cgroup.** It is therefore an experiment about
+larger machines rather than a tuning step on this one, and it is filed that
+way, not shipped.
 
 Budget escape hatches, in the experiment backlog and not in v0: Q8 KV
-(halves KV, and is the enabler for 16 slots/layer), fewer slots/layer. A
-global slot pool shared across layers is **closed as a no**, see "Recorded
-decisions from phase-5 measurement".
+(halves KV, and is a necessary but not sufficient condition for 16
+slots/layer), fewer slots/layer. A global slot pool shared across layers is
+**closed as a no**, see "Recorded decisions from phase-5 measurement".
 
 ## Expert streaming and cache
 
@@ -202,29 +259,38 @@ decisions from phase-5 measurement".
   need).
 - **Registered buffers (`ReadFixed`) are out.** Reasons, in order of weight:
   1. Registering the slot pool pins the whole pool with `FOLL_LONGTERM`
-     (1.4-1.5 GiB at the dials under consideration; 1,569 MiB at 12
-     slots/layer). That memory is unreclaimable and uncompactable, inside a
-     3 GB budget whose entire point is to stay small. Self-defeating for
-     this project.
+     (1.4-1.6 GiB at the dials under consideration; 1,438.6 MiB at the
+     shipped 11 slots/layer). That memory is unreclaimable and
+     uncompactable, inside a 3 GB budget whose entire point is to stay
+     small. Self-defeating for this project.
   2. `RLIMIT_MEMLOCK` under systemd defaults is 8 MiB soft *and* hard, and
      raising the hard limit needs `CAP_SYS_RESOURCE`. Since kernel 6.14 the
      SQ/CQ ring memory is charged against the same limit. A design that only
      works after the user edits a systemd unit is not a design.
   3. The measured benefit is small: ~70 us of CPU per 3 MiB read at our block
-     size, about 4.5% of one core out of 22 (provisional).
+     size, about 4.5% of one core out of 22 (provisional, EXP-008).
 - Queue depth: small, QD4-8, now chosen on measured grounds rather than
-  assumed. The drive saturates by QD4 (1.211 GB/s at QD4 vs 1.390 at QD16 at
-  the expert stride), and deeper queues buy latency rather than bandwidth:
-  measured per-blob p50 is 2.34 ms at QD1 and 15.56 ms at QD8 (provisional).
-  The earlier "~1 ms per blob when the queue is fed" figure was an estimate
-  and is withdrawn; real per-blob latency is worse than that at every depth.
-  Since the decode loop waits on all misses (see "Decode loop"), latency is
-  the quantity that matters, which argues for the low end of the range.
+  assumed, but on the *shape* of the throughput sweep rather than its
+  absolute level. Queue depth saturates early (1.211 GB/s at QD4 vs 1.390 at
+  QD16 at the expert stride, so QD4 is 87% of QD16), and deeper queues buy
+  latency rather than bandwidth: measured per-blob p50 is 2.34 ms at QD1 and
+  15.56 ms at QD8 (provisional). The earlier "~1 ms per blob when the queue
+  is fed" figure was an estimate and is withdrawn; real per-blob latency is
+  worse than that at every depth. Since the decode loop waits on all misses
+  (see "Decode loop"), latency is the quantity that matters, which argues for
+  the low end of the range. **Caveat, unresolved:** those latency figures
+  come from a different probe series than the throughput sweep and the two
+  disagree on level. 2.34 ms for one 2.918 MiB blob is 1.31 GB/s at QD1,
+  which is *above* the tabulated 1.211 GB/s at QD4, so as written the latency
+  data contradicts "the drive saturates by QD4" as a claim about absolute
+  throughput. Both series are provisional; see EXP-008.
 - O_DIRECT is a budget-correctness requirement, and this is now measured
   rather than argued: reading the same 1.4 GiB of experts inside the same
   cgroup peaked at **1,092.2 MiB** buffered versus **5.0 MiB** with O_DIRECT
-  (provisional). Buffered reads charge the page cache to our cgroup and
-  thrash it.
+  (provisional, EXP-009). Buffered reads charge the page cache to our cgroup
+  and thrash it. The transition itself has not landed: the decode loop still
+  reads experts with buffered `pread`, which is why no rule-2 baseline exists
+  yet (EXP-006).
 - **O_DIRECT can be silently downgraded to buffered I/O, so it must be
   verified at runtime.** On btrfs a read can fall back to `filemap_read()`
   with no error and a full byte count returned. Four confirmed triggers:
@@ -247,21 +313,28 @@ decisions from phase-5 measurement".
 - Cache policy: per-layer slot arrays with **LFU over frequency counters
   indexed by expert id, sized `n_experts`, whose counts survive eviction**
   (ghost history). That detail is the policy, and it is where the win comes
-  from. Measured on real routing traces at 10 slots/layer (EXP-005):
+  from. Simulated on real routing traces at 10 slots/layer (EXP-005):
   ghost-LFU 44.8%, per-slot LFU 42.6%, LRU 42.6%, Belady offline-optimal
-  55.8%. Per-slot LFU, which is what the old wording "LFU eviction with
-  recency tie-break" describes, beats LRU by only 0.0-1.7 points at usable
-  slot counts and loses outright at 48. Counters cost `n_experts * u32` per
-  layer (512 B for Qwen3, 24 KiB across 48 layers). No cross-layer prefetch
-  (measured ~7% predictability upstream).
+  55.8%. Those are the simulator's sequential lower bound; the shipped cache
+  replayed over the same traces gives 50.02% at 10 slots (EXP-005
+  Correction), and the policy ranking is unaffected. Per-slot LFU, which is
+  what the old wording "LFU eviction with recency tie-break" describes, is
+  worth **-1.7 to 0.0 points against LRU** at the slot counts measured: tied
+  at 42.6% at 10 slots, and 55.4% against LRU's 57.1% at 16. It is not a
+  weaker win than ghost history, it is a small loss, which is the strongest
+  form of the argument for indexing counters by expert id. Counters cost
+  `n_experts * u32` per layer (512 B for Qwen3, 24 KiB across 48 layers). No
+  cross-layer prefetch (measured ~7% predictability upstream).
 - Concurrency invariant: a slot owned by an in-flight read or by queued
   compute is never reassigned. This is not hygiene, it is a correctness
   requirement with a measured failure mode: aliasing two concurrent O_DIRECT
   reads onto one buffer makes btrfs fail checksum verification, measured at
   13-27% spurious `EIO` plus increments to the filesystem's persistent
   `corruption_errs` counter. An explicit free list measured 0 `EIO` across
-  4,000 reads at QD 4/8/16/32 (provisional). Index arithmetic is not
-  sufficient, because completions arrive out of order.
+  4,000 reads at QD 4/8/16/32 (provisional, EXP-007; the 13-27% is a spread
+  across repeats on a machine that was not quiet, so read it as "frequently,
+  not always" rather than as a rate). Index arithmetic is not sufficient,
+  because completions arrive out of order.
 - Expert reads must treat `EIO` as a **retryable, typed error**, not as an
   impossible outcome. Direct I/O returns real short reads and real errors;
   code that assumes success is code that corrupts a token silently.
@@ -289,10 +362,15 @@ decisions from phase-5 measurement".
   mixed, and io_uring changes the calculus (submission is cheap and batched,
   so there is less work to move off-thread than in a pread design). So it
   becomes a measurement.
-- Signalling cost, measured (provisional), for the reactor-to-compute
-  handoff: futex p50 3.1 us at 0.07 cores; atomic spin 502 ns but 1.03 cores
-  burned; `std::sync::mpsc` p99 237 us. The spin path buys ~2.6 us of latency
-  for a whole core, which is one of the six the GEMVs need.
+- Signalling cost, measured (provisional, EXP-010), for the
+  reactor-to-compute handoff: futex p50 3.1 us at 0.07 cores; atomic spin
+  502 ns but 1.03 cores burned; `std::sync::mpsc` p99 237 us. The spin path
+  buys ~2.6 us of latency for a whole core, which is one of the six the
+  GEMVs need. The shipped pool takes both: a bounded spin then a futex wait,
+  whose full publish-to-barrier round trip measures p50 1.71 us with the
+  workers warm and therefore inside the spin window (provisional, EXP-010).
+  That figure is a whole-pool round trip and is not comparable with the
+  single wake/wait pairs above; it does not measure the futex path.
 - CPU topology must be **derived at runtime from `thread_siblings_list`**,
   never inferred from core ids. On the reference 185H,
   `/sys/devices/cpu_core/cpus` is `0-11` with SMT pairs (0,5) (1,2) (3,4)
@@ -356,7 +434,8 @@ layer" no matter how it is scheduled. So:
   all its routed rows as it arrives.
 - The win is read granularity, not sequentiality per se. On the reference
   drive, large blocks measured 2.04 GB/s at 16 MiB and 2.15 at 24 MiB versus
-  ~1.35 at the 2.918 MiB expert stride: **+51% at 16 MiB** (provisional).
+  ~1.35 at the 2.918 MiB expert stride: **+51% at 16 MiB** (provisional,
+  EXP-008).
   Buffer size for the streaming ring is therefore a tuned parameter, in the
   phase-6 backlog.
 - Expected: ~8.2-8.6 s per 512-token chunk sweep (~17.6 GB of expert data)
@@ -376,17 +455,63 @@ Same GGUF bytes on both sides. Gates, in order:
 1. Tensor-level: repacked expert slab bytes == GGUF slice bytes (exact).
 2. Kernel-level: our Q4_K/Q6_K/Q8_K dot products vs scalar reference within
    documented tolerance; alignment assumptions unit-tested.
-3. Logit-level: KL divergence vs llama.cpp logits on a fixed prompt set;
-   top-1 agreement rate reported. Target revised 2026-08-03 (recorded
-   decision, evidence in EXP-004): mean full-vocab KL <= 3e-2, always
-   reported next to the intra-engine scalar/AVX2 A/B as the noise floor.
-   The original 1e-3 target predates implementation and is unachievable
-   without operation-identical arithmetic: EXP-004 measured mean 1.04e-2
-   against a 0.5-1.3e-2 noise floor from dot-product float ordering
-   alone, flat in context depth through 3492 tokens. PASSED in phase 4
-   against llama.cpp b10217 full-vocab reference dumps
+3. Logit-level: KL divergence vs llama.cpp logits on a fixed set of 8
+   prompts. `scripts/kl_vs_reference.py` enforces **four** conditions, and
+   the gate passes only when all four hold:
+
+   1. mean full-vocab KL(llama.cpp ‖ ramvamp) **<= 3e-2**;
+   2. **every individual prompt <= 6e-2** — a mean over 8 prompts hides
+      one blown prompt behind seven good ones;
+   3. **top-1 agreement on every prompt**, gated rather than merely
+      reported — a flipped argmax is a behavioural change at a KL the
+      mean tolerates;
+   4. **all 8 prompts actually scored** — a prompt dropped for a
+      tokenizer mismatch or a short reference dump shrinks the gate's
+      denominator, so it fails the gate instead of quietly leaving it.
+
+   The mean is always reported next to the intra-engine scalar/AVX2 A/B
+   as the noise floor.
+
+   Revised twice, each as a recorded decision with evidence in EXP-004:
+   the mean on 2026-08-03 (1e-3 -> 3e-2), and conditions 2-4 on
+   2026-08-04. The original 1e-3 predates implementation and is
+   unachievable without operation-identical arithmetic: EXP-004 measured
+   mean 1.04e-2 against a 0.5-1.3e-2 noise floor from dot-product float
+   ordering alone, flat in context depth through 3492 tokens.
+
+   **Why 6e-2 for the per-prompt ceiling.** EXP-004's scalar/AVX2 A/B
+   (`RAMVAMP_FORCE_SCALAR=1`, same binary, dot-product accumulation order
+   the only difference) is the largest float-reordering perturbation this
+   codebase can produce short of an algorithmic change, and it moved the
+   worst per-prompt *cross-engine* KL to 3.4e-2. So 6e-2 sits 1.76x above
+   the largest perturbation ever measured here and 2.2x above the worst
+   status-quo prompt (2.72e-2, single_00): it catches one blown prompt,
+   and reordering every dot product in the engine is not enough to trip
+   it.
+
+   **Caveat on condition 3, recorded rather than smoothed over: the
+   newly-gated top-1 agreement has no measured margin behind it.** Nothing
+   in this repo recorded the top1-vs-top2 logit gap on these prompts, and
+   EXP-004 reports top-1 for the AVX2 side only. A prompt sitting on a
+   near-tie would therefore fail condition 3 on a change that is pure
+   float noise, which makes condition 3 — not the ceiling — the plausible
+   flake vector here. Mitigation shipped with the decision:
+   `scripts/kl_vs_reference.py` now records each prompt's top1-vs-top2 gap
+   on both sides in `kl_results.json` and prints the tightest one. It is
+   reported, never gated; if a future top-1 FAIL lands on a prompt whose
+   recorded margin was already small, that is a near-tie and not a
+   regression. First measurement (2026-08-04, phase-4 build, `--skip-longs`):
+   the tightest gap is **0.228 nats** on single_05 (`def fibonacci(n):`) on
+   the ramvamp side and 0.494 nats on the llama.cpp side. Nothing sits on a
+   knife edge: the tightest gap is roughly 20x the mean cross-engine KL
+   (a scale comparison, not a bound), so condition 3 is not currently
+   fragile. That is now a recorded number instead of an assumption, which
+   was the point.
+
+   PASSED in phase 4 against llama.cpp b10217 full-vocab reference dumps
    (`models/llamacpp-ref/`, recomputable via
-   `scripts/kl_vs_reference.py` with no llama.cpp install).
+   `scripts/kl_vs_reference.py` with no llama.cpp install): mean
+   1.039e-2, worst prompt 2.72e-2, top-1 8/8, 8/8 prompts scored.
 4. Greedy smoke: first N tokens identical on short prompts (expected to
    diverge eventually from fp reordering; report length, do not gate).
    Measured in EXP-003: 3/3 prompts matched all 16 generated tokens
@@ -406,39 +531,70 @@ withdrawn.
 - In-RAM compute ceiling on the 185H: 15-25 tok/s (bandwidth-scaled
   **estimate**; no direct public benchmark exists). Unchanged, still an
   estimate.
-- Decode I/O volume: worst case ~1.02 GiB/token (24 Q4_K layers + 24
-  Q6_K-down layers). At the 12-slot dial the measured hit rate is **49.9%**
-  (EXP-005, 556 decode tokens of real routing traces), leaving **554
-  MB/token** to read.
-- Decode I/O time: ~348 ms/token, a **~2.9 tok/s ceiling from I/O alone**
-  before compute is considered. Provenance: EXP-005 derives this at a 1.59
-  GB/s constant, itself a provisional probe on a non-quiet machine that
-  EXP-005 flags as optimistic by roughly 15%. At the quiet-run 1.35 GB/s the
-  same volume is ~410 ms/token, a ~2.4 tok/s ceiling. Treat 2.4-2.9 tok/s as
-  the current I/O-only band and re-derive it once the bandwidth probe is
+- Decode I/O volume: worst case **1,097 MB/token** (1.02 GiB: 8 experts x 48
+  layers, 24 layers at a 3,059,712 B stride and 24 at 2,654,208 B). This one
+  is exact arithmetic on audited strides, not a measurement.
+- Decode hit rate: **simulated, not measured end to end**, and the two
+  available figures are a lower bound and a replay of the shipped code, not
+  one number. `scripts/lfu_sim.py` gives 44.8% at 10 slots and 49.9% at 12
+  (EXP-005, 556 decode tokens of real routing traces, simulation only);
+  replaying the shipped `io/cache.rs` over the identical traces the way the
+  runtime actually calls it gives **50.02% at 10 and 54.48% at 12** (EXP-005
+  Correction). At the shipped 11 slots/layer the hit rate has **not** been
+  measured and is bracketed by those two.
+- Decode I/O time, derived rather than measured. Miss bytes are estimated as
+  `(1 - hit) x 1,097 MB`, which assumes misses are spread across the two
+  stride classes in proportion to accesses; on the one point where EXP-005
+  reports both, that assumption is within 1% of the simulator's exact byte
+  count. At the tabulated QD4-8 bandwidths (1.211-1.349 GB/s):
+
+  | dial | hit % | miss MB/token | ms/token | io-only tok/s |
+  | --- | ---: | ---: | ---: | ---: |
+  | 10 slots, batch-pinned | 50.02 | 548 | 406-453 | 2.21-2.46 |
+  | 12 slots, batch-pinned | 54.48 | 499 | 370-412 | 2.42-2.70 |
+  | no cache | 0 | 1,097 | 813-906 | 1.10-1.23 |
+
+  So the current I/O-only band at the shipped dial is roughly **2.2-2.7
+  tok/s**, bracketed by the 10- and 12-slot rows. Every input to that band is
+  provisional: the bandwidths are EXP-008's non-quiet probe, and the hit
+  rates are a trace replay rather than a decode run. Note this band replaces
+  the earlier "2.4-2.9 tok/s", which was derived at the 1.59 GB/s constant
+  that EXP-008 records as unsourced; at 1.59 GB/s these same volumes give
+  2.90-3.18 tok/s. Re-derive the whole table once the bandwidth probe is
   redone under rule 2.
 - **This band is drive-dependent and must never be published without the
-  device.** The same design and the same 554 MB/token on a 3.5 GB/s drive
-  computes to roughly 6 tok/s. The reference machine has a DRAM-less QLC
+  device.** The same design and the same ~500 MB/token on a 3.5 GB/s drive
+  computes to roughly 7 tok/s. The reference machine has a DRAM-less QLC
   part; a mainstream TLC Gen4 drive would roughly double these numbers. Any
   headline tok/s figure ships next to the drive it was measured on.
-- **I/O is not currently the binding constraint.** Phase-4 decode is ~2
-  s/token on the 185H (EXP-004 diagnostic: warm cache, single thread), of
-  which uncached expert I/O accounts for 690 ms (EXP-005, no cache). The
-  compute-parallelism work therefore matters at least as much as the cache
-  does, and neither the cache dial nor the bandwidth probe can be evaluated
-  against tok/s until the compute side is threaded.
+- **I/O is probably not the binding constraint yet, but no single
+  measurement says so.** The two figures that suggest it come from different
+  machine states and must not be subtracted from each other (experiment log,
+  rule 3): phase-4 decode is ~2 s/token on the 185H (EXP-004 diagnostic:
+  warm cache, single thread, uncgrouped, and the expert reads in it are
+  buffered `pread` served largely from that warm cache), while the 690 ms of
+  uncached expert I/O is a *simulated* figure at an unsourced bandwidth
+  constant (EXP-005, no cache). What can be said without combining them is
+  that a single-threaded decode step measured in seconds sits an order of
+  magnitude above an I/O budget estimated in hundreds of milliseconds, so
+  compute-parallelism work matters at least as much as the cache does.
+  Neither the cache dial nor the bandwidth probe can be evaluated against
+  tok/s until the compute side is threaded and one run produces both halves
+  under rule 2.
 - **Floor for success: OPEN.** The criterion is currently written as 3 tok/s,
-  which is above the measured I/O-only ceiling on the reference drive. This
-  needs the user's decision, not a silent edit. The three options are: keep 3
-  and accept it is unreachable on this drive, restate the floor per-drive, or
-  lower it. Recorded here as unresolved.
+  which is above the derived I/O-only ceiling on the reference drive at the
+  tabulated bandwidths (2.2-2.7 tok/s). Only the unsourced 1.59 GB/s
+  constant puts 3 tok/s within reach at all, and then only at a slot count
+  that no longer fits the memory budget. This needs the user's decision, not
+  a silent edit. The three options are: keep 3 and accept it is unreachable on
+  this drive, restate the floor per-drive, or lower it. Recorded here as
+  unresolved.
 
 Prior-art anchors, with the qualifiers that were previously missing:
 
 - llama.cpp RFC #23324 (same design, pread sidecar) reports 13 tok/s on a
   16 GB M1 Pro. This does **not** bound our band in either direction: it is
-  **Q6_K, not Q4_K_M**; **48 slots/layer, not 12**; GPU-accelerated; and the
+  **Q6_K, not Q4_K_M**; **48 slots/layer, not 11**; GPU-accelerated; and the
   author explicitly qualifies it as "after warmup", with the macOS page cache
   in the read path. It is a single unreplicated self-report with no cold
   counterpart. Cite it as evidence the design works, never as a throughput
@@ -447,10 +603,15 @@ Prior-art anchors, with the qualifiers that were previously missing:
   unified memory with Metal compute. Closer to comparable than the M1 Pro
   number, still a different machine class.
 - Our traces do **not** reproduce TurboFieldfare's 66.6% hit rate at 16
-  slots/layer: we measure 58.1%, 8.5 points low (EXP-005). The 16-to-24 and
-  16-to-32 deltas match their published shape, so the disagreement is in the
-  absolute level, not the curve. No published claim of ours may lean on their
-  absolute number.
+  slots/layer, but the comparison is **not like-for-like** and the size of
+  the gap is unknown. Our 58.1% is the simulator's sequential lower bound
+  (EXP-005); the batch-pinned figure at 16 slots, which is what the shipped
+  cache would actually do, has never been computed, and at 10 and 12 slots
+  batch pinning was worth about 5 points. So the disagreement is at most 8.5
+  points and is in the absolute level rather than the curve: the 16-to-24 and
+  16-to-32 deltas match their published shape. Until the 16-slot replay is
+  run, no claim of ours may lean on either their absolute number or on the
+  size of the gap.
 
 ## v0 scope caps
 
@@ -494,25 +655,40 @@ are neither now, and they should not come back without new evidence.
 
 ## Experiment backlog (numbered entries when run)
 
-- 16 slots/layer with a Q8 KV cache (worth +8.2 points of hit rate). Note the
-  arithmetic does not close on Q8 KV alone (2,092 + 1,023 + 192 = 3,307 MiB
-  against a 3,072 MiB ceiling), so the experiment has to find another ~235
-  MiB or run at a shorter context.
+- 16 slots/layer **in a 4G cgroup**. The arithmetic does not close in 3G
+  under any single saving once anonymous runtime memory is counted: 3,614.9
+  MiB with the FP16 KV cache, 3,422.9 MiB with Q8 KV, against a 3,072 MiB
+  ceiling (EXP-012). This is an experiment about larger machines, not a
+  tuning step on the reference one. Its hit-rate value is also unquantified
+  until the batch-pinned replay is run at 16 slots.
+- Re-run the slot sweep at 11 slots/layer, batch-pinned, so the shipped dial
+  has a hit rate of its own instead of a bracket (EXP-012).
+- Re-measure peak `anon` at 4K context with the slot pool wired in, to prove
+  or disprove the 111.0 MiB of headroom the 11-slot dial leaves (EXP-012).
 - Dedicated E-core io_uring reactor thread vs inline on the coordinator
   (evidence upstream is mixed both ways; see "Thread topology")
 - Larger read granularity for the phase-6 prefill sweep (16-24 MiB buffers;
-  measured +51% at 16 MiB over the 2.918 MiB expert stride, provisional)
+  measured +51% at 16 MiB over the 2.918 MiB expert stride, provisional,
+  EXP-008)
 - E-cores in compute pool for non-barrier expert GEMVs
-- Peak RSS of scratch + program + tokenizer against the 95 MiB of headroom
-  the 12-slot dial leaves
 - `fadvise`/`readahead` tuning for the prefill sequential sweep
 - Prefill chunk size sweep: 128 vs 256 vs 512
 - Re-measure the O_DIRECT bandwidth probe under rule 2 (cold, inside the
-  benchmark cgroup, quiet machine) and re-derive the performance model
+  benchmark cgroup, quiet machine) and re-derive the performance model. This
+  is the highest-value item on the list: the 1.59 GB/s constant the model
+  was built on cannot be sourced, and the two existing probe series disagree
+  by 17% at the same queue depth (EXP-008)
 
 Dropped from the backlog:
 
-- ~~Slot budget sweep: 8 vs 10 vs 12 vs 16 slots/layer~~: done, EXP-005.
+- ~~Slot budget sweep: 8 vs 10 vs 12 vs 16 slots/layer~~: done, EXP-005 (as
+  a simulated lower bound; the shipped dial's own point is back on the
+  backlog above, see EXP-012).
+- ~~Peak RSS of scratch + program + tokenizer against the headroom the dial
+  leaves~~: superseded by EXP-012. The tenant is `anon`, program text is
+  file-backed and lands with the mmap'd core, and the figure is now measured
+  at 115.1 MiB. The remaining question is the 4K-context re-measurement
+  listed above.
 - ~~Global slot pool vs per-layer~~: closed as a no, see above.
 - ~~Expert layout reordering by co-activation~~: **downgraded to inactive.**
   The 2.23x figure previously cited from llama.cpp #18758 does not describe
@@ -530,9 +706,11 @@ Dropped from the backlog:
 - Chat template rendering: vendor the 2507 template, snapshot-test against
   `transformers` reference renders
 - Slot-ready signalling mechanism between the reactor and the compute pool.
-  Measured candidates (provisional): futex p50 3.1 us at 0.07 cores, atomic
-  spin 502 ns at 1.03 cores burned, `std::sync::mpsc` p99 237 us. With the
-  reactor inline in v0 this is a smaller decision than it was; it becomes
+  Measured candidates (provisional, EXP-010): futex p50 3.1 us at 0.07
+  cores, atomic spin 502 ns at 1.03 cores burned, `std::sync::mpsc` p99
+  237 us. The compute pool already ships the bounded-spin-then-futex
+  compromise; the reactor-to-compute direction is what is still open. With
+  the reactor inline in v0 this is a smaller decision than it was; it becomes
   load-bearing if the dedicated-thread experiment wins.
 - The empirical O_DIRECT / page-cache-residency assertion at startup (see
   "Expert streaming and cache"); the probe mechanism is not yet specified.

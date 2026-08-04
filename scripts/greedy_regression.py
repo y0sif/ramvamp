@@ -107,11 +107,67 @@ gate refuses to compare across configurations.
 
   scripts/greedy_regression.py --ramvamp target/release/ramvamp
   scripts/greedy_regression.py --refresh --ramvamp target/release/ramvamp
-  scripts/greedy_regression.py --only paths --stride 1 --refresh
 
-Results are cached per (prompt, position) under `--cache`, so a rerun
-with the same configuration is free; `--refresh` recomputes, which is
-what a phase-5 wave must pass. Exit 0 = PASS, 1 = FAIL, 2 = harness error.
+A single suite (`--only`), or any `--stride`/`--top`/`--max-new` the
+default baseline was not recorded at, needs a baseline of its own: the
+gate refuses to compare across configurations, and it counts a suite the
+baseline has and the run does not as a coverage gap, which is a FAIL.
+So record one first — into its OWN file, because `--save-baseline`
+overwrites whatever `--baseline` points at and the default file holds the
+full two-suite baseline — then gate against it:
+
+  scripts/greedy_regression.py --only paths --stride 1 --refresh \
+      --ramvamp target/release/ramvamp \
+      --baseline models/llamacpp-ref/greedy-cache/baseline-paths-s1.json \
+      --save-baseline
+  scripts/greedy_regression.py --only paths --stride 1 \
+      --ramvamp target/release/ramvamp \
+      --baseline models/llamacpp-ref/greedy-cache/baseline-paths-s1.json
+
+The first command records and exits 0 (BASELINE RECORDED, nothing gated);
+the second gates a paths-only stride-1 run against a paths-only stride-1
+baseline and can PASS. Running `--only paths --stride 1` against the
+default baseline cannot: it reports `greedy not gated` and `paths not
+gated: baseline stride 8` and exits 1.
+
+Results are cached under `<cache>/bin-<sha256 of the binary>/`, keyed on
+(binary, prompt, position), so a rerun with the same binary and the same
+configuration is free and a rerun after a rebuild recomputes by itself.
+`--refresh` forces a recompute anyway; it is no longer what stands
+between you and scoring the previous build. Without `--ramvamp` there is
+nothing to fingerprint and the cache is disabled outright rather than
+keyed on nothing.
+
+**Cache entries written before the `bin-<sha>/` layout sit directly in
+`<cache>/` and are now orphaned**: nothing reads them, they are not keyed
+on any binary, and they cannot be, since the binary that produced them was
+never recorded. The first run after this change therefore pays a full
+recompute — roughly 29 min for the 8 greedy continuations and ~20 min for
+three stride-8 paths at phase-4 speeds. Delete the stale entries once:
+
+  rm -f <cache>/greedy_single_*.json <cache>/path_*_p*_top*.json
+
+Do not delete `<cache>` wholesale: `baseline.json` and `results.json` live
+there too, and losing `baseline.json` means there is nothing to gate
+against.
+
+A missing baseline, a missing fixture, a suite the baseline covers and
+the run does not, and a run that measured zero positions are all
+failures. The gate's job is to catch a phase-5 regression, so "I checked
+nothing" can never be spelled the same way as "I checked everything and
+it was fine". Those failures are labelled COVERAGE and counted separately
+from REGRESSION in the verdict line, so a partial run is distinguishable
+from a real regression without weakening either.
+
+Exit codes, shared with the repo's other gate scripts (`bitident.py`,
+`cold_bench.py`, `kl_vs_reference.py`, `lfu_sim.py`):
+
+  0  the gate ran and passed (or `--save-baseline` recorded a baseline)
+  1  the gate ran and failed — either a REGRESSION (a measured number
+     dropped below the baseline) or a COVERAGE gap (this run gated less
+     than the baseline does). Both are real results about the run
+  2  the gate could not run: no baseline, a missing fixture or banked
+     text, ramvamp failed to start or timed out, a nonsensical argument
 
 Python stdlib only.
 """
@@ -121,6 +177,7 @@ from __future__ import annotations
 import argparse
 import array
 import ast
+import hashlib
 import io
 import json
 import math
@@ -243,14 +300,63 @@ def base_cmd(args) -> list[str]:
     return ["cargo", "run", "--release", "--quiet", "-p", "ramvamp", "--"]
 
 
-def cached(args, cache_path: str, produce) -> dict:
-    if os.path.isfile(cache_path) and not args.refresh:
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def binary_identity(args) -> dict:
+    """Fingerprint whatever is about to produce the numbers.
+
+    This is part of the cache key. The natural key — (prompt, max_new) or
+    (path, position, top) — does not mention the binary, so without this a
+    rerun after a rebuild scores the *previous* build's cached outputs
+    against the baseline and reports PASS for a binary it never executed.
+    `scripts/bitident.py` records the same three fields for the same
+    reason.
+    """
+    if not args.ramvamp:
+        return {"invocation": "cargo run --release -p ramvamp", "sha256": None}
+    path = os.path.abspath(args.ramvamp)
+    if not os.path.isfile(path):
+        fail(f"no ramvamp binary at {path}")
+    st = os.stat(path)
+    return {
+        "invocation": path,
+        "bytes": st.st_size,
+        "mtime": st.st_mtime,
+        "sha256": sha256_file(path),
+    }
+
+
+def cached(args, name: str, produce) -> dict:
+    """Read-through cache, keyed on (name, binary sha256).
+
+    Entries live under `<cache>/bin-<sha256[:16]>/`, and each entry also
+    carries the identity it was produced with, so neither a renamed
+    directory nor a hand-copied file can pass one binary's output off as
+    another's. When the binary cannot be fingerprinted (`cargo run`, no
+    `--ramvamp`), there is no honest key and the cache is bypassed
+    entirely rather than keyed on nothing.
+    """
+    cache_path = (None if args.cache_runs is None
+                  else os.path.join(args.cache_runs, name))
+    if cache_path and os.path.isfile(cache_path) and not args.refresh:
         with open(cache_path, encoding="utf-8") as f:
-            return json.load(f)
+            payload = json.load(f)
+        if payload.get("_binary", {}).get("sha256") == args.binary["sha256"]:
+            return payload
+        print(f"  cache entry {name} was produced by a different binary; "
+              f"recomputing", file=sys.stderr)
     payload = produce()
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
+    payload["_binary"] = args.binary
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
     return payload
 
 
@@ -267,7 +373,7 @@ def run(args, cmd: list[str], what: str) -> subprocess.CompletedProcess:
     return result
 
 
-def ramvamp_generate(args, prompt: str, cache_path: str) -> dict:
+def ramvamp_generate(args, prompt: str, cache_name: str) -> dict:
     def produce() -> dict:
         cmd = base_cmd(args) + [
             "generate",
@@ -287,10 +393,10 @@ def ramvamp_generate(args, prompt: str, cache_path: str) -> dict:
             text = text[:-1]
         return {"prompt": prompt, "text": text, "stderr": result.stderr[-4000:]}
 
-    return cached(args, cache_path, produce)
+    return cached(args, cache_name, produce)
 
 
-def ramvamp_logits(args, prompt: str, cache_path: str, top: int) -> dict:
+def ramvamp_logits(args, prompt: str, cache_name: str, top: int) -> dict:
     def produce() -> dict:
         cmd = base_cmd(args) + [
             "logits",
@@ -302,7 +408,7 @@ def ramvamp_logits(args, prompt: str, cache_path: str, top: int) -> dict:
         result = run(args, cmd, f"logits ({len(prompt)} chars)")
         return json.loads(result.stdout)
 
-    return cached(args, cache_path, produce)
+    return cached(args, cache_name, produce)
 
 
 # ---------------------------------------------------------------------------
@@ -358,18 +464,24 @@ def run_greedy(args, meta: dict, detok: Detokenizer) -> dict:
         banked = json.load(f)
     by_prompt = {e["prompt"]: e for e in banked}
 
+    if not meta.get("singles"):
+        fail(f"{args.ref}/meta.json lists no singles; the greedy suite would "
+             f"measure nothing")
+
     per_prompt = []
     for entry in meta["singles"]:
         name, prompt = entry["file"], entry["prompt"]
         ref = by_prompt.get(prompt)
+        # Never skip: a prompt the harness cannot measure is a prompt the
+        # gate is not covering, and a gate that quietly covers nothing
+        # reports PASS.
         if ref is None:
-            print(f"[{name}] SKIP: no banked greedy text", file=sys.stderr)
-            continue
+            fail(f"[{name}] no banked greedy text for {prompt!r} in "
+                 f"{ref_path}; the greedy suite cannot gate this prompt")
         want = min(args.max_new, len(ref["tokens"]))
         t0 = time.time()
         got = ramvamp_generate(
-            args, prompt,
-            os.path.join(args.cache, f"greedy_{name}_n{args.max_new}.json"))
+            args, prompt, f"greedy_{name}_n{args.max_new}.json")
         ours = got["text"].encode("utf-8")
         matched, detail = matched_token_prefix(detok, ref["tokens"][:want], ours)
         row = {
@@ -385,8 +497,12 @@ def run_greedy(args, meta: dict, detok: Detokenizer) -> dict:
             print(f"          ref {detail['ref_next']!r}")
             print(f"          our {detail['our_next']!r}")
 
+    if not per_prompt:
+        fail("the greedy suite measured 0 prompts")
     total = sum(r["matched_tokens"] for r in per_prompt)
     possible = sum(r["reference_tokens"] for r in per_prompt)
+    if possible == 0:
+        fail("the greedy suite compared 0 reference tokens")
     full = sum(1 for r in per_prompt if r["matched_tokens"] == r["reference_tokens"])
     print(f"\ngreedy aggregate: {total}/{possible} tokens "
           f"({100.0 * total / possible if possible else 0.0:.1f}%), "
@@ -395,6 +511,7 @@ def run_greedy(args, meta: dict, detok: Detokenizer) -> dict:
     return {
         "max_new": args.max_new,
         "per_prompt": per_prompt,
+        "prompts": len(per_prompt),
         "matched_total": total,
         "possible_total": possible,
         "full_match_prompts": full,
@@ -404,13 +521,29 @@ def run_greedy(args, meta: dict, detok: Detokenizer) -> dict:
 def run_paths(args, meta: dict, detok: Detokenizer) -> dict:
     ids_by_prompt = {e["prompt"]: list(e["ids"])
                      for e in meta.get("tokenized_prompts", [])}
+    if not meta.get("paths"):
+        fail(f"{args.ref}/meta.json lists no paths; the teacher-forced suite "
+             f"would measure nothing")
     per_path = []
-    for entry in meta.get("paths", []):
+    for entry in meta["paths"]:
         name, prompt = entry["file"], entry["prompt"]
         npz_path = os.path.join(args.ref, f"{name}.npz")
+        # Never skip. These fixtures are large and are the usual casualty of
+        # a fresh clone or a partial fetch; skipping them left the suite
+        # comparing an empty list and printing PASS.
         if not os.path.isfile(npz_path):
-            print(f"[{name}] SKIP: no {name}.npz", file=sys.stderr)
-            continue
+            fail(f"[{name}] missing fixture {npz_path}. The teacher-forced "
+                 f"suite cannot gate a path whose reference dump is absent. "
+                 f"Fetch the fixtures. Note that `--only greedy` against the "
+                 f"default baseline is NOT a way around this: that baseline "
+                 f"records a paths suite the run would not measure, so the "
+                 f"gate reports `paths not gated` and exits 1 (FAIL) — by "
+                 f"design, and the verdict line will say 0 regressions and 1 "
+                 f"coverage gap. To gate greedy alone, record a greedy-only "
+                 f"baseline into its own file first (`--only greedy "
+                 f"--baseline FILE --save-baseline`) and gate against FILE; "
+                 f"the paths suite is then explicitly and permanently "
+                 f"ungated.")
         arrays = read_npz(npz_path)
         (n_pos,), chosen = arrays["chosen_ids"]
         (rows, depth), top_ids = arrays["top_ids"]
@@ -425,24 +558,31 @@ def run_paths(args, meta: dict, detok: Detokenizer) -> dict:
         rows_out = []
         first_disagree = None
         retokenized = 0
+        unchecked = 0
         t_path = time.time()
         for pos in positions:
             context = prompt + detok.decode(chosen[:pos]).decode("utf-8", "replace")
             rv = ramvamp_logits(
-                args, context,
-                os.path.join(args.cache,
-                             f"{name}_p{pos:03d}_top{args.top}.json"),
+                args, context, f"{name}_p{pos:03d}_top{args.top}.json",
                 args.top)
             ours = [row["token_id"] for row in rv["top"]]
             ref_row = [int(t) for t in top_ids[pos * depth : pos * depth + 10]]
             agree = topk_agreement(ref_row, ours)
 
-            ctx_ok = True
+            # Tri-state, not a default-True bool: `None` means the reference
+            # meta carries no token ids for this prompt, so the premise the
+            # teacher-forced numbers rest on — both sides sitting at an
+            # identical context — was never checked. That is not the same as
+            # checked-and-matching, and the gate below treats it as a
+            # failure rather than folding it into the `True` bucket.
+            ctx_ok = None
             if prompt_ids is not None:
                 want_ids = prompt_ids + [int(t) for t in chosen[:pos]]
                 ctx_ok = list(rv["prompt_ids"]) == want_ids
                 if not ctx_ok:
                     retokenized += 1
+            else:
+                unchecked += 1
             agree["position"] = pos
             agree["context_ids_match"] = ctx_ok
             rows_out.append(agree)
@@ -450,6 +590,9 @@ def run_paths(args, meta: dict, detok: Detokenizer) -> dict:
                 first_disagree = pos
 
         n = len(rows_out)
+        if n == 0:
+            fail(f"[{name}] measured 0 positions (stride {args.stride}, "
+                 f"{n_pos} reference positions, --positions {args.positions})")
         t1 = sum(r["top1_agree"] for r in rows_out)
         t5 = sum(r["top5_overlap"] for r in rows_out)
         t10 = sum(r["top10_overlap"] for r in rows_out)
@@ -459,23 +602,32 @@ def run_paths(args, meta: dict, detok: Detokenizer) -> dict:
             "top1_agree": t1, "top5_overlap": t5, "top10_overlap": t10,
             "first_disagreement": first_disagree,
             "retokenized_positions": retokenized,
+            "context_checked_positions": n - unchecked,
             "per_position": rows_out,
         })
         where = "none" if first_disagree is None else f"pos {first_disagree}"
         print(f"[{name}] {n} positions (stride {args.stride})  "
               f"top-1 {t1}/{n}  top-5 {t5}/{5 * n}  top-10 {t10}/{10 * n}  "
               f"first disagreement {where}  "
-              f"retokenized {retokenized}/{n}  ({time.time() - t_path:.0f}s)")
+              f"retokenized {retokenized}/{n}  "
+              f"context-checked {n - unchecked}/{n}  "
+              f"({time.time() - t_path:.0f}s)")
 
     n_tot = sum(p["positions"] for p in per_path)
     t1_tot = sum(p["top1_agree"] for p in per_path)
+    ctx_tot = sum(p["context_checked_positions"] for p in per_path)
+    if n_tot == 0:
+        fail("the teacher-forced suite measured 0 positions")
     print(f"\npath aggregate: top-1 {t1_tot}/{n_tot} "
-          f"({100.0 * t1_tot / n_tot if n_tot else 0.0:.1f}%)")
+          f"({100.0 * t1_tot / n_tot:.1f}%), "
+          f"contexts verified {ctx_tot}/{n_tot}")
     return {
         "stride": args.stride, "top": args.top,
         "per_path": per_path,
+        "paths": len(per_path),
         "positions_total": n_tot,
         "top1_total": t1_tot,
+        "context_checked_total": ctx_tot,
     }
 
 
@@ -484,57 +636,147 @@ def run_paths(args, meta: dict, detok: Detokenizer) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def gate(results: dict, baseline: dict) -> tuple[bool, list[str]]:
-    """No measured number may drop below the recorded phase-4 baseline."""
-    problems = []
+# The two kinds of gate failure. Both are FAIL and both exit 1 — a run
+# that gated less than the baseline is not a passing run — but they mean
+# different things and the remedies are opposite: a REGRESSION says fix
+# the code, a COVERAGE gap says fix the run (or the baseline it is being
+# compared against). Printing "REGRESSION: paths not gated" for a missing
+# fixture is exactly how a gate teaches people to ignore it.
+REGRESSION, COVERAGE = "REGRESSION", "COVERAGE"
+
+
+def gate(results: dict, baseline: dict) -> tuple[bool, list[tuple[str, str]]]:
+    """No measured number may drop below the recorded phase-4 baseline.
+
+    "Not measured" is a failure, not an exemption. A sub-gate the run did
+    not produce, a prompt or path the baseline covers and the run does
+    not, a shrunken position count, or a context that was never verified
+    to match the reference's all leave part of the baseline unchecked, and
+    an unchecked gate must not report PASS. Those are reported as COVERAGE
+    rather than REGRESSION so the verdict says which of the two happened.
+    """
+    problems: list[tuple[str, str]] = []
+
+    def regression(message: str) -> None:
+        problems.append((REGRESSION, message))
+
+    def coverage(message: str) -> None:
+        problems.append((COVERAGE, message))
+
+    # Whole sub-gates. Silently comparing nothing is the failure mode this
+    # whole gate exists to catch, so a suite present on one side only is
+    # reported exactly like a configuration mismatch.
+    for suite in ("greedy", "paths"):
+        old, new = baseline.get(suite), results.get(suite)
+        if old and not new:
+            coverage(
+                f"{suite} not gated: the baseline records a {suite} suite but "
+                f"this run did not measure one (--only?). To gate one suite "
+                f"on its own, record a {suite}-free baseline in its own file "
+                f"and pass --baseline")
+        elif new and not old:
+            coverage(
+                f"{suite} not gated: this run measured {suite} but the "
+                f"baseline has no {suite} suite to compare it against; "
+                f"re-record the baseline with --save-baseline")
+    if not baseline.get("greedy") and not baseline.get("paths"):
+        coverage("the baseline records neither suite; it gates nothing")
 
     old, new = baseline.get("greedy"), results.get("greedy")
     if old and new:
         if old["max_new"] != new["max_new"]:
-            problems.append(
+            coverage(
                 f"greedy not gated: baseline --max-new {old['max_new']}, "
                 f"this run {new['max_new']}")
         else:
             was = {r["file"]: r["matched_tokens"] for r in old["per_prompt"]}
+            now = {r["file"] for r in new["per_prompt"]}
+            for missing in sorted(set(was) - now):
+                coverage(
+                    f"greedy {missing}: in the baseline, not measured by this "
+                    f"run — that prompt is ungated")
             for row in new["per_prompt"]:
                 before = was.get(row["file"])
                 if before is None:
                     continue
                 if row["matched_tokens"] < before:
-                    problems.append(
+                    regression(
                         f"greedy {row['file']}: matched {row['matched_tokens']} "
                         f"tokens, baseline {before} (-{before - row['matched_tokens']})")
             if new["matched_total"] < old["matched_total"]:
-                problems.append(
+                regression(
                     f"greedy aggregate {new['matched_total']}, baseline "
                     f"{old['matched_total']}")
+            # The denominator matters as much as the numerator: comparing
+            # fewer reference tokens is a weaker gate, not a passing one.
+            if new["possible_total"] < old["possible_total"]:
+                coverage(
+                    f"greedy compared {new['possible_total']} reference "
+                    f"tokens, baseline {old['possible_total']} — the gate got "
+                    f"smaller")
 
     old, new = baseline.get("paths"), results.get("paths")
     if old and new:
         if (old["stride"], old["top"]) != (new["stride"], new["top"]):
-            problems.append(
+            coverage(
                 f"paths not gated: baseline stride {old['stride']}/top "
-                f"{old['top']}, this run stride {new['stride']}/top {new['top']}")
+                f"{old['top']}, this run stride {new['stride']}/top "
+                f"{new['top']} — record a baseline at this configuration in "
+                f"its own file (--baseline FILE --save-baseline) and gate "
+                f"against that")
         else:
             was = {p["file"]: p for p in old["per_path"]}
+            now = {p["file"] for p in new["per_path"]}
+            for missing in sorted(set(was) - now):
+                coverage(
+                    f"{missing}: in the baseline, not measured by this run — "
+                    f"that path is ungated (missing {missing}.npz?)")
+            if new["positions_total"] < old.get("positions_total", 0):
+                coverage(
+                    f"paths compared {new['positions_total']} positions, "
+                    f"baseline {old['positions_total']} — the gate got smaller")
+            if new["top1_total"] < old.get("top1_total", 0):
+                regression(
+                    f"paths aggregate top-1 {new['top1_total']}, baseline "
+                    f"{old['top1_total']}")
+            # The premise of the whole teacher-forced comparison: both sides
+            # sit at an identical context at every position. Measured and
+            # printed since day one, never gated.
+            if new["context_checked_total"] != new["positions_total"]:
+                coverage(
+                    f"paths: only {new['context_checked_total']} of "
+                    f"{new['positions_total']} positions had their context "
+                    f"re-encoding verified against the reference token ids "
+                    f"(meta.json is missing tokenized_prompts) — the "
+                    f"teacher-forced numbers are only meaningful at an "
+                    f"identical context")
             for path in new["per_path"]:
                 before = was.get(path["file"])
                 if before is None:
                     continue
+                if (path["retokenized_positions"]
+                        > before.get("retokenized_positions", 0)):
+                    regression(
+                        f"{path['file']}: {path['retokenized_positions']} of "
+                        f"{path['positions']} contexts re-encoded to token "
+                        f"ids the reference did not use, baseline "
+                        f"{before.get('retokenized_positions', 0)} — those "
+                        f"positions compare distributions at different "
+                        f"contexts")
                 for key in ("top1_agree", "top5_overlap", "top10_overlap"):
                     if path[key] < before[key]:
-                        problems.append(
+                        regression(
                             f"{path['file']}: {key} {path[key]}, baseline "
                             f"{before[key]}")
                 b_first = before["first_disagreement"]
                 n_first = path["first_disagreement"]
                 if b_first is None and n_first is not None:
-                    problems.append(
+                    regression(
                         f"{path['file']}: top-1 now disagrees at position "
                         f"{n_first}, baseline agreed everywhere")
                 elif (b_first is not None and n_first is not None
                       and n_first < b_first):
-                    problems.append(
+                    regression(
                         f"{path['file']}: first top-1 disagreement moved "
                         f"earlier, {b_first} -> {n_first}")
     return not problems, problems
@@ -550,10 +792,12 @@ def main() -> int:
     parser.add_argument("--ramvamp",
                         help="ramvamp binary (default: cargo run --release)")
     parser.add_argument("--cache", default="models/llamacpp-ref/greedy-cache",
-                        help="where per-(prompt, position) ramvamp outputs live")
+                        help="where baseline.json, results.json and the "
+                             "per-binary output caches live")
     parser.add_argument("--refresh", action="store_true",
-                        help="recompute every cached ramvamp output; this is "
-                             "what a phase-5 wave must run")
+                        help="recompute every cached ramvamp output even for "
+                             "an unchanged binary; a changed binary already "
+                             "invalidates its own cache")
     parser.add_argument("--only", choices=["all", "greedy", "paths"],
                         default="all", help="run one suite only")
     parser.add_argument("--max-new", type=int, default=128,
@@ -583,6 +827,12 @@ def main() -> int:
 
     if args.stride < 1:
         fail("--stride must be >= 1")
+    if args.max_new < 1:
+        fail("--max-new must be >= 1")
+    if args.positions is not None and args.positions < 1:
+        fail("--positions must be >= 1")
+    if args.top < 10:
+        fail("--top must be >= 10 (top-10 overlap is one of the metrics)")
     meta_path = os.path.join(args.ref, "meta.json")
     if not os.path.isfile(meta_path):
         fail(f"no meta.json under {args.ref}")
@@ -592,12 +842,29 @@ def main() -> int:
     os.makedirs(args.cache, exist_ok=True)
     baseline_path = args.baseline or os.path.join(args.cache, "baseline.json")
 
+    # Cache key. Without a binary fingerprint the cache is scoring whatever
+    # produced the entries, which need not be the build under test.
+    args.binary = binary_identity(args)
+    if args.binary["sha256"]:
+        args.cache_runs = os.path.join(
+            args.cache, f"bin-{args.binary['sha256'][:16]}")
+        print(f"binary: {args.binary['invocation']} "
+              f"sha256 {args.binary['sha256'][:16]}... "
+              f"({args.binary['bytes']} B)")
+    else:
+        args.cache_runs = None
+        print("binary: cargo run --release (no --ramvamp) — the binary "
+              "cannot be fingerprinted, so the cache is disabled for this "
+              "run; pass --ramvamp to get caching back", file=sys.stderr)
+
     results: dict = {
         "model": os.path.abspath(args.rvmp),
         "reference": os.path.abspath(args.ref),
         "llama_server_version": meta.get("llama_server_version"),
         "ran": time.strftime("%Y-%m-%d %H:%M:%S %z"),
         "refreshed": args.refresh,
+        "binary": args.binary,
+        "only": args.only,
     }
     if args.only in ("all", "greedy"):
         results["greedy"] = run_greedy(args, meta, detok)
@@ -618,22 +885,42 @@ def main() -> int:
         print("verdict: BASELINE RECORDED (nothing to gate against yet)")
         return 0
 
+    # An absent baseline is a harness error, not a pass. `--cache` defaults
+    # to a generated, uncommitted directory, so "no baseline" is the normal
+    # state of every fresh checkout and every CI container — exactly the
+    # environments where a green exit code is most likely to be believed.
     if not os.path.isfile(baseline_path):
-        print(f"verdict: NO BASELINE at {baseline_path} — rerun with "
-              f"--save-baseline to record this run as the phase-4 reference")
-        return 0
+        fail(f"no baseline at {baseline_path}, so there is nothing to gate "
+             f"against. This run measured numbers but did not check them. "
+             f"Rerun with --save-baseline to record this run as the "
+             f"reference, or point --baseline at an existing one.")
 
     with open(baseline_path, encoding="utf-8") as f:
         baseline = json.load(f)
+    base_bin = (baseline.get("binary") or {}).get("sha256")
+    if base_bin:
+        print(f"baseline binary: {base_bin[:16]}...  this run: "
+              f"{str(args.binary['sha256'])[:16]}...")
     ok, problems = gate(results, baseline)
-    for problem in problems:
-        print(f"  REGRESSION: {problem}")
+    for kind, problem in problems:
+        print(f"  {kind}: {problem}")
     if ok:
         print(f"verdict: PASS — no metric below the baseline recorded "
               f"{baseline.get('ran')}")
         return 0
-    print(f"verdict: FAIL — {len(problems)} metric(s) below the baseline "
-          f"recorded {baseline.get('ran')}")
+    regressions = sum(1 for kind, _ in problems if kind == REGRESSION)
+    gaps = len(problems) - regressions
+    print(f"verdict: FAIL — {regressions} regression(s) and {gaps} coverage "
+          f"gap(s) vs the baseline recorded {baseline.get('ran')}")
+    if not regressions:
+        # Say it out loud, because this is the outcome a partial run (--only,
+        # a non-default --stride, a missing fixture) produces, and a FAIL the
+        # reader cannot tell apart from a real regression is a FAIL the reader
+        # learns to ignore.
+        print("  nothing measured got worse. What failed is that this run "
+              "gated less than the baseline does — fix the coverage, or "
+              "point --baseline at a baseline recorded in this exact "
+              "configuration.")
     return 1
 
 

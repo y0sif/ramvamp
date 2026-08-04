@@ -1,7 +1,11 @@
 //! Pinned compute pool and CPU topology.
 //!
-//! Owned by wave-1 lane D. Six worker threads, one per physical P-core with
+//! Owned by wave-1 lane D. Six compute shards, one per physical P-core with
 //! no SMT sibling, joined by a barrier for the duration of a token step.
+//! With the default [`PoolConfig::inline_caller`] those six shards are five
+//! spawned worker threads plus the submitting decode thread, which runs
+//! shard 0 itself; with `inline_caller: false` they are six spawned workers
+//! and the decode thread only waits.
 //!
 //! Topology on the reference machine (Core Ultra 9 185H) is not guessable
 //! from core ids: `/sys/devices/cpu_core/cpus` is `0-11` and
@@ -25,13 +29,24 @@
 //!
 //! # Handoff cost
 //!
-//! Measured on the reference machine, reactor-to-worker handoff: a futex
-//! wake/wait pair is p50 3.1 µs at 0.07 cores of steady-state overhead;
-//! pure atomic spinning is 502 ns but burns 1.03 cores; `std::sync::mpsc`
-//! is p99 237 µs, which is disqualifying for a per-GEMV barrier. The pool
-//! therefore uses a bounded spin ([`SPIN_ROUNDS`]) followed by a futex
-//! wait, which behaves like the spinner while the decode loop is hot and
-//! like the futex when it goes idle.
+//! Recorded as EXP-010 in `docs/experiments/README.md`, and provisional under
+//! that log's rule 2 (measured on a machine that was not quiet, and a
+//! microbenchmark rather than an end-to-end run): treat the figures as
+//! ordering evidence, not as published numbers.
+//!
+//! What was measured on the reference machine is the round trip this pool
+//! actually performs — submitter publishes, workers wake, workers run, the
+//! barrier retires — for three handoff primitives. A futex wake/wait pair is
+//! p50 3.1 µs at 0.07 cores of steady-state overhead; pure atomic spinning
+//! is 502 ns but burns 1.03 cores; `std::sync::mpsc` is p99 237 µs, which is
+//! disqualifying for a per-GEMV barrier. The figures predate the decision to
+//! drive the io_uring reactor inline on the coordinator, so they are *not* a
+//! reactor-to-worker measurement — this pool performs no such handoff.
+//!
+//! The pool therefore uses a bounded spin ([`SPIN_ROUNDS`]) followed by a
+//! futex wait, which behaves like the spinner while the decode loop is hot
+//! and like the futex when it goes idle. Re-measure with
+//! `cargo test -p ramvamp-core -- --ignored wake_latency --nocapture`.
 //!
 //! # Borrowed work on persistent threads
 //!
@@ -53,11 +68,21 @@
 //!    `pending` has reached zero, i.e. until every worker has finished
 //!    calling the closure and can no longer observe the pointer. The wait is
 //!    performed by a `Drop` guard, exactly as `std::thread::scope` does, so
-//!    a panic in the caller's own shard cannot let the borrow escape.
+//!    a panic in the caller's own shard cannot let the borrow escape. The
+//!    guard is constructed *before* the job is published, so there is no
+//!    instant at which a worker can see the pointer without the guard being
+//!    live.
 //! 5. Worker closures run under `catch_unwind`, so a panicking closure can
 //!    neither skip its `pending` decrement (which would deadlock the
 //!    barrier) nor unwind out of the worker thread (which would silently
 //!    shrink the pool). The payload is re-raised on the submitting thread.
+//!    The decrement is performed by a `Drop` guard rather than by a tail
+//!    call, so it survives an unwind raised *while* the payload is being
+//!    recorded — the one remaining way a `catch_unwind` body can still
+//!    unwind is a panic payload whose own `Drop` panics, and that is
+//!    contained by a second `catch_unwind` around the recording step (see
+//!    `worker_loop`), so it can neither strand the barrier nor kill the
+//!    thread.
 //!
 //! `F: Sync` is what makes `&F` sendable to the workers; `T: Send` is what
 //! makes the disjoint output sub-slices sendable in [`ComputePool::scatter`].
@@ -73,6 +98,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -82,14 +108,28 @@ const SYSFS_ROOT: &str = "/sys";
 
 /// Largest CPU id an affinity mask can hold.
 ///
-/// `rustix`'s `CpuSet` indexes a fixed-size bit array without bounds
-/// checking, so every CPU id parsed out of sysfs is range-checked against
-/// this before it reaches the syscall wrapper.
+/// `rustix`'s `CpuSet` is a fixed-size `[u64; CPU_SETSIZE / 64]` and
+/// `CpuSet::set` indexes it directly (`rustix-1.1.4`,
+/// `src/backend/linux_raw/thread/cpu_set.rs:9-13`). That is an ordinary Rust
+/// array index, so an out-of-range id is a bounds-check *panic*, not
+/// undefined behaviour — but `ramvamp-core` must not panic on data it read
+/// out of sysfs, so every CPU id is range-checked against this constant
+/// before it reaches the syscall wrapper and reported as a typed error
+/// instead.
 #[cfg(target_os = "linux")]
 pub const MAX_CPUS: usize = rustix::thread::CpuSet::MAX_CPU;
 /// Largest CPU id an affinity mask can hold.
 #[cfg(not(target_os = "linux"))]
 pub const MAX_CPUS: usize = 1024;
+
+/// Hard ceiling on [`PoolConfig::shards`].
+///
+/// A shard exists to occupy one CPU, so more shards than an affinity mask
+/// can even name is meaningless — and it is the difference between a caller
+/// typo and `Vec::with_capacity(usize::MAX - 1)`, which aborts the process
+/// instead of unwinding. Values above this are clamped, not rejected,
+/// because the constructors are documented as infallible.
+pub const MAX_SHARDS: usize = MAX_CPUS;
 
 /// Bounded spin, in `pause` iterations, before a thread parks on a futex.
 ///
@@ -483,7 +523,10 @@ impl Topology {
             }
         };
 
-        let compute = smt_primaries(sysfs, &candidates)?;
+        // `None` means sysfs would not say what the SMT layout is for some
+        // candidate (see `read_siblings`). That disables pinning for the
+        // whole machine; every other field is still reported.
+        let compute = smt_primaries(sysfs, &candidates).unwrap_or_default();
 
         // An io_uring reactor wants an E-core that shares L3 with the
         // compute cores, so completion flags hand off through L3 rather than
@@ -641,8 +684,8 @@ fn read_cpu_list(path: &Path) -> Result<Option<Vec<usize>>, TopologyError> {
 ///
 /// Returns an ascending, deduplicated vector. The error is a static reason
 /// string; callers attach the path. Ids at or beyond [`MAX_CPUS`] are
-/// rejected rather than silently truncated, because they would panic the
-/// `CpuSet` bit-array indexing downstream.
+/// rejected rather than silently truncated, because indexing the `CpuSet`
+/// bit array with one would panic downstream (see [`MAX_CPUS`]).
 fn parse_cpu_list(text: &str) -> Result<Vec<usize>, &'static str> {
     let mut cpus = BTreeSet::new();
     let text = text.trim();
@@ -706,7 +749,12 @@ fn format_cpu_list(cpus: &[usize]) -> String {
 /// `candidates` must be ascending. Siblings outside `candidates` still
 /// retire their group — a cpuset that exposes only one half of an SMT pair
 /// still yields exactly one primary for that physical core.
-fn smt_primaries(sysfs: &Path, candidates: &[usize]) -> Result<Vec<usize>, TopologyError> {
+///
+/// `None` means sysfs would not say what the SMT layout is for at least one
+/// candidate, in which case *no* primaries are returned rather than a
+/// partial answer; see [`read_siblings`] for the policy and for why it is
+/// not "assume that CPU is alone on its core".
+fn smt_primaries(sysfs: &Path, candidates: &[usize]) -> Option<Vec<usize>> {
     let mut claimed: BTreeSet<usize> = BTreeSet::new();
     let mut primaries = Vec::new();
     for &cpu in candidates {
@@ -718,26 +766,53 @@ fn smt_primaries(sysfs: &Path, candidates: &[usize]) -> Result<Vec<usize>, Topol
         claimed.insert(cpu);
         claimed.extend(siblings);
     }
-    Ok(primaries)
+    Some(primaries)
 }
 
-/// Sibling logical CPUs of `cpu`, defaulting to `[cpu]` when unknown.
-fn read_siblings(sysfs: &Path, cpu: usize) -> Result<Vec<usize>, TopologyError> {
+/// Sibling logical CPUs of `cpu`, or `None` when sysfs will not say.
+///
+/// # Failure policy
+///
+/// Sibling data is evidence *for* pinning in exactly the way [`cpu_has_l3`]
+/// is evidence for the reactor hint, and both obey the same two rules: a
+/// file this cannot read is never fatal to detection, and is never guessed
+/// at either. Concretely:
+///
+/// * a readable, non-empty list is authoritative;
+/// * both spellings are tried independently, so a malformed
+///   `thread_siblings_list` still falls through to `core_cpus_list` instead
+///   of discarding the machine on the strength of one bad file;
+/// * an absent, empty, unreadable or malformed pair of files yields `None`,
+///   never `[cpu]`. "I could not read the sibling list" is not evidence that
+///   `cpu` has no SMT sibling. The old `[cpu]` default meant that on a
+///   container exposing `devices/cpu_core/cpus` but no `cpuN/topology/`,
+///   *both* halves of every SMT pair were promoted to primaries — twelve
+///   pinned threads on six physical cores, announced only by a `debug!`;
+/// * `None` propagates to [`smt_primaries`] and disables pinning for the
+///   whole machine. Running unpinned is a measurable slowdown that shows up
+///   in `docs/experiments`; double-booking physical cores is a silent
+///   violation of this module's one-thread-per-physical-core invariant, so
+///   the two are not symmetric and the tie goes to unpinned.
+fn read_siblings(sysfs: &Path, cpu: usize) -> Option<Vec<usize>> {
     let base = sysfs.join(format!("devices/system/cpu/cpu{cpu}/topology"));
     // `thread_siblings_list` is the classic name; `core_cpus_list` is the
     // post-5.3 spelling. Either is authoritative.
     for name in ["thread_siblings_list", "core_cpus_list"] {
-        if let Some(list) = read_cpu_list(&base.join(name))? {
-            if !list.is_empty() {
-                return Ok(list);
-            }
+        match read_cpu_list(&base.join(name)) {
+            Ok(Some(list)) if !list.is_empty() => return Some(list),
+            // Absent or empty: try the other spelling.
+            Ok(_) => {}
+            Err(err) => warn!(cpu, file = name, error = %err, "unusable smt sibling list"),
         }
     }
-    debug!(
+    warn!(
         cpu,
-        "no sibling list in sysfs; treating cpu as its own core"
+        topology = %base.display(),
+        "sysfs reports no usable smt sibling list; refusing to pin, because \
+         treating an unknown sibling list as 'no sibling' would put two \
+         compute threads on one physical core"
     );
-    Ok(vec![cpu])
+    None
 }
 
 /// Whether `cpu` has any level-3 cache.
@@ -828,18 +903,64 @@ pub fn shard_range(rows: usize, shards: usize, index: usize) -> Range<usize> {
 // Parking
 // ---------------------------------------------------------------------------
 
+/// Longest a single futex sleep in [`Shared::await_barrier`] may last.
+///
+/// Every futex sleep in this module is bounded, so that a wakeup lost for
+/// *any* reason — a protocol bug, a kernel oddity, a future edit to the wake
+/// path — degrades to a slow poll instead of an unrecoverable hang. This is
+/// defence in depth, not the mechanism the barrier relies on: the protocol
+/// documented on [`Shared`] is what makes lost wakeups impossible, and this
+/// is what makes being wrong about that survivable and observable.
+///
+/// It is free in the hot path. A parked submitter is by definition waiting
+/// on a job that is already running; the decode loop usually never reaches
+/// the park at all ([`SPIN_ROUNDS`] covers the common barrier); and one
+/// extra wakeup per millisecond of a job that already costs milliseconds is
+/// noise.
+const BARRIER_POLL: Duration = Duration::from_millis(1);
+
+/// First bound on a worker's futex sleep in [`Shared::await_seq`].
+///
+/// A worker waits here for the *next* job, so unlike the barrier it can
+/// legitimately sleep for a long time — between tokens, or indefinitely once
+/// the process goes idle. Polling at [`BARRIER_POLL`] forever would cost
+/// five threads x 1000 wakeups/s on an idle pool, which is exactly what the
+/// futex is there to avoid. So the bound starts here, where a lost job
+/// wakeup costs a millisecond, and doubles up to [`JOB_POLL_MAX`].
+const JOB_POLL_MIN: Duration = Duration::from_millis(1);
+
+/// Ceiling on the [`JOB_POLL_MIN`] backoff.
+///
+/// An idle worker settles at ~4 wakeups/s, and the worst case for a wakeup
+/// lost on an already-idle pool is that the next job starts a quarter second
+/// late rather than never.
+const JOB_POLL_MAX: Duration = Duration::from_millis(256);
+
 #[cfg(target_os = "linux")]
 mod park {
     use rustix::thread::futex;
     use std::sync::atomic::AtomicU32;
+    use std::time::Duration;
 
-    /// Sleep until `word` stops being `expected`, or until woken.
+    /// Sleep until `word` stops being `expected`, until woken, or until
+    /// `timeout` elapses.
     ///
-    /// `EAGAIN` (the value already changed) and `EINTR` are both normal and
-    /// indistinguishable from a real wakeup here: every caller re-reads the
-    /// word in a loop, so a spurious return is free.
-    pub(super) fn wait(word: &AtomicU32, expected: u32) {
-        let _ = futex::wait(word, futex::Flags::PRIVATE, expected, None);
+    /// `EAGAIN` (the value already changed), `EINTR` and `ETIMEDOUT` are all
+    /// normal and indistinguishable from a real wakeup here: every caller
+    /// re-reads the word in a loop, so a spurious return is free.
+    ///
+    /// `FUTEX_WAIT` takes a *relative* timeout, which is what a `Duration`
+    /// is; the bitset variants would need an absolute one.
+    pub(super) fn wait(word: &AtomicU32, expected: u32, timeout: Duration) {
+        let timeout = futex::Timespec {
+            // `Duration` seconds outrange `Secs`; saturating keeps the
+            // timeout bounded either way, which is all this needs.
+            tv_sec: futex::Secs::try_from(timeout.as_secs()).unwrap_or(futex::Secs::MAX),
+            // `subsec_nanos()` is under 1e9, which is exact in every `Nsecs`
+            // Linux uses (`i64` on linux-raw, `c_long` on the libc backend).
+            tv_nsec: timeout.subsec_nanos() as futex::Nsecs,
+        };
+        let _ = futex::wait(word, futex::Flags::PRIVATE, expected, Some(&timeout));
     }
 
     /// Wake up to `count` threads parked on `word`.
@@ -851,13 +972,16 @@ mod park {
 #[cfg(not(target_os = "linux"))]
 mod park {
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
 
-    /// Portable stand-in for the futex path: yield until the word changes.
+    /// Portable stand-in for the futex path: yield until the word changes or
+    /// `timeout` elapses.
     ///
     /// Only used for non-Linux development builds; it burns a core while
     /// waiting, which is exactly why the Linux path exists.
-    pub(super) fn wait(word: &AtomicU32, expected: u32) {
-        while word.load(Ordering::Acquire) == expected {
+    pub(super) fn wait(word: &AtomicU32, expected: u32, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while word.load(Ordering::Acquire) == expected && Instant::now() < deadline {
             std::thread::yield_now();
         }
     }
@@ -910,21 +1034,65 @@ unsafe fn call_job<F: Fn(Shard) + Sync>(data: *const (), shard: Shard) {
 ///   barrier.
 /// * `job` is written only by the submitter, only while `pending == 0`, and
 ///   only before the `seq` store that publishes it. Workers read it only
-///   after observing the new `seq`. Those two facts are what make the
-///   `UnsafeCell` sound.
+///   after observing the new `seq`, and strictly before the `fetch_sub` that
+///   retires their shard. Those facts are what make the `UnsafeCell` sound;
+///   see [`Shared::publish`].
 /// * `workers_parked` / `lead_parked` let each side skip the `futex` syscall
 ///   when nobody is actually asleep. Both are updated with `SeqCst` and
 ///   paired against a `SeqCst` access of the corresponding futex word, which
 ///   is the standard Dekker interleaving: whichever side commits second
 ///   necessarily observes the other, so a wakeup can never be lost.
+///
+/// # Why a worker may read the park flag but never take it
+///
+/// The Dekker argument above holds *within* one job. `lead_parked` carries
+/// no job identity, so a flag set for job N+1 is indistinguishable from one
+/// set for job N — and a worker of job N can still be between its
+/// `fetch_sub` and its inspection of the flag long after job N's barrier has
+/// retired, because the barrier is satisfied by the `fetch_sub` itself, not
+/// by the worker leaving `finish_shard`.
+///
+/// If that worker *took* the flag (`swap(0)`) it would consume a flag that
+/// belongs to the next job and wake nobody, because the submitter has not
+/// enqueued on the futex yet. The submitter would then park with
+/// `lead_parked == 0`, and the eventual last decrement of job N+1 would find
+/// no flag and issue no wake: a permanent deadlock. Nothing about that
+/// depends on how narrow the window is, which is why it is fixed by
+/// construction rather than by narrowing.
+///
+/// The invariant that removes the class is: **`lead_parked` is written only
+/// by the thread it belongs to.** Workers only ever `load` it, so no worker
+/// of any generation can consume any other generation's flag; the submitter
+/// sets it once on entering its parked phase and clears it once on leaving,
+/// both in [`Shared::await_barrier`]. A worker of job N that observes job
+/// N+1's flag issues one wake nobody is waiting for, which costs a syscall
+/// and is otherwise inert — that is the entire price, and it is paid only in
+/// the interleaving that used to deadlock.
+///
+/// What remains is a single-generation obligation, and `SeqCst` discharges
+/// it. Worker: `fetch_sub(pending)` then `load(lead_parked)`. Submitter:
+/// `store(lead_parked, 1)` then `load(pending)`. In the total order, if the
+/// worker's load misses the submitter's store then the submitter's load must
+/// come after the worker's decrement — and a submitter that reads
+/// `pending == 0` never parks. A submitter that does park is guaranteed
+/// either a wake or an `EAGAIN`, because `park::wait` only sleeps while
+/// `pending` still equals the value just read, and `pending` decreases
+/// monotonically within a job (`run` takes `&mut self`, so the submitter
+/// cannot republish while it is parked).
 struct Shared {
     seq: AtomicU32,
     pending: AtomicU32,
     workers_parked: AtomicU32,
+    /// Set by the submitter while it is parked on `pending`; read, never
+    /// written, by workers. See the type docs for why the asymmetry is
+    /// load-bearing.
     lead_parked: AtomicU32,
     quit: AtomicU32,
     job: UnsafeCell<Option<JobRef>>,
     panic: Mutex<Option<PanicPayload>>,
+    /// Test-only interleaving control; not present in any other build.
+    #[cfg(test)]
+    probe: tests::BarrierProbe,
 }
 
 // SAFETY: `job` is the only interior-mutable non-atomic field. The protocol
@@ -945,6 +1113,8 @@ impl Shared {
             quit: AtomicU32::new(0),
             job: UnsafeCell::new(None),
             panic: Mutex::new(None),
+            #[cfg(test)]
+            probe: tests::BarrierProbe::new(),
         }
     }
 
@@ -964,9 +1134,21 @@ impl Shared {
 
     /// Publish a job and release the workers.
     fn publish(&self, job: JobRef, workers: u32) {
-        // SAFETY: `pending == 0` here (the previous job's barrier completed
-        // and `run` takes `&mut self`), so no worker can be reading the
-        // slot. The `SeqCst` store below is a release fence for this write.
+        // SAFETY: no worker can be *reading* the slot here.
+        //
+        // Note that this does not follow from `pending == 0` on its own: a
+        // worker is still inside `finish_shard` for a moment after the
+        // `fetch_sub` that drives `pending` to zero, so "the barrier
+        // retired" is not "every worker has left `finish_shard`". What makes
+        // the write sound is the ordering *inside* the worker: `worker_loop`
+        // reads this slot strictly before the `fetch_sub` that retires its
+        // shard, and does not touch it again. So the previous barrier's
+        // observation of `pending == 0` — an `Acquire`/`SeqCst` load reading
+        // the value written by that release `fetch_sub` — happens-after
+        // every worker's read of the slot, and this write happens-after that
+        // observation. `run` takes `&mut self`, so there is no second
+        // submitter. The `SeqCst` `seq` store below releases this write to
+        // the workers that are about to read it.
         unsafe {
             *self.job.get() = Some(job);
         }
@@ -979,15 +1161,35 @@ impl Shared {
     }
 
     /// Retire this worker's shard; wake the submitter if it was the last.
+    ///
+    /// The flag is **read, not taken**. Taking it (`swap(0)`) is what let a
+    /// worker still inside this function from the *previous* job consume the
+    /// flag the submitter had just set for the current one, wake nobody, and
+    /// strand the submitter forever. Only the submitter clears its own flag;
+    /// see the `Shared` type docs for the full argument.
     fn finish_shard(&self) {
-        if self.pending.fetch_sub(1, Ordering::SeqCst) == 1
-            && self.lead_parked.swap(0, Ordering::SeqCst) != 0
-        {
-            park::wake(&self.pending, 1);
+        if self.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+            // The window the cross-generation regression test forces open.
+            #[cfg(test)]
+            let stalled = self.probe.enter_wake_window();
+            let parked = self.lead_parked.load(Ordering::SeqCst) != 0;
+            if parked {
+                park::wake(&self.pending, 1);
+            }
+            #[cfg(test)]
+            if stalled {
+                self.probe.leave_wake_window(parked);
+            }
         }
     }
 
     /// Block until every worker has retired its shard.
+    ///
+    /// `lead_parked` is set once on entering the parked phase and cleared
+    /// once on leaving it, both from this thread. Nothing else ever writes
+    /// it, which is what keeps the flag tied to this call rather than to
+    /// whichever job happens to be in flight when some worker gets around to
+    /// looking at it.
     fn await_barrier(&self) {
         for _ in 0..SPIN_ROUNDS {
             if self.pending.load(Ordering::Acquire) == 0 {
@@ -995,19 +1197,20 @@ impl Shared {
             }
             std::hint::spin_loop();
         }
+        // Dekker: this store is ordered before the `SeqCst` load below, and
+        // a worker's `fetch_sub` is ordered before its load of the flag.
+        self.lead_parked.store(1, Ordering::SeqCst);
         loop {
-            if self.pending.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            self.lead_parked.store(1, Ordering::SeqCst);
             let outstanding = self.pending.load(Ordering::SeqCst);
             if outstanding == 0 {
-                self.lead_parked.store(0, Ordering::SeqCst);
-                return;
+                break;
             }
-            park::wait(&self.pending, outstanding);
-            self.lead_parked.store(0, Ordering::SeqCst);
+            #[cfg(test)]
+            self.probe.enter_park_window(&self.lead_parked);
+            // Bounded: a lost wake costs a millisecond, not the process.
+            park::wait(&self.pending, outstanding, BARRIER_POLL);
         }
+        self.lead_parked.store(0, Ordering::SeqCst);
     }
 
     /// Block until `seq` differs from `last`, returning the new value.
@@ -1019,6 +1222,7 @@ impl Shared {
             }
             std::hint::spin_loop();
         }
+        let mut poll = JOB_POLL_MIN;
         loop {
             self.workers_parked.fetch_add(1, Ordering::SeqCst);
             let seq = self.seq.load(Ordering::SeqCst);
@@ -1026,7 +1230,8 @@ impl Shared {
                 self.workers_parked.fetch_sub(1, Ordering::SeqCst);
                 return seq;
             }
-            park::wait(&self.seq, last);
+            park::wait(&self.seq, last, poll);
+            poll = (poll * 2).min(JOB_POLL_MAX);
             self.workers_parked.fetch_sub(1, Ordering::SeqCst);
             let seq = self.seq.load(Ordering::Acquire);
             if seq != last {
@@ -1056,6 +1261,16 @@ impl Drop for BarrierGuard<'_> {
         if std::thread::panicking() {
             // The caller's own panic wins; drop any worker payload rather
             // than double-panicking out of a `Drop`.
+            //
+            // Dropping it here does run the payload's own `Drop` while this
+            // thread is unwinding, so a payload that panics in `Drop` aborts
+            // the process. That is not a barrier hazard - `await_barrier()`
+            // above has already returned, so `pending == 0` and no worker is
+            // stranded either way - but it is a real abort path, and this
+            // module enumerates those rather than leaving them implicit. It
+            // is accepted: a panic payload is whatever `panic!` was handed,
+            // in practice a `String` or `&str`, and a type whose `Drop`
+            // panics has no non-aborting disposal anywhere in a `Drop` body.
             if self.shared.take_panic().is_some() {
                 warn!("discarding worker panic while the submitting thread unwinds");
             }
@@ -1068,6 +1283,12 @@ impl Drop for BarrierGuard<'_> {
 pub struct PoolConfig {
     /// Total shards per job, counting the submitting thread when
     /// `inline_caller` is set. `None` takes [`Topology::shard_count`].
+    ///
+    /// Clamped to `1..=`[`MAX_SHARDS`]. This is a caller-supplied number
+    /// rather than untrusted input, but `Some(usize::MAX)` would otherwise
+    /// reach `Vec::with_capacity`, and a capacity overflow aborts the
+    /// process rather than unwinding — which is not something a `#[must_use]`
+    /// constructor documented as infallible is allowed to do.
     pub shards: Option<usize>,
     /// Attempt to pin worker threads. Failures degrade to unpinned.
     pub pin: bool,
@@ -1127,6 +1348,11 @@ impl ComputePool {
     }
 
     /// Detect the topology and build a pool with `config`.
+    ///
+    /// Never fails, and — unlike "never returns an error" — never aborts
+    /// either: [`PoolConfig::shards`] is clamped to [`MAX_SHARDS`] before it
+    /// reaches an allocation or a spawn loop, and a spawn that fails part
+    /// way through shrinks the pool with a warning instead of propagating.
     #[must_use]
     pub fn with_config(config: PoolConfig) -> Self {
         let topology = Topology::detect();
@@ -1134,12 +1360,15 @@ impl ComputePool {
     }
 
     /// Build a pool over an already-detected topology.
+    ///
+    /// See [`ComputePool::with_config`] for the clamping and degradation
+    /// rules; this is the same constructor with detection already done.
     #[must_use]
     pub fn with_topology(topology: Topology, config: PoolConfig) -> Self {
         let shards = config
             .shards
             .unwrap_or_else(|| topology.shard_count())
-            .max(1);
+            .clamp(1, MAX_SHARDS);
         let inline_caller = config.inline_caller;
         let pin = config.pin && topology.pins();
         let compute = topology.compute_cpus().to_vec();
@@ -1275,8 +1504,16 @@ impl ComputePool {
         };
 
         let shared: &Shared = &self.shared;
-        shared.publish(job, workers);
+        // The guard is armed *before* the job is published, not after.
+        // Nothing in `publish` can panic today, so the erased `&f` could not
+        // actually escape through that gap — but the entire soundness
+        // argument for the erased pointer is "the guard exists from the
+        // moment the workers can see it", and an argument that depends on
+        // auditing the callee for panics is one edit away from being wrong.
+        // Draining a barrier that was never published is a no-op
+        // (`pending == 0`), so arming early is free.
         let guard = BarrierGuard { shared };
+        shared.publish(job, workers);
         if inline_caller {
             f(Shard {
                 index: 0,
@@ -1376,6 +1613,22 @@ unsafe impl<T: Send> Send for SendPtr<T> {}
 // SAFETY: see `Send`.
 unsafe impl<T: Send> Sync for SendPtr<T> {}
 
+/// Retires one shard on every exit path, the way [`BarrierGuard`] retires
+/// the job.
+///
+/// A tail call to `finish_shard` is correct only as long as nothing above it
+/// can unwind, which is a property of the code as written rather than of the
+/// protocol. This makes the decrement structural.
+struct ShardGuard<'a> {
+    shared: &'a Shared,
+}
+
+impl Drop for ShardGuard<'_> {
+    fn drop(&mut self) {
+        self.shared.finish_shard();
+    }
+}
+
 fn worker_loop(shared: &Shared, shard_index: usize, cpu: Option<usize>) {
     if let Some(cpu) = cpu {
         pin_or_warn(cpu, "compute-worker");
@@ -1387,9 +1640,14 @@ fn worker_loop(shared: &Shared, shard_index: usize, cpu: Option<usize>) {
             break;
         }
         // SAFETY: the submitter wrote this slot before the `seq` store we
-        // just observed with `Acquire`, and cannot write it again until
-        // `finish_shard` below drives `pending` to zero.
+        // just observed with `Acquire`, and cannot write it again until the
+        // `finish_shard` below drives `pending` to zero. This read is
+        // sequenced before that decrement, which is precisely what
+        // `Shared::publish` relies on.
         let job = unsafe { *shared.job.get() };
+        // From here on the decrement happens no matter how this iteration
+        // ends.
+        let _retire = ShardGuard { shared };
         if let Some(job) = job {
             let rows = shard_range(job.rows, job.shards, shard_index);
             if !rows.is_empty() {
@@ -1408,11 +1666,26 @@ fn worker_loop(shared: &Shared, shard_index: usize, cpu: Option<usize>) {
                     unsafe { (job.call)(job.data, shard) }
                 }));
                 if let Err(payload) = result {
-                    shared.record_panic(payload);
+                    // Recording can itself unwind, in exactly one way: the
+                    // payload's own `Drop` panics when `record_panic` drops
+                    // it (the slot was already occupied). `ShardGuard` would
+                    // still retire the shard, but the unwind would leave
+                    // `worker_loop` and kill the thread, and the pool sizes
+                    // its `pending` from the number of join handles, not
+                    // from the number of live threads — so the *next* job
+                    // would never retire. Contain it here instead.
+                    if let Err(second) =
+                        catch_unwind(AssertUnwindSafe(|| shared.record_panic(payload)))
+                    {
+                        // Deliberately leaked, not dropped: dropping it
+                        // would re-enter the same panicking destructor with
+                        // no `catch_unwind` left to catch it.
+                        std::mem::forget(second);
+                        warn!("panic while recording a worker panic; payload leaked");
+                    }
                 }
             }
         }
-        shared.finish_shard();
     }
 }
 
@@ -1424,7 +1697,132 @@ fn worker_loop(shared: &Shared, shard_index: usize, cpu: Option<usize>) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, AtomicUsize};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    /// How long a probe hand-off waits before giving up.
+    ///
+    /// Only reached if the scenario failed to set itself up; the assertions
+    /// then report *that* rather than letting the test hang.
+    const PROBE_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Test-only control over the `finish_shard` / `await_barrier`
+    /// interleaving, forcing the cross-generation window open on demand.
+    ///
+    /// It lives inside [`Shared`] rather than in a `static` so that two
+    /// tests running in parallel — which is cargo's default — cannot arm
+    /// each other's pool. Every field is inert until explicitly armed: an
+    /// unarmed probe costs one uncontended swap per retired job and two
+    /// loads per park iteration, and non-test builds do not have the field
+    /// at all.
+    #[derive(Debug, Default)]
+    pub(super) struct BarrierProbe {
+        /// One-shot: the next worker to drive `pending` to zero stalls
+        /// between that decrement and its look at `lead_parked`.
+        stall_worker: AtomicU32,
+        /// Set by that worker once it is inside the window.
+        worker_waiting: AtomicU32,
+        /// Set by the submitter to let the stalled worker proceed.
+        resume_worker: AtomicU32,
+        /// Set by the worker once it has left the window.
+        worker_left: AtomicU32,
+        /// What the stalled worker saw in `lead_parked`. `1` means the
+        /// submitter had already armed for the *next* job — the interleaving
+        /// the regression test exists to force.
+        worker_saw_flag: AtomicU32,
+        /// One-shot: the submitter holds its arming window open until the
+        /// stalled worker has been all the way through the wake window.
+        stall_lead: AtomicU32,
+        /// `lead_parked`, read by the submitter after the straggler has been
+        /// all the way through the wake window. `1` means the straggler left
+        /// the flag alone; `0` means it consumed it. This is the assertion
+        /// that does not depend on `BARRIER_POLL` rescuing the process.
+        flag_after_straggler: AtomicU32,
+        /// Whether `flag_after_straggler` was ever written.
+        flag_recorded: AtomicU32,
+    }
+
+    impl BarrierProbe {
+        pub(super) fn new() -> Self {
+            Self::default()
+        }
+
+        /// Stall the next worker that retires a job's last shard.
+        fn arm_worker(&self) {
+            self.stall_worker.store(1, Ordering::SeqCst);
+        }
+
+        /// Hold the next park of the submitter open until that worker has
+        /// inspected `lead_parked`.
+        fn arm_lead(&self) {
+            self.stall_lead.store(1, Ordering::SeqCst);
+        }
+
+        /// Whether a straggler was actually held in the wake window and
+        /// released again, i.e. whether the interleaving was exercised.
+        fn straggler_went_through_window(&self) -> bool {
+            self.worker_left.load(Ordering::SeqCst) != 0
+        }
+
+        fn worker_saw_flag(&self) -> bool {
+            self.worker_saw_flag.load(Ordering::SeqCst) != 0
+        }
+
+        /// Whether the submitter's flag survived the straggler, and whether
+        /// it was ever looked at.
+        fn flag_survived_straggler(&self) -> (bool, bool) {
+            (
+                self.flag_recorded.load(Ordering::SeqCst) != 0,
+                self.flag_after_straggler.load(Ordering::SeqCst) != 0,
+            )
+        }
+
+        /// Called from `finish_shard`, between the decrement that retired
+        /// the job and the look at `lead_parked`. Returns whether this
+        /// thread is the stalled one.
+        pub(super) fn enter_wake_window(&self) -> bool {
+            if self.stall_worker.swap(0, Ordering::SeqCst) == 0 {
+                return false;
+            }
+            self.worker_waiting.store(1, Ordering::SeqCst);
+            wait_for(&self.resume_worker);
+            true
+        }
+
+        /// Called from `finish_shard` once the flag has been inspected.
+        pub(super) fn leave_wake_window(&self, saw_flag: bool) {
+            self.worker_saw_flag
+                .store(u32::from(saw_flag), Ordering::SeqCst);
+            self.worker_left.store(1, Ordering::SeqCst);
+        }
+
+        /// Called from `await_barrier` after `lead_parked` is armed and a
+        /// non-zero `pending` has been read, i.e. in the few hundred
+        /// nanoseconds before the submitter is actually enqueued on the
+        /// futex. Releases the stalled worker into exactly that window, then
+        /// records whether its own flag is still armed afterwards.
+        pub(super) fn enter_park_window(&self, lead_parked: &AtomicU32) {
+            if self.stall_lead.load(Ordering::SeqCst) == 0
+                || self.worker_waiting.load(Ordering::SeqCst) == 0
+            {
+                return;
+            }
+            self.resume_worker.store(1, Ordering::SeqCst);
+            wait_for(&self.worker_left);
+            self.flag_after_straggler
+                .store(lead_parked.load(Ordering::SeqCst), Ordering::SeqCst);
+            self.flag_recorded.store(1, Ordering::SeqCst);
+            self.stall_lead.store(0, Ordering::SeqCst);
+        }
+    }
+
+    /// Sleep (never spin: the stress runs use a three-CPU cpuset) until
+    /// `flag` is set or [`PROBE_DEADLINE`] passes.
+    fn wait_for(flag: &AtomicU32) {
+        let deadline = Instant::now() + PROBE_DEADLINE;
+        while flag.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
 
     /// Unique directory under the system temp dir, removed on drop.
     struct TempDir(PathBuf);
@@ -1632,20 +2030,63 @@ mod tests {
     }
 
     #[test]
-    fn malformed_sibling_list_fails_parse_and_degrades_detect() {
+    fn a_malformed_sibling_list_falls_through_to_the_other_spelling() {
+        // One bad `thread_siblings_list` must not discard a machine whose
+        // `core_cpus_list` says the same thing: the failure policy is "no
+        // single unreadable file decides the topology".
         let tmp = reference_sysfs();
         write_file(
             tmp.path(),
             "devices/system/cpu/cpu3/topology/thread_siblings_list",
             "three-and-four\n",
         );
+        write_file(
+            tmp.path(),
+            "devices/system/cpu/cpu3/topology/core_cpus_list",
+            "3,4\n",
+        );
 
-        let err = Topology::parse_at(tmp.path(), CpuMask::up_to(22)).expect_err("must fail");
-        assert!(matches!(err, TopologyError::Malformed { .. }), "{err:?}");
+        let topo = Topology::parse_at(tmp.path(), CpuMask::up_to(22)).expect("parse");
+        assert!(topo.pins());
+        assert_eq!(topo.compute_cpus(), [0, 1, 3, 6, 8, 10]);
+    }
 
-        let topo = Topology::detect_at(tmp.path(), CpuMask::up_to(22));
-        assert!(!topo.pins());
-        assert!(topo.compute_cpus().is_empty());
+    #[test]
+    fn unknowable_smt_siblings_disable_pinning_rather_than_double_booking() {
+        // The container shape: `devices/cpu_core/cpus` is there, but
+        // `cpuN/topology/` is not. Guessing "each cpu is its own core" would
+        // promote both halves of every SMT pair and put twelve pinned
+        // threads on six physical cores.
+        for broken in ["three-and-four\n", ""] {
+            let tmp = reference_sysfs();
+            for name in ["thread_siblings_list", "core_cpus_list"] {
+                write_file(
+                    tmp.path(),
+                    &format!("devices/system/cpu/cpu3/topology/{name}"),
+                    broken,
+                );
+            }
+
+            let topo = Topology::parse_at(tmp.path(), CpuMask::up_to(22)).expect("parse");
+            assert!(!topo.pins(), "{broken:?} still pinned: {topo}");
+            assert!(topo.compute_cpus().is_empty(), "{topo}");
+            // Everything that does not depend on the SMT layout survives.
+            assert!(topo.is_hybrid());
+            assert_eq!(topo.performance_cpus(), &(0..=11).collect::<Vec<_>>()[..]);
+            assert_eq!(topo.reactor_cpu(), Some(12));
+            assert!(topo.shard_count() >= 1);
+        }
+    }
+
+    #[test]
+    fn a_missing_topology_directory_disables_pinning() {
+        let tmp = reference_sysfs();
+        fs::remove_dir_all(tmp.path().join("devices/system/cpu/cpu0/topology"))
+            .expect("drop topology dir");
+        let topo = Topology::parse_at(tmp.path(), CpuMask::up_to(22)).expect("parse");
+        assert!(!topo.pins(), "{topo}");
+        assert!(topo.compute_cpus().is_empty(), "{topo}");
+        assert!(!Topology::detect_at(tmp.path(), CpuMask::up_to(22)).pins());
     }
 
     #[test]
@@ -1916,6 +2357,131 @@ mod tests {
             });
         }
         assert_eq!(total.load(Ordering::Relaxed), 2000 * rows);
+    }
+
+    /// Regression, cross-generation lost wakeup.
+    ///
+    /// A worker that is still inside `finish_shard` for job N must not be
+    /// able to consume the park flag the submitter armed for job N+1.
+    ///
+    /// The interleaving is *forced*, not raced. [`BarrierProbe`] stalls the
+    /// worker that drives `pending` to zero in the two-instruction window
+    /// between its decrement and its look at `lead_parked`, and holds the
+    /// submitter between arming that flag and enqueueing on the futex, so
+    /// the straggler's inspection lands inside the submitter's arming window
+    /// on every run rather than once in a few million barriers.
+    ///
+    /// Against the original `lead_parked.swap(0, SeqCst)` this deadlocks
+    /// deterministically: the straggler takes job N+1's flag, its wake finds
+    /// nobody enqueued, the submitter then parks with `lead_parked == 0`,
+    /// and the last decrement of job N+1 finds no flag and issues no wake.
+    /// With the flag read instead of taken, the straggler's inspection is
+    /// inert and the real last decrement still sees the flag.
+    ///
+    /// The bounded [`BARRIER_POLL`] would *also* rescue the old code here,
+    /// in about a millisecond — that is exactly what it is for. So progress
+    /// alone is not the assertion. The load-bearing one is the protocol
+    /// fact, checked with the submitter still holding its arming window
+    /// open: after a straggler from the *previous* job has been all the way
+    /// through the wake window, the submitter's flag is still armed. That
+    /// fails against `swap(0)` whether or not the timeout is present.
+    #[test]
+    fn a_straggler_cannot_consume_the_next_jobs_park_flag() {
+        let finished = Arc::new(AtomicU32::new(0));
+        let stalled = Arc::new(AtomicU32::new(0));
+        let saw_flag = Arc::new(AtomicU32::new(0));
+        let flag_recorded = Arc::new(AtomicU32::new(0));
+        let flag_survived = Arc::new(AtomicU32::new(0));
+        let scenario = {
+            let (finished, stalled, saw_flag, flag_recorded, flag_survived) = (
+                Arc::clone(&finished),
+                Arc::clone(&stalled),
+                Arc::clone(&saw_flag),
+                Arc::clone(&flag_recorded),
+                Arc::clone(&flag_survived),
+            );
+            std::thread::spawn(move || {
+                // Three shards, inline caller: two spawned workers.
+                let mut pool = test_pool(3);
+
+                // Job N. The submitter's own shard is slow, so both workers
+                // have retired long before it reaches the barrier and it
+                // resolves on the spin path — it never arms `lead_parked`
+                // for job N at all, which is exactly what leaves the
+                // straggler's flag write with nothing of its own to clear.
+                pool.shared.probe.arm_worker();
+                pool.run(300, |shard| {
+                    if shard.index == 0 {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                });
+
+                // Job N+1, submitted immediately, as the decode loop does.
+                // The workers' shards are slow and the submitter's is not,
+                // so the submitter is genuinely parked before any decrement
+                // of this job can land.
+                pool.shared.probe.arm_lead();
+                pool.run(300, |shard| {
+                    if shard.index != 0 {
+                        std::thread::sleep(Duration::from_millis(150));
+                    }
+                });
+
+                stalled.store(
+                    u32::from(pool.shared.probe.straggler_went_through_window()),
+                    Ordering::SeqCst,
+                );
+                saw_flag.store(
+                    u32::from(pool.shared.probe.worker_saw_flag()),
+                    Ordering::SeqCst,
+                );
+                let (recorded, survived) = pool.shared.probe.flag_survived_straggler();
+                flag_recorded.store(u32::from(recorded), Ordering::SeqCst);
+                flag_survived.store(u32::from(survived), Ordering::SeqCst);
+                finished.store(1, Ordering::SeqCst);
+            })
+        };
+
+        // Watchdog: a deadlocked pool must fail the test, not hang the run.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while finished.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "the compute pool deadlocked: a straggler from the previous job \
+             consumed the park flag armed for the current one"
+        );
+        scenario.join().expect("scenario thread");
+
+        assert_eq!(
+            stalled.load(Ordering::SeqCst),
+            1,
+            "the probe never stalled a worker in the wake window; the \
+             interleaving under test was not exercised"
+        );
+        assert_eq!(
+            saw_flag.load(Ordering::SeqCst),
+            1,
+            "the straggler did not observe the submitter's park flag, so it \
+             was never in a position to consume it; the interleaving under \
+             test was not exercised"
+        );
+        assert_eq!(
+            flag_recorded.load(Ordering::SeqCst),
+            1,
+            "the submitter never reached its park window with a straggler \
+             held in the wake window; the interleaving under test was not \
+             exercised"
+        );
+        assert_eq!(
+            flag_survived.load(Ordering::SeqCst),
+            1,
+            "a straggler from the previous job cleared the park flag armed \
+             for the current one; the submitter is about to park with \
+             `lead_parked == 0` and only `BARRIER_POLL` will get it out"
+        );
     }
 
     #[test]

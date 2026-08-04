@@ -15,9 +15,40 @@ For each prompt in the reference meta.json:
   to ~1.0003; renormalizing removes that artifact). KL(Q || P), total
   variation distance, and top-1 agreement are reported alongside.
 
+The verdict needs all four of:
+
+  * mean KL <= KL_TARGET (gate 3 as written in the architecture doc),
+  * every individual prompt <= KL_PROMPT_CEILING — a mean over 8 prompts
+    hides one blown prompt behind seven good ones,
+  * top-1 agreement on every prompt — a flipped argmax is a behavioural
+    change even at a KL the mean tolerates,
+  * every prompt in the fixed set actually scored. A prompt skipped for a
+    tokenizer mismatch or a short reference dump shrinks the gate's
+    denominator, so it fails the gate instead of quietly leaving it.
+
+Alongside the gate, and deliberately *not* part of it, every prompt's
+top1-vs-top2 gap is recorded on both sides (`top1_margin_llamacpp` /
+`top1_margin_ramvamp` per prompt in `kl_results.json`; the minimum is
+printed in the summary). Of the four conditions above, top-1 agreement is
+the only one with no recorded margin behind it: EXP-004 reports top-1 8/8
+but never how close any prompt came to flipping, and it reports top-1 for
+the AVX2 side only. A near-tie is therefore a more plausible source of a
+future spurious FAIL than the KL ceiling is, and this measures the
+distance instead of assuming it. Gaps are computed on logprobs, which is
+the same as on logits: both terms of the subtraction carry the same
+normalizer.
+
 Python stdlib only: the .npz reader below covers exactly what
 numpy.savez_compressed writes (v1/v2 .npy headers, little-endian scalar
 dtypes, C order).
+
+Exit codes, shared with the repo's other gate scripts (`bitident.py`,
+`cold_bench.py`, `greedy_regression.py`, `lfu_sim.py`):
+
+  0  the gate ran and passed
+  1  the gate ran and failed — a real result about the code under test
+  2  the gate could not run (no reference dumps, a dump that does not
+     cover the full vocab, ramvamp failed to start or timed out)
 
 Example:
   scripts/kl_vs_reference.py --rvmp models/qwen3.rvmp \
@@ -48,10 +79,31 @@ import zipfile
 # *intra-engine* noise floor (same binary, AVX2 vs RAMVAMP_FORCE_SCALAR=1),
 # i.e. reordering float accumulation inside one engine moves KL as much as
 # the whole cross-engine gap, and scalar lands closer to llama.cpp than
-# AVX2 on 2 of 3 prompts. 3e-2 sits ~3x above the measured mean and ~2x
-# above the worst single prompt; perplexity (gate 5) is the quality
-# backstop.
+# AVX2 on 2 of 3 prompts. 3e-2 sits ~3x above the measured mean;
+# perplexity (gate 5) is the quality backstop.
 KL_TARGET = 3e-2
+
+# A mean is not a gate on its own: with 8 prompts, one prompt at KL 0.25
+# and a flipped argmax still averages under 3e-2 behind seven good ones.
+# So every prompt also carries its own ceiling, and top-1 must agree
+# everywhere. Measured phase-4 spread (EXP-004 rerun, 2026-08-03): worst
+# single prompt 2.72e-2 (single_00), best 2.65e-3, top-1 8/8.
+#
+# 6e-2 is sized against the largest float-reordering perturbation this
+# codebase can produce short of an algorithmic change. EXP-004's
+# scalar/AVX2 A/B (`RAMVAMP_FORCE_SCALAR=1`, same binary, dot-product
+# accumulation order the only difference) moved the worst per-prompt
+# *cross-engine* KL to 3.4e-2. So the ceiling sits 1.76x above the largest
+# perturbation ever measured here and 2.2x above the worst status-quo
+# prompt (2.72e-2): it catches a single blown prompt, and re-ordering
+# every dot product in the engine is not enough to trip it.
+#
+# The weak spot in this gate is NOT the ceiling. It is the top-1 condition
+# below, which has no recorded margin: nothing in the repo records the
+# top1-vs-top2 gap on these prompts, and EXP-004 reports top-1 for the
+# AVX2 side only. That is why the margin is now measured and written to
+# `kl_results.json` — see `top2()` and the module docstring.
+KL_PROMPT_CEILING = 6e-2
 
 
 def fail(message: str) -> None:
@@ -160,6 +212,28 @@ def compare(p_lp: list[float], q_lp: list[float]) -> dict:
     return {"kl_pq": kl_pq, "kl_qp": kl_qp, "tv": tv / 2.0}
 
 
+def top2(dense: list[float]) -> tuple[int, float]:
+    """`(argmax, best - second best)` in one pass over a dense logprob list.
+
+    The gap is how far this prompt is from flipping its argmax. It is
+    reported, never gated: the point is that the top-1 *gate* stops being
+    an assumption. Renormalization cancels in the subtraction, so the
+    number is the same on raw logits, on logprobs, and on either side's
+    un-renormalized dump — no need to agree on a normalizer first.
+
+    Computed from the dense array rather than from the reference dump's
+    first two rows, so it does not inherit the assumption that the dump
+    arrived sorted.
+    """
+    best_i, best, second = 0, -math.inf, -math.inf
+    for i, v in enumerate(dense):
+        if v > best:
+            best_i, second, best = i, best, v
+        elif v > second:
+            second = v
+    return best_i, best - second
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -193,11 +267,20 @@ def main() -> int:
     vocab = meta["vocab"]
 
     results = []
+    # Prompts that exist in the fixed gate set but could not be scored at an
+    # identical context. They are NOT silently dropped: gate 3's mean is
+    # defined over the whole fixed prompt set, so a shrunken denominator is
+    # a gate failure, not a smaller gate.
+    unscored = []
     for entry in meta["singles"]:
         name, prompt = entry["file"], entry["prompt"]
         if entry["depth"] != vocab:
             print(f"[{name}] SKIP: depth {entry['depth']} < vocab {vocab}",
                   file=sys.stderr)
+            unscored.append({"file": name, "prompt": prompt,
+                             "reason": f"reference depth {entry['depth']} "
+                                       f"< vocab {vocab}",
+                             "tokenizer_match": None})
             continue
         t0 = time.time()
 
@@ -223,18 +306,41 @@ def main() -> int:
             fail(f"ramvamp dump for {name} does not cover the full vocab")
 
         # Same-context check: both sides tokenized the prompt themselves.
+        # A mismatch means the two distributions are conditioned on
+        # different contexts, so their KL measures the tokenizer, not the
+        # forward pass. The long-context branch below already skips on this;
+        # the singles path used to warn and let the number into the mean.
         with gzip.open(os.path.join(args.ref, f"{name}.json.gz"), "rt") as f:
             raw = json.load(f)
         n_theirs = raw.get("tokens_evaluated")
         n_ours = rv.get("prompt_tokens")
-        if n_theirs is not None and n_theirs != n_ours:
-            print(f"[{name}] WARNING: prompt token counts differ "
+        if n_theirs is None:
+            print(f"[{name}] TOKENIZER UNVERIFIED: the reference dump has no "
+                  f"`tokens_evaluated`, so the two contexts cannot be shown "
+                  f"to match — KL skipped", file=sys.stderr)
+            unscored.append({"file": name, "prompt": prompt,
+                             "reason": "reference has no tokens_evaluated",
+                             "tokenizer_match": None})
+            continue
+        if n_theirs != n_ours:
+            print(f"[{name}] TOKENIZER MISMATCH: prompt token counts differ "
                   f"(llama.cpp {n_theirs}, ramvamp {n_ours}) — "
-                  f"distributions are at different contexts", file=sys.stderr)
+                  f"distributions are at different contexts, KL skipped",
+                  file=sys.stderr)
+            unscored.append({"file": name, "prompt": prompt,
+                             "reason": f"llama.cpp {n_theirs} prompt tokens, "
+                                       f"ramvamp {n_ours}",
+                             "tokenizer_match": False})
+            continue
 
         m = compare(p_lp, q_lp)
         top1_p = ids[0]
         top1_q = rv["top"][0]["token_id"]
+        # Reported, not gated: how close each side came to flipping its own
+        # argmax. See the module docstring — the top-1 condition is the one
+        # part of gate 3 that had no recorded margin behind it.
+        _, margin_p = top2(p_lp)
+        _, margin_q = top2(q_lp)
         results.append({
             "file": name, "prompt": prompt,
             "kl_llama_vs_ramvamp": m["kl_pq"],
@@ -242,9 +348,13 @@ def main() -> int:
             "total_variation": m["tv"],
             "top1_llamacpp": top1_p, "top1_ramvamp": top1_q,
             "top1_agree": top1_p == top1_q,
+            "top1_margin_llamacpp": margin_p,
+            "top1_margin_ramvamp": margin_q,
+            "tokenizer_match": True,
         })
         print(f"[{name}] KL(P||Q) {m['kl_pq']:.3e}  KL(Q||P) {m['kl_qp']:.3e}  "
               f"TV {m['tv']:.3e}  top1 {'agree' if top1_p == top1_q else 'DISAGREE'} "
+              f"(margin {min(margin_p, margin_q):.3f} nats)  "
               f"({time.time() - t0:.0f}s)  {prompt!r}")
 
     # Long-context references (RoPE/KV/attention at depth). Reported
@@ -286,16 +396,21 @@ def main() -> int:
 
         m = compare(p_lp, q_lp)
         top1_p, top1_q = ids[0], rv["top"][0]["token_id"]
+        _, margin_p = top2(p_lp)
+        _, margin_q = top2(q_lp)
         long_results.append({
             "file": name, "tokens": entry["tokens"], "tokenizer_match": True,
             "kl_llama_vs_ramvamp": m["kl_pq"],
             "kl_ramvamp_vs_llama": m["kl_qp"],
             "total_variation": m["tv"],
             "top1_agree": top1_p == top1_q,
+            "top1_margin_llamacpp": margin_p,
+            "top1_margin_ramvamp": margin_q,
         })
         print(f"[{name}] ctx {entry['tokens']:>4} tok  KL(P||Q) {m['kl_pq']:.3e}  "
               f"KL(Q||P) {m['kl_qp']:.3e}  TV {m['tv']:.3e}  "
               f"top1 {'agree' if top1_p == top1_q else 'DISAGREE'} "
+              f"(margin {min(margin_p, margin_q):.3f} nats)  "
               f"({time.time() - t0:.0f}s)")
 
     if not results:
@@ -304,11 +419,52 @@ def main() -> int:
     mean_pq = sum(r["kl_llama_vs_ramvamp"] for r in results) / len(results)
     mean_qp = sum(r["kl_ramvamp_vs_llama"] for r in results) / len(results)
     agree = sum(r["top1_agree"] for r in results)
-    verdict = "PASS" if mean_pq <= KL_TARGET else "FAIL"
-    print(f"\nprompts: {len(results)}  top-1 agreement: {agree}/{len(results)}")
+    n_expected = len(meta["singles"])
+
+    # Three independent conditions, all of which must hold. The mean alone
+    # is not a gate: it is an average over 8 prompts and one blown prompt
+    # hides inside it.
+    problems = []
+    if mean_pq > KL_TARGET:
+        problems.append(f"mean KL {mean_pq:.3e} > {KL_TARGET:g}")
+    for r in results:
+        if r["kl_llama_vs_ramvamp"] > KL_PROMPT_CEILING:
+            problems.append(
+                f"{r['file']}: KL {r['kl_llama_vs_ramvamp']:.3e} > "
+                f"per-prompt ceiling {KL_PROMPT_CEILING:g}")
+    for r in results:
+        if not r["top1_agree"]:
+            problems.append(
+                f"{r['file']}: top-1 disagrees (llama.cpp "
+                f"{r['top1_llamacpp']}, ramvamp {r['top1_ramvamp']})")
+    for r in unscored:
+        problems.append(
+            f"{r['file']}: not scored ({r['reason']}) — gate 3's mean is "
+            f"defined over all {n_expected} fixed prompts")
+
+    # Margin behind the top-1 condition, reported so the gate's most
+    # flake-prone condition is measured rather than assumed.
+    tightest = min(results,
+                   key=lambda r: min(r["top1_margin_llamacpp"],
+                                     r["top1_margin_ramvamp"]))
+    min_margin_p = min(r["top1_margin_llamacpp"] for r in results)
+    min_margin_q = min(r["top1_margin_ramvamp"] for r in results)
+
+    verdict = "PASS" if not problems else "FAIL"
+    print(f"\nprompts scored: {len(results)}/{n_expected}  "
+          f"top-1 agreement: {agree}/{len(results)}")
     print(f"mean KL(llama.cpp || ramvamp): {mean_pq:.3e}")
     print(f"mean KL(ramvamp || llama.cpp): {mean_qp:.3e}")
-    print(f"gate 3 (mean KL <= {KL_TARGET:g}): {verdict}")
+    print(f"worst single prompt KL(P||Q):  "
+          f"{max(r['kl_llama_vs_ramvamp'] for r in results):.3e}")
+    print(f"tightest top-1 margin (nats):  llama.cpp {min_margin_p:.3f}, "
+          f"ramvamp {min_margin_q:.3f}  (each a min over prompts; nearest "
+          f"tie overall {tightest['file']}; reported, not gated)")
+    for problem in problems:
+        print(f"  FAILED: {problem}")
+    print(f"gate 3 (mean KL <= {KL_TARGET:g}, every prompt <= "
+          f"{KL_PROMPT_CEILING:g}, top-1 {len(results)}/{len(results)}, all "
+          f"{n_expected} prompts scored): {verdict}")
 
     summary = {
         "reference": {
@@ -318,11 +474,22 @@ def main() -> int:
         },
         "vocab": vocab,
         "kl_target": KL_TARGET,
+        "kl_prompt_ceiling": KL_PROMPT_CEILING,
         "mean_kl_llama_vs_ramvamp": mean_pq,
         "mean_kl_ramvamp_vs_llama": mean_qp,
+        "max_kl_llama_vs_ramvamp": max(r["kl_llama_vs_ramvamp"] for r in results),
         "top1_agreement": f"{agree}/{len(results)}",
+        # Not a gate input. The margin behind the top-1 condition, so a
+        # future top-1 FAIL can be read as "the arithmetic moved" or "this
+        # prompt was always a near-tie" instead of guessed at.
+        "min_top1_margin_llamacpp": min_margin_p,
+        "min_top1_margin_ramvamp": min_margin_q,
+        "tightest_top1_margin_file": tightest["file"],
+        "prompts_scored": f"{len(results)}/{n_expected}",
+        "problems": problems,
         "verdict": verdict,
         "per_prompt": results,
+        "unscored": unscored,
         "long_context": long_results,
     }
     out_path = os.path.join(args.ref, "kl_results.json")

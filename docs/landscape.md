@@ -42,7 +42,7 @@ ramvamp earns its existence because:
 | --- | --- | --- | --- | --- |
 | Dense 26B | none | n/a | ~13 GB | Unusable: multiple seconds per token at NVMe speeds |
 | Coarse MoE (Mixtral 8x7B) | 8, top-2 | ~90 MB | ~5.6 GB | Unusable: experts too large to stream or cache |
-| Fine-grained MoE (Gemma 4 26B-A4B, Qwen3-30B-A3B) | 128, top-8 | ~2.5-3.4 MB | ~0.8-1.1 GB worst case depending on model; a small LFU cache absorbs roughly half | The regime this project targets |
+| Fine-grained MoE (Gemma 4 26B-A4B, Qwen3-30B-A3B) | 128, top-8 | ~2.5-3.4 MB | ~0.8-1.1 GB worst case depending on model; a small LFU cache absorbs roughly half (50.0-54.5% on measured Qwen3 routing traces, EXP-005) | The regime this project targets |
 
 Fine-grained MoE is the direction the field converged on (DeepSeek-V3, Qwen3,
 Gemma 4, GLM-4.5-Air), so the class of runnable models grows over time.
@@ -57,12 +57,25 @@ implementation of this technique:
    2.79 ms) and **~8x** end to end in their full-token *simulator* (0.50 vs
    3.97 tok/s). Quoting "~8x" for the read comparison, as earlier drafts of
    `docs/architecture.md` did, overstates it by 2.3x.
-2. A 16-slot-per-layer LFU cache roughly halves expert I/O
-   (166 to 88 ms/token; LFU beat LRU 72.6 to 64.8 ms/token). Their reported
-   hit rate at 16 slots is 66.6%. **Our traces do not reproduce that
-   absolute level**: EXP-005 measures 58.1% at 16 slots on Qwen3-30B-A3B,
-   8.5 points low, though the 16-to-24 and 16-to-32 deltas match their
-   published shape. Use their curve shape, not their absolute number.
+2. A 16-slot-per-layer LFU cache roughly halves expert I/O, 166 to 88
+   ms/token, on their 8 GB M2 Air. Their reported hit rate at 16 slots is
+   66.6%. Two caveats this document's own citation rule demands. First,
+   **the quant those ms/token figures were taken at is not recorded in our
+   notes**, so the pair is quotable only as "their cache halves their expert
+   I/O on their machine", not as a rate. Second, an earlier version of this
+   item said "LFU beat LRU 72.6 to 64.8 ms/token", which is self-contradictory
+   as written: lower is better, so those numbers say LFU *lost*. Which policy
+   is which cannot be recovered from our notes, so the pair is **withdrawn**
+   pending a re-read of their log. The LFU-versus-LRU question is settled on
+   our own traces anyway: EXP-005 measures ghost-history LFU at 44.8% against
+   LRU's 42.6% at 10 slots/layer, and finds that per-slot LFU without ghost
+   history is worth -1.7 to 0.0 points against LRU. **Our traces also do not
+   reproduce their 66.6% absolute level**: EXP-005 gives 58.1% at 16 slots on
+   Qwen3-30B-A3B, 8.5 points low, but that is not a like-for-like comparison
+   either, because 58.1% is the simulator's sequential lower bound and the
+   batch-pinned replay figure at 16 slots has never been computed (batch
+   pinning was worth about 5 points at 10 and 12 slots). Use their curve
+   shape, not their absolute number, and do not quote the size of the gap.
 3. Cross-layer expert prediction fails (~7% accuracy): no speculative
    prefetch. Cache-on-reuse is the whole game.
 4. Overlap I/O only with compute guaranteed to run (cache hits, shared
@@ -98,7 +111,7 @@ bad versions do not come back.
   machine. Quote it as a directional data point, with those qualifiers.
 - **"13 tok/s on a 16 GB M1 Pro."** Self-reported by the prototype's author
   in the same discussion, unreplicated, and it is **Q6_K not Q4_K_M**,
-  **48 slots/layer not 12**,
+  **48 slots/layer not 11**,
   GPU-accelerated, and explicitly "after warmup" with the macOS page cache
   in the read path. There is no cold counterpart. It does not bound
   ramvamp's expected band in either direction and must not be used as a
@@ -129,8 +142,12 @@ number appears in anything published.
   ~half its per-token time on expert reads. The slowdown versus a
   fits-in-RAM engine is **drive-dependent and larger than the "2-3x" this
   document previously claimed**. On ramvamp's reference machine (Micron 2400,
-  DRAM-less QLC) the measured I/O-only ceiling is 2.4-2.9 tok/s against a
-  15-25 tok/s in-RAM compute estimate, so 5-10x on that device; a mainstream
-  TLC Gen4 drive would roughly halve the gap. The memory saving, ~7x, is the
-  part that does not depend on the drive. See the performance model in
+  DRAM-less QLC, Qwen3-30B-A3B Q4_K_M at the shipped 11 slots/layer) the
+  derived I/O-only ceiling is 2.2-2.7 tok/s against a 15-25 tok/s in-RAM
+  compute estimate, so roughly 6-11x on that device; a mainstream TLC Gen4
+  drive would roughly halve the gap. Both ends of that ratio are soft: the
+  numerator is an estimate and the denominator is derived from a bandwidth
+  probe that fails the experiment log's rule 2. The memory saving, **~6x**
+  (17.35 GiB of model bytes against a ~2.9 GiB resident budget), is the part
+  that does not depend on the drive. See the performance model in
   `docs/architecture.md` for the derivation and its provisional status.

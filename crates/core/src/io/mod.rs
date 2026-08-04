@@ -44,7 +44,7 @@ pub(crate) mod testutil;
 use std::fs;
 use std::path::Path;
 
-pub use cache::{CacheError, CachePlan, CacheStats, LayerCache};
+pub use cache::{CacheError, CachePlan, CacheStats, LayerCache, MAX_SLOTS, STUCK_PROTECTED_PLANS};
 pub use common::MappedCommon;
 pub use error::IoError;
 pub use expert::{ExpertReader, ExpertSlab, ExpertView};
