@@ -59,11 +59,28 @@ What it checks, and why each check exists:
    by `preflight()` instead, because "DIRTY forever, no remedy" is a
    broken harness rather than a failing measurement.
 
+8. The workload argv is handed to the inner wrapper through a **file**,
+   not through `systemd-run`'s command line. systemd expands `${NAME}` and
+   unescapes `$$` inside `ExecStart=` arguments, and it does so silently:
+   measured on systemd 261, `A ${HOME} B` arrives as `A /home/y0sif B`,
+   `A ${UNSET} B` arrives as `A  B`, and `A $$VAR B` arrives as `A $VAR B`.
+   (Bare `$VAR`, `%` specifiers, newlines, tabs, quotes and backslashes all
+   survive, so short English prompts never tripped it.) At phase-6 prefill
+   lengths the prompt is a ~17 KB document that may contain shell, LaTeX or
+   template text, so `${` is not exotic and a silently shortened prompt is a
+   silently wrong prefill measurement. `one_run()` therefore writes the argv
+   as JSON to `<workdir>/runNN.cmd.json` and passes only `--command-file` on
+   the systemd-run command line; the inner wrapper loads it and `exec`s the
+   list directly, which is byte-exact. `--command` still works for ad-hoc
+   use, with the same caveat it always had.
+
 Usage:
 
   scripts/cold_bench.py --ramvamp target/release/ramvamp --max-new 8
   scripts/cold_bench.py --ramvamp target/release/ramvamp \\
       --max-new 64 --repeats 5 --json scratch/cold.json
+  scripts/cold_bench.py --ramvamp target/release/ramvamp \\
+      --prompt-file bench/prompts/4k.txt --max-new 1 --repeats 5
 
 Exit codes, shared with the repo's other gate scripts (`bitident.py`,
 `greedy_regression.py`, `kl_vs_reference.py`, `lfu_sim.py`):
@@ -121,6 +138,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import glob
+import hashlib
 import json
 import os
 import re
@@ -150,6 +168,89 @@ def fail(message: str) -> None:
 
 def mib(n: float) -> str:
     return f"{n / 2**20:.1f} MiB"
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# the prompt
+# ---------------------------------------------------------------------------
+
+
+# Linux caps a *single* argv element at MAX_ARG_STRLEN = 32 pages, separately
+# from the ARG_MAX total. The prompt is one argv element of the ramvamp
+# command, so a prompt past this ceiling fails with a bare E2BIG
+# ("Argument list too long") that says nothing about which argument was too
+# long. A ~4000-token prompt is ~17 KB, so this is headroom, not a limit.
+MAX_ARG_STRLEN = 32 * PAGE
+
+
+def read_prompt_file(path: str) -> tuple[str, dict]:
+    """The benchmark prompt read once from `path`, and its provenance.
+
+    Exactly one trailing newline is stripped: most editors and `printf`
+    leave one behind, it is a token of its own, and prefill throughput is
+    reported per token — so an invisible `\\n` would shift the very number
+    the phase-6 sweep exists to measure. Exactly one, so a prompt that
+    deliberately ends in a blank line can still express that with two. A
+    trailing CRLF is one terminator, not two, and is removed whole rather
+    than left as a dangling CR.
+
+    Read as bytes and decoded explicitly, *not* via text-mode `open`: text
+    mode applies universal-newline translation, which silently rewrites
+    every CRLF in the file to LF. Tokenizers do not treat those alike, so
+    that would be the same class of bug as the systemd `${}` expansion in
+    item 8 — the prompt measured would not be the prompt on disk.
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        fail(f"cannot read --prompt-file {path}: {e}")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        fail(f"--prompt-file {path} is not valid UTF-8: {e}")
+    if text.endswith("\r\n"):
+        text = text[:-2]
+    elif text.endswith("\n"):
+        text = text[:-1]
+    if not text:
+        fail(f"--prompt-file {path} is empty (after stripping one trailing "
+             f"newline). A zero-token prompt has no prefill to measure — "
+             f"check the path.")
+    size = len(text.encode("utf-8"))
+    if size > MAX_ARG_STRLEN:
+        fail(f"--prompt-file {path} is {size} bytes, over the "
+             f"{MAX_ARG_STRLEN}-byte MAX_ARG_STRLEN ceiling on one argv "
+             f"element; the workload would die with a bare E2BIG. Pass the "
+             f"prompt to ramvamp another way, or shorten it.")
+    # Both hashes are recorded: `file_sha256` identifies the artifact on
+    # disk, `sha256` (added by the caller) identifies the bytes actually
+    # handed to ramvamp. They differ by the stripped newline, and a reader
+    # who cannot see both cannot tell which prompt was measured.
+    return text, {"file_sha256": hashlib.sha256(raw).hexdigest(),
+                  "file_bytes": len(raw)}
+
+
+def display_workload(workload: list[str], max_arg: int = 72) -> str:
+    """The workload as one line, with long arguments elided.
+
+    A phase-6 prompt is ~17 KB, and pasting it into every `=== run N ===`
+    header makes the run log unreadable — the reason `--prompt-file` exists.
+    The elision keeps a sha256 prefix so a log line still ties back to the
+    `prompt` provenance block in the JSON. Display only: the JSON records
+    the argv whole.
+    """
+    parts = []
+    for arg in workload:
+        if len(arg) > max_arg:
+            parts.append(f"<{len(arg)} chars sha256:{sha256_text(arg)[:12]}>")
+        else:
+            parts.append(arg)
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +372,36 @@ def read_int(path: str) -> int | None:
         return int(text)
     except ValueError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# workload argv, passed to the inner wrapper out of band
+# ---------------------------------------------------------------------------
+
+
+def write_command_file(path: str, command: list[str]) -> None:
+    """Serialize the workload argv as JSON for the inner wrapper.
+
+    See item 8 of the module docstring: systemd expands `${NAME}` and
+    unescapes `$$` in `ExecStart=` arguments, so anything routed through
+    `systemd-run`'s command line is not what the workload receives. JSON
+    round-trips arbitrary UTF-8 — newlines, quotes, `${...}`, `$$` — with no
+    escaping rules of our own to get wrong.
+    """
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(command, f)
+
+
+def load_command_file(path: str) -> list[str]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            command = json.load(f)
+    except (OSError, ValueError) as e:
+        fail(f"cannot read the command file {path}: {e}")
+    if (not isinstance(command, list) or not command
+            or not all(isinstance(a, str) for a in command)):
+        fail(f"the command file {path} is not a non-empty list of strings")
+    return command
 
 
 # ---------------------------------------------------------------------------
@@ -521,11 +652,13 @@ def one_run(args, index: int, label: str) -> dict:
 
     result_file = os.path.join(
         args.workdir, f"run{index:02d}.json")
+    command_file = os.path.join(args.workdir, f"run{index:02d}.cmd.json")
     # Remove any file from an earlier invocation *before* launching. The
     # `--workdir` default is stable across runs, so a systemd-run that fails
     # to start would otherwise leave the previous run's JSON in place and
     # the harness would happily classify it as this run's result.
-    for stale in (result_file, result_file + ".stdout", result_file + ".stderr"):
+    for stale in (result_file, result_file + ".stdout", result_file + ".stderr",
+                  command_file):
         try:
             os.unlink(stale)
         except FileNotFoundError:
@@ -533,11 +666,16 @@ def one_run(args, index: int, label: str) -> dict:
         except OSError as e:
             fail(f"cannot remove the stale result file {stale}: {e}")
     unit = f"ramvamp-cold-{os.getpid()}-{index}"
+    # The argv goes in a file, not on systemd-run's command line, which
+    # mangles `${NAME}` and `$$` (module docstring, item 8). The inner
+    # wrapper reads it before it samples `/proc/self/io`, so this read
+    # cannot show up in the run's own read_bytes.
+    write_command_file(command_file, args.workload)
     inner_cmd = [
         sys.executable, os.path.abspath(__file__),
         "--inner", "--result-file", result_file,
-        "--command",
-    ] + args.workload
+        "--command-file", command_file,
+    ]
     cmd = [
         "systemd-run", "--user", "--wait", "-q", "--collect",
         f"--unit={unit}",
@@ -547,7 +685,7 @@ def one_run(args, index: int, label: str) -> dict:
         "-p", f"WorkingDirectory={os.getcwd()}",
         "--",
     ] + inner_cmd
-    print(f"  + {' '.join(cmd[:12])} ... {' '.join(args.workload)}")
+    print(f"  + {' '.join(cmd[:12])} ... {display_workload(args.workload)}")
     t0 = time.time()
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     outer_wall = time.time() - t0
@@ -561,6 +699,9 @@ def one_run(args, index: int, label: str) -> dict:
     run["outer_wall_s"] = round(outer_wall, 3)
     run["systemd_run_returncode"] = proc.returncode
     run["label"] = label
+    # A benchmark whose prompt cannot be identified from the log is not
+    # reproducible, and a 4000-token prompt is not identifiable by eye.
+    run["prompt"] = args.prompt_meta
 
     want_max = parse_size(args.memory_max)
     verdict, problems = classify(run, want_max)
@@ -612,12 +753,29 @@ def main() -> int:
     parser.add_argument("--result-file", help=argparse.SUPPRESS)
     parser.add_argument("--command", nargs=argparse.REMAINDER,
                         help=argparse.SUPPRESS)
+    parser.add_argument("--command-file", help=argparse.SUPPRESS)
     parser.add_argument("--rvmp", default="models/qwen3.rvmp",
                         help="installed .rvmp model dir (evicted before each run)")
     parser.add_argument("--ramvamp", default="target/release/ramvamp",
                         help="ramvamp binary to benchmark")
-    parser.add_argument("--prompt", default="The capital of France is",
-                        help="benchmark prompt")
+    # Mutually exclusive: two prompts is an ambiguous measurement, and
+    # argparse's own conflict error exits 2, the same "could not measure"
+    # code `fail()` uses.
+    prompt_group = parser.add_mutually_exclusive_group()
+    prompt_group.add_argument("--prompt", default="The capital of France is",
+                              help="benchmark prompt, given literally")
+    prompt_group.add_argument(
+        "--prompt-file", metavar="PATH",
+        help="read the benchmark prompt from PATH as UTF-8, instead of "
+             "--prompt. Preferred for the long prefill prompts (512-4000 "
+             "tokens) a ~17 KB command line cannot carry readably. Exactly "
+             "one trailing newline is stripped (a trailing CRLF counts as "
+             "one), because it would otherwise be an extra prefill token "
+             "and shift the tok/s being measured; end the file with two "
+             "newlines if a trailing blank line is intended. Nothing else "
+             "is rewritten — interior CRLFs are preserved as authored. The "
+             "path, byte length and SHA-256 of both the file and the "
+             "resulting prompt are recorded in the results JSON.")
     parser.add_argument("--max-new", type=int, default=8,
                         help="tokens to generate per run")
     parser.add_argument("--sampled", action="store_true",
@@ -638,8 +796,12 @@ def main() -> int:
     sys.stdout.reconfigure(line_buffering=True)
 
     if args.inner:
-        if not args.result_file or not args.command:
-            fail("--inner needs --result-file and --command")
+        if not args.result_file:
+            fail("--inner needs --result-file")
+        if bool(args.command) == bool(args.command_file):
+            fail("--inner needs exactly one of --command or --command-file")
+        if args.command_file:
+            args.command = load_command_file(args.command_file)
         return inner(args)
 
     if args.repeats < 1:
@@ -647,6 +809,23 @@ def main() -> int:
              f"zero runs cannot pass a hygiene gate. Use --repeats >= 1.")
     if args.warmup < 0:
         fail(f"--warmup {args.warmup} is negative")
+
+    # Resolve the prompt once, up front — before preflight, before the model
+    # directory is touched and long before the first eviction — so a typo'd
+    # path costs nothing and reports itself, rather than surfacing as a
+    # confusing ramvamp failure three cold runs in. `read_prompt_file` exits
+    # 2 via `fail()`: the harness could not take the measurement.
+    file_meta = {"file_sha256": None, "file_bytes": None}
+    if args.prompt_file:
+        args.prompt_file = os.path.abspath(args.prompt_file)
+        args.prompt, file_meta = read_prompt_file(args.prompt_file)
+    args.prompt_meta = {
+        "source": "file" if args.prompt_file else "argument",
+        "file": args.prompt_file,
+        "sha256": sha256_text(args.prompt),
+        "bytes": len(args.prompt.encode("utf-8")),
+        **file_meta,
+    }
 
     args.rvmp = os.path.abspath(args.rvmp)
     args.ramvamp = os.path.abspath(args.ramvamp)
@@ -666,7 +845,11 @@ def main() -> int:
     preflight(args)
     print(f"cold_bench: {args.warmup} warmup + {args.repeats} scored runs, "
           f"MemoryMax={args.memory_max}, MemorySwapMax=0")
-    print(f"workload: {' '.join(args.workload)}")
+    print(f"workload: {display_workload(args.workload)}")
+    print(f"prompt: {args.prompt_meta['source']} "
+          f"{args.prompt_meta['file'] or '(literal)'} "
+          f"{args.prompt_meta['bytes']} bytes "
+          f"sha256:{args.prompt_meta['sha256']}")
 
     runs = []
     for i in range(args.warmup + args.repeats):
@@ -707,6 +890,7 @@ def main() -> int:
 
     summary = {
         "workload": args.workload,
+        "prompt": args.prompt_meta,
         "memory_max": args.memory_max,
         "warmup": args.warmup, "repeats": args.repeats,
         "hygiene": verdict,

@@ -295,6 +295,18 @@ impl CachePlan {
         self.hits.clear();
         self.misses.clear();
     }
+
+    /// Entries either list can hold before it reallocates.
+    ///
+    /// The *smaller* of the two, which is what
+    /// [`with_capacity`](Self::with_capacity) actually guarantees: a plan
+    /// preallocated for `top_k` reports at least `top_k` here whatever the
+    /// hit/miss split of the steps it has served. Exists so that "the decode
+    /// loop does not allocate" is assertable directly rather than inferred
+    /// from the addresses the two `Vec`s happen to hold.
+    pub fn capacity(&self) -> usize {
+        self.hits.capacity().min(self.misses.capacity())
+    }
 }
 
 /// Cumulative cache telemetry for one layer.
@@ -670,6 +682,42 @@ impl LayerCache {
             return;
         };
         *entry = Slot::EMPTY;
+    }
+
+    /// Drop every slot's assignment at once, keeping the ghost history.
+    ///
+    /// [`invalidate`](Self::invalidate) for the whole layer: every slot goes
+    /// back to `Empty`, and `freq`/`fetched` — which are indexed by expert id
+    /// and survive eviction on purpose — are untouched, so the next miss on an
+    /// expert this layer had fetched is still counted as the eviction miss it
+    /// is.
+    ///
+    /// For the prefill sweep, which borrows every buffer of the pool at once
+    /// ([`ExpertStream::sweep_layer`](crate::io::ExpertStream::sweep_layer)):
+    /// the obligation below is one statement about one moment, and stating it
+    /// once per layer is both cheaper and more honest than restating it per
+    /// slot.
+    ///
+    /// # Safety
+    ///
+    /// [`invalidate`](Self::invalidate)'s contract, for every slot of the
+    /// layer: every read into every one of this layer's buffers must have
+    /// completed, or been **cancelled and reaped**, before this is called.
+    ///
+    /// "Nothing is outstanding" is *not* that statement and must not be
+    /// mistaken for it. A read given up through `Inflight::abandon` — the
+    /// stream's recovery for a completion that can never be reaped — drains the
+    /// outstanding counter *because the read is unknowable*, not because it
+    /// finished; the kernel may write into that buffer forever. A caller with
+    /// such a read behind it has to reason about the buffers it abandoned (the
+    /// stream retires them, which strikes them from the layer), not about the
+    /// counter.
+    ///
+    /// Unprotecting a slot the kernel is still writing into makes it the first
+    /// pick of the next victim search, which puts two O_DIRECT reads on one
+    /// destination — the corruption the slot discipline exists to prevent.
+    pub unsafe fn reset_occupancy(&mut self) {
+        self.slots.fill(Slot::EMPTY);
     }
 
     /// The first slot that has been protected — `Filling` or `Ready` —

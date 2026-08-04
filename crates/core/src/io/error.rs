@@ -116,6 +116,23 @@ pub enum IoError {
     /// Planning one routing step against a layer's slots failed.
     #[error(transparent)]
     Cache(#[from] crate::io::CacheError),
+
+    /// A prefill sweep failed.
+    ///
+    /// Boxed because [`SweepError::Io`](crate::io::SweepError::Io) wraps this
+    /// type in the other direction: the two are mutually recursive, so one of
+    /// the two edges has to be indirect, and the driver-facing direction is
+    /// the one that is taken once per prefill rather than once per read.
+    #[error(transparent)]
+    Sweep(#[from] Box<crate::io::SweepError>),
+}
+
+impl From<crate::io::SweepError> for IoError {
+    /// The direction a driver actually writes: `?` on a sweep call inside a
+    /// function that reports [`IoError`].
+    fn from(error: crate::io::SweepError) -> Self {
+        Self::Sweep(Box::new(error))
+    }
 }
 
 impl IoError {

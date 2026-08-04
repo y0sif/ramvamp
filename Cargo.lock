@@ -793,6 +793,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "ramvamp-core",
  "serde_json",
  "tracing-subscriber",

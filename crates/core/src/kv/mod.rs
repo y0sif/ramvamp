@@ -296,6 +296,17 @@ impl KvCache {
         Ok(())
     }
 
+    /// Drop every appended position, keeping the planes allocated.
+    ///
+    /// Only the per-layer cursors move: no plane is zeroed, because every
+    /// read is bounded by the cursor this resets, so the stale f16 bits left
+    /// behind are unreachable through the public surface. This is what lets a
+    /// second sequence start on an existing [`crate::model::ForwardState`]
+    /// instead of paying for a new expert slot pool.
+    pub fn clear(&mut self) {
+        self.lens.fill(0);
+    }
+
     /// The K row (f16 bits, `kv_dim` elements) for `pos` in `layer`.
     ///
     /// # Errors
@@ -517,6 +528,44 @@ mod tests {
                 capacity: 3,
             }
         );
+        assert_eq!(cache.len(0).unwrap(), 3);
+    }
+
+    /// `clear` rewinds every cursor, makes past positions unreadable again,
+    /// and leaves the cache usable for a fresh sequence.
+    #[test]
+    fn clear_rewinds_every_layer() {
+        let mut cache = KvCache::new(2, 2, 4, 3).unwrap();
+        let row = [0.5f32; 8];
+        cache.append(0, &row, &row).unwrap();
+        cache.append(0, &row, &row).unwrap();
+        cache.append(1, &row, &row).unwrap();
+        assert!(!cache.is_empty());
+
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(cache.seq_len().unwrap(), 0);
+        assert_eq!(cache.len(0).unwrap(), 0);
+        assert_eq!(cache.k_layer(0).unwrap().len(), 0);
+        assert_eq!(
+            cache.k_row(0, 0).unwrap_err(),
+            KvError::PositionOutOfRange {
+                layer: 0,
+                pos: 0,
+                len: 0,
+            }
+        );
+
+        // And a ragged cache is levelled by it, which is the failure mode a
+        // reset exists to recover from.
+        cache.append(0, &row, &row).unwrap();
+        assert!(cache.seq_len().is_err());
+        cache.clear();
+        assert_eq!(cache.seq_len().unwrap(), 0);
+        // The full capacity is available again, so nothing leaked.
+        for _ in 0..3 {
+            cache.append(0, &row, &row).unwrap();
+        }
         assert_eq!(cache.len(0).unwrap(), 3);
     }
 

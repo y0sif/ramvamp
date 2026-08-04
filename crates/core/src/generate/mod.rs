@@ -1,20 +1,33 @@
 //! Generation orchestration: prefill, token-by-token decode, sampling.
 //!
-//! **Prefill today is decode**: [`forward_token`] in a loop over the prompt,
-//! one token at a time, through the same [`ForwardState`] and therefore the
-//! same expert cache, with logits requested only for the last prompt token.
-//! Decode then repeats that loop one generated token at a time. Sampling
-//! supports greedy, temperature, top-k, and top-p (repetition penalty is
-//! not implemented yet); greedy decode must be deterministic for
-//! validation against reference implementations.
+//! **Prefill is the chunked layer-major sweep** ([`prefill_prompt`]): up to
+//! [`DEFAULT_PREFILL_CHUNK`](crate::model::DEFAULT_PREFILL_CHUNK) prompt
+//! positions are carried through the model together and each layer's expert
+//! file is streamed once per chunk, bypassing the decode cache entirely.
+//! Decode then runs [`forward_token`] one generated token at a time through
+//! that cache. Sampling supports greedy, temperature, top-k, and top-p
+//! (repetition penalty is not implemented yet); greedy decode must be
+//! deterministic for validation against reference implementations.
 //!
-//! The layer-major chunked prefill `docs/architecture.md` specifies — a
-//! bounded chunk of positions swept per layer, so one fetched expert serves
-//! many rows and the cache is bypassed entirely — is phase 6, and is not
-//! this code. Nothing here bypasses or bounds the cache differently for
-//! prompt tokens, and the streaming counters reflect that: a pure-prefill
-//! run reports cache hits, because prompt positions reuse each other's
-//! experts exactly the way decode positions do.
+//! The streaming counters reflect the split: a pure-prefill run reports **no
+//! cache accesses at all** (its bytes land in `sweep_bytes_read` and its
+//! windows in `sweep_windows_read`), because prompt positions no longer
+//! request experts through the slot cache. Selecting
+//! [`PrefillMode::TokenMajor`](crate::model::PrefillMode) restores the
+//! phase-5 behaviour, cache accounting included; it exists for the
+//! byte-identical-logits A/B and is not the default.
+//!
+//! # Continuing a sequence
+//!
+//! [`generate_from`] takes a starting position, so a second turn prefills
+//! only the new tokens against a KV cache the first turn left behind. This
+//! is the *only* correct way to continue a conversation: a ChatML
+//! generation-prompt render is not always an id-prefix of the finished
+//! assistant turn (the `\n` that ends `<|im_start|>assistant\n` and the head
+//! of the reply are candidates for the same BPE merge), so a cache cannot be
+//! extended by re-encoding the reply's text. The ids that were actually
+//! generated are reported in [`GenerateStats::generated_ids`] for exactly
+//! that reason.
 //!
 //! # Sampling
 //!
@@ -30,34 +43,38 @@
 //! # Streaming detokenization
 //!
 //! Decoding each token id alone is wrong for byte-level BPE (one Unicode
-//! character can span tokens), so [`generate`] decodes the accumulated ids
-//! and emits the new suffix, withholding any trailing U+FFFD replacement
-//! characters until the bytes that complete them arrive (they are flushed
-//! verbatim at end of generation if the model stops mid-character).
+//! character can span tokens), so [`generate`] decodes a bounded trailing
+//! window of the generated ids and emits the new suffix, withholding any
+//! trailing U+FFFD replacement characters until the bytes that complete
+//! them arrive (they are flushed verbatim at end of generation if the model
+//! stops mid-character).
 
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
 use crate::model::{
-    ForwardError, ForwardState, Model, StreamPhase, forward_token, forward_token_traced,
+    ForwardError, ForwardState, Model, PrefillRouteSink, StreamPhase, forward_token,
+    forward_token_traced, prefill_prompt,
 };
 use crate::tokenizer::{RvmpTokenizer, SamplingDefaults, TokenizerError};
 
 /// Which pass a routing record came from.
 ///
-/// Both passes go through the same [`ForwardState`] and the same expert
-/// cache in this build (see the module docs), so the tag is not a statement
-/// about how the experts were fetched. It exists because the two passes are
-/// not comparable *workloads*: prefill walks a prompt whose positions the
-/// caller chose, decode walks the model's own output, and a cache-hit rate
-/// quoted over both at once is a different number from either. The offline
-/// simulator (`scripts/lfu_sim.py`) filters on it and models decode only, so
-/// anything measured against that simulation has to filter the same way.
+/// The two passes are not comparable *workloads*: prefill walks a prompt
+/// whose positions the caller chose, decode walks the model's own output,
+/// and a cache-hit rate quoted over both at once is a different number from
+/// either. The offline simulator (`scripts/lfu_sim.py`) filters on this tag
+/// and models decode only, so anything measured against that simulation has
+/// to filter the same way.
 ///
-/// `docs/architecture.md` ("Prefill") specifies a cache-bypassing
-/// layer-major prefill sweep for phase 6. When that lands the tag will
-/// additionally mean "fetched differently"; today it does not.
+/// Under the default [`PrefillMode::Sweep`](crate::model::PrefillMode) the
+/// tag additionally means "fetched differently": prefill bypasses the slot
+/// cache and streams each layer front to back. It also means "emitted in a
+/// different order" — the sweep reports `(layer, row)`, the token-major path
+/// reports `(token, layer)` — because that is the order the work happens in.
+/// The set of `(position, layer)` pairs and the selections at each are
+/// identical either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TracePhase {
     /// A prompt token.
@@ -128,16 +145,25 @@ pub enum StopReason {
     MaxNew,
 }
 
-/// Counters and timings from one [`generate`] call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Counters, timings and output ids from one [`generate`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateStats {
     /// Prompt tokens prefilled.
     pub prompt_tokens: usize,
-    /// Tokens generated (stop token excluded).
+    /// Tokens generated (stop token excluded). Always
+    /// `generated_ids.len()`.
     pub generated: usize,
+    /// The ids that were generated, in order, stop token excluded.
+    ///
+    /// The only sound way to continue a conversation: a KV cache is extended
+    /// by appending the ids that were actually produced, never by re-encoding
+    /// the reply's text (see the module docs). `on_token` cannot substitute
+    /// for this, because its final flush event repeats the last id to carry
+    /// the withheld tail of a split character.
+    pub generated_ids: Vec<u32>,
     /// Why generation stopped.
     pub stop: StopReason,
-    /// Wall time of the prefill loop.
+    /// Wall time of the prefill pass.
     pub prefill: Duration,
     /// Wall time of the decode loop (sampling + forward passes).
     pub decode: Duration,
@@ -157,6 +183,19 @@ pub enum GenerateError {
     /// The prompt has no tokens: there are no logits to sample from.
     #[error("generate: empty prompt")]
     EmptyPrompt,
+
+    /// `start_position` does not continue the state's KV cache.
+    ///
+    /// Validated rather than trusted: a caller continuing a conversation owns
+    /// the bookkeeping, and a silent off-by-one would prefill the new turn at
+    /// the wrong RoPE positions and produce plausible nonsense.
+    #[error("generate: start_position {position}, but the state holds {expected} positions")]
+    PositionMismatch {
+        /// The position the caller asked to continue from.
+        position: usize,
+        /// The position the state actually expects next.
+        expected: usize,
+    },
 
     /// Internal invariant: a `want_logits` pass returned no logits.
     /// Unreachable through the public API; reported instead of asserted.
@@ -280,20 +319,79 @@ impl Sampler {
     }
 }
 
-/// Incremental detokenizer: accumulates generated ids, decodes the whole
-/// sequence each push, and returns only the newly-safe suffix. "Safe"
+/// Ids [`StreamDecoder`] keeps once their text has been emitted.
+///
+/// The window only has to span the ids that can still be holding the
+/// UTF-8 bytes of one unfinished character. A Unicode scalar is at most
+/// four UTF-8 bytes and every byte-level BPE token carries at least one
+/// byte, so at most four ids can split a character; eight leaves slack
+/// for added tokens and for a decoder that is less byte-exact than this
+/// vocabulary's plain `ByteLevel` one, at a bounded cost per push.
+const STREAM_WINDOW_KEEP: usize = 8;
+
+/// Hard cap on [`StreamDecoder`]'s window.
+///
+/// Reaching it means [`trim`](StreamDecoder::trim) has refused to split for
+/// `STREAM_WINDOW_MAX - STREAM_WINDOW_KEEP` pushes in a row, which
+/// well-formed UTF-8 cannot do (see [`STREAM_WINDOW_KEEP`]): only a run of
+/// undecodable bytes, or a token stream whose every id boundary lands
+/// strictly inside a character, gets this far. The push that reaches the cap
+/// therefore stops waiting for a clean split and forces one — see
+/// [`force_cut`](StreamDecoder::force_cut), which drops straight back to
+/// [`STREAM_WINDOW_KEEP`] ids **without emitting anything
+/// `decode(all_ids, false)` does not**, so the window is bounded here
+/// unconditionally and the decoder's contract survives it. Well above the
+/// four ids real text needs, so no legitimate sequence trips it.
+const STREAM_WINDOW_MAX: usize = 64;
+
+/// Incremental detokenizer: decodes a bounded trailing window of the
+/// generated ids each push and returns only the newly-safe suffix. "Safe"
 /// excludes trailing U+FFFD replacement characters, which mark a Unicode
 /// character whose UTF-8 bytes are still split across future tokens
 /// (byte-level BPE decode is byte-prefix-stable except for that tail).
-/// DEFERRED (review 2026-08-02): re-decoding the full accumulated sequence
-/// is O(n^2) over a generation — fine at the v0 default `max_new` 128,
-/// must become a bounded-tail incremental decode before phase 6 raises
-/// generation lengths.
+///
+/// # Cost
+///
+/// [`push`](Self::push) decodes the window once and then searches for a
+/// clean cut (see [`trim`](Self::trim)); the push that reaches
+/// [`STREAM_WINDOW_MAX`] decodes the retained tail once more. Everything is
+/// bounded by the window, never by the sequence. The **bound** is the trim
+/// search, which decodes `cut` ids for every cut it tries and so costs at
+/// most `(MAX - KEEP)(MAX - KEEP + 1) / 2` = 1,596 decoded ids in a push, on
+/// top of the window's own decode. Approaching that takes a pathological id
+/// run — one where no leading run ever splits cleanly, which is what drives
+/// the window to the cap in the first place. Separately **measured** on
+/// mixed real text (ASCII, CJK, an emoji ZWJ cluster, added tokens): a worst
+/// case of 14 decoded ids per push, and the scaling test pins it under
+/// `STREAM_WINDOW_KEEP * 3`. Either way nothing here — decoded ids, bytes
+/// allocated, bytes copied — depends on how many tokens have already been
+/// generated, so a whole generation is O(n) rather than the O(n^2) of
+/// re-decoding the accumulated sequence once per token.
+///
+/// # Why sliding is sound
+///
+/// `tokenizers`' decode of this vocabulary is
+/// `String::from_utf8_lossy(concat(bytes(id) for id in ids))`: the bytes
+/// concatenate and the lossy read is taken once over the whole run. So if
+/// the ids dropped off the front decode on their own to complete, valid
+/// UTF-8 that is a prefix of the window's decode, the rest of the window
+/// decodes to exactly the suffix that [`emitted`](Self::emitted) indexes
+/// into. [`trim`](Self::trim) drops ids only after checking exactly that,
+/// so an added token or a split character straddling the window edge
+/// simply stays in the window until it is whole and emitted.
 #[derive(Debug, Default)]
 struct StreamDecoder {
-    ids: Vec<u32>,
-    /// Bytes of the accumulated decode already emitted.
+    /// Trailing ids of the generation, at most [`STREAM_WINDOW_MAX`].
+    window: Vec<u32>,
+    /// Bytes of the *window's* decode already emitted.
     emitted: usize,
+    /// Last id pushed, independent of what the window still holds.
+    last: Option<u32>,
+    /// Ids handed to [`RvmpTokenizer::decode`] since construction; the
+    /// scaling test asserts this grows per push by a bounded amount
+    /// rather than with the sequence length.
+    #[cfg(test)]
+    decoded_ids: usize,
 }
 
 impl StreamDecoder {
@@ -301,56 +399,181 @@ impl StreamDecoder {
         Self::default()
     }
 
+    /// Decode `self.window[start..end]`, counting the work for tests.
+    fn decode_range(
+        &mut self,
+        tokenizer: &RvmpTokenizer,
+        start: usize,
+        end: usize,
+    ) -> Result<String, TokenizerError> {
+        #[cfg(test)]
+        {
+            self.decoded_ids += end - start;
+        }
+        tokenizer.decode(&self.window[start..end], false)
+    }
+
     /// Append one id and return the newly emittable text (possibly empty).
     fn push(&mut self, tokenizer: &RvmpTokenizer, id: u32) -> Result<String, TokenizerError> {
-        self.ids.push(id);
-        let full = tokenizer.decode(&self.ids, false)?;
-        let mut safe = full.len();
-        while full[..safe].ends_with('\u{FFFD}') {
+        self.window.push(id);
+        self.last = Some(id);
+        let len = self.window.len();
+        let text = self.decode_range(tokenizer, 0, len)?;
+
+        // At the cap the search for a clean split has failed for long
+        // enough; cut regardless (see STREAM_WINDOW_MAX).
+        if len >= STREAM_WINDOW_MAX {
+            return self.force_cut(tokenizer, &text);
+        }
+
+        // Withhold a trailing run of replacement characters: those are a
+        // character whose remaining bytes live in ids not pushed yet.
+        let mut safe = text.len();
+        while text[..safe].ends_with('\u{FFFD}') {
             safe -= '\u{FFFD}'.len_utf8();
         }
-        if safe <= self.emitted {
-            return Ok(String::new());
+        let mut out = String::new();
+        if safe > self.emitted {
+            // In range by construction; `get` keeps a hostile tokenizer
+            // from panicking us if decode were ever not prefix-stable.
+            out = text.get(self.emitted..safe).unwrap_or("").to_owned();
+            self.emitted = safe;
         }
-        // In range by construction; `get` keeps a hostile tokenizer from
-        // panicking us if decode were ever not prefix-stable.
-        let out = full.get(self.emitted..safe).unwrap_or("").to_owned();
-        self.emitted = safe;
+
+        self.trim(tokenizer, &text)?;
         Ok(out)
+    }
+
+    /// Force the window back down to [`STREAM_WINDOW_KEEP`] ids, emitting
+    /// everything in `text` that can no longer change.
+    ///
+    /// Runs when the window reaches [`STREAM_WINDOW_MAX`], i.e. when
+    /// [`trim`](Self::trim) has found no clean split for
+    /// `MAX - KEEP` pushes running. It has to cut anyway, and it must do so
+    /// without breaking the contract the rest of the decoder keeps: every
+    /// `push` concatenated with the final [`flush`](Self::flush) equals
+    /// `decode(all_ids, false)`. Two facts make that possible.
+    ///
+    /// **Only the last replacement character is provisional.** Lossy UTF-8
+    /// decoding is greedy and left to right: each maximal invalid subpart is
+    /// terminated by a byte that cannot extend it, and appending bytes never
+    /// revisits that decision. The one exception is a subpart still open at
+    /// the end of the input — the split character this decoder exists to
+    /// withhold — and an open subpart renders as exactly one U+FFFD. So the
+    /// whole-trailing-run withholding [`push`](Self::push) does is merely
+    /// conservative: holding back the final replacement character alone is
+    /// sufficient, and unlike the run it always leaves something emittable.
+    /// That is what breaks the deadlock, because the id runs that reach the
+    /// cap are exactly the ones whose decode is *all* replacement characters.
+    ///
+    /// **The cut need not be a character boundary.** The retained tail is
+    /// re-decoded on its own, so its leading bytes may be the back half of a
+    /// character whose front half is being dropped and decode to replacement
+    /// characters the whole window's decode did not have. That is harmless:
+    /// those bytes were already emitted correctly, out of the whole window's
+    /// decode, where the character was intact. So [`emitted`](Self::emitted)
+    /// is re-anchored from the *back* — the tail's last `withheld` bytes are
+    /// the same open subpart the whole window ended on (an open subpart is at
+    /// most four bytes and every id carries at least one, so it cannot reach
+    /// past the retained ids), and everything before them counts as emitted.
+    /// Dropping a prefix can only make the tail's decode *begin* with more
+    /// replacement characters, and those come from permanently invalid bytes,
+    /// so the tail's decode stays prefix-stable as the window grows again and
+    /// `emitted` keeps indexing what it did before the cut.
+    fn force_cut(
+        &mut self,
+        tokenizer: &RvmpTokenizer,
+        text: &str,
+    ) -> Result<String, TokenizerError> {
+        let mut safe = text.len();
+        if text.ends_with('\u{FFFD}') {
+            safe -= '\u{FFFD}'.len_utf8();
+        }
+        let withheld = text.len() - safe;
+        // `get`, as in `push`: never panic on a decode that is not
+        // prefix-stable, just emit nothing this push.
+        let out = text.get(self.emitted..safe).unwrap_or("").to_owned();
+
+        let len = self.window.len();
+        let cut = len.saturating_sub(STREAM_WINDOW_KEEP);
+        let tail = self.decode_range(tokenizer, cut, len)?;
+        self.window.drain(..cut);
+        self.emitted = tail.len().saturating_sub(withheld);
+        Ok(out)
+    }
+
+    /// Drop the longest leading run of ids that splits cleanly, back down
+    /// to [`STREAM_WINDOW_KEEP`].
+    ///
+    /// `text` is the decode of the current window. A cut is clean when the
+    /// dropped run decodes to complete UTF-8 (no trailing U+FFFD) that is
+    /// already inside the emitted prefix and matches `text` there — the
+    /// conditions that make the rest of the window decode to exactly the
+    /// suffix `emitted` indexes into (see the type docs).
+    ///
+    /// Cuts have to be searched for rather than taken one id at a time:
+    /// byte-level BPE routinely ends an id in the middle of a character
+    /// (the rest of it merged into the next id), and no such id is ever a
+    /// clean cut on its own. So the widest useful cut is tried first and
+    /// narrowed — at most `len - STREAM_WINDOW_KEEP` decodes of at most
+    /// that many ids. When nothing splits, the window grows by one and the
+    /// next push searches one wider, bounded by [`STREAM_WINDOW_MAX`].
+    fn trim(&mut self, tokenizer: &RvmpTokenizer, text: &str) -> Result<(), TokenizerError> {
+        let len = self.window.len();
+        if len <= STREAM_WINDOW_KEEP {
+            return Ok(());
+        }
+        let mut cut = len - STREAM_WINDOW_KEEP;
+        while cut > 0 {
+            let head = self.decode_range(tokenizer, 0, cut)?;
+            if !head.is_empty()
+                && !head.ends_with('\u{FFFD}')
+                && head.len() <= self.emitted
+                && text.starts_with(&head)
+            {
+                self.window.drain(..cut);
+                self.emitted -= head.len();
+                return Ok(());
+            }
+            cut -= 1;
+        }
+        Ok(())
     }
 
     /// Everything still withheld (a trailing incomplete character, decoded
     /// with replacement characters), emptying the decoder's debt.
     fn flush(&mut self, tokenizer: &RvmpTokenizer) -> Result<String, TokenizerError> {
-        if self.ids.is_empty() {
+        if self.window.is_empty() {
             return Ok(String::new());
         }
-        let full = tokenizer.decode(&self.ids, false)?;
-        let out = full.get(self.emitted..).unwrap_or("").to_owned();
-        self.emitted = full.len();
+        let len = self.window.len();
+        let text = self.decode_range(tokenizer, 0, len)?;
+        let out = text.get(self.emitted..).unwrap_or("").to_owned();
+        self.emitted = text.len();
         Ok(out)
     }
 
     fn last_id(&self) -> Option<u32> {
-        self.ids.last().copied()
+        self.last
     }
 }
 
 /// Prefill `prompt_ids` and decode up to `max_new` tokens, streaming each
 /// token id and its newly-decoded text through `on_token`.
 ///
-/// Prefill runs [`forward_token`] per prompt token (logits only for the
-/// last). Decode samples per [`GenerateParams`], stops on any of the
-/// tokenizer's stop tokens (the stop token is neither counted nor
+/// Prefill runs [`prefill_prompt`] over the whole prompt (logits only for
+/// the last position). Decode samples per [`GenerateParams`], stops on any of
+/// the tokenizer's stop tokens (the stop token is neither counted nor
 /// streamed) or after `max_new` tokens, and streams text via incremental
 /// detokenization (see the module docs). `state` must be fresh (empty KV
-/// cache); positions continue from the prompt.
+/// cache); use [`generate_from`] to continue one.
 ///
 /// # Errors
 ///
-/// [`GenerateError::EmptyPrompt`] on an empty prompt; forward-pass and
-/// tokenizer failures pass through typed. On error the state is mid-token
-/// and must be discarded.
+/// [`GenerateError::EmptyPrompt`] on an empty prompt;
+/// [`GenerateError::PositionMismatch`] when `state` is not fresh;
+/// forward-pass and tokenizer failures pass through typed. On error the
+/// state is mid-pass and must be discarded or [`ForwardState::reset`].
 pub fn generate(
     model: &Model,
     state: &mut ForwardState,
@@ -364,6 +587,70 @@ pub fn generate(
         state,
         tokenizer,
         prompt_ids,
+        0,
+        params,
+        tokenizer.stop_tokens(),
+        &mut on_token,
+        None,
+    )
+}
+
+/// [`generate`] continuing a KV cache that already holds `start_position`
+/// positions.
+///
+/// `prompt_ids` is only the **new** tokens — the next turn's render minus
+/// everything the state has already seen — and `start_position` must equal
+/// [`ForwardState::seq_len`]. This is what makes a multi-turn REPL cost one
+/// turn's prefill instead of one whole conversation's, and one
+/// [`ForwardState`] instead of one per turn: constructing a state reserves
+/// the ~1,438 MiB expert slot pool, opens io_uring and spawns the pinned
+/// compute pool.
+///
+/// The new tokens must be the ids that actually continue the sequence. For an
+/// assistant turn that means the ids in
+/// [`GenerateStats::generated_ids`], never a re-encoding of the reply's text:
+/// a generation-prompt render is not always an id-prefix of the finished
+/// turn, because the `\n` closing `<|im_start|>assistant\n` and the first
+/// characters of the reply can merge (measured, across `"hello"`,
+/// `" hello"`, `"\nhello"`, `"```rust"` and `"    indented"`).
+///
+/// # Which ids are "new"
+///
+/// Not every generated id reaches the cache: the last one sampled is emitted
+/// and never fed back (there is nothing left to predict from it), and a
+/// sampled stop token is not fed either. So a caller keeps the full id
+/// history and lets the cache say where it is:
+///
+/// ```text
+/// history.extend(&stats.generated_ids);      // turn N's reply
+/// history.extend(render_next_user_turn());   // turn N+1's prompt
+/// let fed = state.seq_len()?;                // what the model has seen
+/// generate_from(model, state, tok, &history[fed..], fed, params, on_token)?;
+/// ```
+///
+/// `state.seq_len()` is authoritative and `history[fed..]` is by construction
+/// exactly the suffix it has not consumed.
+///
+/// # Errors
+///
+/// [`GenerateError::PositionMismatch`] when `start_position` disagrees with
+/// the cache — including when a previous pass failed and left it ragged —
+/// plus everything [`generate`] returns.
+pub fn generate_from(
+    model: &Model,
+    state: &mut ForwardState,
+    tokenizer: &RvmpTokenizer,
+    prompt_ids: &[u32],
+    start_position: usize,
+    params: &GenerateParams,
+    mut on_token: impl FnMut(u32, &str),
+) -> Result<GenerateStats, GenerateError> {
+    generate_with_stops(
+        model,
+        state,
+        tokenizer,
+        prompt_ids,
+        start_position,
         params,
         tokenizer.stop_tokens(),
         &mut on_token,
@@ -393,6 +680,7 @@ pub fn generate_traced(
         state,
         tokenizer,
         prompt_ids,
+        0,
         params,
         tokenizer.stop_tokens(),
         &mut on_token,
@@ -435,52 +723,66 @@ fn traced_step<'s>(
 }
 
 /// [`generate`] with an explicit stop set (unit tests drive this with
-/// synthetic stop tokens a tiny fixture model can actually emit) and an
-/// optional routing trace.
+/// synthetic stop tokens a tiny fixture model can actually emit), a starting
+/// position, and an optional routing trace.
 #[allow(clippy::too_many_arguments)]
 fn generate_with_stops(
     model: &Model,
     state: &mut ForwardState,
     tokenizer: &RvmpTokenizer,
     prompt_ids: &[u32],
+    start_position: usize,
     params: &GenerateParams,
     stop_tokens: &[u32],
     on_token: &mut dyn FnMut(u32, &str),
     mut trace: Option<RouteSink<'_>>,
 ) -> Result<GenerateStats, GenerateError> {
-    let (&last, rest) = prompt_ids.split_last().ok_or(GenerateError::EmptyPrompt)?;
+    if prompt_ids.is_empty() {
+        return Err(GenerateError::EmptyPrompt);
+    }
+    // The cache decides where the sequence actually is; `start_position` is
+    // the caller's claim about it, and the two have to agree before a single
+    // RoPE position is computed. A ragged cache (a previous pass abandoned
+    // mid-token) reports as a mismatch rather than as an opaque kv error.
+    let expected = state
+        .seq_len()
+        .map_err(|_| GenerateError::PositionMismatch {
+            position: start_position,
+            expected: usize::MAX,
+        })?;
+    if start_position != expected {
+        return Err(GenerateError::PositionMismatch {
+            position: start_position,
+            expected,
+        });
+    }
 
     let prefill_start = Instant::now();
-    for (pos, &id) in rest.iter().enumerate() {
-        traced_step(
-            model,
-            state,
-            id,
-            pos,
-            false,
-            TracePhase::Prefill,
-            &mut trace,
-        )?;
-    }
-    let mut logits = traced_step(
-        model,
-        state,
-        last,
-        rest.len(),
-        true,
-        TracePhase::Prefill,
-        &mut trace,
-    )?
-    .ok_or(GenerateError::MissingLogits)?;
+    state.set_stream_phase(StreamPhase::Prefill);
+    let mut logits = {
+        // The sink borrows `trace` for the length of the prefill only; the
+        // decode loop below needs it back.
+        let mut tagged;
+        let sink: Option<PrefillRouteSink<'_>> = match trace.as_deref_mut() {
+            Some(inner) => {
+                tagged = |position: usize, layer: u32, topk: &[(u32, f32)]| {
+                    inner(TracePhase::Prefill, position, layer, topk);
+                };
+                Some(&mut tagged)
+            }
+            None => None,
+        };
+        prefill_prompt(model, state, prompt_ids, sink)?
+    };
     let prefill = prefill_start.elapsed();
 
     let decode_start = Instant::now();
     let mut sampler = Sampler::new(params, logits.len());
     let mut stream = StreamDecoder::new();
-    let mut position = prompt_ids.len();
-    let mut generated = 0usize;
+    let mut position = start_position + prompt_ids.len();
+    let mut generated_ids: Vec<u32> = Vec::with_capacity(params.max_new);
     let mut stop = StopReason::MaxNew;
-    while generated < params.max_new {
+    while generated_ids.len() < params.max_new {
         let next = sampler.sample(logits);
         if stop_tokens.contains(&next) {
             stop = StopReason::StopToken(next);
@@ -488,8 +790,8 @@ fn generate_with_stops(
         }
         let text = stream.push(tokenizer, next)?;
         on_token(next, &text);
-        generated += 1;
-        if generated == params.max_new {
+        generated_ids.push(next);
+        if generated_ids.len() == params.max_new {
             break;
         }
         logits = traced_step(
@@ -514,7 +816,8 @@ fn generate_with_stops(
 
     Ok(GenerateStats {
         prompt_tokens: prompt_ids.len(),
-        generated,
+        generated: generated_ids.len(),
+        generated_ids,
         stop,
         prefill,
         decode: decode_start.elapsed(),
@@ -528,7 +831,7 @@ mod tests {
     use super::*;
     use crate::io::LoadOptions;
     use crate::io::testutil::build_install;
-    use crate::model::{ForwardState, RuntimeConfig};
+    use crate::model::{ForwardState, PrefillConfig, PrefillMode, RuntimeConfig};
 
     /// Fixture-sized runtime dials: an unpinned two-shard pool and a small
     /// expert budget, so a test suite that runs many states in parallel
@@ -536,6 +839,18 @@ mod tests {
     /// 1,438 MiB per state.
     fn small(model: &Model, context_cap: usize) -> ForwardState {
         ForwardState::with_config(model, context_cap, RuntimeConfig::testing()).unwrap()
+    }
+
+    /// Sweep prefill with a ring narrow enough that the fixture's sub-1 MiB
+    /// slot pool still leaves room for a chunk wider than any prompt here, so
+    /// every test prompt is prefilled as exactly one chunk.
+    fn one_chunk_sweep() -> PrefillConfig {
+        PrefillConfig {
+            mode: PrefillMode::Sweep,
+            chunk: 512,
+            experts_per_window: 1,
+            windows_in_flight: 1,
+        }
     }
 
     /// The committed real-tokenizer fixtures (pinned Qwen3 vocabulary).
@@ -642,6 +957,333 @@ mod tests {
 
     // --- StreamDecoder ---
 
+    use crate::tokenizer::{ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID, IM_START_TOKEN_ID};
+
+    /// A deliberately mixed sequence — ASCII, CJK, an emoji ZWJ cluster,
+    /// a ChatML marker (which encodes to its single added-token id),
+    /// astral-plane characters — repeated `reps` times, so a run over it
+    /// slides the window many times with every awkward case recurring on
+    /// both sides of a slide.
+    fn mixed_ids(tokenizer: &RvmpTokenizer, reps: usize) -> Vec<u32> {
+        const UNIT: &str = "hi \u{4F60}\u{597D}\u{4E16}\u{754C} \u{1F30D}\u{1F469}\u{200D}\u{1F4BB}\
+                            <|im_end|>\n\u{13000}\u{1D518} ok ";
+        tokenizer.encode(&UNIT.repeat(reps)).unwrap()
+    }
+
+    /// Drive a decoder over `ids`, asserting no push leaks a replacement
+    /// character and the window stays bounded. Returns the assembled text
+    /// (every push plus `flush`) and the ids each push handed to the
+    /// tokenizer.
+    fn drive_stream(tokenizer: &RvmpTokenizer, ids: &[u32]) -> (String, Vec<usize>) {
+        let mut stream = StreamDecoder::new();
+        let mut assembled = String::new();
+        let mut per_push = Vec::with_capacity(ids.len());
+        let mut counted = 0usize;
+        for (i, &id) in ids.iter().enumerate() {
+            let piece = stream.push(tokenizer, id).unwrap();
+            assert!(
+                !piece.contains('\u{FFFD}'),
+                "push {i} leaked a replacement char: {piece:?}"
+            );
+            assert!(
+                stream.window.len() <= STREAM_WINDOW_MAX,
+                "window grew past its cap at push {i}"
+            );
+            assembled.push_str(&piece);
+            per_push.push(stream.decoded_ids - counted);
+            counted = stream.decoded_ids;
+        }
+        assembled.push_str(&stream.flush(tokenizer).unwrap());
+        (assembled, per_push)
+    }
+
+    /// The property that actually matters: streaming is a partition of the
+    /// one-shot decode. Whatever the window does, every push concatenated
+    /// with the final flush must equal `decode(all_ids, false)`.
+    #[test]
+    fn stream_decoder_matches_the_full_decode() {
+        let tokenizer = fixture_tokenizer();
+        let enc = |s: &str| tokenizer.encode(s).unwrap();
+        let mut raw_specials = vec![IM_START_TOKEN_ID];
+        raw_specials.extend(enc("user\n"));
+        raw_specials.extend([IM_END_TOKEN_ID, ENDOFTEXT_TOKEN_ID, 151_668]);
+
+        let cases: Vec<(&str, Vec<u32>)> = vec![
+            ("empty", Vec::new()),
+            ("single ascii id", enc("hello")[..1].to_vec()),
+            ("single added-token id", vec![IM_END_TOKEN_ID]),
+            ("ascii", enc("hello world, 1 + 2 = 3. done!")),
+            (
+                "cjk",
+                enc("\u{4F60}\u{597D}\u{4E16}\u{754C}\u{3002}\u{6D4B}\u{8BD5}\u{4E00}\u{4E0B}"),
+            ),
+            (
+                "emoji",
+                enc("ok \u{1F30D}\u{1F680}\u{1F469}\u{200D}\u{1F4BB} fine"),
+            ),
+            ("astral planes", enc("\u{13000}\u{1D518}\u{10348}")),
+            (
+                "chatml round trip",
+                enc("<|im_start|>user\nhi \u{1F600}<|im_end|>\n<|im_start|>assistant\n"),
+            ),
+            ("raw added-token ids", raw_specials),
+            ("long mixed, many slides", mixed_ids(&tokenizer, 24)),
+        ];
+        for (name, ids) in cases {
+            let (assembled, _) = drive_stream(&tokenizer, &ids);
+            assert_eq!(
+                assembled,
+                tokenizer.decode(&ids, false).unwrap(),
+                "case {name}"
+            );
+        }
+    }
+
+    /// The window-boundary case the bounded tail introduces: a character
+    /// whose bytes are split across ids, arriving after the window has
+    /// already started sliding.
+    #[test]
+    fn stream_decoder_carries_a_character_across_a_window_slide() {
+        let tokenizer = fixture_tokenizer();
+        let split = ["\u{13000}", "\u{1D518}", "\u{10348}", "\u{1F30D}"]
+            .iter()
+            .map(|s| tokenizer.encode(s).unwrap())
+            .find(|ids| ids.len() >= 2)
+            .expect("some exotic character splits into multiple ids");
+        assert!(split.len() <= STREAM_WINDOW_KEEP);
+        let prefix = tokenizer
+            .encode(&"the quick brown fox jumps over the lazy dog ".repeat(3))
+            .unwrap();
+        assert!(
+            prefix.len() > STREAM_WINDOW_KEEP * 2,
+            "{} ids",
+            prefix.len()
+        );
+
+        let mut stream = StreamDecoder::new();
+        let mut assembled = String::new();
+        for &id in &prefix {
+            assembled.push_str(&stream.push(&tokenizer, id).unwrap());
+        }
+        // Trimmed to the keep bound, so the character below starts at a
+        // slid window edge rather than at the start of the sequence.
+        assert_eq!(stream.window.len(), STREAM_WINDOW_KEEP);
+        assert_eq!(assembled, tokenizer.decode(&prefix, false).unwrap());
+
+        for (i, &id) in split.iter().enumerate() {
+            let piece = stream.push(&tokenizer, id).unwrap();
+            assert!(!piece.contains('\u{FFFD}'), "push {i}: {piece:?}");
+            // The trim refuses to drop an id whose bytes are unfinished or
+            // still withheld, so a slide cannot cut the character in half.
+            assert!(stream.window.ends_with(&split[..=i]), "push {i}");
+            assembled.push_str(&piece);
+        }
+        assembled.push_str(&stream.flush(&tokenizer).unwrap());
+
+        let all: Vec<u32> = prefix.iter().chain(split.iter()).copied().collect();
+        assert_eq!(assembled, tokenizer.decode(&all, false).unwrap());
+    }
+
+    /// An id whose decode is a lone U+FFFD, and stays one U+FFFD per id when
+    /// repeated. Byte-level BPE has a single-byte token for every byte, so
+    /// the byte alphabet (ids 0..256 in this vocabulary) holds stray
+    /// continuation bytes; a run of them is a real id sequence that `trim`
+    /// can never cut (every candidate head ends in U+FFFD) and `push` can
+    /// never emit (every window decode is nothing but withheld replacement
+    /// characters), so the window grows one id per push to the cap.
+    fn undecodable_filler(tokenizer: &RvmpTokenizer) -> u32 {
+        const FFFD: &str = "\u{FFFD}";
+        (0u32..256)
+            .find(|&id| {
+                let one = tokenizer.decode(&[id], false).unwrap_or_default();
+                let two = tokenizer.decode(&[id, id], false).unwrap_or_default();
+                one == FFFD && two == FFFD.repeat(2)
+            })
+            .expect("the byte alphabet has a stray continuation byte")
+    }
+
+    /// Drive a decoder over `ids` without `drive_stream`'s "no push leaks a
+    /// replacement character" rule: the sequences below really are
+    /// undecodable in part, so replacement characters are the *correct*
+    /// output and withholding them forever is not an option. Returns the
+    /// assembled text and the window length after each push.
+    fn drive_past_the_cap(tokenizer: &RvmpTokenizer, ids: &[u32]) -> (String, Vec<usize>) {
+        let mut stream = StreamDecoder::new();
+        let mut assembled = String::new();
+        let mut lens = Vec::with_capacity(ids.len());
+        for (i, &id) in ids.iter().enumerate() {
+            assembled.push_str(&stream.push(tokenizer, id).unwrap());
+            assert!(
+                stream.window.len() <= STREAM_WINDOW_MAX,
+                "window past the cap at push {i}: {}",
+                stream.window.len()
+            );
+            lens.push(stream.window.len());
+        }
+        assembled.push_str(&stream.flush(tokenizer).unwrap());
+        (assembled, lens)
+    }
+
+    /// The cap branch owes the same promise as every other path through the
+    /// decoder: push-by-push output plus `flush` is `decode(all_ids, false)`,
+    /// byte for byte. Nothing else in this module reaches
+    /// [`STREAM_WINDOW_MAX`] — `drive_stream` only asserts the window stays
+    /// under it, and the scaling test deliberately stays far below — so both
+    /// sequences here are built to land exactly on it, from the two
+    /// directions that can:
+    ///
+    /// 1. **Undecodable bytes, then a character split across ids.** 63 stray
+    ///    continuation bytes grow the window to one short of the cap with
+    ///    nothing emitted, and the 64th push is the *first* id of a multi-id
+    ///    character, so the cap lands with that character half arrived. The
+    ///    branch this replaced emitted the whole window verbatim — including
+    ///    the half character's U+FFFD — and cleared, so the ids completing
+    ///    the character then decoded to a second U+FFFD: two replacement
+    ///    characters where `decode` yields the character itself.
+    /// 2. **A token whose bytes are a rotation of a character's.** Repeated,
+    ///    it puts *every* id boundary strictly inside a character, so no cut
+    ///    is a clean split at all. The forced cut has to sever a character
+    ///    and re-anchor across it, and the character still has to come out
+    ///    whole and exactly once.
+    #[test]
+    fn stream_decoder_cap_matches_the_full_decode() {
+        let tokenizer = fixture_tokenizer();
+
+        let filler = undecodable_filler(&tokenizer);
+        let split = ["\u{13000}", "\u{1D518}", "\u{10348}", "\u{1F30D}"]
+            .iter()
+            .map(|s| tokenizer.encode(s).unwrap())
+            .find(|ids| ids.len() >= 2)
+            .expect("some exotic character splits into multiple ids");
+        let mut half_char = vec![filler; STREAM_WINDOW_MAX - 1];
+        half_char.extend(split.iter().copied());
+
+        // Bytes `92 E1 9E`, and `E1 9E 92` is U+17B2: the only token in the
+        // pinned vocabulary whose own repetition never lands an id boundary
+        // on a character boundary. Pinned by assertion, so a vocabulary
+        // change fails loudly instead of quietly weakening the case.
+        const ROTATION: u32 = 72_496;
+        let once = tokenizer.decode(&[ROTATION], false).unwrap();
+        let twice = tokenizer.decode(&[ROTATION, ROTATION], false).unwrap();
+        assert_ne!(
+            twice,
+            once.repeat(2),
+            "id {ROTATION} no longer straddles a character boundary"
+        );
+        let rotated = vec![ROTATION; STREAM_WINDOW_MAX + STREAM_WINDOW_KEEP];
+
+        for (name, ids) in [
+            ("split character at the cap", half_char),
+            ("rotated token, no clean cut anywhere", rotated),
+        ] {
+            let (assembled, lens) = drive_past_the_cap(&tokenizer, &ids);
+            assert_eq!(
+                assembled,
+                tokenizer.decode(&ids, false).unwrap(),
+                "case {name}"
+            );
+            // And the cap really is what was exercised: the window grew to
+            // one id short of it, and the next push dropped it straight back
+            // to the keep bound instead of clearing or growing.
+            assert_eq!(
+                lens[STREAM_WINDOW_MAX - 2],
+                STREAM_WINDOW_MAX - 1,
+                "case {name}: window did not reach the cap"
+            );
+            assert_eq!(
+                lens[STREAM_WINDOW_MAX - 1],
+                STREAM_WINDOW_KEEP,
+                "case {name}: forced cut did not land on the keep bound"
+            );
+        }
+    }
+
+    /// `generate` calls `on_token` once per generated token, plus one more
+    /// only when `flush` still owes text — `generated` or `generated + 1`,
+    /// never more. That contract lives in these two shapes.
+    #[test]
+    fn stream_decoder_flush_owes_text_at_most_once() {
+        let tokenizer = fixture_tokenizer();
+
+        // Nothing withheld: no extra event.
+        let mut stream = StreamDecoder::new();
+        for &id in &tokenizer.encode("all done.").unwrap() {
+            stream.push(&tokenizer, id).unwrap();
+        }
+        assert_eq!(stream.flush(&tokenizer).unwrap(), "");
+        assert_eq!(stream.flush(&tokenizer).unwrap(), "");
+
+        // Stopped mid-character: exactly one extra event, attributed to the
+        // last id pushed, and nothing after it.
+        let split = tokenizer.encode("\u{13000}").unwrap();
+        assert!(split.len() >= 2);
+        let head = &split[..split.len() - 1];
+        let mut stream = StreamDecoder::new();
+        for &id in head {
+            assert_eq!(stream.push(&tokenizer, id).unwrap(), "");
+        }
+        let tail = stream.flush(&tokenizer).unwrap();
+        assert!(tail.contains('\u{FFFD}'));
+        assert_eq!(stream.last_id(), head.last().copied());
+        assert_eq!(stream.flush(&tokenizer).unwrap(), "");
+    }
+
+    #[test]
+    fn stream_decoder_handles_empty_and_single_id_sequences() {
+        let tokenizer = fixture_tokenizer();
+        let mut empty = StreamDecoder::new();
+        assert_eq!(empty.flush(&tokenizer).unwrap(), "");
+        assert_eq!(empty.last_id(), None);
+
+        for id in [
+            tokenizer.encode("hi").unwrap()[0],
+            IM_START_TOKEN_ID,
+            IM_END_TOKEN_ID,
+        ] {
+            let mut stream = StreamDecoder::new();
+            let piece = stream.push(&tokenizer, id).unwrap();
+            assert_eq!(piece, tokenizer.decode(&[id], false).unwrap(), "id {id}");
+            assert_eq!(stream.flush(&tokenizer).unwrap(), "");
+            assert_eq!(stream.last_id(), Some(id));
+        }
+    }
+
+    /// The review finding this decoder closed (2026-08-02): re-decoding the
+    /// accumulated ids per token is O(n^2). Counted decode work — not wall
+    /// clock, which would flake on a loaded machine — pins that the cost of
+    /// a push is set by the window, not by how much has been generated.
+    #[test]
+    fn stream_decoder_decode_work_per_push_does_not_grow_with_length() {
+        let tokenizer = fixture_tokenizer();
+        let short = mixed_ids(&tokenizer, 3);
+        let long = mixed_ids(&tokenizer, 24);
+        assert!(long.len() > short.len() * 4, "{} ids", long.len());
+
+        let (short_text, short_push) = drive_stream(&tokenizer, &short);
+        let (long_text, long_push) = drive_stream(&tokenizer, &long);
+        assert_eq!(short_text, tokenizer.decode(&short, false).unwrap());
+        assert_eq!(long_text, tokenizer.decode(&long, false).unwrap());
+
+        // Same content, 8x the length, same worst-case push. The second
+        // bound is deliberately far below `STREAM_WINDOW_MAX`: a trim that
+        // stalls (an earlier draft cut one id at a time, which byte-level
+        // BPE blocks whenever an id ends mid-character) still terminates
+        // and still decodes correctly, but drifts the window up to the cap.
+        let short_worst = short_push.iter().copied().max().unwrap();
+        let long_worst = long_push.iter().copied().max().unwrap();
+        assert!(
+            long_worst <= short_worst && long_worst <= STREAM_WINDOW_KEEP * 3,
+            "per-push decode grew with length: {short_worst} -> {long_worst}"
+        );
+
+        // And therefore the whole run is linear, not quadratic: the old
+        // full re-decode would have cost n(n+1)/2 ids.
+        let n = long.len();
+        let total: usize = long_push.iter().sum();
+        assert!(total <= n * STREAM_WINDOW_KEEP * 3, "total {total}, n {n}");
+        assert!(total * 4 < n * (n + 1) / 2, "total {total}, n {n}");
+    }
+
     #[test]
     fn stream_decoder_withholds_split_utf8() {
         let tokenizer = fixture_tokenizer();
@@ -739,6 +1381,7 @@ mod tests {
             &mut state,
             &h.tokenizer,
             prompt,
+            0,
             &greedy_params(max_new),
             stops,
             &mut on_token,
@@ -746,9 +1389,17 @@ mod tests {
         )
         .unwrap();
         // One event per generated token, plus at most one flush event that
-        // re-reports the last id with the withheld tail text.
+        // re-reports the last id with the withheld tail text. That repeat is
+        // exactly why `GenerateStats::generated_ids` exists: `on_token`'s ids
+        // are a stream, not a list, and only the stats carry the sequence a
+        // caller can append to a KV cache.
         assert!(events.len() == stats.generated || events.len() == stats.generated + 1);
+        assert_eq!(stats.generated_ids.len(), stats.generated);
         let ids: Vec<u32> = events.iter().take(stats.generated).map(|e| e.0).collect();
+        assert_eq!(
+            ids, stats.generated_ids,
+            "the stream and the stats disagree"
+        );
         let text: String = events.iter().map(|e| e.1.as_str()).collect();
         (ids, text, stats)
     }
@@ -815,6 +1466,10 @@ mod tests {
             records.push((phase, pos, layer, topk.iter().map(|&(e, _)| e).collect()));
         };
         let mut state = small(&h.model, 16);
+        // One chunk for the whole prompt, so the layer-major emission order
+        // asserted below is not at the mercy of how many rows the fixture's
+        // sub-1 MiB slot pool happens to leave room for.
+        state.set_prefill_config(one_chunk_sweep()).unwrap();
         let mut ids = Vec::new();
         let mut text = String::new();
         let stats = generate_traced(
@@ -837,20 +1492,18 @@ mod tests {
         assert_eq!(ids[..want_ids.len()], want_ids[..]);
         assert_eq!(text, want_text);
 
-        // One record per layer per token, layers in order, phases split at
-        // the prompt boundary, and every routed id inside the expert count.
+        // One record per layer per token, phases split at the prompt
+        // boundary, and every routed id inside the expert count.
         let tokens = prompt.len() + stats.generated - 1;
         assert_eq!(records.len(), tokens * n_layers as usize);
-        for (i, (phase, pos, layer, experts)) in records.iter().enumerate() {
-            let token = i / n_layers as usize;
-            assert_eq!(*layer as usize, i % n_layers as usize);
-            assert_eq!(*pos, token);
-            let want_phase = if token < prompt.len() {
+        for (phase, pos, layer, experts) in &records {
+            let want_phase = if *pos < prompt.len() {
                 TracePhase::Prefill
             } else {
                 TracePhase::Decode
             };
-            assert_eq!(*phase, want_phase, "record {i}");
+            assert_eq!(*phase, want_phase, "position {pos}");
+            assert!(*layer < n_layers);
             assert_eq!(experts.len(), top_k);
             assert!(experts.iter().all(|&e| e < arch.n_experts), "{experts:?}");
             // torch.topk semantics: no expert is selected twice.
@@ -859,55 +1512,308 @@ mod tests {
             unique.dedup();
             assert_eq!(unique.len(), top_k, "{experts:?}");
         }
+
+        // Every (position, layer) pair exactly once, across both phases.
+        let mut pairs: Vec<(usize, u32)> = records.iter().map(|r| (r.1, r.2)).collect();
+        pairs.sort_unstable();
+        let want: Vec<(usize, u32)> = (0..tokens)
+            .flat_map(|pos| (0..n_layers).map(move |layer| (pos, layer)))
+            .collect();
+        assert_eq!(pairs, want);
+
+        // Emission *order* differs by phase, and that is the documented
+        // contract on `TracePhase`: the sweep reports (layer, row) because
+        // that is the order it does the work in, while decode — still one
+        // `forward_token` per token — reports (token, layer).
+        let decode: Vec<_> = records
+            .iter()
+            .filter(|r| r.0 == TracePhase::Decode)
+            .collect();
+        for (i, record) in decode.iter().enumerate() {
+            assert_eq!(
+                record.2 as usize,
+                i % n_layers as usize,
+                "decode record {i}"
+            );
+            assert_eq!(record.1, prompt.len() + i / n_layers as usize);
+        }
+        let prefill: Vec<_> = records
+            .iter()
+            .filter(|r| r.0 == TracePhase::Prefill)
+            .collect();
+        for (i, record) in prefill.iter().enumerate() {
+            assert_eq!(
+                record.2 as usize,
+                i / prompt.len(),
+                "prefill record {i} is not layer-major"
+            );
+            assert_eq!(record.1, i % prompt.len());
+        }
     }
 
     /// F3. The streamer's counters are cumulative from construction, so a
     /// footer that quotes them reports prefill folded into what reads as a
-    /// decode number: a five-token prompt and `--max-new 4` is eight forward
-    /// passes, five of them prefill. `generate` declares the phase to the
-    /// streamer per token; this pins that the split is real, exhaustive, and
-    /// lands exactly where the pass counts say it should.
+    /// decode number. `generate` declares the phase to the streamer for every
+    /// pass; this pins that the split is real, exhaustive, and lands exactly
+    /// where the pass counts say it should — in **both** prefill modes, which
+    /// now account for their expert bytes in different counters entirely.
     #[test]
     fn streaming_counters_split_prefill_from_decode() {
         let h = harness("gen-phase-split");
         let prompt = [1u32, 2, 3];
         let max_new = 4;
-        let mut state = small(&h.model, 16);
-        let stats = generate_with_stops(
-            &h.model,
-            &mut state,
-            &h.tokenizer,
-            &prompt,
-            &greedy_params(max_new),
-            &[],
-            &mut |_, _| {},
-            None,
-        )
-        .unwrap();
-        assert_eq!(stats.generated, max_new);
-
         let arch = h.model.arch();
-        // One request per routed expert per layer per forward pass.
+        // One cache request per routed expert per layer per forward pass.
         let per_pass = u64::from(arch.n_layers) * u64::from(arch.top_k);
+
+        let run = |config: PrefillConfig| {
+            let mut state = small(&h.model, 16);
+            state.set_prefill_config(config).unwrap();
+            let stats = generate_with_stops(
+                &h.model,
+                &mut state,
+                &h.tokenizer,
+                &prompt,
+                0,
+                &greedy_params(max_new),
+                &[],
+                &mut |_, _| {},
+                None,
+            )
+            .unwrap();
+            assert_eq!(stats.generated, max_new);
+            state
+        };
+
+        // Token-major prefill: one cache pass per prompt token, exactly as in
+        // phase 5. Decode runs one pass per generated token *after* the
+        // first, which is sampled from the prompt's logits.
+        let state = run(PrefillConfig {
+            mode: PrefillMode::TokenMajor,
+            ..one_chunk_sweep()
+        });
         let prefill = state.stream_stats_in(StreamPhase::Prefill);
         let decode = state.stream_stats_in(StreamPhase::Decode);
         let total = state.stream_stats();
-
-        // Prefill runs one pass per prompt token. Decode runs one per
-        // generated token *after* the first, which is sampled from the
-        // prompt's logits.
         assert_eq!(prefill.accesses(), prompt.len() as u64 * per_pass);
         assert_eq!(decode.accesses(), (max_new as u64 - 1) * per_pass);
-
         // Exhaustive and disjoint: every request lands in exactly one phase.
         assert_eq!(prefill.accesses() + decode.accesses(), total.accesses());
         assert_eq!(prefill.misses + decode.misses, total.misses);
         assert_eq!(prefill.hits + decode.hits, total.hits);
         assert_eq!(prefill.bytes_read + decode.bytes_read, total.bytes_read);
-
-        // And the point of all of it: the cumulative figure is not the decode
+        // The point of all of it: the cumulative figure is not the decode
         // figure, and quoting it as one overstates the work by the prompt.
         assert_ne!(total.accesses(), decode.accesses());
+
+        // The sweep: prefill makes **no cache requests at all**. Its bytes
+        // are in the sweep counters, which is the whole reason those exist
+        // separately — a prefill hit rate is no longer a number that means
+        // anything, and a decode one is finally clean of the prompt.
+        let state = run(one_chunk_sweep());
+        let prefill = state.stream_stats_in(StreamPhase::Prefill);
+        let decode = state.stream_stats_in(StreamPhase::Decode);
+        let total = state.stream_stats();
+        assert_eq!(prefill.accesses(), 0, "the sweep bypasses the slot cache");
+        assert_eq!(prefill.hits, 0);
+        assert_eq!(prefill.misses, 0);
+        assert_eq!(prefill.bytes_read, 0);
+        assert!(prefill.sweep_windows_read > 0, "no window was ever read");
+        assert!(prefill.sweep_bytes_read > 0, "no expert bytes were swept");
+        assert_eq!(decode.accesses(), (max_new as u64 - 1) * per_pass);
+        assert_eq!(total.accesses(), decode.accesses());
+        assert_eq!(decode.sweep_windows_read, 0, "decode never sweeps");
+    }
+
+    /// A multi-turn conversation on one [`ForwardState`] must produce exactly
+    /// what a fresh state fed the whole history produces. This is what makes
+    /// a REPL affordable: a second turn prefills only its new tokens instead
+    /// of the whole conversation, and reuses the ~1,438 MiB expert slot pool,
+    /// the io_uring ring and the pinned compute pool rather than rebuilding
+    /// them.
+    ///
+    /// It also pins the "which ids are new" rule from `generate_from`'s docs:
+    /// the last sampled id is emitted but never fed, so the un-fed suffix is
+    /// `history[state.seq_len()..]` and nothing else.
+    #[test]
+    fn a_second_turn_continues_an_existing_cache() {
+        let h = harness("gen-continue");
+        let params = greedy_params(3);
+        let mut history: Vec<u32> = vec![1, 2, 3];
+
+        let mut state = small(&h.model, 24);
+        state.set_prefill_config(one_chunk_sweep()).unwrap();
+        let turn1 = generate_with_stops(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            &history.clone(),
+            0,
+            &params,
+            &[],
+            &mut |_, _| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(turn1.generated_ids.len(), 3);
+        history.extend(&turn1.generated_ids);
+
+        // The last generated id was emitted but never fed, so the cache is
+        // one short of the history.
+        let fed = state.seq_len().unwrap();
+        assert_eq!(fed, history.len() - 1);
+
+        // Turn two: the un-fed suffix, which is that trailing id plus the new
+        // user tokens.
+        history.extend([7u32, 8]);
+        let segment = history[fed..].to_vec();
+        let turn2 = generate_with_stops(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            &segment,
+            fed,
+            &params,
+            &[],
+            &mut |_, _| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(turn2.prompt_tokens, segment.len());
+
+        // The reference: a fresh state fed the whole history at once.
+        let mut fresh = small(&h.model, 24);
+        fresh.set_prefill_config(one_chunk_sweep()).unwrap();
+        let want = generate_with_stops(
+            &h.model,
+            &mut fresh,
+            &h.tokenizer,
+            &history,
+            0,
+            &params,
+            &[],
+            &mut |_, _| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            turn2.generated_ids, want.generated_ids,
+            "a continued cache diverged from a rebuilt one"
+        );
+        assert_eq!(state.seq_len().unwrap(), fresh.seq_len().unwrap());
+    }
+
+    /// `start_position` is validated, not trusted: an off-by-one would prefill
+    /// the new turn at the wrong RoPE positions and produce plausible
+    /// nonsense.
+    #[test]
+    fn a_wrong_start_position_is_typed() {
+        let h = harness("gen-start-position");
+        let mut state = small(&h.model, 16);
+        state.set_prefill_config(one_chunk_sweep()).unwrap();
+
+        // A fresh state is at 0, so anything else is refused, both through
+        // the public wrapper and before any work happens.
+        let err = generate_from(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            &[1, 2],
+            1,
+            &greedy_params(1),
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GenerateError::PositionMismatch {
+                    position: 1,
+                    expected: 0
+                }
+            ),
+            "unexpected error: {err}"
+        );
+        assert_eq!(state.seq_len().unwrap(), 0, "nothing was consumed");
+
+        // And `generate` is `generate_from(.., 0, ..)`, so a state that is
+        // *not* fresh is refused rather than silently mis-positioned.
+        generate_from(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            &[1, 2],
+            0,
+            &greedy_params(2),
+            |_, _| {},
+        )
+        .unwrap();
+        let held = state.seq_len().unwrap();
+        assert!(held > 0);
+        let err = generate(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            &[3],
+            &greedy_params(1),
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GenerateError::PositionMismatch {
+                    position: 0,
+                    expected,
+                } if expected == held
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `reset` starts a fresh sequence on an existing state, which must be
+    /// indistinguishable from a brand-new one — without paying for a new
+    /// expert slot pool.
+    #[test]
+    fn reset_starts_a_fresh_sequence() {
+        let h = harness("gen-reset");
+        let prompt = [4u32, 5, 6];
+        let params = greedy_params(3);
+
+        let mut reused = small(&h.model, 16);
+        reused.set_prefill_config(one_chunk_sweep()).unwrap();
+        let first = generate_with_stops(
+            &h.model,
+            &mut reused,
+            &h.tokenizer,
+            &prompt,
+            0,
+            &params,
+            &[],
+            &mut |_, _| {},
+            None,
+        )
+        .unwrap();
+        assert!(reused.seq_len().unwrap() > 0);
+
+        reused.reset();
+        assert_eq!(reused.seq_len().unwrap(), 0);
+        for layer in 0..h.model.n_layers() as usize {
+            assert_eq!(reused.kv_len(layer).unwrap(), 0);
+        }
+        let second = generate_with_stops(
+            &h.model,
+            &mut reused,
+            &h.tokenizer,
+            &prompt,
+            0,
+            &params,
+            &[],
+            &mut |_, _| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(second.generated_ids, first.generated_ids);
     }
 
     #[test]

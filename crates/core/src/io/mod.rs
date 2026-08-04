@@ -10,6 +10,12 @@
 //!   counters indexed by expert id, sized `n_experts`, whose counts survive
 //!   eviction (ghost history; EXP-005). No cross-layer prefetch: measured
 //!   predictability is too low to pay for speculative reads.
+//! - Prefill: **not** the cache. [`LayerSweep`] streams one layer's expert file
+//!   front to back in large windows, borrowing the idle slot pool as scratch,
+//!   and computes each expert against all of a chunk's routed rows as it
+//!   arrives. A 512-token chunk reads every expert once per layer instead of
+//!   `top_k` times per token; replaying the prompt into the decode cache was
+//!   measured at +0.09 points and is deliberately not done (EXP-005).
 //!
 //! Concurrency invariant: a slot being filled by an in-flight read, or still
 //! owned by queued compute, is never reassigned.
@@ -45,6 +51,7 @@ mod error;
 mod expert;
 mod slots;
 mod stream;
+mod sweep;
 #[cfg(test)]
 pub(crate) mod testutil;
 
@@ -58,6 +65,10 @@ pub use error::IoError;
 pub use expert::{ExpertReader, ExpertSlab, ExpertView};
 pub use slots::{MAX_POOL_BYTES, SLOT_ALIGN, SlotError, SlotGuard, SlotPool};
 pub use stream::{ExpertStream, StreamMode, StreamPhase, StreamStats};
+pub use sweep::{
+    DEFAULT_EXPERTS_PER_WINDOW, DEFAULT_WINDOWS_IN_FLIGHT, LayerSweep, MAX_WINDOWS_IN_FLIGHT,
+    PrefillSession, SweepConfig, SweepError, SweepExpert, SweepPlan, SweepWindow,
+};
 
 use crate::format::{FormatError, Manifest, sha256_file};
 use crate::kernels::quants::QuantFormat;

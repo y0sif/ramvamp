@@ -6,17 +6,16 @@
 //! allocates nothing.
 //!
 //! The qualifier is load-bearing rather than decorative. Everything this
-//! module owns is sized once in [`ForwardState::new`] and never grows, but
-//! the streamer's per-step bookkeeping is not: [`ExpertStream::new`] builds
-//! its `CachePlan` hit/miss lists, the open step's hit/miss/protected lists
-//! and the in-flight read table **empty**, and they grow to their top-k
-//! working size the first time each layer is planned — i.e. five small `Vec`
-//! growths per layer, on token 0 only. After that they are cleared and
-//! reused, and the layer loop's only remaining allocations are
-//! [`Model::embed`]'s dequant `Vec` and, above this module, the stream
-//! decoder's `String`. Preallocating them (`CachePlan::with_capacity` exists
-//! for exactly this) would make the claim unconditional; until then it holds
-//! from token 1 on.
+//! module owns is sized once in [`ForwardState::new`] and never grows, and
+//! so is the streamer's per-step bookkeeping: the six `Vec`s that would
+//! otherwise grow on first use — `CachePlan`'s hit and miss lists, the open
+//! step's hit, miss and protected lists, and the in-flight read table — are
+//! all preallocated to `top_k` in [`ExpertStream::new`]. They live on the
+//! streamer, one set per process, not on anything the layer loop rebuilds
+//! per layer, so this is six allocations at construction and none after.
+//! Every step clears and reuses them, and the layer loop's only remaining
+//! allocations are [`Model::embed`]'s dequant `Vec` and, above this module,
+//! the stream decoder's `String`. The claim holds from token 0.
 //!
 //! # Decode loop shape
 //!
@@ -85,9 +84,12 @@
 
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::format::ArchInfo;
-use crate::io::{ExpertStream, ExpertView, IoError, StreamMode, StreamPhase, StreamStats};
+use crate::io::{
+    ExpertStream, ExpertView, IoError, StreamMode, StreamPhase, StreamStats, SweepError, SweepPlan,
+};
 use crate::kernels::KernelError;
 use crate::kernels::attention::{AttentionError, AttentionScratch, decode_attention};
 use crate::kernels::primitives::{
@@ -102,6 +104,7 @@ use crate::threads::{ComputePool, PoolConfig};
 use thiserror::Error;
 
 use super::error::ModelError;
+use super::prefill::{Phase, PhaseClock, PrefillConfig, PrefillMode, PrefillTiming};
 use super::weights::Model;
 
 /// Default total expert-cache budget: 1,440 MiB.
@@ -274,6 +277,82 @@ pub enum ForwardError {
         /// Its value in the model passed to [`forward_token`].
         given: u32,
     },
+
+    /// A chunked-prefill layer sweep failed. See
+    /// [`crate::model::prefill_prompt`].
+    #[error(transparent)]
+    Sweep(#[from] SweepError),
+
+    /// The expert slot slab cannot host a prefill chunk beside the sweep
+    /// ring, even narrowed to a single row with one window in flight.
+    #[error(
+        "prefill: the expert slot pool holds {available} B, but the narrowest \
+         chunk needs {needed} B of scratch plus its sweep ring"
+    )]
+    PrefillScratch {
+        /// Bytes the narrowest viable carve would have needed.
+        needed: u64,
+        /// Bytes the slot pool actually reserved.
+        available: u64,
+    },
+
+    /// The prefill scratch span cannot be aligned for a buffer the chunk
+    /// needs. Ruled out by the slab's page-aligned base; checked rather than
+    /// assumed, because the alternative is an unaligned reinterpretation.
+    #[error("prefill: the scratch span cannot be aligned to {align} B")]
+    PrefillScratchAlign {
+        /// The alignment that could not be met.
+        align: usize,
+    },
+
+    /// The configured prefill chunk is not a usable number of positions.
+    #[error("prefill: chunk size {chunk} is not a usable number of positions")]
+    InvalidPrefillChunk {
+        /// The rejected chunk size.
+        chunk: usize,
+    },
+
+    /// Prefill was handed an empty prompt: there is nothing to run and no
+    /// logits to produce.
+    #[error("prefill: no tokens to prefill")]
+    EmptyPrefill,
+
+    /// A layer sweep finished without computing every routed `(row, slot)`
+    /// pair, so some staging slot would have been reduced stale — the
+    /// chunked analogue of [`ForwardError::StreamPlanCoverage`].
+    #[error("prefill: layer {layer}: the sweep covered {covered} of {expected} routed rows")]
+    PrefillCoverage {
+        /// The layer whose sweep came up short.
+        layer: u32,
+        /// Routed `(row, slot)` pairs actually computed.
+        covered: usize,
+        /// Routed `(row, slot)` pairs the chunk asked for.
+        expected: usize,
+    },
+
+    /// A router selection named an expert the layer does not have. Reported
+    /// rather than trusted: it would otherwise index past the routing index.
+    #[error("prefill: routed expert {expert} is outside the layer's {n_experts} experts")]
+    RoutedExpertOutOfRange {
+        /// The offending expert id.
+        expert: u32,
+        /// Routed experts the layer has.
+        n_experts: usize,
+    },
+
+    /// One chunk row selected the same expert twice, so more `(row, slot)`
+    /// pairs route to it than the chunk has rows and its batch would not fit
+    /// the scratch. Unreachable through the router — top-k selection blanks
+    /// each winner — and refused rather than allowed to index past a buffer.
+    #[error("prefill: expert {expert} is routed {count} times by only {rows} chunk rows")]
+    RepeatedRoutedExpert {
+        /// The over-subscribed expert.
+        expert: u32,
+        /// `(row, slot)` pairs that named it.
+        count: usize,
+        /// Rows the chunk actually holds.
+        rows: usize,
+    },
 }
 
 /// The architecture dimensions a [`ForwardState`]'s buffers were sized from.
@@ -404,6 +483,34 @@ pub struct ForwardState {
     pool: ComputePool,
     /// Expert cache + io_uring/O_DIRECT streamer.
     stream: ExpertStream,
+
+    /// Which prefill path [`crate::model::prefill_prompt`] takes, and how
+    /// wide its chunks are. Seeded from [`PrefillConfig::from_env`].
+    prefill: PrefillConfig,
+    /// The sweep's per-layer window geometry, reused across every layer of
+    /// every chunk so only the first layer of the first prefill allocates.
+    sweep_plan: SweepPlan,
+    /// Deduplicated routed expert ids for the layer being swept, preallocated
+    /// to `n_experts`. Lives here rather than in the session scratch because
+    /// [`crate::io::PrefillSession::split`] takes it *while* handing that
+    /// scratch back, and the two may not alias.
+    routed: Vec<u32>,
+    /// Where the last [`crate::model::prefill_prompt`] call's wall time went.
+    ///
+    /// Rearmed and zeroed by every prefill, so it describes one prompt rather
+    /// than the process — the opposite of the streaming counters beside it.
+    /// `forward_token` charges into it too, but only while a prefill has armed
+    /// it, which is what keeps decode out of a prefill's numbers.
+    prefill_timing: PrefillTiming,
+    /// Whether [`forward_token`] should charge phases into `prefill_timing`.
+    ///
+    /// True only while [`crate::model::prefill_prompt`] is running the
+    /// token-major path. It is not a user-facing dial — instrumentation is
+    /// always on for prefill — but decode and the token-major prefill run the
+    /// *same* instrumented function, and folding a generated token's phases
+    /// into a prompt's split would make every number in it a lie the moment
+    /// generation started.
+    prefill_charging: bool,
 }
 
 impl fmt::Debug for ForwardState {
@@ -526,9 +633,151 @@ impl ForwardState {
             logits: vec![0.0; vocab],
             pool,
             stream,
+            prefill: PrefillConfig::from_env(),
+            sweep_plan: SweepPlan::new(),
+            routed: Vec::with_capacity(n_experts),
+            prefill_timing: PrefillTiming::default(),
+            prefill_charging: false,
         })
     }
 
+    /// The prefill dials this state runs with.
+    pub fn prefill_config(&self) -> PrefillConfig {
+        self.prefill
+    }
+
+    /// Replace the prefill dials.
+    ///
+    /// This is the path-selection and chunk-size dial the CLI wires up; it is
+    /// deliberately not a field on [`RuntimeConfig`], whose fields are
+    /// constructed positionally by another crate.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`PrefillConfig::validate`] refuses:
+    /// [`ForwardError::InvalidPrefillChunk`] for a zero chunk, and
+    /// [`ForwardError::Sweep`] for a degenerate or oversized sweep dial.
+    pub fn set_prefill_config(&mut self, config: PrefillConfig) -> Result<(), ForwardError> {
+        self.prefill = config.validate()?;
+        Ok(())
+    }
+
+    /// The last `want_logits` pass's `[vocab]` output.
+    pub fn logits(&self) -> &[f32] {
+        &self.logits
+    }
+
+    /// Positions appended to one layer of the KV cache.
+    ///
+    /// Unlike [`ForwardState::seq_len`] this does not require the layers to
+    /// agree, which is what makes it usable during a chunked prefill (see
+    /// [`crate::model::prefill_prompt`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ForwardError::Kv`] when `layer` is outside the cache.
+    pub fn kv_len(&self, layer: usize) -> Result<usize, ForwardError> {
+        Ok(self.kv.len(layer)?)
+    }
+
+    /// Drop every cached position, keeping every allocation.
+    ///
+    /// For starting a fresh sequence on an existing state — a new REPL
+    /// conversation, say — without rebuilding the ~1,438 MiB expert slot pool,
+    /// the io_uring ring and the pinned compute pool, which is what
+    /// constructing a new [`ForwardState`] costs.
+    ///
+    /// The KV planes are not zeroed: every read is bounded by the per-layer
+    /// cursor this resets, so stale bits are unreachable. The expert cache,
+    /// its LFU history and the streaming counters all survive on purpose —
+    /// they describe the process, not the sequence.
+    ///
+    /// [`ForwardState::prefill_timing`] does **not** survive, for the same
+    /// reason inverted: it describes one prefill of one sequence, and a
+    /// per-phase split left over from the sequence that was just dropped would
+    /// be read as belonging to the one that replaced it.
+    pub fn reset(&mut self) {
+        self.kv.clear();
+        self.prefill_timing = PrefillTiming::default();
+        self.prefill_charging = false;
+    }
+
+    /// Borrow the pieces the chunked prefill driver needs, all at once.
+    ///
+    /// Field-by-field so the compute pool, the streamer, the KV cache and the
+    /// scratch buffers can be held simultaneously — the same destructuring
+    /// [`forward_token`] does, exposed to the sibling module.
+    pub(super) fn prefill_parts(&mut self) -> PrefillParts<'_> {
+        PrefillParts {
+            kv: &mut self.kv,
+            attn_scratch: &mut self.attn_scratch,
+            topk: &mut self.topk,
+            logits: &mut self.logits,
+            pool: &mut self.pool,
+            stream: &mut self.stream,
+            sweep_plan: &mut self.sweep_plan,
+            routed: &mut self.routed,
+            timing: &mut self.prefill_timing,
+        }
+    }
+
+    /// Drop the previous prefill's numbers and start charging this one.
+    ///
+    /// Paired with [`ForwardState::close_prefill_timing`], which must run
+    /// however the prefill ended: a state left charging would fold the next
+    /// decode token's phases into a prompt that is already over.
+    pub(super) fn arm_prefill_timing(&mut self, mode: PrefillMode, tokens: usize) {
+        self.prefill_timing = PrefillTiming::started(mode, tokens);
+        self.prefill_charging = true;
+    }
+
+    /// Record the whole `prefill_prompt` call's wall time and stop charging.
+    pub(super) fn close_prefill_timing(&mut self, total: Duration) {
+        self.prefill_timing.total = total;
+        self.prefill_charging = false;
+    }
+
+    /// Refuse a model this state's buffers were not sized for.
+    ///
+    /// # Errors
+    ///
+    /// [`ForwardError::ArchMismatch`] naming the first dimension that differs.
+    pub(super) fn check_arch(&self, arch: &ArchInfo) -> Result<(), ForwardError> {
+        self.arch.check(arch)
+    }
+
+    /// All appended K rows of one layer, f16 bits. Test-only: the planes are
+    /// an implementation detail, and this exists so the prefill tests can
+    /// compare what two paths left behind.
+    #[cfg(test)]
+    pub(super) fn kv_k_layer(&self, layer: usize) -> Result<&[u16], ForwardError> {
+        Ok(self.kv.k_layer(layer)?)
+    }
+
+    /// All appended V rows of one layer; see [`ForwardState::kv_k_layer`].
+    #[cfg(test)]
+    pub(super) fn kv_v_layer(&self, layer: usize) -> Result<&[u16], ForwardError> {
+        Ok(self.kv.v_layer(layer)?)
+    }
+}
+
+/// The [`ForwardState`] pieces one chunked prefill borrows, split out so they
+/// can be held at the same time.
+pub(super) struct PrefillParts<'a> {
+    pub(super) kv: &'a mut KvCache,
+    pub(super) attn_scratch: &'a mut AttentionScratch,
+    /// `(expert, weight)` staging for the route sink.
+    pub(super) topk: &'a mut Vec<(u32, f32)>,
+    pub(super) logits: &'a mut Vec<f32>,
+    pub(super) pool: &'a mut ComputePool,
+    pub(super) stream: &'a mut ExpertStream,
+    pub(super) sweep_plan: &'a mut SweepPlan,
+    pub(super) routed: &'a mut Vec<u32>,
+    /// The per-phase timing the chunk driver charges into.
+    pub(super) timing: &'a mut PrefillTiming,
+}
+
+impl ForwardState {
     /// Positions appended so far (the position the next token must use).
     ///
     /// # Errors
@@ -570,12 +819,27 @@ impl ForwardState {
     /// Cumulative expert-streaming counters since this state was built,
     /// summed over **every** phase.
     ///
-    /// This is a whole-process figure and reads as one. A steady-state decode
-    /// hit rate has to come from [`ForwardState::stream_stats_in`]: prefill
-    /// runs through the same cache as decode in this build (there is no
-    /// cache-bypassing prompt sweep yet), so a prompt's worth of cold misses
-    /// is otherwise folded into a number quoted as a decode result. EXP-013
-    /// was written from exactly that mistake.
+    /// This is a whole-process figure and reads as one. **A steady-state
+    /// decode hit rate has to come from [`ForwardState::stream_stats_in`]**,
+    /// and what "hit rate" even means depends on which prefill path ran:
+    ///
+    /// - [`PrefillMode::Sweep`](super::PrefillMode::Sweep), the default: prefill bypasses the expert
+    ///   cache entirely and reports through the sweep counters instead
+    ///   ([`StreamStats::sweep_bytes_read`],
+    ///   [`StreamStats::sweep_windows`] and their siblings). It contributes
+    ///   **no** cache accesses, so [`StreamStats::hit_rate`] over the whole
+    ///   run is a decode figure — but [`StreamStats::bytes_read`] is not the
+    ///   whole story any more, because the prompt's bytes are in
+    ///   `sweep_bytes_read` and nowhere else. A phase with zero
+    ///   [`StreamStats::accesses`] is not an idle phase; ask
+    ///   [`StreamStats::is_idle`].
+    /// - [`PrefillMode::TokenMajor`](super::PrefillMode::TokenMajor), the A/B path: prefill *is* decode, one
+    ///   [`forward_token`] per prompt token through the same cache, so a
+    ///   prompt's worth of cold misses lands in these totals and folds into
+    ///   any hit rate quoted from them. EXP-013 was published from exactly
+    ///   that mistake, when this was the only path there was.
+    ///
+    /// Split by phase before quoting either one.
     pub fn stream_stats(&self) -> StreamStats {
         self.stream.stats()
     }
@@ -584,6 +848,23 @@ impl ForwardState {
     /// was in `phase`.
     pub fn stream_stats_in(&self, phase: StreamPhase) -> StreamStats {
         self.stream.stats_in(phase)
+    }
+
+    /// Where the **last** [`crate::model::prefill_prompt`] call's wall time
+    /// went, split by phase.
+    ///
+    /// Unlike [`ForwardState::stream_stats`] this is not cumulative: every
+    /// prefill zeroes it, and so does [`ForwardState::reset`]. In a multi-turn
+    /// session it therefore describes the most recent turn's prompt.
+    /// [`PrefillTiming::ran`] says whether it describes anything at all.
+    ///
+    /// Both prefill paths report through it, so
+    /// [`PrefillMode::Sweep`](super::PrefillMode::Sweep) and
+    /// [`PrefillMode::TokenMajor`](super::PrefillMode::TokenMajor) can be
+    /// compared phase by phase; [`PrefillTiming::mode`] says which one these
+    /// numbers came from.
+    pub fn prefill_timing(&self) -> PrefillTiming {
+        self.prefill_timing
     }
 
     /// Attribute every expert request from the next [`forward_token`] on to
@@ -614,7 +895,7 @@ pub type ExpertRouteSink<'a> = &'a mut dyn FnMut(u32, &[(u32, f32)]);
 /// Plain f32 dot product with f32 accumulation, matching the reference
 /// router matvec (HF computes router logits in f32).
 #[inline]
-fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+pub(super) fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = 0.0f32;
     for (&x, &y) in a.iter().zip(b) {
         acc += x * y;
@@ -624,7 +905,7 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 
 /// Remember the first kernel error any shard reported, without panicking
 /// out of a worker thread.
-fn record(slot: &Mutex<Option<KernelError>>, err: KernelError) {
+pub(super) fn record(slot: &Mutex<Option<KernelError>>, err: KernelError) {
     let mut held = slot.lock().unwrap_or_else(PoisonError::into_inner);
     if held.is_none() {
         *held = Some(err);
@@ -632,7 +913,7 @@ fn record(slot: &Mutex<Option<KernelError>>, err: KernelError) {
 }
 
 /// Take whatever [`record`] stored.
-fn taken(slot: Mutex<Option<KernelError>>) -> Result<(), KernelError> {
+pub(super) fn taken(slot: Mutex<Option<KernelError>>) -> Result<(), KernelError> {
     match slot.into_inner().unwrap_or_else(PoisonError::into_inner) {
         Some(err) => Err(err),
         None => Ok(()),
@@ -644,7 +925,7 @@ fn taken(slot: Mutex<Option<KernelError>>) -> Result<(), KernelError> {
 /// Bit-identical to `gemv_q8_k` over the same operands: the pool's shards
 /// tile `0..out_dim` in ascending contiguous order and each output row is an
 /// independent dot product (see the module docs).
-fn pool_gemv_q8_k(
+pub(super) fn pool_gemv_q8_k(
     pool: &mut ComputePool,
     format: QuantFormat,
     weight: &[u8],
@@ -814,8 +1095,9 @@ fn stream_experts(
     layer: u32,
     dims: MoeDims,
     scratch: &mut MoeScratch<'_>,
+    clock: &mut PhaseClock<'_>,
 ) -> Result<(), ForwardError> {
-    let outcome = stage_expert_phases(stream, pool, layer, dims, scratch);
+    let outcome = stage_expert_phases(stream, pool, layer, dims, scratch, clock);
     if outcome.is_err()
         && let Err(drain) = stream.await_misses()
     {
@@ -838,17 +1120,27 @@ fn stream_experts(
 ///
 /// Every exit from here is an error the caller must drain behind; see
 /// [`stream_experts`].
+///
+/// The three phase boundaries are what let a token-major prefill report the
+/// same split a swept one does: the two `run_plan` calls are expert
+/// arithmetic, and the block between them is expert I/O. `await_misses`'s
+/// blocked time is separately (and independently) counted by the streamer as
+/// [`StreamStats::io_wait`], so nothing here re-times the drive.
 fn stage_expert_phases(
     stream: &mut ExpertStream,
     pool: &mut ComputePool,
     layer: u32,
     dims: MoeDims,
     scratch: &mut MoeScratch<'_>,
+    clock: &mut PhaseClock<'_>,
 ) -> Result<(), ForwardError> {
     scratch.done.fill(false);
     run_plan(stream, pool, layer, dims, stream.hits(), scratch)?;
+    clock.charge(Phase::ExpertCompute);
     stream.await_misses()?;
+    clock.charge(Phase::ExpertIo);
     run_plan(stream, pool, layer, dims, stream.misses(), scratch)?;
+    clock.charge(Phase::ExpertCompute);
     let covered = scratch.done.iter().filter(|filled| **filled).count();
     if covered != dims.top_k {
         return Err(ForwardError::StreamPlanCoverage {
@@ -954,7 +1246,19 @@ pub fn forward_token_traced<'s>(
         logits,
         pool,
         stream,
+        // Prefill-only state; `forward_token` neither reads nor advances it.
+        prefill: _,
+        sweep_plan: _,
+        routed: _,
+        prefill_timing,
+        prefill_charging,
     } = state;
+
+    // Charges nothing unless `prefill_prompt` armed the timing, which it does
+    // only for `PrefillMode::TokenMajor`. A decode step therefore pays exactly
+    // one `Instant::now()` for the whole token and a predicted-not-taken
+    // branch per boundary; see `PhaseClock`.
+    let mut clock = PhaseClock::new(prefill_timing, *prefill_charging);
 
     let expected = kv.seq_len()?;
     if position != expected {
@@ -976,6 +1280,7 @@ pub fn forward_token_traced<'s>(
         // projections, Q8_0 for the q8_0 attn_k projection.
         quantize_row_q8_k(normed, acts_q8k_hidden)?;
         quantize_row_q8_0(normed, acts_q8_0_hidden)?;
+        clock.charge(Phase::Elementwise);
 
         pool_gemv_q8_k(
             pool,
@@ -996,6 +1301,7 @@ pub fn forward_token_traced<'s>(
             acts_q8k_hidden,
             v,
         )?;
+        clock.charge(Phase::Projections);
 
         // Per-head QK-RMSNorm, then RoPE — HF order: q_norm/k_norm apply
         // after the projection reshape and before rotary embedding
@@ -1011,10 +1317,13 @@ pub fn forward_token_traced<'s>(
         rope_neox_heads(k, n_kv_heads, head_dim, rope_pos, theta)?;
 
         kv.append(layer_idx, k, v)?;
+        clock.charge(Phase::Elementwise);
         decode_attention(q, kv, layer_idx, scale, attn_scratch, attn_out)?;
+        clock.charge(Phase::Attention);
 
         // Output projection (q5_k, Q8_K activations) and residual add.
         quantize_row_q8_k(attn_out, acts_q8k_attn)?;
+        clock.charge(Phase::Elementwise);
         pool_gemv_q8_k(
             pool,
             lw.attn_output.format,
@@ -1024,10 +1333,12 @@ pub fn forward_token_traced<'s>(
             acts_q8k_attn,
             o_proj,
         )?;
+        clock.charge(Phase::Projections);
         vec_add(residual, o_proj)?;
 
         // MoE block: residual = hidden; x = ffn_norm(hidden).
         rmsnorm(residual, lw.ffn_norm, eps, normed)?;
+        clock.charge(Phase::Elementwise);
 
         // Router: f32 matvec (rows validated `[n_experts, hidden]` at
         // load), softmax over all experts in f32, top-k by probability
@@ -1062,6 +1373,9 @@ pub fn forward_token_traced<'s>(
                 *w /= sum;
             }
         }
+        // Charged to `Projections`: the f32 router matvec dominates the
+        // softmax, the top-k scan and the sink it shares this region with.
+        clock.charge(Phase::Projections);
         if let Some(sink) = on_route.as_deref_mut() {
             sink(layer, topk);
         }
@@ -1072,8 +1386,10 @@ pub fn forward_token_traced<'s>(
         quantize_row_q8_k(normed, acts_q8k_hidden)?;
         expert_ids.clear();
         expert_ids.extend(topk.iter().map(|&(expert, _)| expert));
+        clock.charge(Phase::Elementwise);
 
         stream.begin_layer(layer, expert_ids)?;
+        clock.charge(Phase::ExpertIo);
         let mut scratch = MoeScratch {
             ffn: FfnScratch {
                 acts_hidden: acts_q8k_hidden,
@@ -1084,8 +1400,9 @@ pub fn forward_token_traced<'s>(
             staged: expert_staged,
             done: expert_done,
         };
-        let phases = stream_experts(stream, pool, layer, dims, &mut scratch);
+        let phases = stream_experts(stream, pool, layer, dims, &mut scratch, &mut clock);
         stream.end_layer(layer);
+        clock.charge(Phase::ExpertIo);
         phases?;
 
         // Fixed-order reduction: identical to the phase-4 sequential
@@ -1098,6 +1415,7 @@ pub fn forward_token_traced<'s>(
             }
         }
         vec_add(residual, expert_acc)?;
+        clock.charge(Phase::Elementwise);
     }
 
     if !want_logits {
@@ -1105,6 +1423,7 @@ pub fn forward_token_traced<'s>(
     }
     rmsnorm(residual, model.final_norm(), eps, normed)?;
     quantize_row_q8_k(normed, acts_q8k_hidden)?;
+    clock.charge(Phase::Elementwise);
     let head = model.lm_head();
     pool_gemv_q8_k(
         pool,
@@ -1115,6 +1434,7 @@ pub fn forward_token_traced<'s>(
         acts_q8k_hidden,
         logits,
     )?;
+    clock.charge(Phase::Projections);
     Ok(Some(logits))
 }
 
@@ -1127,6 +1447,10 @@ pub fn forward_token_traced<'s>(
 /// these helpers re-stamp the install with small scales.
 #[cfg(test)]
 pub(crate) mod testsupport {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use crate::format::{CommonTensor, LayerLayout};
     use crate::io::parse_quant_format;
     use crate::io::testutil::Fixture;
     use crate::kernels::quants::{QuantFormat, f32_to_f16};
@@ -1155,9 +1479,25 @@ pub(crate) mod testsupport {
     /// with tempered block scales so a full pass stays in f16 range.
     /// Load afterwards with `skip_hashes` (the manifest digests are stale).
     pub(crate) fn temper_install(fx: &Fixture) {
-        let path = fx.root.join("common.bin");
+        temper_parts(&fx.root, &fx.manifest.common_tensors, &fx.layout.layers);
+    }
+
+    /// [`temper_install`] against an install described by its parts rather
+    /// than by an `io::testutil::Fixture`.
+    ///
+    /// The shared builder in `io/testutil.rs` hard-codes one geometry and
+    /// keeps its `TempDir` private, so a test that needs a *different*
+    /// geometry (`prefill.rs`'s wide fixture: `q_dim != hidden`, more than
+    /// one Q8_K block per row, 16 experts) cannot produce a `Fixture` to
+    /// pass here. This takes exactly the three things the tempering reads.
+    pub(crate) fn temper_parts(
+        root: &Path,
+        common_tensors: &BTreeMap<String, CommonTensor>,
+        layers: &[LayerLayout],
+    ) {
+        let path = root.join("common.bin");
         let mut bytes = std::fs::read(&path).unwrap();
-        for tensor in fx.manifest.common_tensors.values() {
+        for tensor in common_tensors.values() {
             if let Some(format) = parse_quant_format(&tensor.dtype) {
                 let start = tensor.offset as usize;
                 restamp_scales(&mut bytes[start..start + tensor.len as usize], format);
@@ -1165,8 +1505,8 @@ pub(crate) mod testsupport {
         }
         std::fs::write(&path, bytes).unwrap();
 
-        for layer in &fx.layout.layers {
-            let path = fx.root.join(&layer.file);
+        for layer in layers {
+            let path = root.join(&layer.file);
             let mut bytes = std::fs::read(&path).unwrap();
             for expert in 0..layer.n_experts {
                 let base = expert as usize * layer.stride as usize;
@@ -1450,7 +1790,16 @@ mod tests {
             assert_eq!(stream.misses().len(), 1, "expert 1 is cold");
             assert_eq!(stream.hits()[0].0, 1, "the hit is the second routed id");
 
-            let err = stream_experts(stream, pool, 0, dims, scratch).unwrap_err();
+            let mut timing = PrefillTiming::default();
+            let err = stream_experts(
+                stream,
+                pool,
+                0,
+                dims,
+                scratch,
+                &mut PhaseClock::new(&mut timing, false),
+            )
+            .unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -1556,7 +1905,16 @@ mod tests {
                 1,
                 "a repeated id resolves once"
             );
-            let err = stream_experts(stream, pool, 0, dims, scratch).unwrap_err();
+            let mut timing = PrefillTiming::default();
+            let err = stream_experts(
+                stream,
+                pool,
+                0,
+                dims,
+                scratch,
+                &mut PhaseClock::new(&mut timing, false),
+            )
+            .unwrap_err();
             assert!(
                 matches!(
                     err,

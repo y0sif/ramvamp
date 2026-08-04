@@ -18,11 +18,36 @@ Usage:
 
     scripts/bitident.py capture models/llamacpp-ref/phase4-baseline
     scripts/bitident.py compare models/llamacpp-ref/phase4-baseline
+    scripts/bitident.py capture <dir> --set longs      # chunk-boundary set
+    scripts/bitident.py compare <dir> --dry-run        # list, run nothing
 
-`capture` runs `ramvamp logits --top N --skip-hashes` over the 8 fixed
-single prompts from the reference `meta.json`, and writes each raw stdout
-plus a `manifest.json` of per-prompt SHA-256 digests, the binary's
-identity (path, size, mtime, sha256), the git commit, and the model dir.
+`capture` runs `ramvamp logits --top N --skip-hashes` over a prompt set
+drawn from the reference `meta.json`, and writes each raw stdout plus a
+`manifest.json` of per-prompt SHA-256 digests, the binary's identity
+(path, size, mtime, sha256), the git commit, the model dir, and the
+prompt set with each prompt's token count.
+
+`--set` picks which prompts are fingerprinted:
+
+  singles  (default)  the 8 short `meta["singles"]` prompts, 4-12 tokens
+  longs               the 3 `meta["longs"]` fixtures, whose text lives in
+                      `<ref>/long_NN.txt`: 512, 1891 and 3492 tokens
+  all                 both, 11 prompts
+
+The singles are a few tokens each, so they exercise one prefill chunk and
+nothing else. The longs exist to pin the *chunked* prefill path: at a
+512-token chunk size, `long_00` is exactly one full chunk with an empty
+remainder (the boundary case that off-by-one errors land on), `long_01`
+is 3 full chunks + 379, `long_02` is 6 full + 420. A prefill rewrite that
+is correct on 5 tokens and wrong at a chunk seam passes `--set singles`
+and fails `--set longs`, which is the entire point of capturing both.
+
+Prompt sets are part of a baseline's identity, not a runtime option:
+`compare` adopts the set recorded in the baseline's manifest exactly as
+it adopts `--top`, so a baseline captured over singles never silently
+starts including longs. Passing a `--set` that contradicts the baseline
+is an error (exit 2), not a comparison over the intersection. Manifests
+written before `--set` existed are read as `singles`.
 
 `compare` re-runs the current build over the same prompts and diffs.
 Identical bytes -> PASS, exit 0. Differing bytes -> FAIL, exit 1, with,
@@ -39,7 +64,14 @@ digests are only cross-checked against them, never substituted for them,
 because a capture directory can be regenerated without its manifest.
 
 An empty manifest is a failed capture and is rejected, not reported as
-`PASS 0/0`.
+`PASS 0/0`. So is a comparand whose prompt set is not the baseline's:
+comparing 8 matching singles while quietly ignoring 3 unexamined longs
+would report PASS over a set nobody chose.
+
+`--dry-run` resolves the prompt set, prints what would be fingerprinted
+(name, kind, token count, per-prompt timeout) and exits 0 without loading
+the model — the cheap way to confirm which prompts a given invocation
+actually selects.
 
 Baseline captured 2026-08-03 on d80cc84 + scripts (phase-4 code, release
 build, 185H): 8/8 prompts, --top 4096, and an immediate second run
@@ -53,10 +85,15 @@ Exit codes, shared with the repo's other gate scripts (`cold_bench.py`,
   1  the gate ran and failed — bytes differ, the forward pass changed
   2  the gate could not run: the directory is not a capture, its manifest
      lists no prompts, a listed payload is missing, a payload and its
-     manifest disagree, the capture directory exists and is not empty
-     without --force, ramvamp failed to start or timed out
+     manifest disagree, the two sides fingerprint different prompt sets,
+     the capture directory exists and is not empty without --force,
+     ramvamp failed to start or timed out
 
-Python stdlib only.
+A timeout is always exit 2. A prompt the runtime never finished produced
+no bytes to compare, so it is "could not run", never "no difference".
+
+Python stdlib only (argparse, hashlib, json, os, shutil, struct,
+subprocess, sys, time).
 """
 
 from __future__ import annotations
@@ -78,6 +115,25 @@ import time
 DEFAULT_TOP = 4096
 
 MANIFEST = "manifest.json"
+
+# Which prompts make up the fingerprint. `singles` is the default and is
+# the historical set: every baseline captured before this flag existed is
+# a singles baseline, and `load_manifest` reads a missing `prompt_set` as
+# such, so the phase-4 gate keeps comparing 8 prompts against 8 prompts.
+PROMPT_SETS = ("singles", "longs", "all")
+DEFAULT_PROMPT_SET = "singles"
+
+# Per-prompt timeout. A flat 3600 s is generous for a 12-token single and
+# marginal for a 3492-token long: phase-5 prefill runs ~1.4 tok/s, so
+# long_02 alone is ~42 minutes of forward pass before the model load and
+# the 151936-way sort. Rather than pick one number that is either useless
+# or unbounded, the default scales with the prompt's known token count and
+# floors at the old value; --timeout overrides it with a flat number for
+# every prompt. The per-token budget is ~4x the measured prefill rate, so
+# a hang is still caught, just not a slow machine.
+DEFAULT_TIMEOUT = 3600.0
+TIMEOUT_S_PER_TOKEN = 3.0
+TIMEOUT_OVERHEAD_S = 600.0
 
 
 def fail(message: str) -> None:
@@ -127,19 +183,97 @@ def binary_identity(args) -> dict:
     }
 
 
-def prompts_from_meta(ref: str) -> list[tuple[str, str]]:
+def select_prompts(ref: str, prompt_set: str) -> list[dict]:
+    """Resolve a prompt set against the reference `meta.json`.
+
+    Two shapes live in that file. `meta["singles"]` carries the prompt
+    text inline; `meta["longs"]` carries only bookkeeping
+    (`file`/`chars`/`tokens`/`depth`) and the text sits beside it in
+    `<ref>/<file>.txt`, read verbatim — trailing newline included, since
+    that is what was tokenized to produce the recorded token count.
+
+    Token counts are free here: longs record theirs, and singles are
+    covered by `meta["tokenized_prompts"]`, so no tokenizer is loaded.
+    """
+    if prompt_set not in PROMPT_SETS:
+        fail(f"unknown prompt set {prompt_set!r}; expected one of "
+             f"{', '.join(PROMPT_SETS)}")
     meta_path = os.path.join(ref, "meta.json")
     if not os.path.isfile(meta_path):
         fail(f"no meta.json under {ref}")
     with open(meta_path) as f:
         meta = json.load(f)
-    entries = [(e["file"], e["prompt"]) for e in meta["singles"]]
-    if not entries:
-        fail(f"{meta_path} lists no singles")
+
+    tokens_by_prompt = {
+        e["prompt"]: len(e["ids"]) for e in meta.get("tokenized_prompts") or []
+    }
+    entries: list[dict] = []
+
+    if prompt_set in ("singles", "all"):
+        singles = meta.get("singles") or []
+        if not singles:
+            fail(f"{meta_path} lists no singles")
+        for e in singles:
+            entries.append({
+                "file": e["file"],
+                "kind": "single",
+                "prompt": e["prompt"],
+                "tokens": tokens_by_prompt.get(e["prompt"]),
+            })
+
+    if prompt_set in ("longs", "all"):
+        longs = meta.get("longs") or []
+        if not longs:
+            fail(f"{meta_path} lists no longs, so --set {prompt_set} has "
+                 f"nothing to fingerprint at chunk length. Point --ref at a "
+                 f"reference dir that has them.")
+        for e in longs:
+            name = e["file"]
+            path = os.path.join(ref, f"{name}.txt")
+            if not os.path.isfile(path):
+                fail(f"{meta_path} lists {name} but its text is missing "
+                     f"({path}); the long prompts live in .txt files next to "
+                     f"the manifest, not inline")
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            if not text:
+                fail(f"{path} is empty")
+            entries.append({
+                "file": name,
+                "kind": "long",
+                "prompt": text,
+                "prompt_file": f"{name}.txt",
+                "prompt_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "chars": len(text),
+                "tokens": e.get("tokens"),
+            })
+
+    names = [e["file"] for e in entries]
+    if len(set(names)) != len(names):
+        fail(f"{meta_path} repeats a prompt file name in set {prompt_set}: "
+             f"{sorted({n for n in names if names.count(n) > 1})}")
     return entries
 
 
-def run_logits(args, prompt: str) -> str:
+def describe(entry: dict) -> str:
+    """One-line label. Never echoes a 15 KB long prompt into the log."""
+    tokens = entry.get("tokens")
+    if entry["kind"] == "long":
+        tok = f", {tokens} tok" if tokens else ""
+        return f"{entry['prompt_file']} ({entry['chars']} chars{tok})"
+    tok = f" ({tokens} tok)" if tokens else ""
+    return f"{entry['prompt']!r}{tok}"
+
+
+def prompt_timeout(args, entry: dict) -> float:
+    """Seconds to allow this prompt. Flat if --timeout was given."""
+    if args.timeout is not None:
+        return float(args.timeout)
+    tokens = entry.get("tokens") or 0
+    return max(DEFAULT_TIMEOUT, TIMEOUT_OVERHEAD_S + tokens * TIMEOUT_S_PER_TOKEN)
+
+
+def run_logits(args, prompt: str, timeout: float, label: str) -> str:
     cmd = [args.ramvamp] if args.ramvamp else [
         "cargo", "run", "--release", "--quiet", "-p", "ramvamp", "--"
     ]
@@ -152,35 +286,65 @@ def run_logits(args, prompt: str) -> str:
     ]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=args.timeout, check=False
+            cmd, capture_output=True, text=True, timeout=timeout, check=False
         )
     except subprocess.TimeoutExpired:
-        fail(f"ramvamp timed out after {args.timeout:.0f}s on {prompt[:60]!r}")
+        # Exit 2, not 1: an unfinished prompt produced no bytes, so there
+        # is nothing to call identical or different. Raise --timeout (or
+        # drop it entirely to get the token-scaled default) and re-run.
+        fail(f"ramvamp timed out after {timeout:.0f}s on {label} — no output, "
+             f"so this is 'could not run', not a comparison. Re-run with a "
+             f"larger --timeout.")
     if result.returncode != 0:
-        fail(f"ramvamp exited {result.returncode} on {prompt[:60]!r}\n"
+        fail(f"ramvamp exited {result.returncode} on {label}\n"
              f"stderr:\n{result.stderr[-2000:]}")
     return result.stdout
 
 
+def manifest_record(entry: dict, blob: bytes, digest: str) -> dict:
+    """What a capture directory says about one prompt.
+
+    Singles keep the historical shape (`file`/`prompt`/`bytes`/`sha256`)
+    so old and new manifests read the same way. Longs record where the
+    text came from and its digest instead of inlining 15 KB of Wikipedia
+    into the manifest — the payload already echoes the prompt back, and
+    the digest is what proves the same fixture was used on both sides.
+    """
+    rec = {"file": entry["file"], "kind": entry["kind"]}
+    if entry["kind"] == "long":
+        rec.update({
+            "prompt_file": entry["prompt_file"],
+            "prompt_sha256": entry["prompt_sha256"],
+            "chars": entry["chars"],
+        })
+    else:
+        rec["prompt"] = entry["prompt"]
+    rec.update({
+        "tokens": entry.get("tokens"),
+        "bytes": len(blob),
+        "sha256": digest,
+    })
+    return rec
+
+
 def capture(args, out_dir: str, quiet: bool = False) -> dict:
-    entries = prompts_from_meta(args.ref)
+    entries = select_prompts(args.ref, args.prompt_set)
     os.makedirs(out_dir, exist_ok=True)
     records = []
     t_start = time.time()
-    for name, prompt in entries:
+    for entry in entries:
+        name, label = entry["file"], describe(entry)
         t0 = time.time()
-        stdout = run_logits(args, prompt)
+        stdout = run_logits(args, entry["prompt"], prompt_timeout(args, entry),
+                            f"[{name}] {label}")
         blob = stdout.encode("utf-8")
         digest = hashlib.sha256(blob).hexdigest()
         with open(os.path.join(out_dir, f"{name}.json"), "wb") as f:
             f.write(blob)
-        records.append({
-            "file": name, "prompt": prompt,
-            "bytes": len(blob), "sha256": digest,
-        })
+        records.append(manifest_record(entry, blob, digest))
         if not quiet:
             print(f"[{name}] {digest[:16]}...  {len(blob):>9} B  "
-                  f"({time.time() - t0:.0f}s)  {prompt!r}")
+                  f"({time.time() - t0:.0f}s)  {label}")
     manifest = {
         "tool": "scripts/bitident.py",
         "captured": time.strftime("%Y-%m-%d %H:%M:%S %z"),
@@ -189,6 +353,7 @@ def capture(args, out_dir: str, quiet: bool = False) -> dict:
         "model": os.path.abspath(args.rvmp),
         "reference": os.path.abspath(args.ref),
         "top": args.top,
+        "prompt_set": args.prompt_set,
         "binary": binary_identity(args),
         "elapsed_s": round(time.time() - t_start, 1),
         "prompts": records,
@@ -208,7 +373,64 @@ def load_manifest(d: str) -> dict:
         fail(f"{path} lists no prompts; there is nothing to fingerprint. "
              f"A capture that recorded 0 prompts is a failed capture, not a "
              f"passing comparison — re-run `bitident.py capture`.")
+
+    # Manifests predating --set have no `prompt_set` and are singles by
+    # construction. Fill it in, then check the claim against the records:
+    # a manifest that says `singles` while listing a long is corrupt, and
+    # trusting either half of it would silently narrow or widen the gate.
+    prompt_set = manifest.setdefault("prompt_set", DEFAULT_PROMPT_SET)
+    if prompt_set not in PROMPT_SETS:
+        fail(f"{path} records prompt_set {prompt_set!r}, which is not one of "
+             f"{', '.join(PROMPT_SETS)}")
+    kinds = {rec.get("kind", "single") for rec in manifest["prompts"]}
+    expected = {"singles": {"single"}, "longs": {"long"},
+                "all": {"single", "long"}}[prompt_set]
+    if not kinds <= expected:
+        fail(f"{path} records prompt_set {prompt_set!r} but lists prompts of "
+             f"kind {sorted(kinds)}; the manifest contradicts itself and "
+             f"cannot be used as a baseline. Re-capture it.")
     return manifest
+
+
+def assert_same_prompt_set(base_dir: str, base: dict,
+                           new_dir: str, new: dict) -> None:
+    """Both sides must fingerprint the same prompts, or neither counts.
+
+    Comparing a longs capture against a singles baseline would match the
+    files they share and report PASS, having never looked at the prompts
+    that were the point. That is a harness misuse, so it is exit 2 rather
+    than a gate failure.
+    """
+    if base["prompt_set"] != new["prompt_set"]:
+        fail(f"prompt-set mismatch: baseline {base_dir} fingerprints "
+             f"{base['prompt_set']!r}, comparand {new_dir} fingerprints "
+             f"{new['prompt_set']!r}. These are not comparable; capture the "
+             f"comparand with --set {base['prompt_set']}.")
+    base_files = sorted(r["file"] for r in base["prompts"])
+    new_files = sorted(r["file"] for r in new["prompts"])
+    if base_files != new_files:
+        missing = sorted(set(base_files) - set(new_files))
+        extra = sorted(set(new_files) - set(base_files))
+        fail(f"prompt-set mismatch within {base['prompt_set']!r}: "
+             f"{len(base_files)} prompts in the baseline, {len(new_files)} in "
+             f"the comparand"
+             + (f"; missing {missing}" if missing else "")
+             + (f"; unexpected {extra}" if extra else "")
+             + ". A comparison over a subset is not a pass.")
+
+    # Same prompt names, but are they the same prompt *text*? The long
+    # fixtures live in files that can be edited; if long_02.txt changed
+    # between the two captures, every logit legitimately differs and the
+    # runtime gets blamed for it.
+    new_by_file = {r["file"]: r for r in new["prompts"]}
+    for rec in base["prompts"]:
+        got = new_by_file[rec["file"]]
+        for field in ("prompt", "prompt_sha256"):
+            if field in rec and rec[field] != got.get(field):
+                fail(f"prompt text for {rec['file']} differs between "
+                     f"{base_dir} and {new_dir} ({field}); the fixture "
+                     f"changed, so any logit difference would not be the "
+                     f"runtime's. Re-capture the baseline.")
 
 
 def actual_digests(d: str, manifest: dict, what: str) -> dict[str, str]:
@@ -296,6 +518,27 @@ def compare(args, base_dir: str) -> int:
               f"--top {args.top} to match", file=sys.stderr)
         args.top = base["top"]
 
+    # Prompt set, same rule as --top: the baseline decides. Silence when
+    # nothing was asked for, an error when something contradictory was —
+    # `--set longs` against a singles baseline is a mistake worth naming,
+    # not a request to quietly fingerprint 8 prompts.
+    if args.set_explicit and args.prompt_set != base["prompt_set"]:
+        fail(f"--set {args.prompt_set} contradicts baseline {base_dir}, which "
+             f"was captured over {base['prompt_set']!r}. A baseline's prompt "
+             f"set is part of its identity: compare it as captured, or "
+             f"capture a new baseline with --set {args.prompt_set}.")
+    if args.prompt_set != base["prompt_set"]:
+        print(f"note: baseline fingerprints {base['prompt_set']!r}, using that "
+              f"prompt set instead of {args.prompt_set!r}", file=sys.stderr)
+        args.prompt_set = base["prompt_set"]
+
+    if args.dry_run:
+        print(f"dry run: would compare {base_dir} "
+              f"(set {base['prompt_set']}, top {base['top']}, captured "
+              f"{base['captured']}, commit {base['git_commit']})")
+        print_selection(args)
+        return 0
+
     if args.new:
         new_dir, new_manifest, temp = args.new, load_manifest(args.new), False
         print(f"comparing {base_dir} vs {new_dir} (no run)")
@@ -306,8 +549,10 @@ def compare(args, base_dir: str) -> int:
         print(f"re-running current build into {new_dir}")
         new_manifest = capture(args, new_dir)
 
+    assert_same_prompt_set(base_dir, base, new_dir, new_manifest)
+
     print(f"baseline: {base['git_commit']}  captured {base['captured']}  "
-          f"top {base['top']}")
+          f"top {base['top']}  set {base['prompt_set']}")
     print(f"current : {new_manifest['git_commit']}  "
           f"captured {new_manifest['captured']}")
     if base["binary"].get("sha256") and new_manifest["binary"].get("sha256"):
@@ -327,17 +572,12 @@ def compare(args, base_dir: str) -> int:
     base_digests = actual_digests(base_dir, base, f"baseline {base_dir}")
     new_digests = actual_digests(new_dir, new_manifest, f"comparand {new_dir}")
 
-    new_by_file = {r["file"]: r for r in new_manifest["prompts"]}
     differing = []
     for rec in base["prompts"]:
         name = rec["file"]
-        got = new_by_file.get(name)
-        if got is None:
-            print(f"[{name}] MISSING in the new capture")
-            differing.append((name, {"kind": "missing"}))
-            continue
+        tok = f"  {rec['tokens']:>4} tok" if rec.get("tokens") else ""
         if new_digests[name] == base_digests[name]:
-            print(f"[{name}] identical  {base_digests[name][:16]}...")
+            print(f"[{name}] identical  {base_digests[name][:16]}...{tok}")
             continue
         detail = diff_prompt(os.path.join(base_dir, f"{name}.json"),
                              os.path.join(new_dir, f"{name}.json"))
@@ -361,14 +601,33 @@ def compare(args, base_dir: str) -> int:
 
     n = len(base["prompts"])
     if not differing:
-        print(f"\nbit-identity: PASS  {n}/{n} prompts byte-identical to "
-              f"{base_dir}")
+        print(f"\nbit-identity: PASS  {n}/{n} {base['prompt_set']} prompts "
+              f"byte-identical to {base_dir}")
         return 0
     numeric = [d for _, d in differing if d["kind"] == "numeric"]
     kinds = ", ".join(sorted({d["kind"] for _, d in differing}))
-    print(f"\nbit-identity: FAIL  {len(differing)}/{n} prompts differ "
-          f"({kinds}); {len(numeric)} numeric -> the forward pass changed")
+    print(f"\nbit-identity: FAIL  {len(differing)}/{n} {base['prompt_set']} "
+          f"prompts differ ({kinds}); {len(numeric)} numeric -> the forward "
+          f"pass changed")
     return 1
+
+
+def print_selection(args) -> None:
+    """--dry-run: exactly which prompts this invocation would fingerprint."""
+    entries = select_prompts(args.ref, args.prompt_set)
+    budget = 0.0
+    print(f"set {args.prompt_set}: {len(entries)} prompts from "
+          f"{os.path.join(args.ref, 'meta.json')} at --top {args.top}")
+    for e in entries:
+        t = prompt_timeout(args, e)
+        budget += t
+        print(f"  {e['file']:<12} {e['kind']:<7} "
+              f"{(str(e['tokens']) + ' tok') if e.get('tokens') else '? tok':>9}  "
+              f"timeout {t:>8.0f}s  {describe(e)[:70]}")
+    print(f"  {'':<12} {'total':<7} {'':>9}  timeout {budget:>8.0f}s "
+          f"({budget / 3600:.1f} h worst case)")
+    inv = binary_identity(args).get("invocation")
+    print(f"binary: {inv}")
 
 
 def main() -> int:
@@ -381,6 +640,15 @@ def main() -> int:
                         help="reference dir supplying the prompt set (meta.json)")
     parser.add_argument("--ramvamp",
                         help="ramvamp binary (default: cargo run --release)")
+    parser.add_argument("--set", dest="prompt_set", choices=PROMPT_SETS,
+                        default=None,
+                        help=f"which prompts to fingerprint (default "
+                             f"{DEFAULT_PROMPT_SET}): 'singles' = the 8 short "
+                             f"prompts, 'longs' = the 512/1891/3492-token "
+                             f"fixtures that cross prefill chunk boundaries, "
+                             f"'all' = both. compare mode adopts the "
+                             f"baseline's set; passing one that contradicts "
+                             f"it is an error")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP,
                         help=f"fingerprint depth (default {DEFAULT_TOP}); "
                              "compare mode adopts the baseline's value")
@@ -392,16 +660,35 @@ def main() -> int:
                         help="compare mode: do not delete the temp capture")
     parser.add_argument("--force", action="store_true",
                         help="capture mode: overwrite a non-empty directory")
-    parser.add_argument("--timeout", type=float, default=3600.0,
-                        help="per-prompt ramvamp timeout (s)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="resolve and print the prompt set, then exit 0 "
+                             "without loading the model")
+    parser.add_argument("--timeout", type=float, default=None,
+                        help=f"flat per-prompt ramvamp timeout (s). Default is "
+                             f"token-scaled: max({DEFAULT_TIMEOUT:.0f}, "
+                             f"{TIMEOUT_OVERHEAD_S:.0f} + "
+                             f"{TIMEOUT_S_PER_TOKEN:.0f}*tokens), so a 3492-token "
+                             f"long gets ~3 h instead of the 1 h a flat default "
+                             f"would give it. A timeout is exit 2, never a pass")
     args = parser.parse_args()
 
+    # Remember whether --set was actually typed: compare mode adopts the
+    # baseline's set when it was not, and refuses when it was and disagrees.
+    args.set_explicit = args.prompt_set is not None
+    if args.prompt_set is None:
+        args.prompt_set = DEFAULT_PROMPT_SET
+
     if args.mode == "capture":
+        if args.dry_run:
+            print(f"dry run: would capture into {args.dir}")
+            print_selection(args)
+            return 0
         if os.path.isdir(args.dir) and os.listdir(args.dir) and not args.force:
             fail(f"{args.dir} exists and is not empty (use --force)")
         manifest = capture(args, args.dir)
-        print(f"\ncaptured {len(manifest['prompts'])} prompts at --top "
-              f"{manifest['top']} in {manifest['elapsed_s']:.0f}s -> {args.dir}")
+        print(f"\ncaptured {len(manifest['prompts'])} {manifest['prompt_set']} "
+              f"prompts at --top {manifest['top']} in "
+              f"{manifest['elapsed_s']:.0f}s -> {args.dir}")
         print(f"commit {manifest['git_commit']}")
         return 0
     return compare(args, args.dir)

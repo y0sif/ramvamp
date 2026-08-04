@@ -138,16 +138,27 @@ number appears in anything published.
 - SSD-streamed MoE costs more energy per token than RAM-resident inference
   (up to ~12x per [arXiv:2508.06978](https://arxiv.org/html/2508.06978v1)).
   Reads do not wear SSDs, but battery life on laptops will be affected.
-- The approach stays I/O-bound: TurboFieldfare's tuned M2 path still spends
-  ~half its per-token time on expert reads. The slowdown versus a
+- **Decode** stays I/O-bound: TurboFieldfare's tuned M2 path still spends
+  ~half its per-token time on expert reads. That is a claim about decode, and
+  it does not carry to prefill on the swept path: EXP-017 measured expert I/O
+  at 1.7% of a 512-token swept prefill and 0.5% at 1891 tokens, with attention
+  taking 61.3% and 85.2%. The slowdown versus a
   fits-in-RAM engine is **drive-dependent and larger than the "2-3x" this
   document previously claimed**. On ramvamp's reference machine (Micron 2400,
   DRAM-less QLC, Qwen3-30B-A3B Q4_K_M at the shipped 11 slots/layer) the
-  derived I/O-only ceiling is 2.2-2.7 tok/s against a 15-25 tok/s in-RAM
-  compute estimate, so roughly 6-11x on that device; a mainstream TLC Gen4
-  drive would roughly halve the gap. Both ends of that ratio are soft: the
-  numerator is an estimate and the denominator is derived from a bandwidth
-  probe that fails the experiment log's rule 2. The memory saving, **~6x**
+  derived I/O-only ceiling is **2.8-3.4 tok/s** against a 15-25 tok/s in-RAM
+  compute estimate, so roughly 4-9x on that device; a mainstream TLC Gen4
+  drive would roughly halve the gap. That band is up from the 2.2-2.7 this
+  document carried before, because the bandwidth under it was re-measured:
+  EXP-019 puts the decode geometry (one expert blob, random order, up to 8
+  outstanding) at **1.55-1.69 GB/s**, cold, in-cgroup, hygiene PASS, against
+  the 1.211-1.349 EXP-008 gave. Both ends of the ratio are still soft, but the
+  old caveat that the denominator "fails the experiment log's rule 2" no
+  longer applies. What remains: the numerator is an estimate with no direct
+  public benchmark, the hit rates behind the band are a trace replay rather
+  than a decode run, and EXP-019's queue was threaded `preadv` rather than
+  io_uring, so it characterises the drive and not the runtime's submission
+  path. The memory saving, **~6x**
   (17.35 GiB of model bytes against a ~2.9 GiB resident budget), is the part
   that does not depend on the drive. See the performance model in
   `docs/architecture.md` for the derivation and its provisional status.

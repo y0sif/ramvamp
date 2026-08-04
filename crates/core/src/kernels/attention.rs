@@ -19,6 +19,16 @@
 //! `scale` is caller-provided (`1 / sqrt(head_dim)` for Qwen3) — never
 //! hardcoded, because Gemma-family models fold query scaling differently.
 //!
+//! Causality: [`decode_attention`] has no mask because it does not need one
+//! — the decode loop appends the current token's K/V and calls immediately,
+//! so the layer holds exactly positions `0..=current`. Chunked layer-major
+//! prefill breaks that invariant on purpose (a whole chunk's K/V lands in
+//! layer `L` before any of the chunk's rows are attended), so it uses
+//! [`attention_at`], which takes the row's position explicitly and stops the
+//! sum there. Both entry points run the same private body, so the masked
+//! form is the unmasked form against a shorter cache — identical f32
+//! operations in identical order, bit for bit.
+//!
 //! Alignment: reads assume nothing beyond the natural 2-byte alignment of
 //! `&[u16]`; every conversion is a scalar element load, no wide loads (per
 //! the kernels module's alignment rule).
@@ -49,7 +59,7 @@ pub enum AttentionError {
     Kernel(#[from] KernelError),
 
     /// `q` is empty or not a whole number of `head_dim` heads.
-    #[error("decode_attention: q length {q_len} is not a nonzero multiple of head_dim {head_dim}")]
+    #[error("attention: q length {q_len} is not a nonzero multiple of head_dim {head_dim}")]
     QLenIndivisible {
         /// Offending query length.
         q_len: usize,
@@ -59,7 +69,7 @@ pub enum AttentionError {
 
     /// The query head count is not a multiple of the kv head count.
     #[error(
-        "decode_attention: {n_q_heads} query heads do not group evenly over \
+        "attention: {n_q_heads} query heads do not group evenly over \
          {n_kv_heads} kv heads"
     )]
     GqaGroupMismatch {
@@ -70,7 +80,7 @@ pub enum AttentionError {
     },
 
     /// The output buffer does not match the query length.
-    #[error("decode_attention: out length {out_len}, expected {expected} (same as q)")]
+    #[error("attention: out length {out_len}, expected {expected} (same as q)")]
     OutLenMismatch {
         /// Offending output length.
         out_len: usize,
@@ -78,28 +88,36 @@ pub enum AttentionError {
         expected: usize,
     },
 
-    /// The layer has no cached positions — attention over an empty history
-    /// is undefined (the caller must append the current token's K/V first).
-    #[error("decode_attention: layer {layer} has no cached positions")]
+    /// There is nothing to attend over: either the layer holds no cached
+    /// positions, or [`attention_at`] was asked for `positions == 0`.
+    /// Attention over an empty history is undefined — the caller must append
+    /// the current token's K/V first, and a row always attends to at least
+    /// itself (`positions = p + 1 >= 1`).
+    #[error("attention: layer {layer} has no positions to attend over")]
     EmptyLayer {
-        /// The empty layer.
+        /// The layer with nothing to attend over.
         layer: usize,
     },
 }
 
-/// Reusable per-position score buffer for [`decode_attention`].
+/// Reusable per-position score buffer for [`decode_attention`] and
+/// [`attention_at`].
 ///
-/// Holds one f32 per cached position. The buffer grows to the high-water
-/// sequence length and is then reused as-is, so a scratch constructed once
-/// (ideally via [`Self::with_capacity`] at the cache's capacity, 4096 for
-/// v0) allocates at most once and never again on the decode path.
+/// Holds one f32 per *attended* position — the full cached length for
+/// [`decode_attention`], `p + 1` for [`attention_at`]. The buffer grows to
+/// the high-water sequence length and is then reused as-is, so a scratch
+/// constructed once (ideally via [`Self::with_capacity`] at the cache's
+/// capacity, 4096 for v0) allocates at most once and never again on the
+/// decode or prefill path. Shrinking for a shorter row only truncates, and
+/// every retained entry is overwritten before it is read, so a short call
+/// after a long one can never pick up a stale score.
 #[derive(Debug, Default)]
 pub struct AttentionScratch {
     scores: Vec<f32>,
 }
 
 impl AttentionScratch {
-    /// An empty scratch; the first [`decode_attention`] call sizes it.
+    /// An empty scratch; the first attention call sizes it.
     pub fn new() -> Self {
         Self::default()
     }
@@ -144,6 +162,65 @@ pub fn decode_attention(
     scratch: &mut AttentionScratch,
     out: &mut [f32],
 ) -> Result<(), AttentionError> {
+    // `None` = "every position the layer holds", which is the decode
+    // invariant above. Delegating means the masked and unmasked paths cannot
+    // drift apart (`decode_attention_matches_attention_at_at_full_length`).
+    attention_impl(q, cache, layer, None, scale, scratch, out)
+}
+
+/// Position-limited GQA attention for one layer: exactly
+/// [`decode_attention`], except the sum runs over cached positions
+/// `0..positions` instead of over the whole layer.
+///
+/// This is the causal mask for chunked layer-major prefill, where a whole
+/// chunk's K/V is appended to layer `L` before any of the chunk's rows are
+/// attended. The row at absolute position `p` passes `positions = p + 1` and
+/// therefore cannot see the future rows already sitting in the cache behind
+/// it. Arguments are otherwise [`decode_attention`]'s.
+///
+/// The mask is *structural*, not additive. Positions `>= positions` are
+/// absent from the score buffer, from the softmax normalizer, and from the V
+/// reduction — precisely as they are absent from a cache that only holds
+/// `positions` rows. Nothing is `-inf`-biased, nothing is zero-weighted and
+/// summed anyway, and the softmax stays the single-pass max / f64-exp /
+/// f64-normalize of [`softmax`]; this is deliberately *not* an online or
+/// flash-style rescaled softmax, because that would reassociate the
+/// reduction and break the byte-identical-logits gate. The f32 operations
+/// and their order are the ones [`decode_attention`] performs against a
+/// `positions`-row cache, so the two agree bit for bit
+/// (`attention_at_is_bit_identical_to_truncated_decode`).
+///
+/// # Errors
+///
+/// Everything [`decode_attention`] returns, plus
+/// [`AttentionError::EmptyLayer`] for `positions == 0` (nothing to attend
+/// over; a row always attends to at least itself) and [`AttentionError::Kv`]
+/// wrapping [`KvError::PositionOutOfRange`] when `positions` exceeds the
+/// positions the layer actually holds — never a silent truncation, never a
+/// panic. `out` is untouched on error.
+pub fn attention_at(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    positions: usize,
+    scale: f32,
+    scratch: &mut AttentionScratch,
+    out: &mut [f32],
+) -> Result<(), AttentionError> {
+    attention_impl(q, cache, layer, Some(positions), scale, scratch, out)
+}
+
+/// The one attention body. `limit` is `Some(positions)` for the causal
+/// prefill form and `None` for "the whole layer" (decode).
+fn attention_impl(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    limit: Option<usize>,
+    scale: f32,
+    scratch: &mut AttentionScratch,
+    out: &mut [f32],
+) -> Result<(), AttentionError> {
     let head_dim = cache.head_dim();
     let n_kv_heads = cache.n_kv_heads();
     let kv_dim = cache.kv_dim();
@@ -168,14 +245,30 @@ pub fn decode_attention(
         });
     }
     let len = cache.len(layer)?;
-    if len == 0 {
+    let positions = limit.unwrap_or(len);
+    if positions == 0 {
         return Err(AttentionError::EmptyLayer { layer });
+    }
+    if positions > len {
+        // Reported, never truncated: a prefill driver asking for a position
+        // the layer has not been given yet is a bug, not a shorter row.
+        return Err(AttentionError::Kv(KvError::PositionOutOfRange {
+            layer,
+            pos: positions - 1,
+            len,
+        }));
     }
     let k_plane = cache.k_layer(layer)?;
     let v_plane = cache.v_layer(layer)?;
 
     let group = n_q_heads / n_kv_heads;
-    let scores = scratch.scores_mut(len);
+    // The causal limit lives entirely in this length. Both reductions below
+    // zip the layer's rows against `scores`, so they stop after `positions`
+    // rows and every later row is absent from the score buffer, the softmax
+    // normalizer, and the V sum — not zero-weighted, absent. That is what
+    // makes the limited call bit-identical to an unlimited call against a
+    // `positions`-row cache.
+    let scores = scratch.scores_mut(positions);
 
     for (h, out_h) in out.chunks_exact_mut(head_dim).enumerate() {
         let kv_head = h / group;
@@ -563,5 +656,201 @@ mod tests {
         assert_eq!(scratch.scores_mut(17).len(), 17);
         assert_eq!(scratch.scores.as_ptr(), ptr);
         assert_eq!(scratch.scores.capacity(), 17);
+    }
+
+    /// Geometries for the position-limited gates: `(n_layers, n_kv_heads,
+    /// n_q_heads, head_dim, n_positions)` — the v0 pin (32:4, group 8), MHA
+    /// (group 1), MQA (8 q-heads over 1 kv head) and group 2, with head_dim
+    /// 128 / 16 / 8 / 4 and more than one layer so the per-layer plane
+    /// offset is exercised alongside the position limit.
+    const LIMITED_GEOMETRIES: [(usize, usize, usize, usize, usize); 4] = [
+        (2, 4, 32, 128, 5),
+        (1, 2, 2, 16, 9),
+        (1, 1, 8, 8, 7),
+        (2, 3, 6, 4, 12),
+    ];
+
+    /// Fill a fresh cache with `n_pos` random positions per layer, returning
+    /// the cache and the f32 rows that produced it (`rows[layer][pos]`).
+    #[allow(clippy::type_complexity)]
+    fn random_cache(
+        rng: &mut Rng,
+        n_layers: usize,
+        n_kv: usize,
+        head_dim: usize,
+        n_pos: usize,
+    ) -> (KvCache, Vec<Vec<(Vec<f32>, Vec<f32>)>>) {
+        let kv_dim = n_kv * head_dim;
+        let rows: Vec<Vec<(Vec<f32>, Vec<f32>)>> = (0..n_layers)
+            .map(|_| {
+                (0..n_pos)
+                    .map(|_| (rng.vec_in(kv_dim, -1.0, 1.0), rng.vec_in(kv_dim, -1.0, 1.0)))
+                    .collect()
+            })
+            .collect();
+        let mut cache = KvCache::new(n_layers, n_kv, head_dim, n_pos.max(1)).unwrap();
+        for (layer, layer_rows) in rows.iter().enumerate() {
+            for (k, v) in layer_rows {
+                cache.append(layer, k, v).unwrap();
+            }
+        }
+        (cache, rows)
+    }
+
+    /// Gate 7 (Phase 6 causal mask, the central claim): for every prefix
+    /// length `n`, `attention_at(.., positions = n)` against a full-length
+    /// cache is *bit-identical* to `decode_attention` against a cache holding
+    /// exactly the first `n` rows. That is the whole correctness argument for
+    /// chunked layer-major prefill: limiting the sum is not a mask applied to
+    /// a longer computation, it *is* the shorter computation — same f32
+    /// operations, same order, so `to_bits()` equality must hold with zero
+    /// tolerance. Any reassociation (an online / flash-style rescaled
+    /// softmax, an additive `-inf` bias, a zero-weighted tail that still
+    /// enters the V sum) breaks this test on the first geometry.
+    ///
+    /// The scratch is primed at full length before each limited call, so a
+    /// stale score surviving into a shorter row would also fail here.
+    #[test]
+    fn attention_at_is_bit_identical_to_truncated_decode() {
+        let mut rng = Rng::new(0xB17D_E17E);
+        let mut scratch = AttentionScratch::new();
+        for &(n_layers, n_kv, n_q, head_dim, n_pos) in &LIMITED_GEOMETRIES {
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let (full, rows) = random_cache(&mut rng, n_layers, n_kv, head_dim, n_pos);
+            let q = rng.vec_in(n_q * head_dim, -1.0, 1.0);
+            let mut prime = vec![0.0f32; q.len()];
+
+            for (layer, layer_rows) in rows.iter().enumerate() {
+                for n in 1..=n_pos {
+                    // Reference: a cache that only ever held `n` positions,
+                    // i.e. exactly what the decode loop sees at position n-1.
+                    let mut trunc = KvCache::new(n_layers, n_kv, head_dim, n).unwrap();
+                    for (k, v) in layer_rows.iter().take(n) {
+                        trunc.append(layer, k, v).unwrap();
+                    }
+
+                    // Drive the scratch to its high-water mark first: the
+                    // limited call must not read the tail it leaves behind.
+                    attention_at(&q, &full, layer, n_pos, scale, &mut scratch, &mut prime).unwrap();
+
+                    let mut got = vec![0.0f32; q.len()];
+                    attention_at(&q, &full, layer, n, scale, &mut scratch, &mut got).unwrap();
+                    let mut want = vec![0.0f32; q.len()];
+                    decode_attention(&q, &trunc, layer, scale, &mut scratch, &mut want).unwrap();
+
+                    for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            w.to_bits(),
+                            "geometry ({n_layers}, {n_kv}, {n_q}, {head_dim}) layer {layer} \
+                             positions {n} elem {i}: attention_at {g:e} vs truncated \
+                             decode_attention {w:e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gate 8: `decode_attention` delegates to the same body, so asking
+    /// `attention_at` for the layer's whole cached length must reproduce it
+    /// bit for bit. Layers are deliberately ragged (3 / 1 / 6 positions) so
+    /// the full length is per-layer, not a shared sequence length.
+    #[test]
+    fn decode_attention_matches_attention_at_at_full_length() {
+        let (n_kv, n_q, head_dim) = (4usize, 32usize, 128usize);
+        let kv_dim = n_kv * head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut rng = Rng::new(0xDE1E_6A7E);
+        let lens = [3usize, 1, 6];
+        let mut cache = KvCache::new(lens.len(), n_kv, head_dim, 6).unwrap();
+        for (layer, &len) in lens.iter().enumerate() {
+            for _ in 0..len {
+                let k = rng.vec_in(kv_dim, -1.0, 1.0);
+                let v = rng.vec_in(kv_dim, -1.0, 1.0);
+                cache.append(layer, &k, &v).unwrap();
+            }
+        }
+        let q = rng.vec_in(n_q * head_dim, -1.0, 1.0);
+        let mut scratch = AttentionScratch::new();
+        for (layer, &len) in lens.iter().enumerate() {
+            assert_eq!(cache.len(layer).unwrap(), len);
+            let mut want = vec![0.0f32; q.len()];
+            decode_attention(&q, &cache, layer, scale, &mut scratch, &mut want).unwrap();
+            let mut got = vec![0.0f32; q.len()];
+            attention_at(&q, &cache, layer, len, scale, &mut scratch, &mut got).unwrap();
+            for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "layer {layer} elem {i}");
+            }
+        }
+    }
+
+    /// Gate 9: every `positions` violation is a typed error and `out` is
+    /// untouched — `ramvamp-core` must not panic on untrusted input, and a
+    /// driver asking past the end must be told, not silently truncated.
+    #[test]
+    fn attention_at_typed_errors_on_positions() {
+        let (n_kv, head_dim) = (2usize, 8usize);
+        let mut cache = KvCache::new(2, n_kv, head_dim, 4).unwrap();
+        let row = vec![0.5f32; n_kv * head_dim];
+        for _ in 0..3 {
+            cache.append(0, &row, &row).unwrap();
+        }
+        // Layer 1 stays empty on purpose.
+        let q = vec![0.25f32; 4 * head_dim];
+        let mut out = vec![7.0f32; q.len()];
+        let mut scratch = AttentionScratch::new();
+
+        // positions == 0: nothing to attend over. A row always attends to at
+        // least itself, so this is a caller bug, reported not tolerated.
+        assert_eq!(
+            attention_at(&q, &cache, 0, 0, 1.0, &mut scratch, &mut out).unwrap_err(),
+            AttentionError::EmptyLayer { layer: 0 }
+        );
+
+        // One past the end, well past it, and the saturating case: reported
+        // against the layer's real length, never truncated, never overflowing.
+        for want in [4usize, 9, usize::MAX] {
+            assert_eq!(
+                attention_at(&q, &cache, 0, want, 1.0, &mut scratch, &mut out).unwrap_err(),
+                AttentionError::Kv(KvError::PositionOutOfRange {
+                    layer: 0,
+                    pos: want - 1,
+                    len: 3,
+                })
+            );
+        }
+
+        // An empty layer rejects even one position, and `positions == 0` on
+        // it is still the empty-history error.
+        assert_eq!(
+            attention_at(&q, &cache, 1, 1, 1.0, &mut scratch, &mut out).unwrap_err(),
+            AttentionError::Kv(KvError::PositionOutOfRange {
+                layer: 1,
+                pos: 0,
+                len: 0,
+            })
+        );
+        assert_eq!(
+            attention_at(&q, &cache, 1, 0, 1.0, &mut scratch, &mut out).unwrap_err(),
+            AttentionError::EmptyLayer { layer: 1 }
+        );
+
+        // Layer and shape checks are the shared ones, and shapes are still
+        // checked before `positions`.
+        assert_eq!(
+            attention_at(&q, &cache, 2, 1, 1.0, &mut scratch, &mut out).unwrap_err(),
+            AttentionError::Kv(KvError::LayerOutOfRange {
+                layer: 2,
+                n_layers: 2,
+            })
+        );
+        assert_eq!(
+            attention_at(&q[..3], &cache, 0, usize::MAX, 1.0, &mut scratch, &mut out).unwrap_err(),
+            AttentionError::QLenIndivisible { q_len: 3, head_dim }
+        );
+
+        // No error path wrote anything.
+        assert!(out.iter().all(|&x| x == 7.0));
     }
 }
