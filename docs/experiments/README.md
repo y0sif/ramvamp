@@ -49,12 +49,16 @@ which is the reason their claims are credible.
 - [EXP-010: Compute-pool signalling: bounded spin then futex](#exp-010-compute-pool-signalling-bounded-spin-then-futex) — KEEP
 - [EXP-011: Row-range GEMV as the single code path](#exp-011-row-range-gemv-as-the-single-code-path) — KEEP
 - [EXP-012: Anonymous runtime memory is missing from the memory contract](#exp-012-anonymous-runtime-memory-is-missing-from-the-memory-contract) — KEEP
+- [EXP-013: io_uring + O_DIRECT streaming and the two-phase decode loop](#exp-013-io_uring--o_direct-streaming-and-the-two-phase-decode-loop) — KEEP
 
-Entries EXP-007 through EXP-012 were measured on a machine that was not
+Entries EXP-007 through EXP-013 were measured on a machine that was not
 quiet, and most are microbenchmarks rather than end-to-end runs. Under rule 2
 none of their numbers is publishable; they are recorded so that the design
 decisions they drove are traceable, and each states the re-measurement it
-needs.
+needs. EXP-013 is the exception worth naming: its **numerics** result
+(byte-identical logits) is a correctness measurement that rule 2 does not
+govern and that does stand as reported; only its throughput figures are
+provisional.
 
 ## EXP-001: AVX2 K-quant dot kernels vs scalar reference
 
@@ -756,3 +760,80 @@ needs.
   The doc's Open-risk paragraph already explained this 35 lines further
   down; the headline row is the one most likely to be quoted without it.
   Nothing about the numbers changed, only what may be published.
+
+## EXP-013: io_uring + O_DIRECT streaming and the two-phase decode loop
+
+- Date / commit: 2026-08-04 / 477618d (`feat/expert-streaming`)
+- Hypothesis: replacing the synchronous uncached per-token expert preads
+  with io_uring + O_DIRECT reads into a per-layer ghost-LFU slot cache,
+  overlapping miss reads with hit compute, and running every GEMV
+  row-parallel across pinned P-cores, improves decode throughput **without
+  changing the output at all**.
+- Method: `models/qwen3.rvmp` on the reference machine
+  (`docs/benchmark-machine.md`). Decode is the coarse two-phase shape:
+  submit all misses, compute all cache hits row-parallel staging each
+  expert's `[hidden]` output, wait for all misses, compute those, then
+  reduce in fixed top-k order. Numerics gate is
+  `scripts/bitident.py compare models/llamacpp-ref/phase4-baseline`, 8
+  prompts at `--top 4096`, SHA-256 per prompt. Speed is
+  `ramvamp generate --greedy --skip-hashes`, single run.
+  **Warm page cache, no cgroup, and the machine was not quiet (review
+  agents were running concurrently). Under rule 2 none of the throughput
+  numbers here is publishable** - they are a direction check. The
+  publishable measurement is a cold run inside `memory.max=3G`, which
+  needs a quiet machine and has not been taken.
+- Baseline: the phase-4 decode path at `d80cc84`, measured on the same
+  machine and prompt in the same session. Its own baseline caveat stands
+  (EXP-006): phase 4 cannot produce a clean 3G-cgroup number at all,
+  because buffered preads charge every expert read to the cgroup as page
+  cache.
+- Result:
+
+  **Numerics (the acceptance gate).** Logits **byte-identical on 8/8
+  prompts**. Verified with a control first: the unmodified phase-4 binary
+  was re-run against the same baseline on the same machine before the
+  phase-5 build was tested, so a failure would have been attributable.
+  Re-verified after the cache dial changed from 10 to 11 slots/layer,
+  confirming the cache is numerically transparent.
+
+  **Throughput**, warm, `"The capital of France is"`, greedy, 32 new
+  tokens, paired on the same machine:
+
+  | | prefill | decode |
+  |---|---|---|
+  | phase 4 | 0.66 tok/s | 0.75 tok/s |
+  | phase 5 | 1.53 tok/s | **1.83 tok/s** |
+
+  Generated text character-identical between the two.
+
+  **Cache behaviour**, 64 decode tokens at the shipped 11 slots/layer
+  default (1,440 MiB budget):
+
+  | metric | value |
+  |---|---|
+  | requests | 33,792 |
+  | hit rate | **50.6%** (17,097 hits, 0 pending hits) |
+  | misses | 16,695 (3,326 cold / 13,369 eviction) |
+  | expert bytes read | 44.6 GiB in 16,695 reads |
+  | read retries / stale completions | 0 / 0 |
+  | I/O wait | 23.42 s of 48.30 s wall |
+  | mode | io_uring + O_DIRECT, probe `verified` |
+
+- Verdict: KEEP
+- Notes: four things worth carrying forward. (1) **The offline simulator
+  predicted this well.** EXP-005's batch-pinned replay gave 50.02% at 10
+  slots and 54.48% at 12; the running implementation measures 50.6% at 11,
+  which sits between them. The simulation is usable for future dial
+  decisions rather than needing a full run each time. (2) **The drive is
+  faster under the real access pattern than the synthetic probe suggested**
+  - 47.9 GB moved in 23.42 s of I/O wait is ~2.05 GB/s, against EXP-008's
+  1.211-1.390 GB/s at the same block size and queue depth. EXP-008's
+  numbers were taken on a contended machine and are already flagged as
+  needing re-measurement; this strengthens that. It also means the
+  performance model built on 1.35-1.59 GB/s is pessimistic. (3) **I/O is
+  still the wall**, 23.42 s of 48.30 s, which is the expected shape and
+  the reason the cache dial matters more than compute parallelism. (4)
+  Zero read retries and zero stale completions across 16,695 reads on
+  btrfs, with the O_DIRECT capability probe reporting `verified`, so the
+  page-cache bypass the 3 GB budget depends on is confirmed on the real
+  path rather than assumed.
