@@ -725,10 +725,17 @@ impl TraceWriter {
 /// produces is byte-identical to the one the token-major path wrote, and
 /// `scripts/lfu_sim.py` sees the record order it always saw.
 ///
-/// Records leave the buffer as soon as their position is complete, so a run
-/// that dies mid-prefill still leaves every finished record on disk. What the
-/// buffer costs is `prompt * n_layers * top_k * 4` bytes — 6.3 MiB at the v0
-/// context cap and Qwen3-30B-A3B's 48 layers and top-8 routing.
+/// Records leave the buffer as soon as their position is complete, but under
+/// the sweep no position in a chunk completes until that chunk's last layer,
+/// so the granularity is a chunk and not a position: a run that dies at layer
+/// 30 of 48 loses the whole chunk in progress. What does leave the buffer goes
+/// into [`TraceWriter`]'s `BufWriter`, which nothing flushes before `finish`,
+/// so the tail of the earlier chunks can be lost with it. A truncated trace is
+/// still readable — the record count readers use comes from the file length
+/// and a half-written trailing record is ignored (see [`TraceWriter`]) — it
+/// just stops short. What the buffer costs is `prompt * n_layers * top_k * 4`
+/// bytes — 6.3 MiB at the v0 context cap and Qwen3-30B-A3B's 48 layers and
+/// top-8 routing.
 struct RouteRecorder {
     writer: TraceWriter,
     n_layers: u32,
@@ -841,7 +848,6 @@ impl RouteRecorder {
     /// caller has declared the prefill over.
     fn flush(&mut self, complete: bool) -> anyhow::Result<()> {
         let stride = self.ids_per_record();
-        let mut staged: Vec<u32> = Vec::new();
         while self
             .layers
             .get(self.flushed)
@@ -851,14 +857,16 @@ impl RouteRecorder {
             let position = self.base + self.flushed;
             for layer in 0..self.n_layers {
                 let cell = base + layer as usize * self.top_k;
-                staged.clear();
-                staged.extend_from_slice(&self.ids[cell..cell + self.top_k]);
+                // Straight out of the buffer: `writer` and `ids` are disjoint
+                // fields, so the row needs no staging copy. It used to get
+                // one per layer, and `push` calls this on every record — a
+                // 512-row chunk was ~24.5k allocations of the trace-only path.
                 self.writer.push_ids(
                     TracePhase::Prefill,
                     position,
                     layer,
-                    staged.len(),
-                    staged.iter().copied(),
+                    self.top_k,
+                    self.ids[cell..cell + self.top_k].iter().copied(),
                 )?;
             }
             self.flushed += 1;
@@ -1088,7 +1096,48 @@ fn generate_stats_line(stats: &GenerateStats, note: Option<&str>) -> String {
     )
 }
 
+/// Every phase's streaming counters as of one instant, so a *span* of a run
+/// can be reported out of a state that outlives it.
+///
+/// A [`ForwardState`]'s counters are cumulative from construction, and
+/// [`ForwardState::reset`] keeps them on purpose — they describe the process,
+/// not the sequence. `chat` builds one state for the whole session, so the
+/// only way for a per-turn line to mean per-turn is to snapshot at the start
+/// of the turn and subtract. [`StreamStats::since`] does the subtraction; this
+/// carries it across both phases at once, because a report is per phase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PhaseStats([StreamStats; StreamPhase::ALL.len()]);
+
+impl PhaseStats {
+    /// The counters as they stand right now.
+    fn take(state: &ForwardState) -> Self {
+        let mut phases = [StreamStats::default(); StreamPhase::ALL.len()];
+        for (slot, phase) in phases.iter_mut().zip(StreamPhase::ALL) {
+            *slot = state.stream_stats_in(phase);
+        }
+        Self(phases)
+    }
+
+    /// What happened between `earlier` and this snapshot, phase by phase.
+    fn since(&self, earlier: &Self) -> Self {
+        let mut delta = *self;
+        for (now, before) in delta.0.iter_mut().zip(&earlier.0) {
+            *now = now.since(before);
+        }
+        delta
+    }
+
+    /// Each phase with its counters, in [`StreamPhase::ALL`] order.
+    fn iter(&self) -> impl Iterator<Item = (StreamPhase, &StreamStats)> {
+        StreamPhase::ALL.into_iter().zip(self.0.iter())
+    }
+}
+
 /// Expert-streaming counters for the run just finished, on stderr.
+///
+/// For a one-run-per-process command. `chat` reuses one state across turns and
+/// must call [`report_stream_stats_since`] instead, or every turn's footer
+/// reports the session.
 ///
 /// This is what a `docs/experiments/README.md` entry quotes: what fraction
 /// of routed experts the cache served, how the misses split between cold and
@@ -1114,29 +1163,65 @@ fn generate_stats_line(stats: &GenerateStats, note: Option<&str>) -> String {
 /// always had, and `StreamStats::is_idle` is the only "did this phase do
 /// anything" test.
 fn report_stream_stats(state: &ForwardState) {
+    report_stream_span(state, &PhaseStats::take(state), None);
+}
+
+/// The same report over one span of a longer-lived state: everything that
+/// happened since `start`, and nothing that happened before it.
+///
+/// What `chat` prints under a reply. The footer sits directly beneath the
+/// tokens it describes, so it has to describe *those* tokens — before this,
+/// turn three's line covered all three turns and all three prefills, under a
+/// heading the docs above call "the run just finished".
+fn report_stream_stats_since(state: &ForwardState, start: &PhaseStats) {
+    report_stream_span(state, &PhaseStats::take(state).since(start), None);
+}
+
+/// Everything the process streamed, labelled so it cannot be read as a turn.
+///
+/// `chat` prints this once, on the way out, because the per-turn deltas no
+/// longer add up to anything a reader can see: a session's total hit rate is
+/// the interesting number for a slot budget, and after this change it was
+/// nowhere. Not tied to `/reset` — the cache, its LFU history and these
+/// counters all survive a reset, so the total covers the process.
+fn report_stream_stats_total(state: &ForwardState) {
+    report_stream_span(state, &PhaseStats::take(state), Some("session"));
+}
+
+/// Geometry, then one line per phase that did something. `scope` names the
+/// span when it is not the obvious one.
+fn report_stream_span(state: &ForwardState, stats: &PhaseStats, scope: Option<&str>) {
     eprintln!(
-        "experts: {} mode, {} slots/layer ({})",
+        "experts{}: {} mode, {} slots/layer ({})",
+        scope.map(|s| format!(" ({s})")).unwrap_or_default(),
         state.stream_mode(),
         state.slots_per_layer(),
         human_bytes(state.cache_bytes()),
     );
-    let mut reported = false;
-    for phase in StreamPhase::ALL {
-        let s = state.stream_stats_in(phase);
+    for line in stream_stats_lines(stats) {
+        eprintln!("{line}");
+    }
+}
+
+/// The body of a stream report: the phase lines, or the one line that says
+/// there were none. Separate from the printing so a test can read it.
+fn stream_stats_lines(stats: &PhaseStats) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (phase, s) in stats.iter() {
         if s.is_idle() {
             continue;
         }
-        reported = true;
         if s.sweep_windows() > 0 {
-            eprintln!("{}", sweep_stats_line(phase, &s));
+            lines.push(sweep_stats_line(phase, s));
         }
         if s.accesses() > 0 {
-            eprintln!("{}", cache_stats_line(phase, &s));
+            lines.push(cache_stats_line(phase, s));
         }
     }
-    if !reported {
-        eprintln!("  no expert requests");
+    if lines.is_empty() {
+        lines.push("  no expert requests".to_owned());
     }
+    lines
 }
 
 /// One phase's cache traffic: what the expert cache was asked for and how it
@@ -1587,6 +1672,9 @@ fn print_repl_help() {
 /// from it. So the cache is asked where it is, and the untouched suffix of
 /// the history is what gets prefilled — `state.seq_len()` is the authority,
 /// never a count kept alongside it.
+///
+/// The shared state is also why the streaming footer is a delta: see
+/// [`report_stream_stats_since`].
 fn chat_turn(
     model: &Model,
     state: &mut ForwardState,
@@ -1607,6 +1695,10 @@ fn chat_turn(
         );
     }
 
+    // Where this turn's streaming starts. The state's counters run from
+    // session start and `reset` keeps them, so the footer below is the delta
+    // against this or it is a session total wearing a turn's label.
+    let at_turn_start = PhaseStats::take(state);
     let mut reply = String::new();
     // Only read on the interrupted path, where `generate_from` never returns
     // its stats: the unwind leaves `on_token` before the id is fed, so this
@@ -1654,7 +1746,7 @@ fn chat_turn(
             history.extend_from_slice(&stats.generated_ids);
             println!();
             report_generate_stats(&stats, None);
-            report_stream_stats(state);
+            report_stream_stats_since(state, &at_turn_start);
             Ok((reply, false))
         }
         Err(payload) => {
@@ -1668,7 +1760,9 @@ fn chat_turn(
             // conversation no longer records.
             history.extend_from_slice(&spoken);
             println!();
-            report_stream_stats(state);
+            // The abort path reports the same delta: the tokens are fewer,
+            // not a different span.
+            report_stream_stats_since(state, &at_turn_start);
             Ok((reply, interrupted))
         }
     }
@@ -1835,6 +1929,12 @@ fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
         eprintln!("context: {used} used, {room} free of {CONTEXT_CAP}");
     }
 
+    if turn > 0 {
+        // The per-turn footers no longer add up to anything visible, so the
+        // whole-process figure is printed once, here, where it cannot be
+        // mistaken for the last reply's. Nothing to print if no turn ran.
+        report_stream_stats_total(&state);
+    }
     eprintln!("bye");
     Ok(())
 }
@@ -2001,6 +2101,7 @@ fn encode_input(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
 
     use super::*;
 
@@ -3437,6 +3538,84 @@ mod tests {
         );
         // Only a phase that did nothing through either path is skipped.
         assert!(StreamStats::default().is_idle());
+    }
+
+    /// `chat` keeps one `ForwardState` for the session and its counters are
+    /// cumulative from construction (`reset` keeps them on purpose), so a
+    /// footer built from them straight would put every turn's traffic under
+    /// the third turn's reply — a number `docs/experiments/README.md` quotes,
+    /// silently meaning something else. The footer is a delta.
+    #[test]
+    fn a_chat_turn_reports_its_own_traffic_and_not_the_session() {
+        let busy = |scale: u64| StreamStats {
+            hits: 900 * scale,
+            misses: 100 * scale,
+            cold_misses: 100 * scale,
+            bytes_read: 1024 * 1024 * scale,
+            reads_submitted: 100 * scale,
+            io_wait: Duration::from_millis(1_000 * scale),
+            ..StreamStats::default()
+        };
+        // Two turns already done, a third just finished.
+        let at_turn_start = PhaseStats([busy(2), busy(4)]);
+        let now = PhaseStats([busy(3), busy(6)]);
+
+        let delta = now.since(&at_turn_start);
+        assert_eq!(delta.0[0].accesses(), 1_000, "one turn's prefill");
+        assert_eq!(delta.0[1].accesses(), 2_000, "one turn's decode");
+        assert_eq!(delta.0[1].io_wait, Duration::from_secs(2));
+
+        let lines = stream_stats_lines(&delta);
+        assert!(
+            lines.iter().any(|l| l.contains("prefill: 1000 requests")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("decode: 2000 requests")),
+            "{lines:?}"
+        );
+        // The session totals (3000 prefill, 6000 decode) appear nowhere.
+        for line in &lines {
+            assert!(!line.contains("3000 requests"), "{line}");
+            assert!(!line.contains("6000 requests"), "{line}");
+        }
+        // And the session total, printed once at exit, is the raw counters.
+        assert!(
+            stream_stats_lines(&now)
+                .iter()
+                .any(|l| l.contains("decode: 6000 requests")),
+            "{:?}",
+            stream_stats_lines(&now)
+        );
+    }
+
+    /// The delta is per phase and per path, so a phase idle *this turn* drops
+    /// out instead of reprinting an earlier turn's numbers — and a turn that
+    /// streamed nothing at all says so rather than showing the session.
+    #[test]
+    fn a_turn_delta_covers_the_sweep_half_and_drops_idle_phases() {
+        let swept = |windows: u64| StreamStats {
+            sweep_windows_read: windows,
+            sweep_bytes_read: 1024 * 1024 * windows,
+            sweep_reads_submitted: windows,
+            ..StreamStats::default()
+        };
+        let decoded = StreamStats {
+            hits: 10,
+            ..StreamStats::default()
+        };
+        let at_turn_start = PhaseStats([swept(48), decoded]);
+        let now = PhaseStats([swept(96), decoded]);
+
+        let lines = stream_stats_lines(&now.since(&at_turn_start));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("prefill: 48 windows"), "{lines:?}");
+
+        // Nothing since the snapshot: the state's history is not this turn's.
+        assert_eq!(
+            stream_stats_lines(&now.since(&now)),
+            vec!["  no expert requests".to_owned()],
+        );
     }
 
     // -----------------------------------------------------------------

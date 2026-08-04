@@ -52,6 +52,7 @@ which is the reason their claims are credible.
 - [EXP-013: io_uring + O_DIRECT streaming and the two-phase decode loop](#exp-013-io_uring--o_direct-streaming-and-the-two-phase-decode-loop) — KEEP
 - [EXP-014: First clean cold measurement inside the 3G cgroup](#exp-014-first-clean-cold-measurement-inside-the-3g-cgroup) — KEEP
 - [EXP-015: Phase-6 building blocks, landed and unmeasured](#exp-015-phase-6-building-blocks-landed-and-unmeasured) — KEEP
+- [EXP-016: Chunked layer-major prefill lands as the default path](#exp-016-chunked-layer-major-prefill-lands-as-the-default-path) — KEEP
 
 Entries EXP-007 through EXP-013 were measured on a machine that was not
 quiet, and most are microbenchmarks rather than end-to-end runs. Under rule 2
@@ -1121,3 +1122,162 @@ provisional.
      before, and finding 2 meant the fingerprint could pass while covering
      only the eight short singles. Neither fact is a measurement of the
      sweep; they are what makes a future measurement of it trustworthy.
+  7. **Forward pointer: the driver landed, so several statements above are
+     now stale (added 2026-08-04, EXP-016).** The Baseline table says "no
+     caller" of the batched GEMV, the sweep reader and `attention_at`, and
+     the Result section records no byte figure for the driver's staging
+     "because the driver is not written". All four were true the day this
+     entry was written and none of them is true now: `37fcf81` and `32917f2`
+     wired the sweep into the forward pass as the default prefill path, and
+     the staging span is 80,935,940 B at the v0 dials and a 512-row chunk.
+     The same goes for the aside under "The ring costs zero bytes", which
+     says the pool is idle only in the intended arrangement and not in the
+     shipped one; the shipped arrangement is now the intended one. The entry
+     is left as written, because it records what shipped that day; EXP-016
+     records what changed. Note 1's claim that the measurement is owed still
+     stands, and EXP-016 did not pay it either.
+
+## EXP-016: Chunked layer-major prefill lands as the default path
+
+- Date / commit: 2026-08-04 / 32917f2 (`feat/prefill-sweep`); the runtime
+  half is 37fcf81 on the same branch.
+- Hypothesis: driving prefill through the layer-major sweep, instead of one
+  `forward_token` per prompt token, reads each expert once per layer per
+  chunk rather than once per token, **without changing a single output bit**
+  and without taking a byte from the memory contract.
+- Method: **nothing was measured.** No cold run, no cgroup, no timing, no
+  tok/s, no `memory.peak`. The entry exists because CLAUDE.md requires one
+  for every performance-motivated change, and because this change is now the
+  default path, so what it did to correctness has to be on the record even
+  while what it did to speed is not. Two correctness gates were run, one
+  against the real model and one in-process; both are under Result. Rule 2
+  governs neither, because neither is a throughput number.
+- Baseline: EXP-014's cold 3G-cgroup medians (decode 1.88 tok/s, prefill
+  1.33 tok/s, `memory.peak` 2,471.1 MiB) are still the last publishable
+  numbers, and they describe the token-major prefill this change displaces.
+  Unlike EXP-015, this work **is** expected to move the prefill figure.
+  Nothing here says by how much, or in which direction the memory peak moves.
+- Result:
+
+  **What landed**, and what it replaces in EXP-015's "no caller" table:
+
+  | change | where | on the default path? |
+  |---|---|---|
+  | Chunked layer-major prefill driver (`PrefillMode::Sweep`, `DEFAULT_PREFILL_CHUNK` 512) | `model/prefill.rs` | yes, the default |
+  | Token-major prefill (one `forward_token` per prompt token) | `model/prefill.rs` | retained, selectable via `--prefill token-major` / `RAMVAMP_PREFILL` |
+  | Batched GEMV entry points | `kernels/gemv.rs` | yes, per layer per chunk (EXP-015: "no caller") |
+  | Sweep reader over the slot-pool arena | `io/sweep.rs`, `io/stream.rs` | yes, once per layer per chunk (EXP-015: "no caller") |
+  | Position-limited attention (`attention_at`) | `kernels/attention.rs` | yes, once per row per layer (EXP-015: "no caller") |
+  | `generate_from`, `GenerateStats::generated_ids`, `ForwardState::reset` | `generate/mod.rs`, `model/forward.rs` | yes, they are what lets a turn continue without rebuilding the slot pool |
+  | `chat` REPL | `crates/cli` | yes |
+  | `run_logits` prefilling through `prefill_prompt` | `crates/cli` | yes, and this is what puts `scripts/bitident.py` on the swept path at all |
+
+  **Gate 1, the fingerprint against llama.cpp.**
+  `python3 scripts/bitident.py compare models/llamacpp-ref/phase4-baseline
+  --ramvamp target/release/ramvamp --rvmp models/qwen3.rvmp`:
+
+  | field | value |
+  |---|---|
+  | result | **PASS, 8/8 byte-identical** |
+  | current build | `32917f25fd074fb51f6d0d8eaf2d85b984c67630` |
+  | baseline | `650b5ea7...-dirty`, captured 2026-08-03 |
+  | `top` | 4096 |
+  | prompt set | `singles` |
+  | binary | DIFFERENT |
+
+  **The honest caveat on gate 1: those 8 prompts are 4 to 12 tokens long.**
+  Every one of them fits inside a single 512-token chunk, so not one crosses
+  a chunk seam. What the gate proves is that a *one-chunk* sweep reproduces
+  the token-major logits on the real model at real geometry, which is worth
+  having and is not nothing. It proves nothing about the multi-chunk path.
+
+  **Gate 2, the in-process A/B.**
+  `sweep_and_token_major_agree_bit_for_bit` runs both paths through
+  `prefill_prompt` and compares the final logits at `to_bits()` equality
+  across 8 prompt lengths (1, 2, 3, 4, 6, 7, 8, 12) times 6 chunk sizes
+  (1, 2, 3, 4, 8, 512), which covers exact multiples of the chunk, ragged
+  final chunks, and prompts shorter than one chunk.
+  `both_paths_leave_the_same_kv_cache` asserts the same for the stored f16
+  K/V on every layer, and `decode_continues_off_a_swept_prefill` asserts
+  decode picks up cleanly afterwards. All of it runs on the small synthetic
+  fixture, not on the model.
+
+  **The coverage gap between the two gates**, which an adversarial review
+  identified and which matters:
+
+  | dial | unit fixture | Qwen3 v0 |
+  |---|---:|---:|
+  | hidden | 256 | 2,048 |
+  | `q_dim` | 256, equal to hidden | 4,096, not equal to hidden |
+  | Q8_K blocks per hidden-width activation row | 1 | 8 |
+  | experts per sweep window | 1 | 8 (the shipped default) |
+  | chunks per gated prompt | 1 to 12 (gate 2) | 1 (gate 1) |
+
+  So gate 2 covers multi-chunk at toy geometry and gate 1 covers real
+  geometry at one chunk. **Multi-chunk at production dials on the real
+  model's geometry is covered by neither, and that is outstanding.** Two
+  things close it: a wider fixture (`q_dim` unequal to hidden, several blocks
+  per row, more than one expert per window), which is being added, and the
+  long-prompt bit-identity baseline against the real model, whose reference
+  prompts are 512, 1891 and 3492 tokens and are therefore 1, 4 and 7 chunks
+  at the default chunk size (EXP-015 Note 6).
+
+  **Memory: prefill still costs zero additional bytes.** Both spans are
+  sub-allocations of the `PrefillSession` arena, which is the head of the
+  idle expert slot pool:
+
+  | span | bytes | MiB |
+  |---|---:|---:|
+  | chunk scratch, 512 rows at the v0 dims | 80,935,940 | 77.19 |
+  | sweep ring, 8 experts per window x 2 windows in flight | 48,955,392 | 46.69 |
+
+  Both sit inside the 1,438.59 MiB expert-pool row of the memory contract,
+  and the arithmetic is pinned by a test rather than asserted in prose: it
+  checks the 512-row scratch to the byte, checks that `scratch_bytes` is
+  affine in rows so no term is quietly quadratic, and checks that scratch
+  plus ring fits under 1,438 MiB. The 3 GB budget therefore does not move on
+  account of this change, which is a property of the arena borrow (EXP-015)
+  rather than a new result.
+
+- Verdict: KEEP (correctness gates pass at the coverage described above;
+  **nothing measured and no speed claimed**)
+- Notes:
+  1. **Under rule 2 this entry publishes nothing.** There is no cold cgroup
+     run behind it. Every figure above is either a gate result, exact
+     arithmetic on the audited dims, or a restatement of an earlier entry.
+     The measurement the whole phase exists for is still **owed**, and it is
+     now owed by EXP-017: prefill throughput and `memory.peak` for the swept
+     path, cold inside `memory.max=3G`, against the token-major path on the
+     same prompt. EXP-015 said the measurement belonged to the driver's
+     entry. The driver has an entry now and it is this one, and it does not
+     have the number.
+  2. **Attention is the deferred half, and it bears directly on that first
+     measurement.** The driver batches the projections and the expert FFN
+     across a chunk's rows, but it runs `attention_at` row by row on the
+     calling thread through one shared score buffer, so attention is neither
+     batched nor parallel. The work is quadratic in prompt length, so at a 4K
+     prompt it is a substantial term sitting outside the compute pool
+     entirely, and it is a plausible reason for a first measurement to land
+     below what the I/O arithmetic alone suggests. Parallelizing over rows is
+     bit-neutral, because rows are independent and `shard_range` is a pure
+     function, but it needs one score buffer per shard and the arena carve
+     does not have one. **Measure before building it**, so that the
+     measurement decides rather than the intuition.
+  3. **Trace records are reordered back into position order by the CLI, and
+     that is deliberate.** The sweep produces routing layer-major, but
+     `scripts/lfu_sim.py` replays trace records sequentially into a simulated
+     cache, so record order is what determines its hits and its evictions.
+     Emitting layer-major would have silently changed what every past
+     simulation measured, including the policy decisions in EXP-005, while
+     still producing a file that parses. A `RouteRecorder` buffers a chunk
+     and hands the writer whole records in position order, the resulting file
+     is asserted byte-identical to what token-major wrote, and records leave
+     the buffer as each position completes so a run that dies mid-prefill
+     still leaves every finished record readable.
+  4. **Keeping the token-major path is not sentiment.** It is the reference
+     half of gate 2; deleting it deletes the only test that covers the
+     multi-chunk seams at all, and it is also the A/B arm EXP-017 needs to
+     express its result as a ratio on one machine in one session (rule 3).
+     Both dials are `Option`s rather than clap defaults, so a flag left unset
+     does not silently override the `RAMVAMP_PREFILL` environment variables
+     the state seeds itself from.
