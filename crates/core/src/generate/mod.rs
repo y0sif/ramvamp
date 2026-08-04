@@ -1,21 +1,22 @@
-//! Generation orchestration: chunked prefill, token-by-token decode, sampling.
+//! Generation orchestration: prefill, token-by-token decode, sampling.
 //!
-//! Prefill processes the prompt in bounded chunks (so one fetched expert
-//! serves many rows and scratch memory stays fixed) and is layer-major.
-//! Decode repeats the routed layer loop one token at a time. Sampling
+//! **Prefill today is decode**: [`forward_token`] in a loop over the prompt,
+//! one token at a time, through the same [`ForwardState`] and therefore the
+//! same expert cache, with logits requested only for the last prompt token.
+//! Decode then repeats that loop one generated token at a time. Sampling
 //! supports greedy, temperature, top-k, and top-p (repetition penalty is
 //! not implemented yet); greedy decode must be deterministic for
 //! validation against reference implementations.
 //!
-//! # What exists today
+//! The layer-major chunked prefill `docs/architecture.md` specifies — a
+//! bounded chunk of positions swept per layer, so one fetched expert serves
+//! many rows and the cache is bypassed entirely — is phase 6, and is not
+//! this code. Nothing here bypasses or bounds the cache differently for
+//! prompt tokens, and the streaming counters reflect that: a pure-prefill
+//! run reports cache hits, because prompt positions reuse each other's
+//! experts exactly the way decode positions do.
 //!
-//! [`generate`] is the token-at-a-time baseline: prefill is
-//! [`forward_token`] in a loop (logits requested only for the last prompt
-//! token — the layer-major chunked sweep replaces this later), then the
-//! decode loop samples, streams, and stops on a stop token or
-//! [`GenerateParams::max_new`].
-//!
-//! ## Sampling
+//! # Sampling
 //!
 //! Greedy is a pure argmax over the raw logits (first index wins ties) and
 //! is what the llama.cpp validation gates use. The stochastic path applies
@@ -26,7 +27,7 @@
 //! inline seeded xorshift64* PRNG — deterministic for a fixed seed, no
 //! external dependency.
 //!
-//! ## Streaming detokenization
+//! # Streaming detokenization
 //!
 //! Decoding each token id alone is wrong for byte-level BPE (one Unicode
 //! character can span tokens), so [`generate`] decodes the accumulated ids
@@ -38,8 +39,51 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::model::{ForwardError, ForwardState, Model, forward_token};
+use crate::model::{
+    ForwardError, ForwardState, Model, StreamPhase, forward_token, forward_token_traced,
+};
 use crate::tokenizer::{RvmpTokenizer, SamplingDefaults, TokenizerError};
+
+/// Which pass a routing record came from.
+///
+/// Both passes go through the same [`ForwardState`] and the same expert
+/// cache in this build (see the module docs), so the tag is not a statement
+/// about how the experts were fetched. It exists because the two passes are
+/// not comparable *workloads*: prefill walks a prompt whose positions the
+/// caller chose, decode walks the model's own output, and a cache-hit rate
+/// quoted over both at once is a different number from either. The offline
+/// simulator (`scripts/lfu_sim.py`) filters on it and models decode only, so
+/// anything measured against that simulation has to filter the same way.
+///
+/// `docs/architecture.md` ("Prefill") specifies a cache-bypassing
+/// layer-major prefill sweep for phase 6. When that lands the tag will
+/// additionally mean "fetched differently"; today it does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TracePhase {
+    /// A prompt token.
+    Prefill,
+    /// A generated token.
+    Decode,
+}
+
+impl From<TracePhase> for StreamPhase {
+    /// The two enums name the same split from opposite ends — the trace
+    /// format's phase byte and the streamer's counter bucket — and
+    /// [`generate`] is what keeps them in step, declaring the streamer's
+    /// phase for every token whether or not anything is tracing.
+    fn from(phase: TracePhase) -> Self {
+        match phase {
+            TracePhase::Prefill => Self::Prefill,
+            TracePhase::Decode => Self::Decode,
+        }
+    }
+}
+
+/// Observer for [`generate_traced`], called once per layer per token with
+/// `(phase, position, layer, top_k)`. `top_k` is the final
+/// `(expert, weight)` selection in routed order (descending router
+/// probability).
+pub type RouteSink<'a> = &'a mut dyn FnMut(TracePhase, usize, u32, &[(u32, f32)]);
 
 /// Knobs for one [`generate`] call.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -323,11 +367,77 @@ pub fn generate(
         params,
         tokenizer.stop_tokens(),
         &mut on_token,
+        None,
     )
 }
 
+/// [`generate`] with a [`RouteSink`] recording every layer's routing
+/// decision for both the prefill and the decode passes.
+///
+/// Numerically identical to [`generate`] (see [`forward_token_traced`]).
+///
+/// # Errors
+///
+/// Exactly [`generate`]'s.
+pub fn generate_traced(
+    model: &Model,
+    state: &mut ForwardState,
+    tokenizer: &RvmpTokenizer,
+    prompt_ids: &[u32],
+    params: &GenerateParams,
+    mut on_token: impl FnMut(u32, &str),
+    trace: RouteSink<'_>,
+) -> Result<GenerateStats, GenerateError> {
+    generate_with_stops(
+        model,
+        state,
+        tokenizer,
+        prompt_ids,
+        params,
+        tokenizer.stop_tokens(),
+        &mut on_token,
+        Some(trace),
+    )
+}
+
+/// One [`forward_token`], tagging any routing it reports with `phase` and
+/// `position` before handing it to `trace`. Untraced runs take the plain
+/// [`forward_token`] path.
+///
+/// `phase` is also declared to the expert streamer here — every forward pass
+/// this module runs goes through this function, so the streamer's per-phase
+/// counters cannot drift out of step with the trace's phase byte. It costs
+/// one store per token, traced or not.
+fn traced_step<'s>(
+    model: &Model,
+    state: &'s mut ForwardState,
+    token_id: u32,
+    position: usize,
+    want_logits: bool,
+    phase: TracePhase,
+    trace: &mut Option<RouteSink<'_>>,
+) -> Result<Option<&'s [f32]>, ForwardError> {
+    state.set_stream_phase(StreamPhase::from(phase));
+    match trace.as_deref_mut() {
+        Some(sink) => {
+            let mut on_route = |layer: u32, topk: &[(u32, f32)]| sink(phase, position, layer, topk);
+            forward_token_traced(
+                model,
+                state,
+                token_id,
+                position,
+                want_logits,
+                Some(&mut on_route),
+            )
+        }
+        None => forward_token(model, state, token_id, position, want_logits),
+    }
+}
+
 /// [`generate`] with an explicit stop set (unit tests drive this with
-/// synthetic stop tokens a tiny fixture model can actually emit).
+/// synthetic stop tokens a tiny fixture model can actually emit) and an
+/// optional routing trace.
+#[allow(clippy::too_many_arguments)]
 fn generate_with_stops(
     model: &Model,
     state: &mut ForwardState,
@@ -336,15 +446,32 @@ fn generate_with_stops(
     params: &GenerateParams,
     stop_tokens: &[u32],
     on_token: &mut dyn FnMut(u32, &str),
+    mut trace: Option<RouteSink<'_>>,
 ) -> Result<GenerateStats, GenerateError> {
     let (&last, rest) = prompt_ids.split_last().ok_or(GenerateError::EmptyPrompt)?;
 
     let prefill_start = Instant::now();
     for (pos, &id) in rest.iter().enumerate() {
-        forward_token(model, state, id, pos, false)?;
+        traced_step(
+            model,
+            state,
+            id,
+            pos,
+            false,
+            TracePhase::Prefill,
+            &mut trace,
+        )?;
     }
-    let mut logits =
-        forward_token(model, state, last, rest.len(), true)?.ok_or(GenerateError::MissingLogits)?;
+    let mut logits = traced_step(
+        model,
+        state,
+        last,
+        rest.len(),
+        true,
+        TracePhase::Prefill,
+        &mut trace,
+    )?
+    .ok_or(GenerateError::MissingLogits)?;
     let prefill = prefill_start.elapsed();
 
     let decode_start = Instant::now();
@@ -365,8 +492,16 @@ fn generate_with_stops(
         if generated == params.max_new {
             break;
         }
-        logits = forward_token(model, state, next, position, true)?
-            .ok_or(GenerateError::MissingLogits)?;
+        logits = traced_step(
+            model,
+            state,
+            next,
+            position,
+            true,
+            TracePhase::Decode,
+            &mut trace,
+        )?
+        .ok_or(GenerateError::MissingLogits)?;
         position += 1;
     }
     // Flush a trailing incomplete character (attributed to the last id).
@@ -393,7 +528,15 @@ mod tests {
     use super::*;
     use crate::io::LoadOptions;
     use crate::io::testutil::build_install;
-    use crate::model::ForwardState;
+    use crate::model::{ForwardState, RuntimeConfig};
+
+    /// Fixture-sized runtime dials: an unpinned two-shard pool and a small
+    /// expert budget, so a test suite that runs many states in parallel
+    /// neither pins every thread to one core nor reserves the production
+    /// 1,438 MiB per state.
+    fn small(model: &Model, context_cap: usize) -> ForwardState {
+        ForwardState::with_config(model, context_cap, RuntimeConfig::testing()).unwrap()
+    }
 
     /// The committed real-tokenizer fixtures (pinned Qwen3 vocabulary).
     fn fixtures_dir() -> PathBuf {
@@ -565,7 +708,14 @@ mod tests {
     fn harness(tag: &str) -> Harness {
         let fx = build_install(tag);
         crate::model::testsupport::temper_install(&fx);
-        let model = Model::load(&fx.root, LoadOptions { skip_hashes: true }).unwrap();
+        let model = Model::load(
+            &fx.root,
+            LoadOptions {
+                skip_hashes: true,
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap();
         Harness {
             _fx: fx,
             model,
@@ -579,7 +729,7 @@ mod tests {
         max_new: usize,
         stops: &[u32],
     ) -> (Vec<u32>, String, GenerateStats) {
-        let mut state = ForwardState::new(&h.model, 16).unwrap();
+        let mut state = small(&h.model, 16);
         let mut events: Vec<(u32, String)> = Vec::new();
         let mut on_token = |id: u32, piece: &str| {
             events.push((id, piece.to_owned()));
@@ -592,6 +742,7 @@ mod tests {
             &greedy_params(max_new),
             stops,
             &mut on_token,
+            None,
         )
         .unwrap();
         // One event per generated token, plus at most one flush event that
@@ -652,9 +803,117 @@ mod tests {
     }
 
     #[test]
+    fn tracing_records_every_layer_and_changes_nothing() {
+        let h = harness("gen-trace");
+        let prompt = [1u32, 2, 3];
+        let (want_ids, want_text, want_stats) = run_greedy(&h, &prompt, 4, &[]);
+
+        let arch = h.model.arch();
+        let (n_layers, top_k) = (arch.n_layers, arch.top_k as usize);
+        let mut records: Vec<(TracePhase, usize, u32, Vec<u32>)> = Vec::new();
+        let mut sink = |phase: TracePhase, pos: usize, layer: u32, topk: &[(u32, f32)]| {
+            records.push((phase, pos, layer, topk.iter().map(|&(e, _)| e).collect()));
+        };
+        let mut state = small(&h.model, 16);
+        let mut ids = Vec::new();
+        let mut text = String::new();
+        let stats = generate_traced(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            &prompt,
+            &greedy_params(4),
+            |id, piece| {
+                ids.push(id);
+                text.push_str(piece);
+            },
+            &mut sink,
+        )
+        .unwrap();
+
+        // Identical output: the sink observes, it does not perturb.
+        assert_eq!(stats.stop, StopReason::MaxNew);
+        assert_eq!(stats.generated, want_stats.generated);
+        assert_eq!(ids[..want_ids.len()], want_ids[..]);
+        assert_eq!(text, want_text);
+
+        // One record per layer per token, layers in order, phases split at
+        // the prompt boundary, and every routed id inside the expert count.
+        let tokens = prompt.len() + stats.generated - 1;
+        assert_eq!(records.len(), tokens * n_layers as usize);
+        for (i, (phase, pos, layer, experts)) in records.iter().enumerate() {
+            let token = i / n_layers as usize;
+            assert_eq!(*layer as usize, i % n_layers as usize);
+            assert_eq!(*pos, token);
+            let want_phase = if token < prompt.len() {
+                TracePhase::Prefill
+            } else {
+                TracePhase::Decode
+            };
+            assert_eq!(*phase, want_phase, "record {i}");
+            assert_eq!(experts.len(), top_k);
+            assert!(experts.iter().all(|&e| e < arch.n_experts), "{experts:?}");
+            // torch.topk semantics: no expert is selected twice.
+            let mut unique = experts.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), top_k, "{experts:?}");
+        }
+    }
+
+    /// F3. The streamer's counters are cumulative from construction, so a
+    /// footer that quotes them reports prefill folded into what reads as a
+    /// decode number: a five-token prompt and `--max-new 4` is eight forward
+    /// passes, five of them prefill. `generate` declares the phase to the
+    /// streamer per token; this pins that the split is real, exhaustive, and
+    /// lands exactly where the pass counts say it should.
+    #[test]
+    fn streaming_counters_split_prefill_from_decode() {
+        let h = harness("gen-phase-split");
+        let prompt = [1u32, 2, 3];
+        let max_new = 4;
+        let mut state = small(&h.model, 16);
+        let stats = generate_with_stops(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            &prompt,
+            &greedy_params(max_new),
+            &[],
+            &mut |_, _| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(stats.generated, max_new);
+
+        let arch = h.model.arch();
+        // One request per routed expert per layer per forward pass.
+        let per_pass = u64::from(arch.n_layers) * u64::from(arch.top_k);
+        let prefill = state.stream_stats_in(StreamPhase::Prefill);
+        let decode = state.stream_stats_in(StreamPhase::Decode);
+        let total = state.stream_stats();
+
+        // Prefill runs one pass per prompt token. Decode runs one per
+        // generated token *after* the first, which is sampled from the
+        // prompt's logits.
+        assert_eq!(prefill.accesses(), prompt.len() as u64 * per_pass);
+        assert_eq!(decode.accesses(), (max_new as u64 - 1) * per_pass);
+
+        // Exhaustive and disjoint: every request lands in exactly one phase.
+        assert_eq!(prefill.accesses() + decode.accesses(), total.accesses());
+        assert_eq!(prefill.misses + decode.misses, total.misses);
+        assert_eq!(prefill.hits + decode.hits, total.hits);
+        assert_eq!(prefill.bytes_read + decode.bytes_read, total.bytes_read);
+
+        // And the point of all of it: the cumulative figure is not the decode
+        // figure, and quoting it as one overstates the work by the prompt.
+        assert_ne!(total.accesses(), decode.accesses());
+    }
+
+    #[test]
     fn empty_prompt_is_a_typed_error() {
         let h = harness("gen-empty");
-        let mut state = ForwardState::new(&h.model, 16).unwrap();
+        let mut state = small(&h.model, 16);
         let err = generate(
             &h.model,
             &mut state,
@@ -672,7 +931,7 @@ mod tests {
         // The fixture model's 32-token vocab can never emit 151645/151643,
         // so the public wrapper runs to max_new.
         let h = harness("gen-public");
-        let mut state = ForwardState::new(&h.model, 16).unwrap();
+        let mut state = small(&h.model, 16);
         let mut count = 0usize;
         let stats = generate(
             &h.model,

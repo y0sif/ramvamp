@@ -11,7 +11,10 @@
 //! Decode step per layer: attention + router on resident weights; read back
 //! the top-k expert IDs; plan hits/misses against the layer cache; start
 //! misses' reads while cache-hit expert work (and the shared expert, if any)
-//! runs; combine branches; layer tail.
+//! runs; combine branches; layer tail. Every GEMV on that path — the four
+//! attention projections, all three expert projections, and `lm_head` —
+//! fans out over contiguous output-row ranges across a pinned compute pool,
+//! which is bit-identical to the whole-matrix call by construction.
 //!
 //! # Loading layer
 //!
@@ -28,7 +31,15 @@
 //! - [`Model::embedding_row`] / [`Model::embed`]: one token's packed q4_k
 //!   row, or its dequantized `hidden`-vector.
 //! - [`Model::lm_head`] / [`Model::final_norm`]: the layer-48 tail.
-//! - [`Model::expert_reader`]: the streaming side's file access.
+//! - [`Model::expert_reader`]: the validated expert-blob geometry — the
+//!   per-layer gate/up/down slab table that every `ExpertView` is carved
+//!   with, plus one synchronous positioned read of a single blob. This is
+//!   **not** the streaming side: `io::ExpertStream` owns the slot pool, the
+//!   per-layer cache and the io_uring/pread submission path, and borrows
+//!   this reader only to carve a slot it has already filled. The reader's
+//!   own `read_expert` is the portable one-blob-at-a-time baseline the
+//!   streamer was built beside; nothing on the decode path calls it, and it
+//!   is exercised only by tests.
 //!
 //! # Forward pass
 //!
@@ -42,9 +53,12 @@ mod forward;
 mod shapes;
 mod weights;
 
-pub use crate::io::LoadOptions;
+pub use crate::io::{LoadOptions, StreamPhase};
 pub use error::ModelError;
 #[cfg(test)]
 pub(crate) use forward::testsupport;
-pub use forward::{ForwardError, ForwardState, forward_token};
+pub use forward::{
+    DEFAULT_CACHE_BYTES, ExpertRouteSink, ForwardError, ForwardState, RuntimeConfig, forward_token,
+    forward_token_traced,
+};
 pub use weights::{F32Tensor, LayerWeights, Model, QuantTensor};

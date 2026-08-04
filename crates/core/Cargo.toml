@@ -26,4 +26,6 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 memmap2 = { workspace = true }
 io-uring = { workspace = true, optional = true }
+rustix = { workspace = true }
+libc = { workspace = true }
 tokenizers = { workspace = true }

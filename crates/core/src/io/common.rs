@@ -123,7 +123,15 @@ mod tests {
             err,
             IoError::Format(FormatError::HashMismatch { name, .. }) if name == COMMON_FILE
         ));
-        MappedCommon::open(&fx.root, &fx.manifest, LoadOptions { skip_hashes: true }).unwrap();
+        MappedCommon::open(
+            &fx.root,
+            &fx.manifest,
+            LoadOptions {
+                skip_hashes: true,
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -132,8 +140,15 @@ mod tests {
         let path = fx.root.join(COMMON_FILE);
         let data = std::fs::read(&path).unwrap();
         std::fs::write(&path, &data[..data.len() - 64]).unwrap();
-        let err = MappedCommon::open(&fx.root, &fx.manifest, LoadOptions { skip_hashes: true })
-            .unwrap_err();
+        let err = MappedCommon::open(
+            &fx.root,
+            &fx.manifest,
+            LoadOptions {
+                skip_hashes: true,
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             IoError::Format(FormatError::SizeMismatch { name, .. }) if name == COMMON_FILE

@@ -17,10 +17,11 @@
 //!   total for v0 — an accepted load-time copy so router matvecs read
 //!   plain `&[f32]` rows.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::format::{
-    ArchInfo, LAYOUT_FILE, LayerLayout, Manifest, ProjectionName, load_layout, load_manifest,
+    ArchInfo, ExpertsLayout, LAYOUT_FILE, LayerLayout, Manifest, ProjectionName, load_layout,
+    load_manifest,
 };
 use crate::io::{ExpertReader, LoadOptions, MappedCommon, to_usize, verify_named_file};
 use crate::kernels::KernelError;
@@ -152,7 +153,13 @@ struct LayerMeta {
 /// routers, and lazy expert-file access.
 #[derive(Debug)]
 pub struct Model {
+    /// The install directory this model was opened from. Kept so the
+    /// expert streamer can be built later, against the same files and the
+    /// same load-time policy.
+    dir: PathBuf,
     manifest: Manifest,
+    layout: ExpertsLayout,
+    options: LoadOptions,
     common: MappedCommon,
     experts: ExpertReader,
     embedding: TensorSpec,
@@ -262,7 +269,10 @@ impl Model {
             "model loaded"
         );
         Ok(Self {
+            dir: dir.to_path_buf(),
             manifest,
+            layout,
+            options,
             common,
             experts,
             embedding,
@@ -280,6 +290,22 @@ impl Model {
     /// The validated manifest.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// The install directory this model was opened from.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The validated expert-file layout (`experts/layout.json`).
+    pub fn layout(&self) -> &ExpertsLayout {
+        &self.layout
+    }
+
+    /// The integrity policy this model was opened under, so anything opened
+    /// alongside it (the expert streamer) applies the same one.
+    pub fn load_options(&self) -> LoadOptions {
+        self.options
     }
 
     /// Transformer layer count.
@@ -543,7 +569,10 @@ mod tests {
         rewrite_layout,
     };
 
-    const SKIP: LoadOptions = LoadOptions { skip_hashes: true };
+    const SKIP: LoadOptions = LoadOptions {
+        skip_hashes: true,
+        verify_layer_hashes: false,
+    };
 
     #[test]
     fn load_happy_path_with_hashes() {
