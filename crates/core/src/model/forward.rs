@@ -1150,6 +1150,24 @@ const ATTENTION_FANOUT_MIN_POSITIONS: usize = 8;
 /// legal no-op. The fan-out therefore reaches `min(n_kv_heads, pool.shards())`
 /// workers on any machine instead of silently reaching one.
 ///
+/// # How the shards share `out`
+///
+/// They do not. A shard is handed the **full** `q` — `&[f32]`, so sharing it
+/// costs nothing and `group` stays derived from all `n_q_heads`, which is the
+/// trap the query-head slab fell into — and its **own** `kv_heads.len() *
+/// group_dim` window of `out`, indexed from zero. Every shard therefore
+/// reconstructs exactly one `&mut [f32]`, over exactly the elements it owns.
+///
+/// That is not a tidiness point. Before, each shard rebuilt a `&mut [f32]` over
+/// the *whole* of `out` and the writes were argued to be disjoint; but two
+/// simultaneously live `&mut` over one allocation are undefined behaviour under
+/// both Stacked and Tree Borrows whether or not they ever touch the same
+/// element, because creating the second invalidates the first. Windowing the
+/// slice replaces that argument with a structure: `kv_head_range` tiles
+/// `0..n_kv_heads` and `group_dim` is a constant stride, so the windows are
+/// pairwise disjoint by construction rather than by appeal to the kernel's
+/// contract.
+///
 /// # Bit-neutrality
 ///
 /// A kv head's arithmetic depends on nothing but its own slice of `q`, the
@@ -1208,10 +1226,20 @@ fn pool_decode_attention(
     // point that owns those errors. A mismatched `out` does the same, and that
     // is also what makes the raw split below infallible.
     let positions = kv.len(layer).unwrap_or(0);
+    // One kv head's slice of `out`, `group * head_dim` wide. Derived from the
+    // **full** `q` (`q.len() == n_kv_heads * group * head_dim`), never from a
+    // shard's range — the same derivation the kernel makes, for the same
+    // reason. A `q` that is not a whole number of kv heads gives a stride that
+    // would not tile `out`, so it joins the fall-through cases rather than
+    // being split here; the single call below is the entry point that owns
+    // `QLenIndivisible` and `GqaGroupMismatch`.
+    let group_dim = q.len().checked_div(n_kv_heads).unwrap_or(0);
     if units < 2
         || n_kv_heads < 2
         || positions < ATTENTION_FANOUT_MIN_POSITIONS
         || out.len() != q.len()
+        || group_dim == 0
+        || group_dim * n_kv_heads != q.len()
     {
         decode_attention_in(q, kv, layer, scale, scratch, out)?;
         return Ok(());
@@ -1231,7 +1259,6 @@ fn pool_decode_attention(
     let failure: Mutex<Option<(usize, AttentionError)>> = Mutex::new(None);
     let out_base = SendPtr(out.as_mut_ptr());
     let scratch_base = SendPtr(scratch.as_mut_ptr());
-    let out_len = out.len();
     pool.run(units, |shard| {
         let kv_heads = kv_head_range(n_kv_heads, units, &shard.rows);
         if kv_heads.is_empty() {
@@ -1240,35 +1267,37 @@ fn pool_decode_attention(
             return;
         }
         let index = shard.index;
-        // SAFETY (`out`): every shard rebuilds a view over the *whole* of
-        // `out`, because `decode_attention_kv_range_in` addresses query heads
-        // by their absolute index and so must be handed the full vector —
-        // narrowing it would re-derive a smaller GQA group and re-map the heads
-        // onto the wrong kv heads, which is the mistake the slab existed to
-        // avoid. The views therefore overlap; what makes that sound is that the
-        // *writes* do not. The kernel reads nothing from `out` and writes
-        // exactly `kv_heads.start * group * head_dim .. kv_heads.end * group *
-        // head_dim` (its documented contract, pinned by its own
-        // `kv_range_union_is_bit_identical_to_the_whole_call`, which only holds
-        // if a range call leaves every other head's output alone), and
-        // `kv_head_range` gives distinct shards disjoint kv ranges.
+        let lo = kv_heads.start * group_dim;
+        let len = kv_heads.len() * group_dim;
+        // SAFETY (`out`): the invariant is that **shard windows are the image
+        // of a tiling under an injective map**, so no two are ever live at
+        // once over the same element. `kv_head_range` carries the pool's
+        // tiling of `0..units` to a tiling of `0..n_kv_heads`
+        // (`the_kv_head_split_tiles_the_kv_heads`), and scaling a range by the
+        // constant stride `group_dim` preserves disjointness; so distinct
+        // shards reconstruct disjoint `&mut [f32]`, and each shard reconstructs
+        // exactly one. In bounds because `kv_heads.end <= n_kv_heads` and
+        // `n_kv_heads * group_dim == q.len() == out.len()`, both established
+        // above. Nothing here rests on what the kernel does with the slice: it
+        // is handed only the elements it owns, so a kernel that wrote outside
+        // its range would be a wrong answer rather than undefined behaviour.
         //
-        // SAFETY (`scratch`): shard indices are distinct across the job and each
-        // is visited by exactly one thread, so `index * shard_scratch` names a
-        // disjoint `shard_scratch`-long run, in bounds by the integer-division
-        // argument above.
+        // SAFETY (`scratch`): the same invariant. Shard indices are distinct
+        // across the job and each is visited by exactly one thread, so
+        // `index * shard_scratch` names a disjoint `shard_scratch`-long run, in
+        // bounds by the integer-division argument above.
         //
         // Both buffers are mutably borrowed by this frame for the whole call
         // and `run` joins before returning, so no view outlives the borrow.
-        let whole_out = unsafe { std::slice::from_raw_parts_mut(out_base.get(), out_len) };
-        let mine = unsafe {
+        let mine_out = unsafe { std::slice::from_raw_parts_mut(out_base.get().add(lo), len) };
+        let mine_scratch = unsafe {
             std::slice::from_raw_parts_mut(
                 scratch_base.get().add(index * shard_scratch),
                 shard_scratch,
             )
         };
         if let Err(err) =
-            decode_attention_kv_range_in(q, kv, layer, scale, kv_heads, mine, whole_out)
+            decode_attention_kv_range_in(q, kv, layer, scale, kv_heads, mine_scratch, mine_out)
         {
             record(&failure, index, err);
         }
@@ -2025,42 +2054,95 @@ mod tests {
     }
 
     /// The sharded decode attention is bit-identical to the single whole-`q`
-    /// call, on every shard count.
+    /// call, on every geometry, every layer and every shard count.
     ///
     /// The decode half of the parallel-attention argument, isolated from the
     /// forward pass so a failure names the split rather than the model. A shard
-    /// is a contiguous range of kv heads, and a kv head's arithmetic touches
-    /// nothing but its own slice of `q`, its own K and V rows and its own
-    /// scratch — the same rows, the same softmax over the same contiguous run,
-    /// the same reduction order. `to_bits`, no tolerance: the point is that no
-    /// reduction was reassociated, and a tolerance would hide exactly that.
+    /// is a contiguous range of kv heads; it reads the whole `q`, writes its
+    /// own `kv_heads.len() * group * head_dim` window of `out`, and its
+    /// arithmetic touches nothing but its own slice of `q`, its own K and V
+    /// rows and its own scratch — the same rows, the same softmax over the same
+    /// contiguous run, the same reduction order. `to_bits`, no tolerance: the
+    /// point is that no reduction was reassociated, and a tolerance would hide
+    /// exactly that.
     ///
-    /// `shards` runs past `n_kv_heads` on purpose. That is the surplus-shard
-    /// case — the one the old query-head split silently declined to run at all
-    /// — and it is where an off-by-one in the empty-range handling would either
-    /// drop a kv head (stale `out`) or compute one twice.
+    /// The window carve is what this test is really pinning now that a shard is
+    /// handed a sub-slice rather than the whole vector. The kernel writes its
+    /// buffer from index zero, so it can no longer place a head wrongly on its
+    /// own; the offset arithmetic here can, and a shard writing the right bits
+    /// at the wrong offset is exactly the failure `f32::NAN` poisoning and
+    /// element-wise `to_bits` catch.
+    ///
+    /// Coverage. **Geometries**: an uneven kv/shard split at group 4, an
+    /// MQA-shaped single kv head (which takes the serial fall-through), plain
+    /// MHA at group 1, and a group that divides none of the shard counts.
+    /// **Layers**: ragged on purpose, so `positions` is a per-layer property —
+    /// 1 and 7 are below [`ATTENTION_FANOUT_MIN_POSITIONS`] and must agree via
+    /// the serial path, 8 is exactly the threshold, 17 is a full fan-out.
+    /// **Shards**: past `n_kv_heads` on purpose. That is the surplus-shard case
+    /// — the one the old query-head split silently declined to run at all — and
+    /// it is where an off-by-one in the empty-range handling would either drop
+    /// a kv head (stale `out`, caught as a surviving `NaN`) or compute one
+    /// twice.
     #[test]
     fn the_kv_range_split_is_bit_identical_to_the_whole_call() {
-        let (n_kv_heads, head_dim, group, positions) = (3usize, 8usize, 4usize, 17usize);
-        let n_heads = n_kv_heads * group;
-        let (q_dim, kv_dim) = (n_heads * head_dim, n_kv_heads * head_dim);
+        // (n_kv_heads, group, head_dim).
+        const GEOMETRIES: [(usize, usize, usize); 4] =
+            [(3, 4, 8), (1, 8, 8), (4, 1, 16), (2, 3, 4)];
+        // Per-layer cached lengths; the cache is this deep.
+        const LENS: [usize; 4] = [1, 7, 8, 17];
 
-        let mut kv = KvCache::new(1, n_kv_heads, head_dim, positions).unwrap();
-        for t in 0..positions {
-            let k: Vec<f32> = (0..kv_dim).map(|i| spread(t * 7 + i)).collect();
-            let v: Vec<f32> = (0..kv_dim).map(|i| spread(t * 11 + i + 3)).collect();
-            kv.append(0, &k, &v).unwrap();
+        /// One geometry's cache, query and per-layer reference outputs.
+        struct Case {
+            label: String,
+            q: Vec<f32>,
+            kv: KvCache,
+            scale: f32,
+            carve: usize,
+            want: Vec<Vec<f32>>,
         }
-        let q: Vec<f32> = (0..q_dim).map(|i| spread(i * 5 + 1)).collect();
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let carve = attention_scratch_len(n_heads, n_kv_heads, head_dim, positions);
 
-        let mut want = vec![0.0f32; q_dim];
-        decode_attention_in(&q, &kv, 0, scale, &mut vec![0.0; carve], &mut want).unwrap();
-        assert!(
-            want.iter().any(|v| *v != 0.0),
-            "the reference is degenerate"
-        );
+        let cap = LENS.iter().copied().max().unwrap();
+        let cases: Vec<Case> = GEOMETRIES
+            .into_iter()
+            .map(|(n_kv_heads, group, head_dim)| {
+                let n_heads = n_kv_heads * group;
+                let (q_dim, kv_dim) = (n_heads * head_dim, n_kv_heads * head_dim);
+                let mut kv = KvCache::new(LENS.len(), n_kv_heads, head_dim, cap).unwrap();
+                for (layer, &len) in LENS.iter().enumerate() {
+                    for t in 0..len {
+                        let k: Vec<f32> = (0..kv_dim).map(|i| spread(t * 7 + i + layer)).collect();
+                        let v: Vec<f32> = (0..kv_dim)
+                            .map(|i| spread(t * 11 + i + 3 + layer * 5))
+                            .collect();
+                        kv.append(layer, &k, &v).unwrap();
+                    }
+                }
+                let q: Vec<f32> = (0..q_dim).map(|i| spread(i * 5 + 1)).collect();
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                let carve = attention_scratch_len(n_heads, n_kv_heads, head_dim, cap);
+                let want: Vec<Vec<f32>> = (0..LENS.len())
+                    .map(|layer| {
+                        let mut w = vec![0.0f32; q_dim];
+                        decode_attention_in(&q, &kv, layer, scale, &mut vec![0.0; carve], &mut w)
+                            .unwrap();
+                        assert!(
+                            w.iter().any(|v| *v != 0.0),
+                            "the reference is degenerate at layer {layer}"
+                        );
+                        w
+                    })
+                    .collect();
+                Case {
+                    label: format!("({n_kv_heads}, {group}, {head_dim})"),
+                    q,
+                    kv,
+                    scale,
+                    carve,
+                    want,
+                }
+            })
+            .collect();
 
         for shards in [1usize, 2, 3, 4, 5, 8] {
             let mut pool = ComputePool::with_config(PoolConfig {
@@ -2069,13 +2151,31 @@ mod tests {
                 pin_caller: false,
                 inline_caller: true,
             });
-            let mut scratch = vec![0.0f32; carve * pool.shards()];
-            // Poisoned, not zeroed: a kv head no shard claimed would otherwise
-            // read as a plausible zero rather than as a failure.
-            let mut got = vec![f32::NAN; q_dim];
-            pool_decode_attention(&mut pool, &kv, 0, scale, &q, &mut scratch, &mut got).unwrap();
-            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
-                assert_eq!(a.to_bits(), b.to_bits(), "shards {shards}, element {i}");
+            for case in &cases {
+                let mut scratch = vec![0.0f32; case.carve * pool.shards()];
+                for layer in 0..LENS.len() {
+                    // Poisoned, not zeroed: a kv head no shard claimed would
+                    // otherwise read as a plausible zero rather than a failure.
+                    let mut got = vec![f32::NAN; case.q.len()];
+                    pool_decode_attention(
+                        &mut pool,
+                        &case.kv,
+                        layer,
+                        case.scale,
+                        &case.q,
+                        &mut scratch,
+                        &mut got,
+                    )
+                    .unwrap();
+                    for (i, (a, b)) in got.iter().zip(&case.want[layer]).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{} shards {shards} layer {layer} element {i}",
+                            case.label
+                        );
+                    }
+                }
             }
         }
     }

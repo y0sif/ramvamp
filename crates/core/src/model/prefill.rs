@@ -991,12 +991,13 @@ impl SendPtr {
 // kernels shard over *weight rows* while `scatter` shards over output
 // *elements*, and one weight row is `n_acts` of them.
 //
-// `super::forward::pool_decode_attention` has one use that is not disjoint: the
-// kv-range attention kernel addresses query heads absolutely and so takes the
-// *whole* `out`, giving every shard an overlapping view. It carries its own
-// argument at the call site — the kernel reads nothing from `out` and the
-// ranges it writes are disjoint — and that argument, not this one, is what
-// makes it sound.
+// `super::forward::pool_decode_attention` used to be an exception: the kv-range
+// attention kernel addressed query heads absolutely, so every shard rebuilt a
+// view of the *whole* `out` and the soundness argument rested on the kernel
+// reading nothing from it. Miri rejected that under both Stacked and Tree
+// Borrows — overlapping `&mut` is UB whether or not the writes collide — so the
+// kernel now takes only its range's sub-slice and that use is disjoint like
+// every other. There is no exception left.
 unsafe impl Send for SendPtr {}
 // SAFETY: as above.
 unsafe impl Sync for SendPtr {}
