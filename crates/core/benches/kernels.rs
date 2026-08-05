@@ -1,6 +1,6 @@
 //! Warm-cache, single-thread microbenches for the quantized kernels:
 //! scalar reference vs AVX2 dispatch for every dot kernel and both
-//! activation quantizers.
+//! activation quantizers, plus the decode-attention context sweep.
 //!
 //! Deliberately no criterion (keeps the dependency tree lean): a plain
 //! `std::time::Instant` harness with warmup and median-of-31 runs. Numbers
@@ -12,9 +12,11 @@
 
 use std::time::Instant;
 
+use ramvamp_core::kernels::attention::{AttentionScratch, decode_attention};
 use ramvamp_core::kernels::quants::{
     BlockQ8_0, BlockQ8K, QuantFormat, avx2, f32_to_f16, quantize_row_q8_0, quantize_row_q8_k,
 };
+use ramvamp_core::kv::KvCache;
 
 /// Deterministic 64-bit LCG (Knuth MMIX constants).
 struct Lcg(u64);
@@ -64,21 +66,30 @@ type KDot = fn(&[u8], &[BlockQ8K], bool) -> Result<f32, ramvamp_core::kernels::K
 const WARMUP: usize = 5;
 const RUNS: usize = 31;
 
-/// Median wall time of `RUNS` timed calls after `WARMUP` untimed ones.
-fn median_ns<F: FnMut() -> f32>(mut f: F) -> f64 {
+/// Median wall time of `runs` timed calls after `warmup` untimed ones.
+///
+/// `runs` must be odd so the median is a real sample rather than an average
+/// of two. Callers whose timed unit is long (the attention sweep) dial the
+/// counts down instead of skipping ladder rungs.
+fn median_ns_n<F: FnMut() -> f32>(runs: usize, warmup: usize, mut f: F) -> f64 {
     let mut sink = 0f32;
-    for _ in 0..WARMUP {
+    for _ in 0..warmup {
         sink += f();
     }
-    let mut samples = Vec::with_capacity(RUNS);
-    for _ in 0..RUNS {
+    let mut samples = Vec::with_capacity(runs);
+    for _ in 0..runs {
         let t = Instant::now();
         sink += f();
         samples.push(t.elapsed().as_nanos() as f64);
     }
     std::hint::black_box(sink);
     samples.sort_by(f64::total_cmp);
-    samples[RUNS / 2]
+    samples[runs / 2]
+}
+
+/// Median wall time of `RUNS` timed calls after `WARMUP` untimed ones.
+fn median_ns<F: FnMut() -> f32>(f: F) -> f64 {
+    median_ns_n(RUNS, WARMUP, f)
 }
 
 struct Row {
@@ -136,6 +147,172 @@ fn bench_dot_q8_0(weight: &[u8], row_bytes: usize, acts: &[BlockQ8_0], force_sca
         }
         acc
     }) / rows as f64
+}
+
+// ---------------------------------------------------------------------------
+// Decode attention vs context length.
+// ---------------------------------------------------------------------------
+
+/// v0 pin geometry, from `models/qwen3.rvmp/manifest.json`: 48 layers, 32
+/// query heads over 4 kv heads (GQA group 8), head_dim 128 — so q_dim 4096
+/// and kv_dim 512 — against the runtime's 4096-position context cap.
+const ATTN_LAYERS: usize = 48;
+const ATTN_Q_HEADS: usize = 32;
+const ATTN_KV_HEADS: usize = 4;
+const ATTN_HEAD_DIM: usize = 128;
+const ATTN_CAP: usize = 4096;
+
+/// Context lengths both arms sweep. The cache grows through the ladder in
+/// place, so every rung is measured against the same allocation.
+const CONTEXT_LADDER: [usize; 7] = [64, 128, 256, 512, 1024, 2048, 4096];
+
+/// `(runs, warmup)` per ladder rung for the single-layer arm: cheap enough
+/// to keep the standard median-of-31 everywhere.
+const ARM_A_SAMPLES: [(usize, usize); 7] = [(RUNS, WARMUP); 7];
+
+/// `(runs, warmup)` per ladder rung for the 48-layer arm, aligned with
+/// [`CONTEXT_LADDER`]. One timed unit there is a whole token's attention and
+/// grows linearly with context (seconds at the top rung), so the sample count
+/// comes down at the long end rather than the ladder losing rungs. Every
+/// entry is still an odd run count after untimed warmups, as [`median_ns`]
+/// does.
+const ARM_B_SAMPLES: [(usize, usize); 7] =
+    [(31, 3), (31, 3), (21, 2), (15, 2), (11, 1), (7, 1), (5, 1)];
+
+/// One ladder rung of one arm.
+struct AttnRow {
+    /// Cached positions the kernel attended over.
+    context: usize,
+    /// Layers swept per timed unit (1 for arm A, 48 for arm B).
+    layers: usize,
+    /// Timed runs the median came from.
+    runs: usize,
+    /// Median wall nanoseconds per timed unit.
+    ns_per_unit: f64,
+}
+
+impl AttnRow {
+    /// Wall milliseconds for one token's worth of attention: arm B measures
+    /// that directly, arm A is scaled by the model's layer count so the two
+    /// arms sit in the same units.
+    fn ms_per_token(&self) -> f64 {
+        self.ns_per_unit * (ATTN_LAYERS / self.layers) as f64 / 1e6
+    }
+
+    /// Nanoseconds per cached position per timed unit. Flat across the
+    /// ladder means the cost is linear in context.
+    fn ns_per_pos(&self) -> f64 {
+        self.ns_per_unit / self.context as f64
+    }
+
+    /// The same figure normalized to a single layer, so arm A and arm B are
+    /// directly comparable.
+    fn ns_per_pos_per_layer(&self) -> f64 {
+        self.ns_per_pos() / self.layers as f64
+    }
+
+    /// Unique K+V bytes the timed unit walks: `layers * context * kv_dim`
+    /// f16 elements across two planes.
+    fn bytes(&self) -> usize {
+        self.layers * self.context * ATTN_KV_HEADS * ATTN_HEAD_DIM * 2 * 2
+    }
+}
+
+/// Sweep [`decode_attention`] over [`CONTEXT_LADDER`] on a `layers`-deep
+/// cache, timing one call per layer per unit.
+///
+/// Arm A (`layers = 1`, 8 MiB of planes) is the pure kernel curve, mostly
+/// cache-resident. Arm B (`layers = ATTN_LAYERS`, **384 MiB** of planes —
+/// the KV tenant's whole v0 budget, so this arm alone dominates the bench's
+/// footprint) makes one timed unit a full 48-layer sweep, i.e. exactly one
+/// decoded token's attention: by the time layer `L` comes round again its
+/// planes have not been touched since the previous unit, which is the
+/// residency the real decode loop sees.
+///
+/// The query vector, the K/V fill and the scratch are all built outside the
+/// timed region, and the scratch is preallocated at the context cap so it
+/// never reallocates mid-measurement.
+fn bench_attention_arm(
+    layers: usize,
+    schedule: &[(usize, usize); 7],
+    rng: &mut Lcg,
+) -> Vec<AttnRow> {
+    let kv_dim = ATTN_KV_HEADS * ATTN_HEAD_DIM;
+    let scale = 1.0 / (ATTN_HEAD_DIM as f32).sqrt();
+    let mut cache = KvCache::new(layers, ATTN_KV_HEADS, ATTN_HEAD_DIM, ATTN_CAP).unwrap();
+    let q: Vec<f32> = (0..ATTN_Q_HEADS * ATTN_HEAD_DIM)
+        .map(|_| rng.next_f32())
+        .collect();
+    let mut out = vec![0.0f32; q.len()];
+    let mut scratch = AttentionScratch::with_capacity(ATTN_CAP);
+    let mut k_row = vec![0.0f32; kv_dim];
+    let mut v_row = vec![0.0f32; kv_dim];
+
+    let mut filled = 0usize;
+    let mut rows = Vec::with_capacity(CONTEXT_LADDER.len());
+    for (&context, &(runs, warmup)) in CONTEXT_LADDER.iter().zip(schedule) {
+        // Grow the cache to this rung. Values are uniform in [-1, 1), which
+        // keeps the QK scores near unit scale: no denormals, no softmax
+        // overflow, and nothing value-dependent for the kernel to branch on.
+        while filled < context {
+            for layer in 0..layers {
+                for (k, v) in k_row.iter_mut().zip(v_row.iter_mut()) {
+                    *k = rng.next_f32();
+                    *v = rng.next_f32();
+                }
+                cache.append(layer, &k_row, &v_row).unwrap();
+            }
+            filled += 1;
+        }
+
+        let ns_per_unit = median_ns_n(runs, warmup, || {
+            let mut sink = 0f32;
+            for layer in 0..layers {
+                decode_attention(&q, &cache, layer, scale, &mut scratch, &mut out)
+                    .expect("decode_attention");
+                sink += out[0];
+            }
+            sink
+        });
+        rows.push(AttnRow {
+            context,
+            layers,
+            runs,
+            ns_per_unit,
+        });
+    }
+    rows
+}
+
+fn print_attn_table(arm: &str, rows: &[AttnRow]) {
+    println!("{arm}");
+    println!(
+        "{:>7} {:>5} {:>14} {:>10} {:>10} {:>14} {:>10}",
+        "context", "runs", "ns/unit", "ms/token", "ns/pos", "ns/pos/layer", "eff GB/s"
+    );
+    for r in rows {
+        println!(
+            "{:>7} {:>5} {:>14.0} {:>10.3} {:>10.1} {:>14.3} {:>10.2}",
+            r.context,
+            r.runs,
+            r.ns_per_unit,
+            r.ms_per_token(),
+            r.ns_per_pos(),
+            r.ns_per_pos_per_layer(),
+            r.bytes() as f64 / r.ns_per_unit,
+        );
+    }
+}
+
+/// `ns/pos` at context 4096 over `ns/pos` at context 512 — 1.0 means the
+/// cost is exactly linear in context.
+fn linearity_ratio(rows: &[AttnRow]) -> Option<f64> {
+    let at = |context: usize| {
+        rows.iter()
+            .find(|r| r.context == context)
+            .map(AttnRow::ns_per_pos)
+    };
+    Some(at(4096)? / at(512)?)
 }
 
 fn main() {
@@ -263,4 +440,41 @@ fn main() {
     }
 
     print_table(&rows);
+
+    // Decode attention against context length. Arm A runs and is dropped
+    // before arm B allocates, so the 384 MiB arm is the only large tenant
+    // alive at any moment.
+    println!(
+        "\ndecode attention vs context (v0 pin: {ATTN_Q_HEADS} q-heads : {ATTN_KV_HEADS} kv-heads, \
+         head_dim {ATTN_HEAD_DIM}, scale 1/sqrt({ATTN_HEAD_DIM}), cap {ATTN_CAP})"
+    );
+    println!(
+        "ms/token normalizes both arms to one token's {ATTN_LAYERS} layers; ns/pos = ns per timed \
+         unit / context;\neff GB/s counts the unique K+V bytes of the walked planes \
+         (layers * context * kv_dim * 2 B * 2 planes) — the\nkernel re-reads each kv head's \
+         columns once per query head in its group, so the bytes it actually\ntouches are 8x this.\n"
+    );
+
+    let arm_a = bench_attention_arm(1, &ARM_A_SAMPLES, &mut rng);
+    print_attn_table(
+        "arm A: 1 layer (8 MiB planes), timed unit = one decode_attention call",
+        &arm_a,
+    );
+    println!();
+    let arm_b = bench_attention_arm(ATTN_LAYERS, &ARM_B_SAMPLES, &mut rng);
+    print_attn_table(
+        "arm B: 48 layers (384 MiB planes), timed unit = one token (all 48 layers)",
+        &arm_b,
+    );
+
+    println!();
+    for (arm, rows) in [("arm A", &arm_a), ("arm B", &arm_b)] {
+        match linearity_ratio(rows) {
+            Some(ratio) => println!(
+                "linearity {arm}: ns/pos(4096) / ns/pos(512) = {ratio:.3}x \
+                 (1.0 = cost linear in context)"
+            ),
+            None => println!("linearity {arm}: ladder is missing 512 or 4096, no ratio"),
+        }
+    }
 }
