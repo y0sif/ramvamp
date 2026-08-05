@@ -30,8 +30,18 @@
 //! operations in identical order, bit for bit.
 //!
 //! Alignment: reads assume nothing beyond the natural 2-byte alignment of
-//! `&[u16]`; every conversion is a scalar element load, no wide loads (per
-//! the kernels module's alignment rule).
+//! `&[u16]` and the 4-byte alignment of `&[f32]` (per the kernels module's
+//! alignment rule). The scalar path converts one element at a time, so it
+//! assumes nothing at all. The AVX2 path ([`x86`]) uses wide loads, and every
+//! one of them is an **unaligned** form — `_mm_loadu_si128` for the f16 K/V
+//! head slices, `_mm256_loadu_ps` / `_mm256_storeu_ps` for the f32 query
+//! transpose, conversion row, score runs and output. That is not belt and
+//! braces: a head slice sits at a `kv_head * head_dim` element offset inside
+//! a row of `n_kv_heads * head_dim`, so an odd `head_dim` puts it on a
+//! 2-byte boundary and the matching `out` sub-slice on a 4-byte one. Tested
+//! at `head_dim = 9` end to end
+//! (`misaligned_head_slices_match_the_scalar_reference`) and against
+//! deliberately shifted views inside [`x86`].
 //!
 //! Loop order: **kv-head outer, query head inner**. Each K and each V
 //! element is converted from f16 exactly once and then reused by every query
@@ -52,12 +62,85 @@
 //! reduction still accumulates over `t` ascending, per output element. Same
 //! operands, same order, same roundings
 //! (`restructured_kernel_is_bit_identical_to_head_major_reference`).
+//!
+//! Vectorization: phase 7's wave 2 added an AVX2 + F16C path for both phases
+//! ([`x86`]), dispatched at runtime and **bit-identical** to the scalar
+//! reference below, which is what the whole gate rests on. `vcvtph2ps`
+//! widens eight f16 at a time and is exact; the QK dot puts the eight vector
+//! lanes on the **GQA group**, an axis whose accumulators are already
+//! independent, so each lane still walks `i` ascending in one f32 with a
+//! separate multiply and add; the V reduction puts them on `i`, which is
+//! elementwise, and leaves `t` sequential. No FMA anywhere — `acc += qv * kv`
+//! is two roundings and `_mm256_fmadd_ps` would make it one. The full
+//! argument lives in [`x86`]'s module docs.
+//!
+//! Dispatch follows the convention `quants::avx2` set: the path is chosen by
+//! a runtime CPUID probe ([`avx2_f16c_available`]) and can be pinned with a
+//! `force_scalar` parameter threaded through the `*_dispatch` entry points,
+//! never an environment variable, so tests and benches can drive both paths
+//! in one process.
 
 use super::KernelError;
 use super::primitives::softmax;
 use super::quants::f16_to_f32;
 use crate::kv::{KvCache, KvError};
 use thiserror::Error;
+
+#[cfg(target_arch = "x86_64")]
+mod x86;
+
+/// The largest `head_dim` the AVX2 path covers.
+///
+/// [`x86::qk_scores`] carves its transposed query block and its K conversion
+/// block from fixed stack arrays sized by this constant, rather than from the
+/// caller's scratch: [`scratch_len`] is a pinned contract that a later lane
+/// sizes a prefill arena from, and widening it to fund a vectorization detail
+/// would be the wrong trade. Geometries past this bound fall through to the
+/// scalar reference, which has no such limit. 256 is twice the v0 pin's
+/// `head_dim` and covers every head size in current use.
+#[cfg(target_arch = "x86_64")]
+const MAX_SIMD_HEAD_DIM: usize = 256;
+
+/// True when the running CPU supports both AVX2 and F16C.
+///
+/// F16C is a **separate CPUID bit** from AVX2 and FMA, so this is not
+/// [`super::quants::avx2::avx2_fma_available`] and must not be folded into
+/// it: this kernel needs `vcvtph2ps` and deliberately does not want FMA.
+/// `is_x86_feature_detected!` caches the probe, so calling this per kv head
+/// costs an atomic load.
+#[inline]
+pub fn avx2_f16c_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("f16c")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// True when a call at this `head_dim` really takes the AVX2 path, i.e. when
+/// `force_scalar` selects between two *different* kernels rather than running
+/// the same one twice.
+///
+/// This is [`avx2_f16c_available`] **and** the [`MAX_SIMD_HEAD_DIM`] envelope.
+/// The second half matters to tests: a geometry outside the envelope falls
+/// back silently and correctly, and a bit-identity test swept over
+/// `force_scalar` on such a geometry would compare the scalar kernel with
+/// itself while looking like a two-path proof. `simd_matches_scalar_bit_for_bit`
+/// asserts this instead of assuming it.
+pub fn avx2_f16c_path_covers(head_dim: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        head_dim <= MAX_SIMD_HEAD_DIM && avx2_f16c_available()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = head_dim;
+        false
+    }
+}
 
 /// Typed errors from decode attention.
 ///
@@ -249,7 +332,31 @@ pub fn decode_attention(
     // `None` = "every position the layer holds", which is the decode
     // invariant above. Delegating means the masked and unmasked paths cannot
     // drift apart (`decode_attention_matches_attention_at_at_full_length`).
-    attention_owned(q, cache, layer, None, scale, scratch, out)
+    attention_owned(q, cache, layer, None, scale, scratch, out, false)
+}
+
+/// [`decode_attention`] with the kernel path pinned instead of probed.
+///
+/// `force_scalar = true` runs the scalar reference; `false` is exactly
+/// [`decode_attention`], i.e. the runtime AVX2 + F16C dispatch. The two are
+/// bit-identical — that is the gate, not a tolerance — so production code
+/// calls [`decode_attention`] and this exists only so tests and benches can
+/// drive both implementations in one process, the convention `gemv` and
+/// `quants::avx2` already use.
+///
+/// # Errors
+///
+/// Exactly [`decode_attention`]'s.
+pub fn decode_attention_dispatch(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    scale: f32,
+    scratch: &mut AttentionScratch,
+    out: &mut [f32],
+    force_scalar: bool,
+) -> Result<(), AttentionError> {
+    attention_owned(q, cache, layer, None, scale, scratch, out, force_scalar)
 }
 
 /// [`decode_attention`] against caller-provided scratch instead of an owning
@@ -273,7 +380,25 @@ pub fn decode_attention_in(
     scratch: &mut [f32],
     out: &mut [f32],
 ) -> Result<(), AttentionError> {
-    attention_borrowed(q, cache, layer, None, scale, scratch, out)
+    attention_borrowed(q, cache, layer, None, scale, scratch, out, false)
+}
+
+/// [`decode_attention_in`] with the kernel path pinned instead of probed; see
+/// [`decode_attention_dispatch`].
+///
+/// # Errors
+///
+/// Exactly [`decode_attention_in`]'s.
+pub fn decode_attention_in_dispatch(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    scale: f32,
+    scratch: &mut [f32],
+    out: &mut [f32],
+    force_scalar: bool,
+) -> Result<(), AttentionError> {
+    attention_borrowed(q, cache, layer, None, scale, scratch, out, force_scalar)
 }
 
 /// Position-limited GQA attention for one layer: exactly
@@ -315,7 +440,36 @@ pub fn attention_at(
     scratch: &mut AttentionScratch,
     out: &mut [f32],
 ) -> Result<(), AttentionError> {
-    attention_owned(q, cache, layer, Some(positions), scale, scratch, out)
+    attention_owned(q, cache, layer, Some(positions), scale, scratch, out, false)
+}
+
+/// [`attention_at`] with the kernel path pinned instead of probed; see
+/// [`decode_attention_dispatch`].
+///
+/// # Errors
+///
+/// Exactly [`attention_at`]'s.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_at_dispatch(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    positions: usize,
+    scale: f32,
+    scratch: &mut AttentionScratch,
+    out: &mut [f32],
+    force_scalar: bool,
+) -> Result<(), AttentionError> {
+    attention_owned(
+        q,
+        cache,
+        layer,
+        Some(positions),
+        scale,
+        scratch,
+        out,
+        force_scalar,
+    )
 }
 
 /// [`attention_at`] against caller-provided scratch instead of an owning
@@ -347,7 +501,36 @@ pub fn attention_at_in(
     scratch: &mut [f32],
     out: &mut [f32],
 ) -> Result<(), AttentionError> {
-    attention_borrowed(q, cache, layer, Some(positions), scale, scratch, out)
+    attention_borrowed(q, cache, layer, Some(positions), scale, scratch, out, false)
+}
+
+/// [`attention_at_in`] with the kernel path pinned instead of probed; see
+/// [`decode_attention_dispatch`].
+///
+/// # Errors
+///
+/// Exactly [`attention_at_in`]'s.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_at_in_dispatch(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    positions: usize,
+    scale: f32,
+    scratch: &mut [f32],
+    out: &mut [f32],
+    force_scalar: bool,
+) -> Result<(), AttentionError> {
+    attention_borrowed(
+        q,
+        cache,
+        layer,
+        Some(positions),
+        scale,
+        scratch,
+        out,
+        force_scalar,
+    )
 }
 
 /// The validated geometry of one attention call: what the shape checks
@@ -423,6 +606,7 @@ fn plan(
 }
 
 /// The owning-scratch path: validate, size the `Vec`, run the body.
+#[allow(clippy::too_many_arguments)]
 fn attention_owned(
     q: &[f32],
     cache: &KvCache,
@@ -431,6 +615,7 @@ fn attention_owned(
     scale: f32,
     scratch: &mut AttentionScratch,
     out: &mut [f32],
+    force_scalar: bool,
 ) -> Result<(), AttentionError> {
     let plan = plan(q, cache, layer, limit, out)?;
     // Size from the cache's capacity, not this call's `positions`: capacity
@@ -444,10 +629,11 @@ fn attention_owned(
         cache.capacity().max(plan.positions),
     );
     let buf = scratch.buf_mut(need);
-    attention_body(q, cache, layer, &plan, scale, buf, out)
+    attention_body(q, cache, layer, &plan, scale, buf, out, force_scalar)
 }
 
 /// The borrowed-scratch path: validate, check the carve fits, run the body.
+#[allow(clippy::too_many_arguments)]
 fn attention_borrowed(
     q: &[f32],
     cache: &KvCache,
@@ -456,6 +642,7 @@ fn attention_borrowed(
     scale: f32,
     scratch: &mut [f32],
     out: &mut [f32],
+    force_scalar: bool,
 ) -> Result<(), AttentionError> {
     let plan = plan(q, cache, layer, limit, out)?;
     let need = plan.scratch_len();
@@ -465,7 +652,7 @@ fn attention_borrowed(
             need,
         });
     }
-    attention_body(q, cache, layer, &plan, scale, scratch, out)
+    attention_body(q, cache, layer, &plan, scale, scratch, out, force_scalar)
 }
 
 /// The one attention body, kv-head outer. `scratch` is at least
@@ -478,6 +665,7 @@ fn attention_borrowed(
 /// makes the limited call bit-identical to an unlimited call against a
 /// `positions`-row cache, and it is why there is no online or flash-style
 /// rescaled softmax here.
+#[allow(clippy::too_many_arguments)]
 fn attention_body(
     q: &[f32],
     cache: &KvCache,
@@ -486,6 +674,7 @@ fn attention_body(
     scale: f32,
     scratch: &mut [f32],
     out: &mut [f32],
+    force_scalar: bool,
 ) -> Result<(), AttentionError> {
     let &Plan {
         head_dim,
@@ -493,8 +682,13 @@ fn attention_body(
         group,
         positions,
     } = plan;
-    let k_plane = cache.k_layer(layer)?;
-    let v_plane = cache.v_layer(layer)?;
+    // `plan` proved `positions <= cache.len(layer)`, and `k_layer`/`v_layer`
+    // return exactly `len(layer)` rows of `kv_dim`, so these are the first
+    // `positions` rows and the multiply cannot overflow. Bounding the planes
+    // once here is what lets both the scalar and the AVX2 phases index rows
+    // directly instead of re-deriving the limit.
+    let k_rows = &cache.k_layer(layer)?[..positions * kv_dim];
+    let v_rows = &cache.v_layer(layer)?[..positions * kv_dim];
 
     // The carve: a group-major score block (one contiguous `positions`-long
     // run per query head in the group, so `softmax` gets a contiguous slice)
@@ -514,24 +708,19 @@ fn attention_body(
 
         // Phase 1 — scores for the whole group. K[t, kv_head] is widened
         // once per element here and read by all `group` query heads.
-        // scores[g][t] = scale * (q_{kv_head*group+g} . K[t, kv_head]),
-        // accumulated over `i` ascending in one f32, scaled once at the end.
-        for (t, k_row) in k_plane.chunks_exact(kv_dim).take(positions).enumerate() {
-            let k_th = &k_row[col..col + head_dim];
-            for (dst, &bits) in kbuf.iter_mut().zip(k_th) {
-                *dst = f16_to_f32(bits);
-            }
-            for (q_h, run) in q_group
-                .chunks_exact(head_dim)
-                .zip(scores.chunks_exact_mut(positions))
-            {
-                let mut acc = 0.0f32;
-                for (&qv, &kv) in q_h.iter().zip(kbuf.iter()) {
-                    acc += qv * kv;
-                }
-                run[t] = scale * acc;
-            }
-        }
+        qk_scores(
+            q_group,
+            k_rows,
+            kv_dim,
+            col,
+            head_dim,
+            group,
+            positions,
+            scale,
+            kbuf,
+            scores,
+            force_scalar,
+        );
 
         for run in scores.chunks_exact_mut(positions) {
             softmax(run)?;
@@ -541,29 +730,169 @@ fn attention_body(
         // widened once per element and every output element still
         // accumulated over `t` ascending.
         out_group.fill(0.0);
-        for (t, v_row) in v_plane.chunks_exact(kv_dim).take(positions).enumerate() {
-            let v_th = &v_row[col..col + head_dim];
-            for (dst, &bits) in vbuf.iter_mut().zip(v_th) {
-                *dst = f16_to_f32(bits);
+        v_reduce(
+            v_rows,
+            kv_dim,
+            col,
+            head_dim,
+            positions,
+            scores,
+            vbuf,
+            out_group,
+            force_scalar,
+        );
+    }
+    Ok(())
+}
+
+/// Phase 1 for one kv head, dispatched: AVX2 + F16C when the CPU has both and
+/// the geometry fits, else the scalar reference.
+///
+/// Both write the same bits (see the module docs and [`x86`]), so this is a
+/// performance choice and never a numerical one. `force_scalar` is threaded
+/// rather than read from the environment so tests and benches can drive both
+/// paths in one process.
+#[allow(clippy::too_many_arguments)]
+fn qk_scores(
+    q_group: &[f32],
+    k_rows: &[u16],
+    kv_dim: usize,
+    col: usize,
+    head_dim: usize,
+    group: usize,
+    positions: usize,
+    scale: f32,
+    kbuf: &mut [f32],
+    scores: &mut [f32],
+    force_scalar: bool,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if !force_scalar && avx2_f16c_path_covers(head_dim) {
+        // SAFETY: AVX2 and F16C presence was checked at runtime just above,
+        // and `head_dim <= MAX_SIMD_HEAD_DIM` bounds the stack buffers the
+        // body carves. `k_rows` holds exactly `positions` rows of `kv_dim`,
+        // `col + head_dim <= kv_dim` because `col = kv_head * head_dim` with
+        // `kv_head < n_kv_heads`, `q_group` holds `group * head_dim` f32 and
+        // `scores` holds `group * positions`.
+        unsafe {
+            x86::qk_scores(
+                q_group, k_rows, kv_dim, col, head_dim, group, positions, scale, scores,
+            );
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = force_scalar;
+    qk_scores_scalar(
+        q_group, k_rows, kv_dim, col, head_dim, positions, scale, kbuf, scores,
+    );
+}
+
+/// The scalar reference for phase 1: `scores[g][t] = scale * (q_g . K[t])`,
+/// accumulated over `i` ascending in one f32 with a separate multiply and
+/// add, scaled once at the end.
+///
+/// This is the arithmetic every other path is pinned to, so it is written
+/// once and never specialized.
+#[allow(clippy::too_many_arguments)]
+fn qk_scores_scalar(
+    q_group: &[f32],
+    k_rows: &[u16],
+    kv_dim: usize,
+    col: usize,
+    head_dim: usize,
+    positions: usize,
+    scale: f32,
+    kbuf: &mut [f32],
+    scores: &mut [f32],
+) {
+    for (t, k_row) in k_rows.chunks_exact(kv_dim).take(positions).enumerate() {
+        let k_th = &k_row[col..col + head_dim];
+        for (dst, &bits) in kbuf.iter_mut().zip(k_th) {
+            *dst = f16_to_f32(bits);
+        }
+        for (q_h, run) in q_group
+            .chunks_exact(head_dim)
+            .zip(scores.chunks_exact_mut(positions))
+        {
+            let mut acc = 0.0f32;
+            for (&qv, &kv) in q_h.iter().zip(kbuf.iter()) {
+                acc += qv * kv;
             }
-            for (out_h, run) in out_group
-                .chunks_exact_mut(head_dim)
-                .zip(scores.chunks_exact(positions))
-            {
-                let w = run[t];
-                for (o, &vv) in out_h.iter_mut().zip(vbuf.iter()) {
-                    *o += w * vv;
-                }
+            run[t] = scale * acc;
+        }
+    }
+}
+
+/// Phase 2 for one kv head, dispatched; see [`qk_scores`]. `out_group` is
+/// already zeroed by the caller.
+#[allow(clippy::too_many_arguments)]
+fn v_reduce(
+    v_rows: &[u16],
+    kv_dim: usize,
+    col: usize,
+    head_dim: usize,
+    positions: usize,
+    scores: &[f32],
+    vbuf: &mut [f32],
+    out_group: &mut [f32],
+    force_scalar: bool,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if !force_scalar && avx2_f16c_path_covers(head_dim) {
+        // SAFETY: AVX2 and F16C presence was checked at runtime just above.
+        // `v_rows` holds exactly `positions` rows of `kv_dim`,
+        // `col + head_dim <= kv_dim`, `vbuf` is exactly `head_dim` f32,
+        // `scores` is `group * positions` and `out_group` `group * head_dim`.
+        unsafe {
+            x86::v_reduce(
+                v_rows, kv_dim, col, head_dim, positions, scores, vbuf, out_group,
+            );
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = force_scalar;
+    v_reduce_scalar(
+        v_rows, kv_dim, col, head_dim, positions, scores, vbuf, out_group,
+    );
+}
+
+/// The scalar reference for phase 2: `out[h][i] += w_t * V[t][i]`, every
+/// output element accumulated over `t` ascending.
+#[allow(clippy::too_many_arguments)]
+fn v_reduce_scalar(
+    v_rows: &[u16],
+    kv_dim: usize,
+    col: usize,
+    head_dim: usize,
+    positions: usize,
+    scores: &[f32],
+    vbuf: &mut [f32],
+    out_group: &mut [f32],
+) {
+    for (t, v_row) in v_rows.chunks_exact(kv_dim).take(positions).enumerate() {
+        let v_th = &v_row[col..col + head_dim];
+        for (dst, &bits) in vbuf.iter_mut().zip(v_th) {
+            *dst = f16_to_f32(bits);
+        }
+        for (out_h, run) in out_group
+            .chunks_exact_mut(head_dim)
+            .zip(scores.chunks_exact(positions))
+        {
+            let w = run[t];
+            for (o, &vv) in out_h.iter_mut().zip(vbuf.iter()) {
+                *o += w * vv;
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kernels::quants::f32_to_f16;
+    use std::io::Write;
 
     // Local copies of the deterministic PRNG and tolerance assertion from
     // `primitives::testutil` — that module is `#[cfg(test)]`-private to
@@ -1467,5 +1796,311 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ----------------------------------------- AVX2 + F16C vs scalar (wave 2)
+
+    /// The device against a silent single-path pass, ported from `gemv`
+    /// (`gemv.rs`, `KernelPaths` / `kernel_paths`) with this kernel's probe
+    /// swapped in.
+    ///
+    /// Sweeping `force_scalar` over `[false, true]` only selects between two
+    /// implementations when the host has AVX2 **and** F16C; on a host without
+    /// them `false` runs the very same scalar kernel as `true`, and both
+    /// iterations prove nothing while still looking like a two-path proof. So
+    /// the sweep is narrowed to the paths that exist and the shortfall is
+    /// announced rather than asserted away — "scalar otherwise" is a real
+    /// configuration of this module, so a bare
+    /// `assert!(avx2_f16c_available())` would turn a portable gate into one
+    /// that cannot pass on an ARM, macOS, or pre-Ivy-Bridge box.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum KernelPaths {
+        /// AVX2+F16C is live: `[false, true]` really is two kernels.
+        Both,
+        /// Scalar only. The AVX2-vs-scalar half of the claim is not tested.
+        ScalarOnly,
+    }
+
+    impl KernelPaths {
+        /// The `force_scalar` flags worth sweeping on this host.
+        fn flags(self) -> &'static [bool] {
+            match self {
+                KernelPaths::Both => &[false, true],
+                KernelPaths::ScalarOnly => &[true],
+            }
+        }
+    }
+
+    /// Resolve [`KernelPaths`] for this host, announcing `claim` as untested
+    /// when only one path exists.
+    ///
+    /// The notice goes straight to `stderr` rather than through `eprintln!`
+    /// because libtest captures the print macros and replays them only for
+    /// *failing* tests; a skip nobody can see on a green run is precisely the
+    /// silent single-path pass this exists to prevent.
+    ///
+    /// # Panics
+    ///
+    /// On an x86_64 host whose CPU reports AVX2 and F16C while
+    /// [`avx2_f16c_available`] does not. That is a dispatch bug, not an
+    /// unsupported host: every attention call would quietly run the scalar
+    /// kernel on a machine that has the vector one, and no test would say so.
+    fn kernel_paths(claim: &str) -> KernelPaths {
+        let dispatch = avx2_f16c_available();
+        #[cfg(target_arch = "x86_64")]
+        {
+            let cpu = std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("f16c");
+            assert_eq!(
+                dispatch, cpu,
+                "kernel dispatch disagrees with this x86_64 CPU: CPUID reports \
+                 avx2+f16c = {cpu}, `avx2_f16c_available()` reports {dispatch}. \
+                 Every attention call dispatches on the latter, so this is a \
+                 live mis-dispatch, not an unsupported host."
+            );
+        }
+        if dispatch {
+            return KernelPaths::Both;
+        }
+        let mut err = std::io::stderr();
+        let _ = writeln!(
+            err,
+            "\n\
+             ##########################################################\n\
+             # NOT PROVEN ON THIS HOST: {claim}\n\
+             #\n\
+             # This host has no AVX2+F16C, so `force_scalar = false`\n\
+             # dispatches to the same scalar kernel as `force_scalar =\n\
+             # true`. The scalar arithmetic was exercised in full; the\n\
+             # AVX2-vs-scalar half of phase 7's bit-identity gate was NOT\n\
+             # tested. A green run here is not evidence for it. Re-run the\n\
+             # kernel tests on an AVX2+F16C machine before relying on it.\n\
+             ##########################################################\n"
+        );
+        let _ = err.flush();
+        KernelPaths::ScalarOnly
+    }
+
+    /// Geometries for the wave-2 dispatch gates: the four
+    /// [`LIMITED_GEOMETRIES`] (GQA groups 8 / 1 / 8 / 2, `head_dim` 128 / 16 /
+    /// 8 / 4), the real v0 pin at a length that exercises the position
+    /// blocking *and* its tail (67 = 16 blocks of 4, then 3), and two odd
+    /// `head_dim` geometries whose head slices cannot be better than 2-byte
+    /// aligned.
+    fn dispatch_geometries() -> Vec<(usize, usize, usize, usize, usize)> {
+        let mut g = LIMITED_GEOMETRIES.to_vec();
+        g.push((1, 4, 32, 128, 67));
+        g.push((1, 1, 8, 9, 11));
+        g.push((2, 3, 6, 9, 13));
+        g
+    }
+
+    /// The position counts to sweep for a geometry: 1, exact multiples of the
+    /// position block, one either side of them, primes, and the full length.
+    fn dispatch_lengths(n_pos: usize) -> Vec<usize> {
+        let mut lengths: Vec<usize> = [1usize, 2, 3, 4, 5, 7, 8, 9, 11, 12, 13, 16, 31, 61]
+            .into_iter()
+            .filter(|&p| p < n_pos)
+            .collect();
+        lengths.push(n_pos);
+        lengths
+    }
+
+    /// Gate 11 (phase 7 wave 2, the central claim of the vectorization): the
+    /// AVX2 + F16C path is **bit-identical** to the scalar reference, and both
+    /// are bit-identical to the pre-wave-1 head-major nest.
+    ///
+    /// Every f32 the kernel produces is pinned with `to_bits()` and zero
+    /// tolerance, through all four entry points, on all seven geometries, at
+    /// every position count in [`dispatch_lengths`], on every layer. That is
+    /// the whole argument for the vectorization: `vcvtph2ps` is an exact
+    /// widening, the QK dot's eight lanes ride the GQA group (whose
+    /// accumulators are already independent) so each lane still walks `i`
+    /// ascending in one f32 with a separate multiply and add, and the V
+    /// reduction's eight lanes ride `i` (elementwise) while `t` stays
+    /// sequential. An `_mm256_fmadd_ps` anywhere, eight lanes over `i` in the
+    /// dot, a horizontal tree, folding `scale` per element, or splitting the
+    /// `t` axis all break this test on the first geometry.
+    ///
+    /// The comparison is also asserted to be a real two-path comparison: on a
+    /// host with the instructions, every geometry here must be inside
+    /// [`avx2_f16c_path_covers`]'s envelope, or `force_scalar = false` would
+    /// silently run the scalar kernel a second time.
+    #[test]
+    fn simd_matches_scalar_bit_for_bit() {
+        let paths = kernel_paths("the AVX2+F16C attention path vs the scalar reference");
+        let mut rng = Rng::new(0x5119_D0A7);
+
+        for (n_layers, n_kv, n_q, head_dim, n_pos) in dispatch_geometries() {
+            if paths == KernelPaths::Both {
+                assert!(
+                    avx2_f16c_path_covers(head_dim),
+                    "geometry ({n_layers}, {n_kv}, {n_q}, {head_dim}) is outside the AVX2 \
+                     envelope, so sweeping `force_scalar` here would run the scalar kernel \
+                     twice and report it as a two-path proof"
+                );
+            }
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let (cache, _rows) = random_cache(&mut rng, n_layers, n_kv, head_dim, n_pos);
+            let q = rng.vec_in(n_q * head_dim, -1.0, 1.0);
+            let mut owned = AttentionScratch::new();
+
+            for layer in 0..n_layers {
+                for &positions in &dispatch_lengths(n_pos) {
+                    let mut want = vec![0.0f32; q.len()];
+                    head_major_reference(&q, &cache, layer, positions, scale, &mut want);
+
+                    let need = scratch_len(n_q, n_kv, head_dim, positions);
+                    // One entry per swept flag, in `flags()` order.
+                    let mut by_path: Vec<Vec<f32>> = Vec::new();
+
+                    for &force_scalar in paths.flags() {
+                        let mut got = vec![0.0f32; q.len()];
+                        attention_at_dispatch(
+                            &q,
+                            &cache,
+                            layer,
+                            positions,
+                            scale,
+                            &mut owned,
+                            &mut got,
+                            force_scalar,
+                        )
+                        .unwrap();
+
+                        let mut carve = vec![0.0f32; need];
+                        let mut got_in = vec![0.0f32; q.len()];
+                        attention_at_in_dispatch(
+                            &q,
+                            &cache,
+                            layer,
+                            positions,
+                            scale,
+                            &mut carve,
+                            &mut got_in,
+                            force_scalar,
+                        )
+                        .unwrap();
+
+                        let mut got_decode = got.clone();
+                        let mut got_decode_in = got.clone();
+                        if positions == n_pos {
+                            decode_attention_dispatch(
+                                &q,
+                                &cache,
+                                layer,
+                                scale,
+                                &mut owned,
+                                &mut got_decode,
+                                force_scalar,
+                            )
+                            .unwrap();
+                            decode_attention_in_dispatch(
+                                &q,
+                                &cache,
+                                layer,
+                                scale,
+                                &mut carve,
+                                &mut got_decode_in,
+                                force_scalar,
+                            )
+                            .unwrap();
+                        }
+
+                        for (i, &w) in want.iter().enumerate() {
+                            let label = format!(
+                                "geometry ({n_layers}, {n_kv}, {n_q}, {head_dim}) layer \
+                                 {layer} positions {positions} force_scalar {force_scalar} \
+                                 elem {i}"
+                            );
+                            assert_eq!(
+                                got[i].to_bits(),
+                                w.to_bits(),
+                                "{label}: attention_at_dispatch {:e} vs head-major \
+                                 reference {w:e}",
+                                got[i]
+                            );
+                            assert_eq!(got_in[i].to_bits(), w.to_bits(), "{label}: at_in");
+                            assert_eq!(got_decode[i].to_bits(), w.to_bits(), "{label}: decode");
+                            assert_eq!(
+                                got_decode_in[i].to_bits(),
+                                w.to_bits(),
+                                "{label}: decode_in"
+                            );
+                        }
+                        by_path.push(got);
+                    }
+
+                    // The pairwise statement, so a failure names the two
+                    // paths rather than only the reference. `flags()` yields
+                    // `[false, true]` here, so entry 0 is the AVX2 run and
+                    // entry 1 the scalar one.
+                    if paths == KernelPaths::Both {
+                        let (simd, scalar) = (&by_path[0], &by_path[1]);
+                        for (i, (&s, &r)) in simd.iter().zip(scalar).enumerate() {
+                            assert_eq!(
+                                s.to_bits(),
+                                r.to_bits(),
+                                "geometry ({n_layers}, {n_kv}, {n_q}, {head_dim}) layer \
+                                 {layer} positions {positions} elem {i}: AVX2 {s:e} vs \
+                                 scalar {r:e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The alignment claim, end to end: an odd `head_dim` puts a head's K/V
+    /// slice on a 2-byte boundary (the row stride `n_kv_heads * head_dim` is
+    /// odd, and the column offset `kv_head * head_dim` is odd for odd
+    /// `kv_head`) and the matching `out` and score sub-slices on 4-byte ones.
+    /// Every wide load and store in the AVX2 path is an unaligned form, so
+    /// the result must still be the scalar reference's bits exactly.
+    ///
+    /// `head_dim` 9 and 17 both leave a scalar tail after the wide loads, so
+    /// the remainder path is covered at those offsets too.
+    #[test]
+    fn misaligned_head_slices_match_the_scalar_reference() {
+        let paths = kernel_paths("the AVX2+F16C path on 2-byte-aligned head slices");
+        let mut rng = Rng::new(0x0A11_6EDD);
+        for &(n_kv, n_q, head_dim, n_pos) in &[
+            (1usize, 8usize, 9usize, 14usize),
+            (3, 6, 9, 11),
+            (3, 3, 17, 9),
+            (5, 5, 17, 13),
+        ] {
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let (cache, _rows) = random_cache(&mut rng, 2, n_kv, head_dim, n_pos);
+            let q = rng.vec_in(n_q * head_dim, -1.0, 1.0);
+            let mut owned = AttentionScratch::new();
+
+            for layer in 0..2 {
+                for positions in 1..=n_pos {
+                    let mut want = vec![0.0f32; q.len()];
+                    attention_at_dispatch(
+                        &q, &cache, layer, positions, scale, &mut owned, &mut want, true,
+                    )
+                    .unwrap();
+                    let mut got = vec![0.0f32; q.len()];
+                    attention_at_dispatch(
+                        &q, &cache, layer, positions, scale, &mut owned, &mut got, false,
+                    )
+                    .unwrap();
+                    for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            w.to_bits(),
+                            "({n_kv}, {n_q}, {head_dim}) layer {layer} positions \
+                             {positions} elem {i}: AVX2 {g:e} vs scalar {w:e}"
+                        );
+                    }
+                }
+            }
+        }
+        // Announced, not asserted: on a host without the instructions the
+        // loop above compared the scalar kernel with itself.
+        let _ = paths;
     }
 }
