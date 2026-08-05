@@ -435,24 +435,43 @@ pub struct ForwardState {
     /// the model [`forward_token`] is handed, once per token.
     arch: ArchFingerprint,
     kv: KvCache,
-    /// Per-shard attention scratch, `[shards][attention_scratch_len]`.
+    /// Per-shard attention scratch,
+    /// `[min(n_kv_heads, shards)][attention_scratch_len]`.
     ///
-    /// One whole carve per compute shard rather than one shared buffer,
-    /// because [`pool_decode_attention`] runs a kv-head range on every shard at
-    /// once and the scores are the only state a call keeps. Sized from the
-    /// context cap up front, so nothing on the decode path ever reallocates.
+    /// One whole carve per compute shard that can reach it, rather than one
+    /// shared buffer, because [`pool_decode_attention`] runs a kv-head range on
+    /// every shard at once and the scores are the only state a call keeps.
+    /// Sized from the context cap up front, so nothing on the decode path ever
+    /// reallocates.
+    ///
+    /// **`min(n_kv_heads, shards)`, not `shards`.** The fan-out's unit count is
+    /// `shards`, but its work axis is the kv head: [`kv_head_range`] hands the
+    /// slots past `n_kv_heads` an empty range, and [`pool_decode_attention`]'s
+    /// closure returns on an empty range *before* it touches scratch. A carve
+    /// for a surplus slot could therefore never be read or written — at the v0
+    /// pin that was 2 of 6 carves, 264,192 B zero-filled at construction and
+    /// dead for the process's life. The reachable count is the bound the
+    /// closure's own indexing argument establishes (see there), so this is the
+    /// size that argument actually supports.
     ///
     /// **Bytes.** One carve is `scratch_len(32, 4, 128, 4096) = 33_024` f32 =
-    /// 132,096 B at the v0 pin, so this field is `shards * 132_096` B: 792,576
-    /// B (774 KiB) on the six-shard reference machine, and proportionally more
-    /// on a wider pool. Decode attention held exactly one such carve before the
-    /// fan-out, so the fan-out's *new* anonymous memory is
-    /// `(shards - 1) * 132_096` B = **660,480 B (645 KiB)** at six shards, and
-    /// this field is now the whole of it. The query-head slab also carried two
-    /// `[n_heads * head_dim]` permutation buffers, `2 * 4096 * 4 = 32,768 B`,
-    /// which the kv-head split does not need — a kv head's query heads are
-    /// already contiguous — so they are gone, and the figure c78981e recorded
-    /// (693,248 B, "+677 KiB net") comes down by exactly that.
+    /// 132,096 B at the v0 pin, so this field is `min(n_kv_heads, shards) *
+    /// 132_096` B: **528,384 B (516 KiB)** on the six-shard reference machine,
+    /// where `n_kv_heads = 4` is the binding term — and it stays 528,384 B on
+    /// any wider pool, because the cap is the cache's kv head count. Decode
+    /// attention held exactly one such carve before the fan-out, so the
+    /// fan-out's *new* anonymous memory is `(min(n_kv_heads, shards) - 1) *
+    /// 132_096` B = **396,288 B (387 KiB)** at four reachable shards. The
+    /// query-head slab also carried two `[n_heads * head_dim]` permutation
+    /// buffers, `2 * 4096 * 4 = 32,768 B`, which the kv-head split does not
+    /// need — a kv head's query heads are already contiguous — so they are
+    /// gone, and the figure c78981e recorded (693,248 B, "+677 KiB net") comes
+    /// down by that and by the 264,192 B of unreachable carves above.
+    ///
+    /// This is **not** the prefill arena's `attn_shards` carve, which is
+    /// `shards * attention_scratch_len` and stays that way: prefill fans out
+    /// over *rows*, so every shard there is reachable and the 792,576 B
+    /// `prefill::tests` pins is a different buffer with a different bound.
     ///
     /// This is heap, not arena: there is no [`crate::io::PrefillSession`]
     /// outside a prefill, which is why prefill's equivalent comes out of the
@@ -460,7 +479,7 @@ pub struct ForwardState {
     /// not. It is charged against a **provisional** ~111 MiB of headroom
     /// (EXP-014, provisional under that entry's own provenance correction),
     /// which already carries an unexplained 99-105 MiB residual between
-    /// EXP-014 and EXP-018. 645 KiB is small against both, but it is not free
+    /// EXP-014 and EXP-018. 387 KiB is small against both, but it is not free
     /// and the headroom it is charged against is not measured.
     attn_scratch: Vec<f32>,
     /// Residual stream (`[hidden]`).
@@ -649,21 +668,30 @@ impl ForwardState {
             "decode runtime ready"
         );
 
-        // One whole attention carve per shard, sized from the context cap and
-        // never grown: `scratch_len` is the *whole* buffer the kernel needs
-        // (a group-major score block plus two conversion rows), not just the
-        // score count, so passing the cap alone would under-reserve by the
-        // GQA group factor and cost a reallocation on the first token.
+        // One whole attention carve per *reachable* shard, sized from the
+        // context cap and never grown: `scratch_len` is the *whole* buffer the
+        // kernel needs (a group-major score block plus two conversion rows),
+        // not just the score count, so passing the cap alone would
+        // under-reserve by the GQA group factor and cost a reallocation on the
+        // first token. `min(n_kv_heads, shards)` because `pool_decode_attention`
+        // fans out over kv heads: a slot past `n_kv_heads` takes an empty range
+        // and returns before touching scratch, so a carve for it is allocated,
+        // zero-filled and never read. See the field's docs for the bytes. The
+        // `.max(1)` is belt and braces — `KvCache::new` above already rejected a
+        // zero `n_kv_heads` and a pool always has at least one shard — but the
+        // serial fall-through hands the *whole* buffer to one call, so a
+        // zero-carve buffer would fail every decode with `ScratchTooShort`.
         let attn_shard = attention_scratch_len(
             arch.n_heads as usize,
             arch.n_kv_heads as usize,
             arch.head_dim as usize,
             context_cap,
         );
+        let attn_carves = (arch.n_kv_heads as usize).min(pool.shards()).max(1);
         Ok(Self {
             arch: ArchFingerprint::of(arch),
             kv,
-            attn_scratch: vec![0.0; attn_shard.saturating_mul(pool.shards())],
+            attn_scratch: vec![0.0; attn_shard.saturating_mul(attn_carves)],
             hidden: vec![0.0; hidden],
             normed: vec![0.0; hidden],
             acts_q8k_hidden: vec![BlockQ8K::default(); hidden / QK_K],
@@ -1100,12 +1128,20 @@ const ATTENTION_FANOUT_MIN_POSITIONS: usize = 8;
 /// # Why the kv head is the axis
 ///
 /// [`decode_attention_kv_range_in`] is kv-head-outer: it widens each K and V
-/// element from f16 exactly once per kv head and then reuses it across that
-/// head's whole GQA group, and its AVX2 QK dot rides its eight lanes on that
-/// group. Cutting the kv-head axis duplicates no conversion and narrows no
-/// vector — every shard runs a full `group = 8` call over its own kv heads —
-/// and a kv head's `group` query heads are contiguous in both `q` and `out`, so
-/// a shard needs no gather, no scatter and no permutation buffer.
+/// element from f16 once per kv head and then reuses it across that head's
+/// whole GQA group, and its AVX2 QK dot rides its eight lanes on that group.
+/// Cutting the kv-head axis duplicates no conversion and narrows no vector —
+/// every shard runs a full `group = 8` call over its own kv heads — and a kv
+/// head's `group` query heads are contiguous in both `q` and `out`, so a shard
+/// needs no gather, no scatter and no permutation buffer.
+///
+/// "Once per kv head" is exact on the scalar path and for V on both paths; on
+/// the AVX2 path K is widened `ceil(group / 8)` times per kv head, because the
+/// position sweep sits inside the kernel's eight-query-head chunk loop. At the
+/// v0 pin's `group = 8` that factor is 1, and it is a property of the *kernel*,
+/// identical in the serial call and in every shard — the split neither creates
+/// it nor changes it. See `kernels::attention`'s module docs for the measured
+/// ratios.
 ///
 /// Cutting the **query-head** axis instead, which is what this function did
 /// before, narrows the group that those eight lanes ride. A `k = 1` strided
@@ -1194,11 +1230,15 @@ const ATTENTION_FANOUT_MIN_POSITIONS: usize = 8;
 /// contention the fan-out arm pays for and the serial arm does not, so treat
 /// these as lower bounds.
 ///
-/// The arithmetic itself is not duplicated — each K and V element is still
-/// widened exactly once across the whole fan-out, which is a structural
-/// property of cutting the kv-head axis, not a measurement — where the slab
-/// measured a 3.1x increase in total CPU work taken from the same cores the
-/// streamed-expert GEMVs need. These are **decode-attention** figures, not
+/// The arithmetic itself is not duplicated — the fan-out widens each K and V
+/// element exactly as many times as the serial call does, which is a structural
+/// property of cutting the kv-head axis, not a measurement: the partition gives
+/// each kv head to exactly one shard, so no shard repeats another's work. (That
+/// count is once per element at the v0 pin; the kernel's own AVX2 K-widening
+/// factor of `ceil(group / 8)` is 1 at `group = 8` and is the same on both
+/// sides of the comparison either way.) Against that, the slab measured a 3.1x
+/// increase in total CPU work taken from the same cores the streamed-expert
+/// GEMVs need. These are **decode-attention** figures, not
 /// end-to-end token throughput: attention's share of a decode token is the
 /// question `decode_timing` exists to answer and is not settled here.
 ///
@@ -1245,17 +1285,39 @@ fn pool_decode_attention(
         return Ok(());
     }
 
-    // One equal carve per unit slot. `shard.index < shard.count <= units` for
-    // every shard the pool hands out, so `(index + 1) * shard_scratch <=
-    // units * shard_scratch <= scratch.len()` follows from integer division
-    // alone: the bound the raw split needs is established by construction, and
-    // that is why there is no length check here. (There used to be one, against
+    // One equal carve per *reachable* unit slot, which is `min(n_kv_heads,
+    // units)` and not `units`: slots past that take an empty kv range and
+    // return below without touching `scratch`, so carving for them would divide
+    // the buffer into slices that can never be read. `ForwardState` sizes its
+    // buffer to exactly this many carves for the same reason.
+    //
+    // In bounds without a length check, by the same integer-division argument
+    // as before, over the tighter bound:
+    //
+    // - A shard reaches the two lines below only if its kv range is nonempty.
+    //   `kv_head_range`'s `first(u)` is constant for `u >= reachable` — it is
+    //   `n_kv_heads` there — so a nonempty range forces
+    //   `shard.rows.start < reachable`.
+    // - `shard.rows` is `shard_range(units, count, index)`, whose start is
+    //   `index * (units / count) + min(index, units % count)`. That is `>=
+    //   index` when `units / count >= 1`, and exactly `index` in the only other
+    //   case that yields a nonempty range (`units / count == 0` and `index <
+    //   units % count`). `ComputePool::run`'s single-shard fallback hands out
+    //   `index = 0`, which satisfies it trivially.
+    //
+    // So `index <= shard.rows.start < reachable`, hence `(index + 1) *
+    // shard_scratch <= reachable * shard_scratch <= scratch.len()` by integer
+    // division alone. (There used to be a length check here, against
     // `units * (scratch.len() / units)`, which is unsatisfiable — so the
     // `PrefillScratch` its doc promised could never be returned.) A carve too
     // short for the geometry is not silently absorbed either: the kernel
     // reports `ScratchTooShort` per shard, and `record` keeps the lowest
     // shard's.
-    let shard_scratch = scratch.len() / units;
+    //
+    // `reachable >= 2`: the fall-through above already returned unless both
+    // `units >= 2` and `n_kv_heads >= 2`, so the division is safe.
+    let reachable = n_kv_heads.min(units);
+    let shard_scratch = scratch.len() / reachable;
     let failure: Mutex<Option<(usize, AttentionError)>> = Mutex::new(None);
     let out_base = SendPtr(out.as_mut_ptr());
     let scratch_base = SendPtr(scratch.as_mut_ptr());
@@ -1285,7 +1347,8 @@ fn pool_decode_attention(
         // SAFETY (`scratch`): the same invariant. Shard indices are distinct
         // across the job and each is visited by exactly one thread, so
         // `index * shard_scratch` names a disjoint `shard_scratch`-long run, in
-        // bounds by the integer-division argument above.
+        // bounds by the `index < reachable` argument above — which applies
+        // because the empty-range return sits ahead of this point.
         //
         // Both buffers are mutably borrowed by this frame for the whole call
         // and `run` joins before returning, so no view outlives the borrow.
@@ -2152,7 +2215,13 @@ mod tests {
                 inline_caller: true,
             });
             for case in &cases {
-                let mut scratch = vec![0.0f32; case.carve * pool.shards()];
+                // Exactly what `ForwardState` allocates: one carve per
+                // *reachable* shard. Sizing this to `pool.shards()` instead
+                // would leave slack past the last carve and hide an off-by-one
+                // in the closure's `index * shard_scratch` window, which is the
+                // half of this test that is not about bits.
+                let reachable = case.kv.n_kv_heads().min(pool.shards()).max(1);
+                let mut scratch = vec![0.0f32; case.carve * reachable];
                 for layer in 0..LENS.len() {
                     // Poisoned, not zeroed: a kv head no shard claimed would
                     // otherwise read as a plausible zero rather than a failure.
@@ -2177,6 +2246,47 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// [`ForwardState::attn_scratch`] holds one carve per **reachable** shard,
+    /// `min(n_kv_heads, shards)`, not one per pool shard.
+    ///
+    /// [`pool_decode_attention`] fans out over kv heads, so a unit slot past
+    /// `n_kv_heads` takes an empty range from [`kv_head_range`] and returns
+    /// before it touches scratch. A carve for such a slot is allocated,
+    /// zero-filled at construction and then unreachable for the life of the
+    /// process — 2 of 6 at the v0 pin, 264,192 B of the 660,480 B the field's
+    /// doc used to charge the fan-out with.
+    ///
+    /// The floor of one carve is pinned too: the serial fall-through hands the
+    /// **whole** buffer to a single [`decode_attention_in`], so a zero-carve
+    /// buffer would fail every decode with `ScratchTooShort`.
+    #[test]
+    fn attn_scratch_holds_one_carve_per_reachable_shard() {
+        let (_fx, model) = load_fixture("fwd-attn-carves");
+        let arch = model.arch();
+        let n_kv = arch.n_kv_heads as usize;
+        assert!(n_kv >= 2, "the fixture must have a kv head axis to split");
+        let cap = 16usize;
+        let carve = attention_scratch_len(arch.n_heads as usize, n_kv, arch.head_dim as usize, cap);
+        for threads in [1usize, 2, n_kv, n_kv + 3, n_kv * 4] {
+            let config = RuntimeConfig {
+                cache_bytes: 4 * 1024 * 1024,
+                threads: Some(threads),
+                pin: false,
+            };
+            let st = ForwardState::with_config(&model, cap, config).unwrap();
+            let shards = st.pool.shards();
+            assert_eq!(
+                st.attn_scratch.len(),
+                carve * n_kv.min(shards),
+                "threads {threads} (pool gave {shards} shards)"
+            );
+            assert!(
+                st.attn_scratch.len() >= carve,
+                "threads {threads}: the serial fall-through needs a whole carve"
+            );
         }
     }
 

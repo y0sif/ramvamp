@@ -44,13 +44,39 @@
 //! deliberately shifted views inside [`x86`].
 //!
 //! Loop order: **kv-head outer, query head inner**. Each K and each V
-//! element is converted from f16 exactly once and then reused by every query
-//! head in its GQA group (8 of them at the v0 pin) out of a `head_dim`-long
-//! f32 buffer. The head-major order this replaced re-converted every element
-//! once per query head in the group, and phase 7's wave-0 bench measured
-//! that conversion plus the serial f32 accumulate as the whole cost of the
-//! kernel — 1.54 ns per element against only 0.17 GB/s of unique K+V bytes,
-//! i.e. compute-bound, not memory-bound.
+//! element is converted from f16 once per kv head and then reused by every
+//! query head in its GQA group (8 of them at the v0 pin) out of a
+//! `head_dim`-long f32 buffer, instead of being re-converted per query head.
+//! The head-major order this replaced re-converted every element once per
+//! query head in the group, and phase 7's wave-0 bench measured that
+//! conversion plus the serial f32 accumulate as the whole cost of the kernel
+//! — 1.54 ns per element against only 0.17 GB/s of unique K+V bytes, i.e.
+//! compute-bound, not memory-bound.
+//!
+//! **How often "once per kv head" really is.** On the scalar reference it is
+//! literally once, for K and V, at every `group`. On the AVX2 path it is
+//! literally once for V, and for K it holds only while `group <= 8`.
+//! `x86::qk_scores` walks the group in chunks of `x86::LANES` (8) and the
+//! whole position sweep — the K widening included — sits *inside* that chunk
+//! loop, so K is widened `ceil(group / 8)` times per kv head. Counted in
+//! `x86::widen_rows` at `n_kv = 1`, `head_dim = 128`, 16 positions, against
+//! the unique element count: K is 1.00x for `group` 1-8, 2.00x for 9-16,
+//! 3.00x for 17-24 and 4.00x for 25-32, while V is 1.00x throughout and the
+//! scalar path is 1.00x throughout. **The v0 pin is `group = 8`, where the
+//! ratio is exactly 1.00**, and so is the attention bench's geometry — so the
+//! bench's "unique bytes == touched bytes" model and the 0.17 GB/s
+//! compute-bound reading above are unaffected. Groups past 8 are covered by
+//! the correctness sweep (`dispatch_geometries` carries 9, 12, 17 and 32) but
+//! are not a v0 shape.
+//!
+//! The redundancy is deliberately **not** hoisted out of the chunk loop. Doing
+//! so needs the position axis outer and the group axis inner, and then the
+//! transposed query block — currently one chunk's worth, `LANES *
+//! MAX_SIMD_HEAD_DIM` f32 of fixed stack — has to hold the *whole* group, a
+//! size bounded by nothing in the geometry, or be re-transposed once per
+//! position block. Both trade a bounded stack carve for an unbounded one or a
+//! new per-position cost, to remove a factor that is 1 at every geometry v0
+//! runs. The honest bound is worth more than the micro-optimization.
 //!
 //! The restructure is bit-neutral by construction, which is the only reason
 //! it is allowed here. `h = kv_head * group + g` with `kv_head` outer and
@@ -76,9 +102,13 @@
 //!
 //! Sharding: the axis a compute pool fans this kernel across is the **kv
 //! head** ([`decode_attention_kv_range_in`], [`attention_at_kv_range_in`]),
-//! and it is the only axis that costs nothing. The kv-head-outer loop already
-//! widens each K and V element exactly once per kv head, so cutting there
-//! duplicates no conversion; the `group` query heads of one kv head are
+//! and it is the only axis that costs nothing. A partition of the kv heads
+//! gives each kv head to exactly one shard, and a kv head's widening cost is
+//! whatever the whole call already paid for it — once per element on the
+//! scalar path and for V, `ceil(group / 8)` times for K on the AVX2 path,
+//! 1.00x either way at the v0 pin (see the once-per-kv-head note above) — so
+//! cutting there duplicates no conversion **relative to the whole call**,
+//! whatever `group` is; the `group` query heads of one kv head are
 //! contiguous and disjoint in both `q` and `out`, so a shard needs no gather,
 //! no scatter and no permutation; and the AVX2 QK dot keeps all eight of its
 //! lanes on the GQA group, which stays whole. Cutting the **query head** axis
@@ -385,6 +415,14 @@ impl AttentionScratch {
 /// [`AttentionError::Kv`] for a bad layer index; [`AttentionError`]'s shape
 /// variants for `q`/`out`/GQA mismatches; [`AttentionError::EmptyLayer`]
 /// when the layer holds no positions. `out` is untouched on error.
+///
+/// **Precedence.** Checks run in a fixed order and the *first* failure is the
+/// one reported: `q`'s length, then the GQA grouping, then `layer`, then the
+/// position count, then the kv-head range (which this entry point always
+/// passes), then `out`'s length. `out` is validated **last** — see the note on
+/// the private `plan` — so a call that gets both `layer` and `out` wrong is
+/// told about `layer`, not about `out`. Pinned by
+/// `error_precedence_is_pinned_from_q_to_out`.
 pub fn decode_attention(
     q: &[f32],
     cache: &KvCache,
@@ -436,6 +474,13 @@ pub fn decode_attention_dispatch(
 /// Everything [`decode_attention`] returns, plus
 /// [`AttentionError::ScratchTooShort`] when `scratch` is smaller than
 /// [`scratch_len`] requires. `out` is untouched on error.
+///
+/// **Precedence.** [`decode_attention`]'s order — `q`, GQA, `layer`,
+/// positions, kv range, `out` — with the scratch length checked **after** all
+/// of it, because the length it is checked against is this call's whole
+/// validated geometry. A call that is short on scratch *and* wrong on `out` is
+/// therefore told about `out`. Pinned by
+/// `error_precedence_is_pinned_from_q_to_out`.
 pub fn decode_attention_in(
     q: &[f32],
     cache: &KvCache,
@@ -610,6 +655,14 @@ pub fn decode_attention_kv_range_in_dispatch(
 /// wrapping [`KvError::PositionOutOfRange`] when `positions` exceeds the
 /// positions the layer actually holds — never a silent truncation, never a
 /// panic. `out` is untouched on error.
+///
+/// **Precedence.** [`decode_attention`]'s order — `q`, GQA, `layer`,
+/// `positions`, kv range (always passed here), `out` — with the caller's
+/// explicit `positions` taking the slot the layer's own length takes there. So
+/// `positions = 0` against a mis-sized `out` reports
+/// [`AttentionError::EmptyLayer`], and `positions` past the end reports
+/// [`KvError::PositionOutOfRange`]; neither reports `out`. Pinned by
+/// `error_precedence_is_pinned_from_q_to_out`.
 pub fn attention_at(
     q: &[f32],
     cache: &KvCache,
@@ -671,6 +724,11 @@ pub fn attention_at_dispatch(
 /// Everything [`attention_at`] returns, plus
 /// [`AttentionError::ScratchTooShort`] when `scratch` is smaller than
 /// [`scratch_len`] requires. `out` is untouched on error.
+///
+/// **Precedence.** [`attention_at`]'s order — `q`, GQA, `layer`, `positions`,
+/// kv range, `out` — with the scratch length checked **after** all of it, as in
+/// [`decode_attention_in`]. Pinned by
+/// `error_precedence_is_pinned_from_q_to_out`.
 pub fn attention_at_in(
     q: &[f32],
     cache: &KvCache,
@@ -847,6 +905,24 @@ impl Plan {
 /// whole-vector entry points that expected length is exactly `q.len()`, so
 /// they see the same [`AttentionError::OutLenMismatch`] payload they always
 /// did.
+///
+/// The *payload* is unchanged; the **precedence is not**, and that is
+/// semver-visible on the four whole-vector `pub fn`s. `out` used to be
+/// validated before the layer and before `positions`, when its expected length
+/// was just `q.len()` and nothing had to be known first. So for the same bad
+/// input the reported variant moved:
+///
+/// | call | before | now |
+/// |---|---|---|
+/// | `decode_attention` with a bad layer and a short `out` | `OutLenMismatch` | `Kv(LayerOutOfRange)` |
+/// | `attention_at` with `positions == 0` and a short `out` | `OutLenMismatch` | `EmptyLayer` |
+/// | `attention_at` with `positions > len` and a short `out` | `OutLenMismatch` | `Kv(PositionOutOfRange)` |
+///
+/// Every ordering this function establishes — `q`, GQA, layer, positions, kv
+/// range, `out` — is pinned end to end by
+/// `error_precedence_is_pinned_from_q_to_out`, so a future reorder is a test
+/// failure rather than a silent behaviour change for a downstream caller
+/// matching on the variant.
 fn plan(
     q: &[f32],
     cache: &KvCache,
@@ -1539,6 +1615,276 @@ mod tests {
 
         // No error path wrote anything.
         assert!(out.iter().all(|&x| x == 7.0));
+    }
+
+    /// The **order** the checks run in, pinned end to end through every entry
+    /// point that validates an `out`: `q`, then the GQA grouping, then `layer`,
+    /// then `positions`, then the kv-head range, then `out`, then the scratch
+    /// carve.
+    ///
+    /// `typed_errors_on_bad_shapes` and `attention_at_typed_errors_on_positions`
+    /// pin the *variants*: each of their cases breaks one thing and passes a
+    /// correctly-sized `out`, so none of them can tell which check ran first.
+    /// This test breaks several at once and asserts the earliest one wins.
+    ///
+    /// It exists because the order is semver-visible and it **changed**. `out`
+    /// used to be validated before the layer and before `positions`, when its
+    /// expected length was just `q.len()`; it is now
+    /// `kv_heads.len() * group * head_dim`, a function of the validated range,
+    /// so it moved to the end (see `plan`'s docs). The three calls that moved —
+    /// `decode_attention` with a bad layer, `attention_at` with `positions == 0`
+    /// and with `positions > len`, each against a mis-sized `out` — are all
+    /// below, and a future reorder fails here instead of silently changing the
+    /// variant a downstream caller matches on.
+    #[test]
+    fn error_precedence_is_pinned_from_q_to_out() {
+        let (n_layers, n_kv, n_q, head_dim, n_pos) = (2usize, 4usize, 8usize, 8usize, 3usize);
+        let cap = 4usize;
+        let mut cache = KvCache::new(n_layers, n_kv, head_dim, cap).unwrap();
+        let row = vec![0.5f32; n_kv * head_dim];
+        for _ in 0..n_pos {
+            cache.append(0, &row, &row).unwrap();
+        }
+        // Layer 1 stays empty on purpose: it is how the unlimited (decode)
+        // forms reach the position check, which they cannot be handed directly.
+        let q = vec![0.25f32; n_q * head_dim];
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let group_dim = (n_q / n_kv) * head_dim;
+        // Long enough for every call below whose plan succeeds, so the scratch
+        // check never fires ahead of the one under test. The scratch level gets
+        // its own block at the end.
+        let need = scratch_len(n_q, n_kv, head_dim, cap);
+
+        // A length no call here ever wants: not `q.len()`, and not
+        // `k * group_dim` for any `k`.
+        const WRONG_OUT: usize = 7;
+        // Past the cache's kv heads, so the range forms trip level 5 unless
+        // something earlier fires first.
+        let bad_range = n_kv + 1..n_kv + 1;
+        let range_forms = ["decode_attention_kv_range_in", "attention_at_kv_range_in"];
+
+        // One broken call through all six entry points. `positions` is used by
+        // the limited forms only and `kv_heads` by the range forms only, so a
+        // probe can carry a fault at every level at once and each entry point
+        // reports the first level it can actually see. `out` is NaN-poisoned:
+        // a rejected call that wrote anything is caught right here.
+        let probe = |q_arg: &[f32],
+                     layer: usize,
+                     positions: usize,
+                     out_len: usize,
+                     kv_heads: Range<usize>|
+         -> Vec<(&'static str, AttentionError)> {
+            let mut owned = AttentionScratch::new();
+            let mut carve = vec![0.0f32; need];
+            let mut out = vec![f32::NAN; out_len];
+            let got: Vec<(&'static str, AttentionError)> = vec![
+                (
+                    "decode_attention",
+                    decode_attention(q_arg, &cache, layer, scale, &mut owned, &mut out)
+                        .unwrap_err(),
+                ),
+                (
+                    "decode_attention_in",
+                    decode_attention_in(q_arg, &cache, layer, scale, &mut carve, &mut out)
+                        .unwrap_err(),
+                ),
+                (
+                    "attention_at",
+                    attention_at(q_arg, &cache, layer, positions, scale, &mut owned, &mut out)
+                        .unwrap_err(),
+                ),
+                (
+                    "attention_at_in",
+                    attention_at_in(q_arg, &cache, layer, positions, scale, &mut carve, &mut out)
+                        .unwrap_err(),
+                ),
+                (
+                    "decode_attention_kv_range_in",
+                    decode_attention_kv_range_in(
+                        q_arg,
+                        &cache,
+                        layer,
+                        scale,
+                        kv_heads.clone(),
+                        &mut carve,
+                        &mut out,
+                    )
+                    .unwrap_err(),
+                ),
+                (
+                    "attention_at_kv_range_in",
+                    attention_at_kv_range_in(
+                        q_arg, &cache, layer, positions, scale, kv_heads, &mut carve, &mut out,
+                    )
+                    .unwrap_err(),
+                ),
+            ];
+            assert!(
+                out.iter().all(|x| x.is_nan()),
+                "a rejected call wrote to `out`"
+            );
+            got
+        };
+
+        // Levels 1-3 — `q`, the GQA grouping, `layer`. Every entry point checks
+        // these identically, so one expectation covers all six. Each probe also
+        // carries a wrong `out`, a `positions` past the end and a broken range,
+        // and none of those is what comes back.
+        let bad_layer = n_layers + 3;
+        for (label, q_arg, want) in [
+            (
+                "q length",
+                &q[..13],
+                AttentionError::QLenIndivisible {
+                    q_len: 13,
+                    head_dim,
+                },
+            ),
+            (
+                "GQA grouping",
+                &q[..5 * head_dim],
+                AttentionError::GqaGroupMismatch {
+                    n_q_heads: 5,
+                    n_kv_heads: n_kv,
+                },
+            ),
+            (
+                "layer",
+                &q[..],
+                AttentionError::Kv(KvError::LayerOutOfRange {
+                    layer: bad_layer,
+                    n_layers,
+                }),
+            ),
+        ] {
+            for (name, err) in probe(q_arg, bad_layer, n_pos + 9, WRONG_OUT, bad_range.clone()) {
+                assert_eq!(err, want, "{label} beats everything after it: {name}");
+            }
+        }
+
+        // Level 4, the empty-history shape. All six agree: the unlimited forms
+        // take layer 1's own length (0) and the limited ones are handed 0.
+        for (name, err) in probe(&q, 1, 0, WRONG_OUT, bad_range.clone()) {
+            assert_eq!(
+                err,
+                AttentionError::EmptyLayer { layer: 1 },
+                "an empty layer beats the range and `out`: {name}"
+            );
+        }
+
+        // Level 4 again, `positions` past the end — which only the limited
+        // forms can be handed. The unlimited forms take layer 0's own length,
+        // which is valid, so they fall through to the *next* level they can
+        // see: the range for the range form, `out` for the whole-vector ones.
+        // That split is the precedence claim, not an accident of this input.
+        for (name, err) in probe(&q, 0, n_pos + 9, WRONG_OUT, bad_range.clone()) {
+            let want = match name {
+                "attention_at" | "attention_at_in" | "attention_at_kv_range_in" => {
+                    AttentionError::Kv(KvError::PositionOutOfRange {
+                        layer: 0,
+                        pos: n_pos + 8,
+                        len: n_pos,
+                    })
+                }
+                "decode_attention_kv_range_in" => AttentionError::KvHeadRangeOutOfRange {
+                    start: bad_range.start,
+                    end: bad_range.end,
+                    n_kv_heads: n_kv,
+                },
+                _ => AttentionError::OutLenMismatch {
+                    out_len: WRONG_OUT,
+                    expected: q.len(),
+                },
+            };
+            assert_eq!(err, want, "`positions` past the end: {name}");
+        }
+
+        // Level 5 — the kv range, with everything before it valid. The
+        // whole-vector entry points pass `0..n_kv_heads` and therefore cannot
+        // reach this error at all; they report `out` instead.
+        for (name, err) in probe(&q, 0, n_pos, WRONG_OUT, bad_range.clone()) {
+            let want = if range_forms.contains(&name) {
+                AttentionError::KvHeadRangeOutOfRange {
+                    start: bad_range.start,
+                    end: bad_range.end,
+                    n_kv_heads: n_kv,
+                }
+            } else {
+                AttentionError::OutLenMismatch {
+                    out_len: WRONG_OUT,
+                    expected: q.len(),
+                }
+            };
+            assert_eq!(err, want, "the range beats `out`: {name}");
+        }
+
+        // Level 6 — `out` alone, against a whole range and against a partial
+        // one, so the expected length really is the *range's* and not `q`'s.
+        for (kv_heads, heads) in [(0..n_kv, n_kv), (1..3, 2)] {
+            for (name, err) in probe(&q, 0, n_pos, WRONG_OUT, kv_heads) {
+                let expected = if range_forms.contains(&name) {
+                    heads * group_dim
+                } else {
+                    q.len()
+                };
+                assert_eq!(
+                    err,
+                    AttentionError::OutLenMismatch {
+                        out_len: WRONG_OUT,
+                        expected,
+                    },
+                    "`out` is last, over {heads} kv heads: {name}"
+                );
+            }
+        }
+
+        // Level 7 — the scratch carve, checked after the whole plan. Sized from
+        // this call's own `positions` (3), not from the cache's capacity, so
+        // one f32 short really is short.
+        let need_at = scratch_len(n_q, n_kv, head_dim, n_pos);
+        let mut short = vec![0.0f32; need_at - 1];
+        let mut wrong = vec![f32::NAN; WRONG_OUT];
+        for (name, err) in [
+            (
+                "decode_attention_in",
+                decode_attention_in(&q, &cache, 0, scale, &mut short, &mut wrong).unwrap_err(),
+            ),
+            (
+                "attention_at_in",
+                attention_at_in(&q, &cache, 0, n_pos, scale, &mut short, &mut wrong).unwrap_err(),
+            ),
+        ] {
+            assert_eq!(
+                err,
+                AttentionError::OutLenMismatch {
+                    out_len: WRONG_OUT,
+                    expected: q.len(),
+                },
+                "`out` beats the scratch carve: {name}"
+            );
+        }
+        assert!(wrong.iter().all(|x| x.is_nan()));
+        let mut right = vec![f32::NAN; q.len()];
+        for (name, err) in [
+            (
+                "decode_attention_in",
+                decode_attention_in(&q, &cache, 0, scale, &mut short, &mut right).unwrap_err(),
+            ),
+            (
+                "attention_at_in",
+                attention_at_in(&q, &cache, 0, n_pos, scale, &mut short, &mut right).unwrap_err(),
+            ),
+        ] {
+            assert_eq!(
+                err,
+                AttentionError::ScratchTooShort {
+                    len: need_at - 1,
+                    need: need_at,
+                },
+                "with `out` right, the scratch is what is reported: {name}"
+            );
+        }
+        assert!(right.iter().all(|x| x.is_nan()));
     }
 
     /// Gate 6: scale sensitivity. Two positions with QK dots 0 and 1, V

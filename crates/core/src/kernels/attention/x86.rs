@@ -228,6 +228,15 @@ fn store_block<const N: usize>(
 /// results, which is what makes `group = 1` (plain MHA) correct rather than
 /// special.
 ///
+/// **The position sweep is inside the chunk loop**, so K is widened
+/// `ceil(group / LANES)` times per kv head, not once — the one place the
+/// kernel's "each element widened once per kv head" property is conditional.
+/// It holds exactly while `group <= LANES`, which covers the v0 pin's
+/// `group = 8`; counted ratios and the reason this is not hoisted are in the
+/// parent module's docs. Hoisting needs `t` outer and a transposed query block
+/// sized by `group` rather than by [`LANES`], which is not a bounded stack
+/// carve, so the redundancy is documented instead of removed.
+///
 /// Two stack buffers are carved per call: the transposed query block
 /// (`LANES * MAX_SIMD_HEAD_DIM` f32) and the K conversion block
 /// (`T_BLOCK * MAX_SIMD_HEAD_DIM` f32), 12 KiB together. They are fully

@@ -245,15 +245,26 @@ impl AttnRow {
     /// K+V bytes the timed unit walks: `layers * context * kv_dim` f16
     /// elements across two planes.
     ///
-    /// This is both the *unique* byte count and the *touched* byte count, and
-    /// the two have been the same number since 8fc3c4a made the kernel
-    /// kv-head-outer: each K and V head slice is widened from f16 once per
-    /// position and reused across that head's whole GQA group. The
-    /// pre-8fc3c4a kernel re-read every kv head's columns once per query head,
-    /// so its touched count was `group` (8) times this one. Anything derived
-    /// from `eff GB/s` — the "0.17 GB/s, therefore compute-bound" reading in
-    /// particular — has to use this figure as printed and must not be scaled
-    /// by the group.
+    /// This is both the *unique* byte count and the *touched* byte count **at
+    /// this bench's geometry**, and the two have been the same number since
+    /// 8fc3c4a made the kernel kv-head-outer: each K and V head slice is
+    /// widened from f16 once per position and reused across that head's whole
+    /// GQA group. The pre-8fc3c4a kernel re-read every kv head's columns once
+    /// per query head, so its touched count was `group` (8) times this one.
+    /// Anything derived from `eff GB/s` — the "0.17 GB/s, therefore
+    /// compute-bound" reading in particular — has to use this figure as printed
+    /// and must not be scaled by the group.
+    ///
+    /// The equality is `group`-dependent on the AVX2 path and is not a general
+    /// claim about the kernel. `x86::qk_scores` walks the GQA group in chunks
+    /// of eight query heads with the position sweep *inside* that loop, so K is
+    /// widened `ceil(group / 8)` times per kv head — 1x for `group` 1-8, 2x for
+    /// 9-16, 3x for 17-24, 4x for 25-32 (counted directly in `x86::widen_rows`);
+    /// V is 1x always, and the scalar path is 1x always. This bench is pinned to
+    /// [`ATTN_Q_HEADS`]:[`ATTN_KV_HEADS`] = 32:4, i.e. `group = 8`, exactly
+    /// where the factor is 1 — which is why "unique == touched" holds here. A
+    /// future arm at a wider group would have to scale the K half of this
+    /// figure by `ceil(group / 8)` before calling it a touched-byte count.
     fn bytes(&self) -> usize {
         self.layers * self.context * ATTN_KV_HEADS * ATTN_HEAD_DIM * 2 * 2
     }
