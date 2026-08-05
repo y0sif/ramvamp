@@ -177,6 +177,19 @@ Left over from item 1, none of it blocking:
   `scratch/cold-bench/summary.json` with `pgsteal` 0 on every run, so
   `--reverdict` leaves it PASS either way and its numbers are unaffected.
 
+Found while testing phase 7, and deliberately deferred:
+
+- **Multi-line paste into the chat REPL submits one line per turn.** The reader
+  takes a line at a time, so pasting a paragraph runs each line as its own
+  prompt instead of one long one. A limitation of the REPL, not of the model or
+  the runtime. Deferred on purpose: the REPL is a development affordance, and
+  the project's direction is to drive ramvamp from another harness rather than
+  to build one here. If it ever matters the fix is bracketed-paste mode or an
+  explicit multi-line terminator. Long prompts already work through
+  `generate --prompt "$(cat file)"` and through `--messages-file`, which is how
+  every long-prompt measurement in EXP-020 and EXP-021 was taken, so nothing in
+  the validation path depends on the REPL.
+
 Carried over, untouched by phase 7:
 
 - `crates/core/src/io/testutil.rs` hard-codes one fixture geometry and keeps
