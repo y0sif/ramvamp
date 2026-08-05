@@ -41,7 +41,10 @@
 //! in the same order as `acc += qv * kv`, per lane. Positions are blocked by
 //! [`T_BLOCK`] purely to run that many *independent* accumulator chains and
 //! fill the vector add latency; each `(position, lane)` pair still keeps a
-//! single chain over `i`. `scale` is applied once at the end, to the finished
+//! single chain over `i`. The sweep steps `T_BLOCK`, then [`T_TAIL_BLOCK`],
+//! then 1, which changes only how many chains run at once and never which
+//! operands land in which chain — a position's accumulator is the same f32
+//! sequence at every rung. `scale` is applied once at the end, to the finished
 //! accumulator, never folded per element.
 //!
 //! **(c) The V reduction.** `out[h][i] += w * v[i]` accumulates over `t`
@@ -88,11 +91,87 @@ pub(super) const LANES: usize = 8;
 
 /// Cached positions converted and dotted per block.
 ///
-/// Different positions are independent accumulators, so a block of four runs
-/// four independent dependency chains over `i` and fills the vector add's
-/// ~4-cycle latency. It does **not** reassociate anything: chain `j` is
-/// position `t + j`'s own accumulator, still walking `i` ascending.
-pub(super) const T_BLOCK: usize = 4;
+/// Different positions are independent accumulators, so a block of eight runs
+/// eight independent dependency chains over `i` and fills the vector add's
+/// ~4-cycle latency twice over. It does **not** reassociate anything: chain
+/// `j` is position `t + j`'s own accumulator, still walking `i` ascending, one
+/// `_mm256_mul_ps` and one `_mm256_add_ps` per `i`. Widening this constant is
+/// the *only* legal way to add parallelism to the QK dot — lanes over `i` or a
+/// horizontal tree would split a chain rather than add one, and would move
+/// bits.
+///
+/// **Eight rather than four, and not sixteen.** Eight chains covers the vector
+/// add's latency with margin on both the 4-cycle and the rarer 5-cycle
+/// `vaddps`, and it is the last width that still fits AVX2's 16 ymm registers.
+/// That was **read out of the generated code, not assumed**: in the linked
+/// release build of [`qk_scores`] the inlined `head_dim` loop holds the eight
+/// accumulators in `ymm8`-`ymm15`, the query vector in `ymm0` and the
+/// broadcast-and-product temporary in `ymm1` (with `ymm3` picked up for one
+/// step, to overlap two broadcasts) — eleven vector registers touched, five
+/// spare, and **not one spill or reload**. The loop's only `%rsp` operands are
+/// the two stack buffers it is *meant* to read: the `vmovups` that loads a row
+/// of `qt` and the `vbroadcastss` that loads `kb`'s first row, plus the `lea`
+/// forming the pointer the other seven rows step from. There is no stack
+/// *store* in the body at all, which is the actual no-spill statement.
+/// The same probe at `N = 16` spills: 16 accumulators plus the two temporaries
+/// is 18 live values against 16 registers, and the loop grows 17 stack moves.
+/// So 8 is the ceiling of this technique, not a midpoint.
+///
+/// **This is a reasoned bound, not a measured speedup.** No benchmark was run
+/// for this change — the QK dot's arithmetic is unchanged and only its
+/// instruction-level parallelism moves, so the claim rests on the register
+/// allocation above. If the orchestrator's measurement pass disagrees, the
+/// measurement wins and this constant goes back to 4; nothing else in the file
+/// depends on its value.
+///
+/// The cost is stack: `kb` below is `T_BLOCK * MAX_SIMD_HEAD_DIM` f32, so 8
+/// doubles it from 4 KiB to 8 KiB and takes the pair of buffers in
+/// [`qk_scores`] from 12 KiB to 16 KiB. The arithmetic and what it is charged
+/// against are in that function's docs.
+pub(super) const T_BLOCK: usize = 8;
+
+/// The one intermediate block width the position sweep steps down through
+/// before the scalar tail.
+///
+/// This exists so that widening [`T_BLOCK`] cannot regress *any* geometry.
+/// Without it, a plain `::<T_BLOCK>` loop plus a `::<1>` tail would drop
+/// positions `p mod 8 ∈ 4..=7` from a four-chain block onto four to seven
+/// one-chain blocks — strictly worse than the `T_BLOCK = 4` code it replaces,
+/// and at exactly the short contexts that are real here: prefill row `r`
+/// attends `start + r + 1` positions so every remainder occurs, and decode's
+/// fan-out gate opens at 8 cached positions.
+///
+/// With the step in, the sweep runs `⌊p/8⌋` eight-blocks, then **at most one**
+/// four-block, then `p mod 4` one-blocks. The count of one-blocks is
+/// `p mod 8 mod 4 = p mod 4`, which is exactly what `T_BLOCK = 4` ran, and
+/// every position not in that scalar tail sits in a block of four or eight
+/// instead of four. So at every `p` the new sweep runs the same number of
+/// serial positions and no narrower a block than the old one: the change is a
+/// strict superset, never a trade. `if` rather than `while` is deliberate —
+/// the remainder after the eight-loop is below 8, so a second four-block is
+/// unreachable.
+///
+/// A further `::<2>` rung was considered and rejected: it would save an
+/// average of ~3 position-equivalents per call against another
+/// monomorphization of [`dot_block`] and [`widen_rows`], where this rung saves
+/// ~6 and is the one that makes the "never worse than before" argument hold.
+pub(super) const T_TAIL_BLOCK: usize = 4;
+
+const _: () = assert!(
+    T_TAIL_BLOCK != 0
+        && T_TAIL_BLOCK < T_BLOCK
+        && T_BLOCK % T_TAIL_BLOCK == 0
+        && T_BLOCK <= 2 * T_TAIL_BLOCK,
+    "the stepped tail must *divide* the main block and be at least half of it, \
+     not merely be narrower than it. Both halves are load-bearing for the \
+     `strict superset, never a trade` argument above: divisibility is what \
+     makes the scalar rung's count `p mod T_BLOCK mod T_TAIL_BLOCK` collapse \
+     to `p mod T_TAIL_BLOCK`, and `T_BLOCK <= 2 * T_TAIL_BLOCK` is what makes \
+     the single `if` after the main loop enough to reach that count. \
+     `T_TAIL_BLOCK < T_BLOCK` alone is far too weak: 3 would pass it and leave \
+     a scalar tail of up to 4 positions, which is *worse* than the \
+     `T_BLOCK = 4` code this replaced"
+);
 
 /// Widen f16 bit patterns into f32, eight at a time.
 ///
@@ -238,15 +317,38 @@ fn store_block<const N: usize>(
 /// carve, so the redundancy is documented instead of removed.
 ///
 /// Two stack buffers are carved per call: the transposed query block
-/// (`LANES * MAX_SIMD_HEAD_DIM` f32) and the K conversion block
-/// (`T_BLOCK * MAX_SIMD_HEAD_DIM` f32), 12 KiB together. They are fully
-/// overwritten before they are read; Rust's zero-initialization of them is
-/// the only cost, ~1500 cycles per attention call at the v0 pin's four kv
-/// heads, against a call that does milliseconds of work at a full 4096-position
-/// context. They are *not* carved from the caller's scratch because
+/// (`LANES * MAX_SIMD_HEAD_DIM` = 8 * 256 f32 = 8 KiB) and the K conversion
+/// block (`T_BLOCK * MAX_SIMD_HEAD_DIM` = 8 * 256 f32 = 8 KiB), **16 KiB
+/// together**. Only the second scales with [`T_BLOCK`], and it is why widening
+/// that constant from 4 to 8 cost 4 KiB: the pair was 12 KiB before. The
+/// narrower rungs of the position sweep (`T_TAIL_BLOCK`, then 1) reuse a
+/// prefix of the same `kb`, so the stepped tail adds nothing.
+///
+/// They are fully overwritten before they are read; Rust's zero-initialization
+/// of them is the only cost, and it is real rather than elided — the release
+/// prologue is two `memset(_, 0, 8192)` calls, one per buffer. Four kv heads
+/// means four such calls per attention call, so 64 KiB zeroed at a 32 B/cycle
+/// store port is **~2000 cycles** (it was ~1500 at 12 KiB), against a call that
+/// does milliseconds of work at a full 4096-position context.
+///
+/// The whole frame measures **17,144 B** of `sub` in the linked release build
+/// — the 16 KiB of buffers plus 760 B of spilled scalars and alignment — on
+/// top of 48 B of callee-saved pushes. That is the number that ships: the
+/// workspace release profile is `lto = "thin"` with `codegen-units = 1`, and
+/// the figure is read from the linked binary. A per-CU
+/// `cargo rustc --release --lib -- --emit asm` probe reports 16,936 B (552 B
+/// of spill) for the same function *before* LTO; if a later reader measures
+/// that instead, this is why the two disagree. Either way the frame crosses
+/// four guard pages, so the prologue emits four inline stack probes where it
+/// emitted three — one extra store per call. 16 KiB is two orders of magnitude
+/// under the 2 MiB a spawned thread's stack gets and the compute pool sets no
+/// smaller one, so the frame is nowhere near a limit on the fan-out path.
+///
+/// They are *not* carved from the caller's scratch because
 /// [`super::scratch_len`] is a pinned contract that a later lane sizes an
 /// arena from, and widening it to fund a vectorization detail would be the
-/// wrong trade.
+/// wrong trade. That decision is unchanged by the larger `kb`: the whole point
+/// is that this cost stays on the stack and off the arena.
 ///
 /// # Safety
 ///
@@ -295,12 +397,22 @@ pub(super) unsafe fn qk_scores(
                 }
             }
 
+            // Stepped: `T_BLOCK` while a whole one fits, then at most one
+            // `T_TAIL_BLOCK` (the remainder is below `T_BLOCK`, so `if`, not
+            // `while`), then the scalar rung. See `T_TAIL_BLOCK`'s docs for
+            // why the middle rung is not optional.
             let mut t = 0;
             while t + T_BLOCK <= positions {
                 widen_rows::<T_BLOCK>(k_rows, kv_dim, col, head_dim, t, &mut kb);
                 let block = dot_block::<T_BLOCK>(&qt, &kb, head_dim, scale);
                 store_block(&block, base, lanes, positions, t, scores);
                 t += T_BLOCK;
+            }
+            if t + T_TAIL_BLOCK <= positions {
+                widen_rows::<T_TAIL_BLOCK>(k_rows, kv_dim, col, head_dim, t, &mut kb);
+                let block = dot_block::<T_TAIL_BLOCK>(&qt, &kb, head_dim, scale);
+                store_block(&block, base, lanes, positions, t, scores);
+                t += T_TAIL_BLOCK;
             }
             while t < positions {
                 widen_rows::<1>(k_rows, kv_dim, col, head_dim, t, &mut kb);

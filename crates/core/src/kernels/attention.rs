@@ -2231,9 +2231,20 @@ mod tests {
     /// Coverage: all four `LIMITED_GEOMETRIES` (GQA groups 8, 1, 8 and 2 —
     /// group 1 is the degenerate case where the group-major score block is a
     /// single run) plus the real v0 pin (32 q heads : 4 kv heads, head_dim
-    /// 128) at a prime full length; every layer; position counts 1, the
-    /// primes up to the geometry's length, and the full length; and all four
-    /// entry points, owning and borrowed, limited and unlimited.
+    /// 128) at a prime full length; every layer; the position counts in
+    /// [`dispatch_lengths`]; and all four entry points, owning and borrowed,
+    /// limited and unlimited.
+    ///
+    /// The length sweep is [`dispatch_lengths`] rather than a private list of
+    /// primes on purpose. This gate runs through the public entry points, so
+    /// on an AVX2 + F16C host it exercises the vector kernel's *stepped*
+    /// position sweep too, and which rungs of that sweep run depends only on
+    /// `positions % x86::T_BLOCK`. Its old list `[1, 2, 3, 5, 7, 11, 13, 31,
+    /// 61]` covered remainders `{1, 2, 3, 4, 5, 7}`, so poisoning the
+    /// `T_TAIL_BLOCK` rung for `positions % 8 == 6` left this test green — the
+    /// same hole `dispatch_lengths` had. Two lists meant two places to keep
+    /// honest; there is now one, guarded by
+    /// `dispatch_lengths_cover_every_position_block_remainder`.
     #[test]
     fn restructured_kernel_is_bit_identical_to_head_major_reference() {
         let mut rng = Rng::new(0x0401_57ED);
@@ -2246,14 +2257,8 @@ mod tests {
             let q = rng.vec_in(n_q * head_dim, -1.0, 1.0);
             let mut owned = AttentionScratch::new();
 
-            let mut lengths: Vec<usize> = [1usize, 2, 3, 5, 7, 11, 13, 31, 61]
-                .into_iter()
-                .filter(|&p| p < n_pos)
-                .collect();
-            lengths.push(n_pos);
-
             for layer in 0..n_layers {
-                for &positions in &lengths {
+                for &positions in &dispatch_lengths(n_pos) {
                     let mut want = vec![0.0f32; q.len()];
                     head_major_reference(&q, &cache, layer, positions, scale, &mut want);
 
@@ -2568,7 +2573,9 @@ mod tests {
     /// Geometries for the wave-2 dispatch gates: the four
     /// [`LIMITED_GEOMETRIES`] (GQA groups 8 / 1 / 8 / 2, `head_dim` 128 / 16 /
     /// 8 / 4), the real v0 pin at a length that exercises the position
-    /// blocking *and* its tail (67 = 16 blocks of 4, then 3), two odd
+    /// blocking and its scalar rung (at `x86::T_BLOCK = 8`, 67 is 8 whole
+    /// blocks then 3 single positions; the `T_TAIL_BLOCK` rung is reached from
+    /// the other lengths in [`dispatch_lengths`]), two odd
     /// `head_dim` geometries whose head slices cannot be better than 2-byte
     /// aligned, and the group / `head_dim` rows below.
     ///
@@ -2626,15 +2633,83 @@ mod tests {
         g
     }
 
-    /// The position counts to sweep for a geometry: 1, exact multiples of the
-    /// position block, one either side of them, primes, and the full length.
+    /// The position counts to sweep for a geometry: 1, **every remainder class
+    /// modulo `x86::T_BLOCK`**, the exact multiples of that block with one
+    /// either side of each, primes, and the full length.
+    ///
+    /// # Why every remainder class, spelled out
+    ///
+    /// `x86::qk_scores` steps the position sweep `x86::T_BLOCK` (8) while a
+    /// whole block fits, then **at most one** `x86::T_TAIL_BLOCK` (4), then 1.
+    /// Which rungs a call runs is decided entirely by `positions % T_BLOCK`,
+    /// and the middle rung fires only for classes 4..=7 — so this sweep is a
+    /// proof about the stepped tail exactly to the extent that it hits those
+    /// classes.
+    ///
+    /// It did not. The list was `[1, 2, 3, 4, 5, 7, 8, 9, 11, 12, 13, 16, 31,
+    /// 61]`, whose union of remainders is `{0, 1, 2, 3, 4, 5, 7}`: **class 6
+    /// was absent**, and poisoning the `T_TAIL_BLOCK` rung for
+    /// `positions % 8 == 6` left both designated bit-identity gates
+    /// (`simd_matches_scalar_bit_for_bit` and
+    /// `restructured_kernel_is_bit_identical_to_head_major_reference`) green.
+    /// It was caught only incidentally, by two tests about GQA head mapping
+    /// and misalignment whose geometries happen to land there — exactly the
+    /// failure mode recorded as GOTCHA 7. 6 and 14 close it, and
+    /// `dispatch_lengths_cover_every_position_block_remainder` now asserts the
+    /// property directly so it cannot reopen by editing a geometry.
+    ///
+    /// The old comment's stated intent — "exact multiples of the position
+    /// block, one either side of them" — was also stale: it described
+    /// `T_BLOCK = 4`, and at 8 it wants 8 / 16 / 24 with 7 / 9, 15 / 17 and
+    /// 23 / 25 around them, of which only 7 / 8 / 9 / 16 were present. 15, 17,
+    /// 23, 24 and 25 make it true again.
+    ///
+    /// All of these are still filtered by `< n_pos`, so only the geometry with
+    /// `n_pos = 67` sees the lengths above 16; the rest of the sweep is
+    /// unchanged in cost.
     fn dispatch_lengths(n_pos: usize) -> Vec<usize> {
-        let mut lengths: Vec<usize> = [1usize, 2, 3, 4, 5, 7, 8, 9, 11, 12, 13, 16, 31, 61]
-            .into_iter()
-            .filter(|&p| p < n_pos)
-            .collect();
+        let mut lengths: Vec<usize> = [
+            1usize, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 23, 24, 25, 31, 61,
+        ]
+        .into_iter()
+        .filter(|&p| p < n_pos)
+        .collect();
         lengths.push(n_pos);
         lengths
+    }
+
+    /// GOTCHA 7 guard for the stepped position sweep: [`dispatch_lengths`]
+    /// must hit **every** `positions % x86::T_BLOCK` class across
+    /// [`dispatch_geometries`].
+    ///
+    /// The bit-identity gates only pin the geometries and lengths they sweep,
+    /// and which rungs of `x86::qk_scores`'s stepped sweep a call runs is a
+    /// function of that remainder alone. Class 6 was missing for the whole
+    /// life of the eight-wide block and nothing went red. Asserting the
+    /// property here means a future edit to either list — a geometry's `n_pos`
+    /// changed, a length dropped, `T_BLOCK` widened — fails *this* test with a
+    /// message naming the dark class, instead of silently unpinning a rung.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dispatch_lengths_cover_every_position_block_remainder() {
+        let mut seen = [false; x86::T_BLOCK];
+        for (.., n_pos) in dispatch_geometries() {
+            for p in dispatch_lengths(n_pos) {
+                seen[p % x86::T_BLOCK] = true;
+            }
+        }
+        for (class, &hit) in seen.iter().enumerate() {
+            assert!(
+                hit,
+                "no length in the dispatch sweep leaves `positions % {} == {class}`, so \
+                 the rungs `x86::qk_scores` runs for that remainder are pinned by no \
+                 bit-identity gate. The `T_TAIL_BLOCK` rung in particular fires only \
+                 for classes {}..={}.",
+                x86::T_BLOCK,
+                x86::T_TAIL_BLOCK,
+                x86::T_BLOCK - 1
+            );
+        }
     }
 
     /// Gate 11 (phase 7 wave 2, the central claim of the vectorization): the
