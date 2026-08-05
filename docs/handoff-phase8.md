@@ -1,7 +1,8 @@
 # Phase 8 handoff
 
-Written 2026-08-05, at `feat/attention` = `aade585` (phase 7 complete, not yet
-merged to `main`).
+Written 2026-08-05, at `feat/attention` = `4b39104` (phase 7 complete and
+measured, not yet merged to `main`). The runtime is unchanged since `aade585`;
+everything after it is harness and docs.
 
 ## Where things stand
 
@@ -23,11 +24,15 @@ Cumulatively the kernel is **6.4x to 9.1x** faster at one token's worth of
 attention across the 64-to-4096 context ladder, and **~10x** on the
 single-layer arm at every rung.
 
-**None of that is publishable.** Every figure above is warm, in process and
-diagnostic. Rule 2 wants a cold run inside `memory.max=3G` with
-`memory.swap.max=0`, and nobody has taken one on this build. The honest
-one-line summary of phase 7 is: *the kernel got much faster on a
-microbenchmark, and nobody has measured what that did to a token.*
+**None of that is publishable on its own.** Every figure above is warm, in
+process and diagnostic. The cold rule-2 measurement has since been taken and
+is **EXP-021**. Cold, inside `memory.max=3G` with `memory.swap.max=0`, paired
+against the banked phase-5 binary on one machine in one session: prefill went
+**1.68 to 11.17 tok/s, 6.65x**, over five scored runs per arm; decode at
+`--max-new 256` went **1.18 to 1.99 tok/s**; a 3,961-token prompt peaks at
+**2,920-2,924 MiB** of the 3,072 MiB ceiling; and all three numerics gates
+pass. Quote EXP-021. The warm figures above are the mechanism, not the
+result.
 
 Prefill still costs **zero additional heap bytes** — its per-shard score
 buffers come out of the `PrefillSession` arena, 77.19 to 77.94 MiB of a
@@ -44,30 +49,58 @@ file.
 
 ## WORK TO DO
 
-### 1. Take the cold measurement. This blocks everything. (high)
+### 1. The cold measurement is done. It is EXP-021. (closed)
 
-The runbook is committed at `scratch/phase7/wave3-runbook.md`. Roughly two
-hours, most of it unattended, and it needs a **quiet machine**. It produces
-**EXP-021**, which is already reserved by name in EXP-020 Note 9 and in the
-architecture backlog.
+Taken 2026-08-05 in two unattended sessions. **Read EXP-021 before quoting any
+phase-7 number.** Nothing in this list blocks phase 8 any more.
 
-Four things, in the runbook's order:
+Where a future session looks for the machinery, all committed:
 
-- **The numerics gate first**, because it is the cheapest way to find out bits
-  moved: `bitident.py` against the phase-4 baseline (~85 s), `kl_vs_reference
-  .py` (~3 min), `greedy_regression.py` (~50 min, unattended).
-- **Paired cold prefill at 512 tokens, `--repeats 5`.** Closes EXP-018 Note 5,
-  which flagged its own `--repeats 1` as leaving the spread unbounded.
-  Baseline to beat: 4.23 tok/s cold.
-- **Paired cold decode at `--max-new 256`.** This is what settles the EXP-018
-  cold-start question. At `--max-new 4` almost everything measured was the
-  transient; 256 tokens is 5x EXP-005's token-48 steady-state threshold, and
-  context only grows 512 to 768 so the attention term drifts ~25% rather than
-  100%. Keep the stderr: the new `decode split (forward_token):` block is what
-  says whether attention's share of decode actually moved.
-- **The 4K-context `memory.peak` run**, the last open item on the 11-slot
-  dial, and the one that might explain EXP-018's unexplained 99-105 MiB
-  residual.
+- `scripts/phase7_overnight.sh` — the whole thing in one go: build, warm bench,
+  the three numerics gates, then the four cold steps. ~2.5-3 h, unattended,
+  never aborts on the first failure. Logs and `SUMMARY.txt` land in
+  `scratch/phase7/overnight-<stamp>/`.
+- `scripts/phase7_rerun_cold.sh` — the cold steps only, with no model work
+  before them and a settle loop that waits for `MemAvailable` >= 6,000 MiB to
+  hold across four consecutive 15-second samples. ~55 min. Use this when a
+  step needs repeating; the overnight script's numerics gate leaves the
+  machine in a state the cold runs should not start from.
+- Raw summaries: `scratch/cold-bench/p7-*.json` (session 1) and `re-*.json`
+  (session 2). The runbook that specified all of it is still at
+  `scratch/phase7/wave3-runbook.md`.
+
+What it settled:
+
+- **Prefill 6.65x cold**, 1.68 to 11.17 tok/s against the banked phase-5
+  binary on a 512-token prompt, five scored runs per arm, full range 0.70% and
+  1.07% about each arm's wall median. That closes EXP-018 Note 5's unbounded
+  `--repeats 1` spread.
+- **EXP-018's decode "regression" is explained and reversed.** Phase 5's own
+  decode falls 1.81 to 1.18 tok/s as the window grows from `--max-new 4` to
+  256 — its decode degrades with context, which is what EXP-020 Note 3's
+  linear-in-context finding predicts. Phase 7 holds 1.83-1.99 over the same
+  window and is faster at four tokens too. The 1.88-to-1.38 EXP-018 reported
+  was two non-steady-state numbers compared to each other. **EXP-005's
+  prompt-replay decision does not need revisiting**: there is no longer a
+  deficit for it to recover.
+- **4K context fits and is measured.** A 3,961-token prompt peaks at
+  2,920.4 / 2,924.2 MiB of 3,072, so 148-152 MiB spare, `pgsteal` 0. The
+  11-slot dial is validated at full context and EXP-014 Note 2 closes.
+- **Numerics all pass** on the measured binary: `bitident.py` 8/8
+  byte-identical to the phase-4 baseline, `kl_vs_reference.py --refresh` gate
+  3 PASS, `greedy_regression.py` PASS against the 2026-08-03 baseline.
+
+**One hygiene rule changed under those numbers, and it is worth judging rather
+than inheriting.** Both sessions first reported most runs DIRTY. All 11 dirty
+runs were **100% khugepaged** — `pgsteal_kswapd`, `_direct` and `_proactive`
+all zero, `pgscan == pgsteal` exactly, on a machine 16x above the watermark
+that wakes kswapd, with the flagged runs 0.39% *faster* than the clean ones.
+`4b39104` excludes khugepaged from the pressure signal (still reporting it as
+a SOFT note) and adds `cold_bench.py --reverdict`, which re-classifies
+recorded counters without running anything. EXP-021's verdicts come from
+`--reverdict`, not from a re-run. The gate was verified not to weaken:
+kswapd, direct, proactive, an unknown reclaimer, a missing breakdown and
+khugepaged mixed with kswapd all still fail HARD.
 
 **`kl_vs_reference.py` requires `--refresh`.** Its per-prompt dumps are cached
 at `models/llamacpp-ref/llamacpp_ref/rv_single_*.json` and **the cache is not
@@ -75,13 +108,23 @@ keyed on the binary**. Without `--refresh` it re-scores stale JSON from disk in
 seconds and reports PASS having tested nothing about this build.
 `greedy_regression.py` *is* keyed on binary sha256 and will recompute
 correctly; `bitident.py` runs fresh. This is one script with one wrong cache
-key, and it is the one that gates the logits.
+key, and it is the one that gates the logits. `phase7_overnight.sh` passes it.
 
 ### 2. Next levers, with honest ceilings (medium)
 
-None of these should be started before item 1. All four ceilings below are
-**derived or estimated**, never measured.
+Every ceiling below is **derived or estimated**, never measured — except the
+first bullet, which EXP-021 measured and which changes what the rest are worth.
 
+- **Attention is no longer the wall in prefill, and the target should be
+  re-chosen before any of the rest of this list is started.** EXP-021 Note 9,
+  from the 4K run's own split: expert compute **42.1%**, projections **22.8%**,
+  attention **20.4%**, elementwise **12.2%**, expert io **2.5%**. EXP-017 put
+  attention at 85.2% of an 1891-token prefill on the pre-phase-7 kernel; that
+  is a different entry, a different session and a different kernel, so rule 3
+  forbids one curve and the only licensed reading is directional — the term
+  phase 7 attacked is now third. Decode's split is different again (expert io
+  42.0%, attention 29.3%), so prefill and decode no longer want the same
+  lever. Measure the split on the workload you actually care about first.
 - **Softmax is 23.5% of the kernel** at 4096 positions (1,059 µs of 4,499 µs,
   measured) and `primitives` is frozen. Leaving it frozen caps every other
   attention lever at `1 / 0.235` = **4.26x** on the kernel; perfecting softmax
@@ -109,7 +152,32 @@ None of these should be started before item 1. All four ceilings below are
   not more arithmetic. That is also why the 48-layer arm's cumulative speedup
   decays 9.1x to 6.4x across the ladder while the 1-layer arm holds ~10x.
 
-### 3. Still carried over, untouched by phase 7 (low)
+### 3. Left over from the measurement, and still carried (low)
+
+Left over from item 1, none of it blocking:
+
+- **The decode-256 pair and the 4K run are `--repeats 1`.** Only the prefill
+  pair got five scored runs. Their only spread control is that two independent
+  sessions agree, and the two phase-7 decode figures differ by 8.7% (1.99
+  against 1.83 tok/s). A `--repeats 3` decode pair would cost ~35 min.
+- **The 512-token phase split was not captured cold.** `cold_bench.py` writes
+  the child's stderr — which carries the `prefill split` and `decode split`
+  blocks — to `run0N.json.stderr` on a fixed path that the next invocation
+  clobbers, so only the last session's 4K run and phase-5 512 run survive.
+  Copy the sidecars alongside the `--json` summary if the split matters.
+- **The size of the post-sweep cold-start transient is still unmeasured.**
+  EXP-021 shows it no longer costs a regression at any window measured; it
+  does not measure the transient itself.
+- **EXP-014's discarded DIRTY runs cannot be re-checked.** Its first attempt
+  scored 3 of 5 with `pgsteal` 2,817 and 2,946 pages. Those are two orders of
+  magnitude larger than anything khugepaged did here and had a recorded
+  external cause, so they were probably genuine pressure — but the JSONs were
+  overwritten and `scratch/` is gitignored, so the classification is now
+  uncheckable. EXP-014's *published* run survives at
+  `scratch/cold-bench/summary.json` with `pgsteal` 0 on every run, so
+  `--reverdict` leaves it PASS either way and its numbers are unaffected.
+
+Carried over, untouched by phase 7:
 
 - `crates/core/src/io/testutil.rs` hard-codes one fixture geometry and keeps
   its `TempDir` private, so `prefill.rs`'s `mod wide` had to copy the install
@@ -124,9 +192,14 @@ None of these should be started before item 1. All four ceilings below are
   does not cover 1024 or the memory peak.
 - **Kaggle or SSH-provider portability smoke.** The only path that exercises
   ext4 and the loop-device "O_DIRECT lies" fallback. Untouched since phase 4.
-- **EXP-018's `memory.peak` residual.** 2,576.0 MiB, inside the 3,072 ceiling,
-  but 99-105 MiB above EXP-014 where KV arithmetic explains only about 42. The
-  4K run in item 1 is what might close it.
+- **EXP-018's `memory.peak` residual, still open.** ~2,570-2,576 MiB at 516
+  tokens of context, inside the 3,072 ceiling, but 99-105 MiB above EXP-014
+  where KV arithmetic explains only about 42. The 4K run did **not** close it:
+  EXP-021's 512-token peaks land in the same band (medians 2,571.8 and 2,577.9
+  MiB, full scored range 2,569.4-2,583.5), so phase 7 added nothing to it and
+  nothing identified it. What the 4K run did settle is that the contract
+  survives full context, which is a different question. Closing this needs the
+  provisional `anon` row in `docs/architecture.md` re-measured under rule 2.
 
 ## PROCESS
 

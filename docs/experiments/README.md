@@ -57,6 +57,7 @@ which is the reason their claims are credible.
 - [EXP-018: Cold paired prefill, the swept path against the token-major path at 512 tokens](#exp-018-cold-paired-prefill-the-swept-path-against-the-token-major-path-at-512-tokens) — KEEP
 - [EXP-019: O_DIRECT bandwidth under rule 2, and EXP-008 refuted](#exp-019-o_direct-bandwidth-under-rule-2-and-exp-008-refuted) — NEUTRAL
 - [EXP-020: The attention kernel rebuilt in three waves, measured warm](#exp-020-the-attention-kernel-rebuilt-in-three-waves-measured-warm) — NEUTRAL
+- [EXP-021: Phase 7 measured cold: prefill, decode and 4K context under rule 2](#exp-021-phase-7-measured-cold-prefill-decode-and-4k-context-under-rule-2) — KEEP
 
 Entries EXP-007 through EXP-013 were measured on a machine that was not
 quiet, and most are microbenchmarks rather than end-to-end runs. Under rule 2
@@ -2141,3 +2142,349 @@ they are, as the record of what was believed when phase 5 was designed.
      `scratch/phase7/wave3-runbook.md`. Until EXP-021 exists, the honest
      summary of phase 7 is "the kernel got roughly 6 to 10x faster warm, on a
      microbenchmark, and nobody has measured what that did to a token."
+
+## EXP-021: Phase 7 measured cold: prefill, decode and 4K context under rule 2
+
+- Date / commit: 2026-08-05. Phase-7 arm: `target/release/ramvamp` sha256
+  `d56dc034ebd3...`, the tree at `aade585` (`feat/attention`), which is the
+  last commit up to `4b39104` that touches `crates/` at all — so that binary
+  is the phase-7 runtime as it stands today. Session 1's harness recorded HEAD
+  as `f6d8c7c` and session 2's as `9141341`; those commits add the two
+  harness scripts and nothing else, and session 1 recorded the same binary
+  sha256 after its `cargo build --release`, so both sessions ran that binary.
+  Phase-5 arm: the binary banked by EXP-018 at `scratch/phase5-ref/ramvamp`,
+  commit `c3572fd`, sha256 `e0f58f2486...`. Harness correction: `4b39104`.
+- Hypothesis: EXP-020 rebuilt attention and measured 6.4x-9.1x on a warm
+  in-process microbench, and EXP-020 Note 9 reserved this entry for the cold
+  rule-2 measurement of what that did to a token. Four things are owed here:
+  paired cold prefill at 512 tokens with `--repeats 5` (closing EXP-018
+  Note 5), paired cold decode at `--max-new 256` (settling the EXP-018 Note 1
+  cold-start question), the 4K-context `memory.peak` run (the last open item
+  on the 11-slot dial, EXP-014 Note 2), and the numerics gate.
+- Method: two unattended sessions on the reference machine
+  (`docs/benchmark-machine.md`), both driven by committed harnesses so what
+  ran is readable rather than reconstructed:
+
+  - **Session 1**, `bash scripts/phase7_overnight.sh`, started 15:49:19,
+    logs in `scratch/phase7/overnight-20260805-154919/`. Numerics gate, then
+    the four cold steps. Raw summaries `scratch/cold-bench/p7-*.json`.
+  - **Session 2**, `bash scripts/phase7_rerun_cold.sh`, started 17:34:10, logs
+    in `scratch/phase7/recold-20260805-173410/`. The cold steps only, with no
+    model work before them and a settle loop that waits for `MemAvailable` to
+    hold above 6,000 MiB for four consecutive 15-second samples. Raw summaries
+    `scratch/cold-bench/re-*.json`.
+
+  Every cold step is `scripts/cold_bench.py`: evict all 53 model files with
+  `posix_fadvise(POSIX_FADV_DONTNEED)` and prove the eviction with `mincore`,
+  launch under `systemd-run --user --wait -p MemoryMax=3G -p MemorySwapMax=0
+  -p MemoryAccounting=yes`, and read `memory.peak`, `memory.events`,
+  `memory.stat` and `/proc/self/io` `read_bytes` from inside the cgroup before
+  exit. The prompt goes out of band as JSON. The 512-token workload is
+  `models/llamacpp-ref/llamacpp_ref/long_00.txt`, delivered sha256
+  `d1b6c407c55a...` over 2,002 bytes on all 22 of the 512-token runs, so both
+  arms are one workload. The 4K workload is
+  `scratch/ctx4k/p4k.txt`, sha256 `68582aae37b9...` over 17,000 bytes.
+  Prefill: `--max-new 4 --warmup 1 --repeats 5`. Decode: `--max-new 256
+  --warmup 0 --repeats 1`. 4K: `--max-new 8 --warmup 0 --repeats 1`.
+
+  **The hygiene story, head-on, because a rule changed under these numbers.**
+  Both sessions initially reported most runs DIRTY: 11 runs across the two
+  sessions recorded nonzero `pgsteal` and `cold_bench.py` refused to publish
+  them. The reclaim was **entirely khugepaged** in all 11 — see Note 1 for the
+  evidence — and `4b39104` corrected the verdict to key on the pressure
+  reclaimers rather than on the bare `pgsteal` total, still reporting
+  khugepaged as a SOFT note. That commit also added `--reverdict`, which
+  re-classifies already-recorded counters and prints the old verdict beside
+  the new one.
+
+  **The verdicts below come from `--reverdict`, not from re-running.** Every
+  counter the hygiene verdict depends on is in the summary files already, so
+  correcting the rule cost no further cold runs, and the correction is visible
+  as a diff:
+
+  ```
+  python3 scripts/cold_bench.py --reverdict \
+      scratch/cold-bench/p7-*.json scratch/cold-bench/re-*.json
+  ```
+
+  All nine summaries re-classify to **PASS**; seven of them were recorded
+  DIRTY. A reader who thinks the correction is wrong should read Note 1 and
+  Note 3 and then discount this entry, which is the point of saying so here
+  rather than presenting nine numbers that came back clean.
+
+  Independent of the reclaim question, on all 24 runs across both sessions
+  (21 scored, 3 discarded warmups): every `memory.events` counter 0,
+  `memory.swap.peak` 0, every return code 0, and `read_bytes` non-trivial, so
+  eviction did happen on every one.
+- Baseline: the phase-5 arm of each pair, run back to back with the phase-7
+  arm in the same session on the same prompt — the same banked binary EXP-018
+  used, so the comparison is paired and rule 3 is satisfied inside this entry.
+  Two figures from other entries are quoted as context and are **not** put on
+  one curve with anything here: EXP-018 measured phase-6 prefill at **4.23
+  tok/s** cold and decode falling 1.88 to 1.38 tok/s at `--max-new 4`, and
+  EXP-014 recorded cold medians of decode 1.88 tok/s, prefill 1.33 tok/s and
+  `memory.peak` 2,471.1 MiB at a 5-token prompt.
+- Result:
+
+  **Prefill, 512-token prompt, `--max-new 4`.** Medians of 5 scored runs after
+  1 discarded warmup, session 1, both arms back to back:
+
+  | metric | phase 5 | phase 7 | ratio |
+  | --- | ---: | ---: | ---: |
+  | prefill | 1.68 tok/s | **11.17 tok/s** | **6.65x** |
+  | prefill time | 304.67 s | 45.84 s | 6.65x |
+  | decode (4 tokens) | 1.81 tok/s | 2.08 tok/s | 1.15x |
+  | model load | 1.30 s | 1.30 s | 1.00x |
+  | wall | 308.88 s | 49.70 s | 6.21x |
+  | cgroup `memory.peak` (median) | 2,571.8 MiB | 2,577.9 MiB | |
+  | process `read_bytes` | 239.33 GB | 20.72 GB | **11.55x fewer** |
+
+  **Headline: prefill 6.65x over phase 5, cold, inside `memory.max=3G` with
+  swap off, over 5 scored runs per arm.** The phase-7 arm's scored spread is
+  49.57 s to 49.91 s of wall and 11.13 to 11.21 tok/s of prefill; the phase-5
+  arm's is 308.54 s to 311.84 s and 1.66 to 1.68 tok/s. As a full range about
+  each arm's own wall median that is **0.70%** and **1.07%**, which is the
+  bound EXP-018 Note 5 asked for and did not have.
+
+  Session 2 re-ran the phase-5 arm alone (the phase-7 arm had already scored
+  PASS unaided): prefill **1.68 tok/s**, wall 309.50 s, decode 1.85 tok/s,
+  `memory.peak` median 2,571.0 MiB. Identical to the printed resolution on
+  every field that matters.
+
+  **Against EXP-018's phase-6 figure, 11.17 against 4.23 tok/s is 2.64x — and
+  that ratio is weaker than the 6.65x above, for the reason rule 3 exists.**
+  The 4.23 is one run in a different session on a different build; nothing
+  here re-measures it. Two things make the comparison worth writing down
+  anyway and neither makes it a paired number: the phase-5 arm reproduces
+  across the two entries at 1.65 against 1.68 tok/s on the same banked binary
+  and the same prompt, a 1.8% gap; and the byte counts are identical to the
+  byte (Note 7). Quote 6.65x. Do not put 1.65, 4.23 and 11.17 on one curve.
+
+  **Decode, 512-token prompt, `--max-new 256`.** One run per arm per session:
+
+  | metric | ph 5, s1 | ph 7, s1 | ph 5, s2 | ph 7, s2 |
+  | --- | ---: | ---: | ---: | ---: |
+  | decode | 1.18 tok/s | **1.99 tok/s** | 1.17 tok/s | **1.83 tok/s** |
+  | decode time (256 tokens) | 217.05 s | 128.82 s | 217.97 s | 140.25 s |
+  | prefill | 1.66 tok/s | 11.21 tok/s | 1.68 tok/s | 11.29 tok/s |
+  | wall | 526.89 s | 176.46 s | 524.01 s | 187.60 s |
+  | cgroup `memory.peak` | 2,597.8 MiB | 2,608.6 MiB | 2,602.1 MiB | 2,611.6 MiB |
+  | process `read_bytes` | 365.90 GB | 146.44 GB | 365.90 GB | 146.44 GB |
+
+  Within session 1 that is **1.69x**; within session 2, **1.56x**. Each is a
+  paired ratio inside one session; the two sessions are not averaged.
+
+  **4K context, phase 7, `--max-new 8`.** `p4k.txt` tokenizes to **3,961
+  prompt tokens**, inside `CONTEXT_CAP = 4096`:
+
+  | metric | session 1 | session 2 |
+  | --- | ---: | ---: |
+  | prefill | 9.89 tok/s | 9.86 tok/s |
+  | decode (8 tokens) | 1.47 tok/s | 1.37 tok/s |
+  | wall | 408.07 s | 409.44 s |
+  | cgroup `memory.peak` | **2,920.4 MiB** | **2,924.2 MiB** |
+  | headroom under 3,072 MiB | 151.6 MiB | 147.8 MiB |
+  | process `read_bytes` | 146.10 GB | 146.10 GB |
+
+  **The memory contract holds at full context**, with 148 to 152 MiB spare.
+  This is the run EXP-014 Note 2 named as the remaining open item on the
+  11-slot dial and it closes it.
+
+  **Numerics, session 1, on the same binary, all three gates PASS:**
+
+  | gate | result |
+  | --- | --- |
+  | `bitident.py` vs the phase-4 baseline | **PASS**, 8/8 singles byte-identical |
+  | `kl_vs_reference.py --refresh`, gate 3 | **PASS**, mean KL 1.039e-02, worst prompt 2.721e-02, top-1 8/8 |
+  | `greedy_regression.py` | **PASS**, no metric below the 2026-08-03 baseline |
+
+  The greedy aggregate is 407/1024 tokens (39.7%) with 1/8 prompts identical
+  for all 128 tokens, and the path check is top-1 24/24 with 24/24 contexts
+  verified — the same shape as the recorded baseline, which is what the gate
+  compares against.
+- Verdict: KEEP
+- Notes:
+  1. **The reclaim that dirtied 11 runs was khugepaged, and the evidence is
+     four independent facts.** (a) `pgsteal_khugepaged` accounted for **100%**
+     of `pgsteal` in every one of the 11, 44 to 753 pages (0.2 to 2.9 MiB),
+     with `pgsteal_kswapd`, `pgsteal_direct` and `pgsteal_proactive` all zero.
+     (b) `pgscan == pgsteal` **exactly** in every one — a 100% steal rate,
+     which is the signature of targeted freeing, not of LRU scanning under
+     pressure. (c) The machine's Normal zone sat **16x above the watermark
+     that wakes kswapd**, so there was no pressure to reclaim under. (d) Wall
+     times were statistically identical: over the 12 runs of the identical
+     phase-5 512-token workload (6 per session, warmups included), mean wall
+     was **309.14 s for the flagged runs against 310.34 s for the clean ones**
+     — the flagged runs were **1.20 s, or 0.39%, faster**, which is the
+     expected sign, since collapsing base pages into 2 MiB hugepages helps the
+     TLB. khugepaged wakes on its own 10-second timer, scans a bounded number
+     of pages and frees the base pages it collapses, and that freeing lands in
+     `pgsteal_khugepaged` with nothing under memory pressure at all.
+
+     Two provenance caveats. The free-page and watermark figures behind (c)
+     were read from `/proc/zoneinfo` during the investigation (944,748 free
+     pages against a high watermark of 57,965, hence 16.3x) and are **not**
+     captured in any summary file; what is committed is the 16x ratio, in
+     `scripts/cold_bench.py`'s module docstring and in `4b39104`'s message.
+     And those same two places record the wall means as 309.13 s and 310.35 s;
+     recomputed from the JSONs they are 309.14 s and 310.34 s, a 0.01 s
+     rounding difference in each that changes nothing.
+  2. **The dirty/clean split inverted between the sessions, and that is what
+     falsifies the alternative explanation.** Session 1's phase-5 prefill went
+     dirty on runs 0-2 and clean on runs 3-5; session 2's went **clean on runs
+     0-2 and dirty on runs 3-5**. Same workload, same binaries, same harness
+     logic. `scripts/phase7_rerun_cold.sh`'s own header states the hypothesis
+     it was written on — that the ~15-minute numerics gate immediately before
+     the cold runs left global memory pressure, so the early runs paid for it
+     and the machine settled — and session 2 refutes that hypothesis: it ran
+     no model work beforehand, its settle loop recorded `MemAvailable` at
+     **11,371 / 11,354 / 11,369 / 11,362 MiB** before its four steps with swap
+     use flat at 3,155-3,156 MiB, and its dirty runs were the *late* ones. An
+     independent daemon on its own timer fits an arbitrary split in either
+     direction; workload-driven pressure does not.
+  3. **The correction was verified not to weaken the gate, and the
+     verification is the reason to trust it.** `4b39104` subtracts khugepaged
+     *from* the total rather than summing the reclaimers it knows about, so a
+     reclaimer the script has never heard of counts as pressure instead of
+     vanishing, and a `memory.stat` with no breakdown at all still counts the
+     whole total — unknown stays DIRTY. Verified by test: kswapd, direct,
+     proactive, an invented reclaimer name, a missing breakdown, and
+     khugepaged mixed with kswapd all still fail HARD, and the mixed case
+     reports the **kswapd** pages rather than the total. khugepaged is still
+     reported on every run it touched, as a SOFT note, so a run is never
+     silently credited as clean when something did touch its pages.
+     `--reverdict` runs nothing and prints old verdict beside new, so this is
+     a rule change a reader can audit rather than a number that quietly
+     improved.
+  4. **EXP-018's decode regression is explained, and it is reversed.** EXP-018
+     measured decode falling 1.88 to 1.38 tok/s and Note 1 offered a
+     cold-start transient as an unmeasured hypothesis. The measurement that
+     settles it is the decode window, taken here on both arms:
+
+     | arm | decode at `--max-new 4` | decode at `--max-new 256` | ratio |
+     | --- | ---: | ---: | ---: |
+     | phase 5, session 1 | 1.81 tok/s | 1.18 tok/s | 0.65x |
+     | phase 5, session 2 | 1.85 tok/s | 1.17 tok/s | 0.63x |
+     | phase 7, session 1 | 2.08 tok/s | 1.99 tok/s | 0.96x |
+
+     **Phase 5's own decode degrades by a third as the window grows from 4
+     tokens to 256**, on one machine in one session, which is exactly what
+     EXP-020 Note 3's linear-in-context finding predicts: context grows 516 to
+     768 and attention's per-token cost grows with it. Phase 7 holds 1.83-1.99
+     over the same window. So EXP-018's 1.88 was a 4-token figure inflated by
+     a warm cache and a short context, its 1.38 was almost entirely the
+     transient, and the "regression" was a comparison of two things neither of
+     which was steady state. At the window where it matters phase 7 is
+     **1.56x-1.69x faster than phase 5**, and it is faster at `--max-new 4`
+     too (2.08 against 1.81/1.85), so the empty-cache cost is no longer
+     visible as a regression at any window measured. (Phase 7's 4-token figure
+     is session 1 only; its 1.83 tok/s at 256 tokens is session 2, so the
+     0.88x that pair implies crosses sessions and is not tabulated.)
+
+     **The mechanism EXP-018 hypothesized is confirmed on the phase-5 side.**
+     The surviving stderr sidecar for a scored phase-5 512-token run
+     (`scratch/cold-bench/run05.json.stderr`) records its decode phase as
+     1,152 expert requests, 718 hits (**62.3%**), 434 misses of which only
+     **4 are cold** — the token-major prefill did leave the decode cache warm,
+     which is the half of EXP-018 Note 1 that was argued from `stream.rs`
+     rather than measured.
+
+     **EXP-005's "prefill does not warm the cache" decision does not need
+     revisiting, and this makes the question moot rather than answering it in
+     EXP-005's favour.** EXP-005 closed prompt-replay-into-cache as worth
+     **+0.09 points** of hit rate; EXP-018 Note 1 reopened it only because the
+     sweep's empty cache appeared to cost real throughput. It does not: phase
+     7 is at or above phase 5 at both windows measured here, so there is no
+     deficit for prompt replay to recover and no reason to spend a phase on a
+     +0.09-point lever. What this entry still does not do is measure the size
+     of the transient itself; it measures that the transient no longer shows
+     up as a loss.
+  5. **4K context fits, and the `memory.peak` progression is now three
+     measured points.** Within this entry, on the phase-7 arm: **2,577.9 MiB**
+     median at 512 prompt tokens plus 4 decode tokens, **2,608.6-2,611.6 MiB**
+     at 512 plus 256, and **2,920.4-2,924.2 MiB** at 3,961 plus 8. The last
+     one leaves 148-152 MiB under the 3,072 MiB ceiling with `pgsteal` 0 and
+     every `memory.events` counter 0, so the **11-slot dial is validated at
+     full context** and EXP-014 Note 2 closes. For the record and not as a
+     curve: EXP-012 predicted 2,961.0 MiB, EXP-014 Note 2 extrapolated ~2,848
+     MiB and EXP-018 Note 3 extrapolated ~2,906 MiB; the measurement lands
+     between the last two and about 40 MiB under the first. That 148-152 MiB
+     of measured spare is not the same quantity as the 111.0 MiB of headroom
+     `docs/architecture.md` marks **provisional** — the architecture figure is
+     a budget built on a provisional `anon` row that fails rule 2, and this is
+     a measured cgroup peak on one workload. They agree in sign and order of
+     magnitude, which is all that should be read into it; the `anon` row still
+     needs its own re-measurement before the budget can be published.
+  6. **EXP-018's unexplained 99-105 MiB residual is still unexplained, and the
+     4K run did not close it.** Phase-7 512-token prefill peaks land in the
+     same band EXP-018 recorded: median 2,577.9 MiB on the phase-7 arm and
+     2,571.8 MiB on the phase-5 arm, against EXP-018's 2,576.0 and 2,570.1,
+     with a full scored range of 2,569.4-2,583.5 MiB across both arms and both
+     sessions. So the residual did not move, phase 7 did not add to it, and
+     nothing here identifies it. It remains a backlog item; the 4K run
+     established that the contract survives full context, which is a different
+     question from where those ~100 MiB go.
+  7. **Phase 7 moved no bytes, and the counter says so exactly.** All six
+     phase-7 512-token runs read **20,716,994,560 B** — the same integer, run
+     to run, and byte-for-byte the count EXP-018 recorded for phase 6. That is
+     1.11x the 18,626,213,888 B installed model, the signature of a sweep that
+     reads each expert once. This is a byte identity across two entries, not a
+     throughput comparison, and it is quoted only to say that the attention
+     work touched no I/O path.
+  8. **EXP-018's inferred 58% token-major prefill hit rate is now measured at
+     58.2%.** EXP-018 derived "near 58%" from bytes on the assumption that
+     every miss reads one whole blob. The phase-5 stderr sidecar records the
+     prefill phase directly: **196,608 requests, 114,375 hits (58.2%), 82,233
+     misses (4,343 cold / 77,890 eviction), 220.8 GiB read in 82,233 reads,
+     106.46 s of io wait**. The inference was right; it is now a measurement.
+     77,890 eviction misses against 4,343 cold ones is the 11-slot pool
+     thrashing, which is the thing the sweep exists to avoid.
+  9. **The 4K prefill phase split, which redirects phase 8's target.** From
+     the session-2 4K run's stderr sidecar
+     (`scratch/cold-bench/run00.json.stderr`), shares of that run's own
+     401.53 s prefill: **expert compute 42.1%** (169.19 s), **projections
+     22.8%** (91.61 s), **attention 20.4%** (81.84 s), **elementwise 12.2%**
+     (49.01 s), **expert io 2.5%** (9.89 s, of which 7.17 s blocked on the
+     drive), other 0.00 s. Its decode split over 5.85 s: expert io 42.0%,
+     attention 29.3%, expert compute 17.3%, projections 9.8%, elementwise
+     1.7%. **Attention is no longer the wall in prefill.** EXP-017 measured it
+     at 85.2% of an 1891-token prefill on the pre-phase-7 kernel; that figure
+     and this one come from different entries, different sessions and
+     different kernels, so rule 3 forbids putting them on one curve and the
+     only licensed statement is directional: the term EXP-017 named as the
+     target is now the third largest, and expert compute is the largest.
+     A phase-8 lane should measure the split on its own workload before
+     choosing, not inherit this one.
+  10. **EXP-014's own DIRTY runs cannot be re-checked, because the JSONs are
+      gone.** EXP-014 recorded a first attempt that scored 3 of 5 clean with
+      the two dirty runs at `pgsteal` 2,817 and 2,946 pages, coinciding with
+      the operator opening a terminal mid-run. Those are two orders of
+      magnitude larger than anything here (44-753 pages) and they have a
+      recorded external cause, so they are probably genuine pressure — but
+      after `4b39104` the classification is checkable, and nobody has checked
+      it. It cannot be checked now: the only surviving EXP-014 artifact is
+      `scratch/cold-bench/summary.json` (mtime 2026-08-04 11:47), which is the
+      **clean** second attempt, 6 runs with `pgsteal` 0 on every one. The
+      first attempt was written to the same default path and overwritten,
+      `scratch/` is in `.gitignore` so there is no history, and a search of
+      every cold-bench-shaped JSON under `scratch/` finds no run with either
+      value. `--reverdict` on the surviving file returns PASS unchanged, so
+      **EXP-014's published numbers are unaffected by the rule change either
+      way**; what is lost is the ability to say whether its discarded runs
+      were correctly discarded. Harness lesson, worth more than the lost data:
+      `cold_bench.py`'s per-run sidecars (`run0N.json.stderr`) are written to a
+      fixed path and clobbered by the next invocation, which is also why this
+      entry has stderr for the 4K run and the phase-5 512 run and for nothing
+      else. A summary that is going to be cited should be copied to a named
+      file at the time, as `phase7_overnight.sh` does with `--json`.
+  11. **What this entry does not settle.** The prefill pair is 5 scored runs
+      per arm and its spread is bounded; the decode pair and the 4K run are
+      `--repeats 1`, so EXP-018 Note 5's criticism still applies to them and
+      their only spread control is that two independent sessions agree (1.99
+      against 1.83 tok/s on phase-7 decode is an 8.7% gap between sessions,
+      and that is the honest error bar on that figure). The phase-7 512-token
+      prefill arm was measured in session 1 only. Nothing here measures the
+      size of the cold-start transient itself, only that it no longer costs a
+      regression. And the phase-7 512-token prefill and decode splits were not
+      captured — the sidecars were overwritten — so the only phase split this
+      entry carries is the 4K one in Note 9.
