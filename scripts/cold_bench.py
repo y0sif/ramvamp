@@ -801,6 +801,15 @@ def reverdict(paths: list[str]) -> int:
     a diff rather than as a number that quietly improved. Exits 1 if any
     run is still DIRTY, 0 if all are clean, 2 if a file could not be read —
     the same convention as a live run.
+
+    "Could not read" covers a file that parses as JSON but is not a summary.
+    Summaries share `--workdir` with the per-run `runNN.json` records and the
+    `runNN.cmd.json` argv files, so `--reverdict scratch/cold-bench/*.json` is
+    the natural thing to type and it hands this function all three. A
+    `cmd.json` is a JSON *list*, and asking a list for `.get("runs")` used to
+    raise an uncaught AttributeError — a traceback, from a script whose whole
+    job is to be the thing you trust about a measurement. Rejected by shape,
+    named, and counted as unreadable rather than silently verdicted.
     """
     worst = 0
     for path in paths:
@@ -809,6 +818,20 @@ def reverdict(paths: list[str]) -> int:
                 summary = json.load(fh)
         except (OSError, ValueError) as err:
             print(f"{path}: could not read ({err})", file=sys.stderr)
+            worst = max(worst, 2)
+            continue
+
+        if not isinstance(summary, dict) or not isinstance(
+                summary.get("runs"), list):
+            what = ("a JSON list, i.e. a runNN.cmd.json argv file"
+                    if isinstance(summary, list) else
+                    f"a JSON {type(summary).__name__} with no `runs` list, "
+                    f"i.e. not a summary — a runNN.json holds one run, not a "
+                    f"run list")
+            print(f"{path}: could not read (this is {what}). --reverdict "
+                  f"takes the summaries written by --json, which share a "
+                  f"workdir with the per-run files; narrow the glob.",
+                  file=sys.stderr)
             worst = max(worst, 2)
             continue
 
@@ -875,6 +898,29 @@ def main() -> int:
                         help="use the checkpoint's sampler instead of greedy "
                              "decoding (default is greedy, so repeats do the "
                              "same work)")
+    parser.add_argument("--cache-bytes", metavar="BYTES", default=None,
+                        help="forward `--cache-bytes BYTES` to ramvamp, the "
+                             "total expert-cache budget the slot count per "
+                             "layer is derived from. Passed through verbatim: "
+                             "ramvamp's own `parse_bytes` is the authority on "
+                             "the grammar (a plain byte count or a K/M/G/T "
+                             "suffix, optionally spelled KiB/MiB/...), and it "
+                             "accepts spellings this script's `parse_size` "
+                             "does not, so re-parsing it here could only "
+                             "reject a value ramvamp would have taken. Omitted "
+                             "entirely by default, so the argv, and therefore "
+                             "every number, stays comparable with runs taken "
+                             "before this flag existed. A slot costs the sum "
+                             "of every layer's page-aligned stride, which is "
+                             "130.781 MiB for the shipped Qwen3-30B-A3B "
+                             "layout, so 1440M (ramvamp's default) buys 11 "
+                             "slots/layer, 1570M buys 12 and 1701M buys 13 — "
+                             "but each of those clears its threshold by under "
+                             "1 MiB, and a repack with a different stride "
+                             "moves the thresholds. The slot count a budget "
+                             "actually bought is therefore never assumed here: "
+                             "read it off the `model loaded in` line of the "
+                             "stderr this harness now records.")
     parser.add_argument("--repeats", type=int, default=3,
                         help="scored runs (after the warmups)")
     parser.add_argument("--warmup", type=int, default=1,
@@ -884,7 +930,21 @@ def main() -> int:
                         help="cgroup MemoryMax (docs rule: 3G)")
     parser.add_argument("--workdir", default="scratch/cold-bench",
                         help="where per-run JSON lands")
-    parser.add_argument("--json", help="write the full summary here")
+    parser.add_argument("--json",
+                        help="write the full summary here. Each run record "
+                             "keeps the child's stderr verbatim — the phase "
+                             "splits and per-phase cache stats — because the "
+                             "`<workdir>/runNN.json.stderr` sidecars are "
+                             "overwritten by the next invocation, and a path "
+                             "chosen per experiment is not. Pass one. The "
+                             "default, `<workdir>/summary.json`, is a fixed "
+                             "path, so it is overwritten by the next "
+                             "invocation exactly like the sidecars it exists "
+                             "to outlive: the retention argument only holds "
+                             "for a path you chose. Defaulting onto an "
+                             "existing summary is warned about up front, not "
+                             "refused — see the comment at the call site for "
+                             "why refusing is worse.")
     parser.add_argument("--reverdict", metavar="SUMMARY.json", nargs="+",
                         help="re-classify already-recorded runs against the "
                              "current rules and print the verdicts, without "
@@ -933,6 +993,27 @@ def main() -> int:
     args.ramvamp = os.path.abspath(args.ramvamp)
     os.makedirs(args.workdir, exist_ok=True)
     args.workdir = os.path.abspath(args.workdir)
+    # Resolved here rather than at the end, so the one action that can
+    # silently destroy an earlier experiment's record is reported *before*
+    # the cold runs start instead of after they finish. `--json` is chosen
+    # per invocation; its default is not, and a `<workdir>/summary.json`
+    # from an earlier session goes with no trace — the same loss, one level
+    # up, that cost phase 7 its stderr sidecars and motivated keeping stderr
+    # in the summary at all.
+    #
+    # Warned, not refused. The summary is written *after* the measurement, so
+    # refusing at that point would discard runs that already cost their cold
+    # time; refusing up front would make a bare `cold_bench.py` fail on a file
+    # from weeks ago, and a gate script that will not run by default gets
+    # worked around rather than heeded. A named path on stderr, before
+    # anything is evicted, is enough for the user to Ctrl-C and pass --json.
+    args.summary_json = args.json or os.path.join(args.workdir, "summary.json")
+    if not args.json and os.path.exists(args.summary_json):
+        print(f"warning: no --json given, so this run will overwrite the "
+              f"existing {args.summary_json} when it finishes. That file is "
+              f"the only surviving copy of its runs' stderr — the phase "
+              f"splits and cache stats. Pass --json <path> to keep both.",
+              file=sys.stderr)
     args.workload = [
         args.ramvamp,
         "generate",
@@ -941,8 +1022,26 @@ def main() -> int:
         "--max-new", str(args.max_new),
         "--skip-hashes",
     ]
+    # Appended only when asked for. An always-present `--cache-bytes 1440M`
+    # would be the same value ramvamp defaults to, but it would change the
+    # argv recorded in every summary, and "the argv is identical" is how a
+    # reader establishes that two runs measured the same workload.
+    if args.cache_bytes is not None:
+        args.workload += ["--cache-bytes", args.cache_bytes]
     if not args.sampled:
         args.workload.append("--greedy")
+    # Recorded like the prompt is, and for the same reason: a run whose dial
+    # is not in its own summary is a run nobody can interpret six weeks later.
+    # `source` distinguishes "the harness set it" from "ramvamp's built-in
+    # default applied", which a bare null cannot. The default is deliberately
+    # not named here — this script cannot see ramvamp's default and guessing
+    # it would eventually be a lie; the budget and the slot count it bought
+    # are both on the `model loaded in` line of the recorded stderr.
+    args.cache_meta = {
+        "source": ("argument" if args.cache_bytes is not None
+                   else "ramvamp-default"),
+        "value": args.cache_bytes,
+    }
 
     preflight(args)
     print(f"cold_bench: {args.warmup} warmup + {args.repeats} scored runs, "
@@ -993,16 +1092,40 @@ def main() -> int:
     summary = {
         "workload": args.workload,
         "prompt": args.prompt_meta,
+        "cache_bytes": args.cache_meta,
         "memory_max": args.memory_max,
         "warmup": args.warmup, "repeats": args.repeats,
         "hygiene": verdict,
         "median": {k: median_of(scored, k)
                    for k in ("wall_s", "load_s", "prefill_tok_s",
                              "decode_tok_s", "prefill_s", "decode_s")},
-        "runs": [{k: v for k, v in r.items() if k not in ("stdout", "stderr")}
+        # `stderr` is kept whole; only `stdout` is dropped. The child's stderr
+        # carries the `model loaded in` line, the `prefill:`/`decode:` timing
+        # line, the `experts:` cache block and the `prefill split (sweep)` /
+        # `decode split (forward_token)` phase splits — the most detailed
+        # diagnostic this harness produces, and the only record of *where* the
+        # time went rather than how much of it there was.
+        #
+        # `inner()` already spools it to `<result-file>.stderr`, but that path
+        # is `<workdir>/runNN.json.stderr` with `NN` restarting at 0 every
+        # invocation and `--workdir` defaulting to a fixed directory, so each
+        # session silently overwrites the previous session's sidecars. Phase 7
+        # lost every phase split but one that way, and the single most
+        # important finding of that phase nearly went unread. A `--json` path
+        # is chosen per invocation, so this copy survives where the sidecar
+        # does not.
+        #
+        # Unfiltered, and uncapped, on purpose: a filter that keeps only the
+        # blocks known today drops the one a future runtime adds, and a
+        # truncation drops either the load line (head) or the phase splits
+        # (tail) — both of which are the point. It is also cheap; measured
+        # 607-1111 bytes per run, against summaries that are already 7-38 KB.
+        # `stdout` is the generated text, previewed in the run log and
+        # reproducible from the recorded argv, so it stays out.
+        "runs": [{k: v for k, v in r.items() if k != "stdout"}
                  for r in runs],
     }
-    out = args.json or os.path.join(args.workdir, "summary.json")
+    out = args.summary_json
     with open(out, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     print(f"wrote {out}")
