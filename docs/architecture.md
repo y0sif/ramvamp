@@ -218,7 +218,7 @@ exact count depends on its blob stride and has not been computed.
 | Common core (mmap, read-only) | 1,023.34 MiB (audited) | touched every token, page cache keeps it resident; charged to the cgroup as `file` |
 | KV cache FP16 | 384 MiB @ 4K | 96 KiB/token; linear append, 48 layers; allocated zeroed at full capacity and faulted lazily |
 | Expert slot pool | 1,438.59 MiB | 11 slots x 48 layers at the real per-layer strides, page-aligned, allocated once, every page faulted at construction |
-| Runtime anonymous memory | 115.1 MiB (**provisional**, EXP-012) | activations and scratch, tokenizer, thread stacks, allocator arenas; peak `anon` sampled from inside the cgroup on a live decode run whose context length, token count and page-cache state were not recorded — it fails rule 2, so it is a floor for this tenant, not a ceiling. See Open risk below |
+| Runtime anonymous memory | 115.1 MiB (**provisional**, EXP-012) + 387 KiB (phase 7) | activations and scratch, tokenizer, thread stacks, allocator arenas; peak `anon` sampled from inside the cgroup on a live decode run whose context length, token count and page-cache state were not recorded — it fails rule 2, so it is a floor for this tenant, not a ceiling. See Open risk below. The 387 KiB is decode's per-shard attention scratch, `min(n_kv_heads, shards)` carves of 132,096 B for 528,384 B total against the one 132,096 B carve that preceded it (EXP-020); it is exact arithmetic on top of a provisional figure, so it does not make the row less provisional |
 | Subtotal | **2,961.0 MiB** (**provisional**) | 111.0 MiB headroom under `memory.max=3G` (3,072 MiB), also provisional: both cells inherit the provenance of the anon row above, and neither may be published until that row is re-measured |
 
 **The prefill sweep is not a fifth row.** Its streaming ring is a
@@ -238,10 +238,12 @@ row.** `ExpertStream::begin_prefill` opens a `PrefillSession`, which carves
 one span laid out as `[scratch | pad | ring]` (scratch at the slab base, ring
 at the next 4096 boundary past it) and hands the two halves out disjointly,
 so the driver writes staging while it consumes swept experts. At the v0 dials
-and the default 512-row chunk that scratch is **80,935,940 B (77.19 MiB)**, of
-which 33,554,432 B is the `[n_rows][top_k][hidden]` staging proper; the
-arithmetic is pinned by a test (EXP-016). It sits inside the 1,438.59 MiB pool
-row alongside the ring, so chunked prefill still moves no cell in this table.
+and the default 512-row chunk that scratch is **81,728,516 B (77.94 MiB)**, of
+which 33,554,432 B is the `[n_rows][top_k][hidden]` staging proper and 792,576
+B is phase 7's six per-shard attention score buffers; the
+arithmetic is pinned by a test (EXP-016, EXP-020). It sits inside the 1,438.59
+MiB pool row alongside the ring, so chunked prefill still moves no cell in this
+table, and neither does sharding its attention.
 The chunk size that sets the figure is a dial, and the 128/256/512/1024 sweep
 that picks it is still owed.
 
@@ -287,7 +289,9 @@ this tenant, not a ceiling, and the 111.0 MiB of spare is not yet proven at
 4K context with the slot pool wired in. If the real figure exceeds 226 MiB
 the dial drops to 10 slots/layer, or the KV cache goes Q8. Needs the
 re-measurement EXP-012 asks for before the 11-slot dial is treated as
-settled.
+settled. Two things have since been charged against that unproven spare and
+neither is large: EXP-018's unexplained 99-105 MiB residual, and phase 7's
+387 KiB of decode attention scratch. The first is the one to worry about.
 
 16 slots/layer is the next real step (simulated 58.1% hit; the batch-pinned
 figure at 16 has never been computed) but its 2,092.5 MiB pool puts the
@@ -419,6 +423,13 @@ slots/layer), fewer slots/layer. A global slot pool shared across layers is
 - Compute pool: 6 threads pinned to P-cores, one per physical core, no SMT
   siblings. Spin barrier within a token step (ggml-style), condvar sleep
   between generations.
+- What the pool runs: expert and projection GEMVs, and since phase 7 attention
+  as well — over **rows** in prefill and over **kv heads** in decode. Two
+  things follow. `ComputePool::run` runs a job inline as a single shard when
+  `rows < shards()`, so a fan-out submitted at fewer units than shards
+  silently serialises; submit at `pool.shards()` and map the indices yourself.
+  And the decode axis has only `n_kv_heads` = 4 units at the v0 pin, so two of
+  the six pinned cores take an empty range on every decode attention call.
 - I/O: the io_uring reactor runs **inline on the coordinator thread** in v0.
   It submits, reaps completions, and flips slot-ready flags between compute
   phases. A dedicated E-core reactor thread is an **experiment**, not a
@@ -455,6 +466,9 @@ slots/layer), fewer slots/layer. A global slot pool shared across layers is
 ## Decode loop (per token, per layer)
 
 1. Attention (QK-norm, RoPE, GQA over FP16 KV) + router on resident weights.
+   Attention itself fans across the compute pool by **kv head** above 8 cached
+   positions, so it is not a serial prologue to the expert work any more; see
+   "Attention: the kernel and its fan-out".
 2. Top-8 expert IDs + renormalized weights.
 3. Cache plan: hits, misses, eviction victims.
 4. Submit all misses to io_uring as one batch. Then dispatch **all** cache-hit
@@ -605,14 +619,19 @@ layer" no matter how it is scheduled. So:
   withdrawn 3.6 GB/s number and is superseded. TF's design (random tile
   fetches through the decode cache) achieved ~28 tok/s, so the sequential
   sweep is still the right call.
-- **The third term the ceiling above leaves out is attention, and it is now
-  measured to be the largest one (EXP-017).** The shipped driver batches the
-  projections and the expert FFN across a chunk's rows, but it runs
-  `attention_at` row by row on the calling thread through one shared score
-  buffer, so attention is neither batched nor parallel, it gets nothing from
-  the six pinned P-cores, and it converts K and V from f16 to f32 per element
-  with no vectorization. Measured on the swept path, attention is **61.3% of
-  a 512-token prefill and 85.2% of a 1891-token one**, against expert I/O at
+- **The third term the ceiling above leaves out is attention, and it was
+  measured to be the largest one (EXP-017).** Phase 7 rebuilt it; what that
+  build now does is "Attention: the kernel and its fan-out" below, and this
+  bullet records the measurement that sent phase 7 there. On the phase-6
+  build, the driver batched the projections and the expert FFN across a
+  chunk's rows but ran `attention_at` row by row on the calling thread through
+  one shared score buffer, so attention was neither batched nor parallel, it
+  got nothing from the six pinned P-cores, and it converted K and V from f16
+  to f32 per element with no vectorization. **All four of those clauses are
+  false on the current build**, and none of the shares below has been
+  re-measured against it — that is EXP-021's job. Measured on the swept path
+  at phase 6, attention is **61.3% of a 512-token prefill and 85.2% of a
+  1891-token one**, against expert I/O at
   1.7% and 0.5% over the same runs. Per-token attention cost is 148.9 ms at
   512 tokens and 555.7 ms at 1891, a ratio of 3.73 against a prompt-length
   ratio of 3.69, which is what a quadratic total looks like measured per
@@ -629,13 +648,15 @@ layer" no matter how it is scheduled. So:
   candidate for the rest. That crosses two entries, so it is a derivation and
   not a measurement, and it is only defensible at all because both batches
   were taken minutes apart in one session on one machine.
-  Parallelizing over rows is bit-neutral, since rows
-  are independent, but it needs one score buffer per shard and the arena
-  carve does not have one (EXP-016); vectorizing the f16 conversion and the
-  dot is a second and independent lever. **No speedup figure is predicted
-  here.** The headroom looks large and the measurement is owed, which is the
-  same rule that made this term worth measuring before building anything
-  against it.
+  **Both levers this bullet named have since been taken** (EXP-020): rows are
+  fanned across the pool by cost, and the conversion, the dot and the V
+  reduction are vectorized with AVX2 + F16C. Warm and in process the kernel
+  is 6.4x to 9.1x faster at one token's worth of attention over the 64-to-4096
+  context ladder, and the prefill fan-out is an **estimated** ~5.9x on the
+  attention region — which Amdahl on the shares above turns into an
+  **estimated** ~2.0x on a 512-token prefill and ~3.4x at 1891. **No cold
+  number exists**, so nothing here may be published; EXP-021 is reserved for
+  the run that produces one.
 - Decode cache starts cold after prefill; acceptable, first tokens warm it.
   Replaying the prompt into the cache during prefill is closed as a "no",
   see "Recorded decisions from phase-5 measurement". **This line predicted a
@@ -698,7 +719,10 @@ What that buys:
   `PrefillSession::split` hands the two out as disjoint `&mut`s. That is what
   lets the layer-major driver write staging while it consumes swept experts
   without a second allocation, and at the v0 dials and a 512-row chunk the
-  scratch half of that span is 80,935,940 B, 77.19 MiB (EXP-016). The
+  scratch half of that span is 81,728,516 B, 77.94 MiB (EXP-016 measured
+  80,935,940 B / 77.19 MiB; phase 7 added six 132,096 B attention score
+  buffers, one per compute shard, for 792,576 B — see "Attention: the kernel
+  and its fan-out"). The
   scratch is deliberately **not zeroed**:
   taking it is address arithmetic over pages the pool already faulted, so the
   bytes are whatever the last expert read or the last prefill left there, and
@@ -746,6 +770,217 @@ What it costs:
   `CacheError::TooFewSlots` three decode steps later, which names a symptom
   and no cause at all. Neither error is a repair; nothing can repair this
   while the arena is the pool, which is the design.
+
+## Attention: the kernel and its fan-out (phase 7)
+
+EXP-017 measured attention as the binding term in prefill and phase 7 rebuilt
+it in three steps. Every step is **bit-neutral**, pinned to the bit against the
+kernel it replaced, and that is not a tolerance — it is the condition under
+which the work was allowed at all. What follows is what the code does now.
+EXP-020 records what each step was worth, warm; **no cold measurement of any of
+it exists yet** (EXP-021).
+
+**The forbidden thing first, because it has not changed.** No online,
+streaming or flash-style rescaled softmax, anywhere, at any point. The causal
+limit is a *length*: masked positions are **absent** from the score buffer,
+from the softmax normalizer and from the V sum, rather than present with a
+zero weight. A rescaled softmax reassociates the normalizer and breaks the
+bit-identity gate that everything else here rests on. This is recorded in the
+kernel's own module docs, in `x86.rs`'s, and here.
+
+### Loop order: kv head outer, query head inner
+
+GQA pairs 32 query heads with 4 kv heads at the v0 pin, so the group is 8. The
+old nest put the query head outermost, which converted every K and every V
+element from f16 to f32 **eight times**, once per query head in its group. The
+nest is now kv-head outer with the group inner, so each element is widened once
+into a `head_dim`-long f32 buffer and reused across the whole group.
+
+Bit-neutral by construction rather than by tolerance: `h = kv_head * group + g`
+visits the query heads in the same ascending order as `kv_head = h / group`;
+the f16-to-f32 widening is exact, so a buffered value is bit-for-bit the value
+the inline conversion produced; the dot still walks `i` ascending into one f32
+with a separate multiply and add; the scale is still applied once at the end;
+softmax still receives a contiguous run. The pre-change nest is kept verbatim
+as a test-only reference and the two are asserted identical.
+
+**"Once per kv head" is scoped, and the scope matters.** On the scalar path it
+is literally once, for K and for V, at every group size. On the AVX2 path it is
+literally once for V, and for K it is `ceil(group / 8)` — the K widening sits
+*inside* `x86::qk_scores`'s chunk loop over the group. Counted: 1.00x for
+groups 1-8, 2.00x for 9-16, 3.00x for 17-24, 4.00x for 25-32. **v0 is group 8,
+where the ratio is exactly 1**, so nothing measured moves; the correctness
+sweep carries groups 9, 12, 17 and 32, which is why an unqualified claim would
+have sat next to its own disproof. Hoisting it needs the position axis outer
+and the group axis inner, which makes the transposed query block hold the whole
+group — a size bounded by nothing in the geometry — or re-transpose per
+position block. Not worth it to remove a factor of 1.
+
+### AVX2 + F16C, and why the obvious axis is illegal
+
+`crates/core/src/kernels/attention/x86.rs` is gated on a runtime probe of
+`avx2` **and** `f16c`. Those are separate CPUID bits, so this is not the same
+probe `quants::avx2` uses, and geometries past `MAX_SIMD_HEAD_DIM = 256` fall
+through to the scalar reference. Three pieces, each vectorized along an axis
+that is **already independent**, so none of them reassociates a reduction:
+
+- **The f16 widening.** `vcvtph2ps` eight at a time. Every f16 is exactly
+  representable in f32, so the conversion has nothing to round; swept against
+  the scalar path over all 65,536 bit patterns. Signalling NaN is the one
+  scoped exception — the instruction quiets a payload the scalar path
+  preserves — and a non-finite activation means the pass already failed
+  upstream.
+- **The QK dot.** The lanes ride the **GQA group**, not `head_dim`. The scalar
+  order is one f32 accumulator per (query head, position) walking `i`
+  ascending. **Eight lanes over `head_dim` would split that 128-long chain
+  into eight partials plus a horizontal tree, which moves bits, so it is
+  illegal here** — and it is the axis a reader reaches for first, which is why
+  it is written down. The group's eight accumulators are already independent:
+  transpose the group's queries once per kv head into `[i][lane]`, broadcast
+  each converted K element across them, and lane `g` still walks `i` ascending
+  in its own f32. Positions are blocked by `T_BLOCK = 4` purely to run four
+  *independent* chains and fill the vector add's latency; each (position, lane)
+  pair still keeps a single chain over `i`.
+- **The V reduction.** Lanes over `head_dim`, which is elementwise and
+  therefore exact; `t` stays strictly sequential, with the accumulator loaded
+  from and stored back to `out` on every `t`, so element `i` sees exactly the
+  scalar sequence.
+
+**No FMA anywhere in that file, deliberately.** `acc += qv * kv` is a multiply
+*and* an add — two roundings — and `_mm256_fmadd_ps` or `f32::mul_add`
+collapses them into one and changes the result bits. The host has FMA and the
+module does not enable it. This was verified load-bearing rather than assumed:
+injecting an FMA at each of the two sites in an isolated copy broke four tests
+each time, which also proves the vector path is genuinely taken rather than
+silently falling back to scalar. **A future contributor will want to "fix"
+both of these. Both are wrong.**
+
+All loads and stores are unaligned forms. A head slice sits at a
+`kv_head * head_dim` element offset inside a row, so an odd `head_dim` puts it
+on a 2-byte boundary and the matching `out` sub-slice on a 4-byte one; the
+claim is tested against deliberately shifted views and end to end at
+`head_dim` 9.
+
+**Miri cannot see any of this.** `is_x86_feature_detected!` is false under
+Miri, so the tool takes the scalar path and never executes a single `unsafe`
+block in `x86.rs`. Its soundness rests on inspection and on the bit-identity
+sweep proving the *results* match — not on tooling. Treat that file
+accordingly.
+
+### Prefill fans over rows, by cost, out of the arena
+
+`prefill::scatter_attention` submits one row per unit to the compute pool.
+Rows are independent — each is a separate `attention_at_in` call reading an
+immutable `q` and an immutable cache and writing only its own `[q_dim]` span of
+`out` — so *any* partition reproduces the serial bytes exactly. That freedom is
+spent on a **cost-balanced** split rather than an equal-row one: row `r`
+attends `start + r + 1` positions, so the cumulative cost of rows `0..r` is
+`r * start + r * (r + 1) / 2`, and the shard boundaries are a binary search on
+that curve for `total * index / shards`. The split is a pure function of
+`(rows, start, shards, index)` — no clock, no pool state — so runs stay
+reproducible.
+
+The numbers, pinned by a test: for the first 512-row chunk of a prompt over six
+shards the total is **131,328** cost units, an even split would be **21,888**
+each, the equal-row split's last shard carries **39,950** (a 3.3x makespan
+where 6x was available), and the cost-balanced split's longest shard carries
+**22,175** — 1.3% off ideal, hence an **estimated** 5.9x on the region.
+
+**The per-shard score buffers come from the `PrefillSession` arena, so prefill
+still costs zero additional bytes.** Six carves of 132,096 B took the scratch
+half of the span from 80,935,940 B (77.19 MiB) to **81,728,516 B (77.94 MiB)**
+of the ~1,438 MiB slab. `shards` and `max_positions` moved into `PrefillDims`
+so no `scratch_bytes` call site changed, and the new term is constant in
+`rows`, which is what keeps `plan_arena`'s affine assumption true.
+
+### Decode fans over kv heads, and the query-head split was wrong
+
+Decode splits differently, and the first attempt was measured and rejected.
+`decode_attention` derives the GQA group from `q.len()`, so handing a shard a
+contiguous slice of query heads silently re-maps them onto the wrong kv heads;
+the split that preserves the mapping is a **strided slab** of query heads. It
+works and it is bit-identical — and it fights the vectorization. `dot_block`
+puts its eight lanes on the GQA group, so a one-head slab issues a full group's
+vector-op count with seven lanes carrying zeros. Measured warm at 4096
+positions: the whole `group = 8` call 4,293.8 µs, a `group = 1` slab 1,981.1 µs
+— eight slabs are ~15.8 ms of CPU against 4.3 ms for the one call (**derived**
+from those two measurements). End to end that was 1.8x at six shards for 3.1x
+the CPU, taken from the cores the streamed experts need, and it **inverted** at
+short context: 0.46x at 64 positions, which is where EXP-014's decode baseline
+sits.
+
+**The kv head is the axis that costs nothing.** A partition gives each kv head
+to exactly one shard, so no conversion is duplicated relative to the whole
+call; the group's query heads are contiguous and disjoint in both `q` and
+`out`, so no gather, scatter or permutation is needed; and the group stays
+whole, so the eight lanes stay full. Measured **2.4x at 4096 and 1.9x at 64**,
+on a loaded machine, so a lower bound.
+
+Three consequences worth writing down:
+
+- **The ceiling is `n_kv_heads`, which is 4.** Six shards buy at most four.
+  Going wider needs an axis that is neither the group (measured worse, above)
+  nor positions (that needs the forbidden rescaled softmax).
+- **The job is submitted at exactly `pool.shards()` rows**, not at
+  `n_kv_heads`, and each unit slot is mapped to a kv-head range. That is a
+  correctness invariant, not a tuning choice: `ComputePool::run` runs a job
+  with `rows < shards()` **inline as a single shard**, so submitting 4 rows to
+  a 6-shard pool would serialise the whole call — on every non-hybrid machine,
+  where the pool is 12 to 32 wide against 4 kv heads, it would have serialised
+  always. Surplus slots take an empty range, which the kernel documents as a
+  legal no-op. The split is read from the closure's own `shard.rows` rather
+  than from `pool.shards()` recomputed inside the body, so the two cannot
+  disagree.
+- **The fan-out is gated below 8 cached positions**, measured rather than
+  assumed: from 8 upward it won every rung of every repeat by 1.66x to 2.56x;
+  below 8 both arms cost 3-14 µs and the median swings either side of 1.0. The
+  gate is a pure function of `kv.len(layer)`, never of a clock — a gate that
+  read the wall time would make the partition, and therefore the reduction
+  order, depend on how busy the machine was.
+
+Decode has no arena, so its scratch is heap: one carve per **reachable** unit,
+`min(n_kv_heads, shards)` of them, **528,384 B (516 KiB)** at the v0 pin. Sizing
+it at `shards` instead left 264,192 B zero-filled at construction and never
+touched. The fan-out's *new* anonymous memory is therefore **396,288 B (387
+KiB)**, charged against the ~111 MiB of headroom this document already marks
+**provisional** and that EXP-018's unexplained 99-105 MiB residual already eats
+into.
+
+### The aliasing lesson
+
+The kv-range entry points originally addressed query heads absolutely, so every
+shard rebuilt a `&mut` view of the **entire** output vector. The writes were
+disjoint and the kernel never reads `out`, which is why it computed the right
+answer and why every test passed. It was still undefined behaviour: two live
+`&mut` over one allocation are UB whether or not the writes collide, because
+creating the second invalidates the first.
+
+Miri said so three ways on the pre-fix tree — Stacked Borrows against the
+`Unique` held by the kernel body, Stacked Borrows against the `SharedReadOnly`
+held by its validation parameter, and Tree Borrows as an outright data race
+between a retag read on a worker and a non-atomic write on the submitter. `out`
+is now the shard's own sub-slice, indexed from zero, while `q` stays the full
+vector because the group must still be derived from it. Disjointness is
+**structural**: shard windows are the image of a tiling under an injective map,
+and a kernel writing outside its range would be a wrong answer rather than
+unsoundness.
+
+### Instrumentation
+
+`decode split (forward_token):` now prints on stderr beside the prefill split,
+in the same shape: a heading with token count, total and ms/token, then the six
+disjoint phases (`attention`, `expert compute`, `expert io`, `projections`,
+`elementwise`, `other`). It is always on when any token was decoded — no flag,
+no environment variable. The heading deliberately does not begin `decode:`,
+because `scripts/cold_bench.py`'s `TIMING_RE` is anchored on the prefill line
+and a second match would break the harness.
+
+It reverses a documented hot-path choice: decode's `PhaseClock` used to be left
+unarmed, so a decode token paid one `Instant::now()` for the whole token. It
+now pays one per phase boundary — **724 reads per token, derived by counting
+the sites**, at ~27 ns each on this machine's vDSO, so ~20 µs against a token
+EXP-018 puts in the hundreds of milliseconds. Order 1e-4 of the token, well
+under the run-to-run noise of anything it would be read against.
 
 ## Validation protocol vs llama.cpp
 
@@ -937,7 +1172,10 @@ Prior-art anchors, with the qualifiers that were previously missing:
 
 Single sequence, 4K context, CLI chat + raw completion, greedy +
 standard sampling, no server, no batching, no speculative anything, Linux
-only, x86-64 with AVX2 required. Gemma 4 26B-A4B is model #2 and brings:
+only, x86-64 with AVX2 required. Attention additionally probes **F16C**, a
+separate CPUID bit from AVX2 and FMA, and falls back to the scalar reference
+without it; it deliberately does not enable FMA (see "Attention: the kernel and
+its fan-out"). Gemma 4 26B-A4B is model #2 and brings:
 shared-expert overlap, SWA KV rings, per-layer attention-type mix, logit
 softcap, and (if we adopt their quant source) a second quant scheme decision.
 
@@ -1029,14 +1267,37 @@ are neither now, and they should not come back without new evidence.
   at 161 s, 143 s and 131 s on a 512-token prompt, all three byte-identical
   to token-major (EXP-017). That is a direction, not the sweep: it fails
   rule 2, it does not cover 1024, and it says nothing about the memory peak
-- **Parallelize and vectorize prefill attention.** It is 61.3% of a 512-token
-  prefill and 85.2% of a 1891-token one (EXP-017), single-threaded on the
-  calling thread through one shared score buffer, with an unvectorized
-  per-element f16-to-f32 conversion. Parallelizing over rows is bit-neutral
-  and needs one score buffer per shard, which the arena carve does not have;
-  vectorizing the conversion and the dot is a second lever and is subject to
-  rule 4. No speedup is predicted, and the levers should be measured
-  separately
+- **The cold rule-2 measurement of phase 7's attention work.** EXP-020 is warm
+  and in process; the runbook for the cold pass is committed at
+  `scratch/phase7/wave3-runbook.md` and **EXP-021 is reserved for it**: paired
+  cold prefill at `--repeats 5`, paired cold decode at `--max-new 256`, the 4K
+  `memory.peak` run, and the numerics gate. Until it exists, phase 7 has
+  published nothing (EXP-020)
+- **Softmax, and unfreezing `primitives`.** `primitives::softmax` is 23.5% of
+  the attention kernel at 4096 positions (1,059 µs of 4,499 µs, measured,
+  EXP-020) and `primitives` is frozen. Leaving it frozen caps every other
+  attention lever at `1 / 0.235` = 4.26x on the kernel; perfecting it alone
+  buys at most `1 / (1 - 0.235)` = 1.31x. Both figures are **derived**.
+  Vectorizing it bit-neutrally means reproducing libm's `f64::exp`
+  lane-for-lane and leaving the f64 normalizer serial, which is a project
+  rather than a patch. Unfreezing `primitives` is a decision, not an oversight
+  (EXP-020)
+- **Blocking or tiling attention at long context.** After vectorization the
+  kernel's cost is no longer linear in context: `max(ns/pos) / min(ns/pos)`
+  over the ladder went from 1.03x to 1.40-1.57x on the 48-layer arm, because
+  the arithmetic got roughly 10x cheaper and the memory traffic did not move
+  at all. That is the next structural lever, and it is not more arithmetic
+  (EXP-020)
+- **`T_BLOCK` in `x86::dot_block`, 4 to 8.** The implementing lane called it
+  the cheapest remaining win in that file, roughly 1.5-2x on the QK dot, at 8
+  more live ymm registers and 16 KiB of stack. **Estimated, never measured**,
+  and it must stay bit-neutral: more independent position chains is legal,
+  splitting one chain over `i` is not (EXP-020)
+- **A wider decode attention axis than the kv head.** The fan-out ceiling at
+  the v0 pin is `n_kv_heads` = 4 against six pinned cores. The query-head split
+  was tried and measured worse (it narrows the axis the SIMD lanes ride), and
+  the position axis needs the forbidden rescaled softmax, so this is an open
+  question rather than a queued task (EXP-020)
 - **A longer `--max-new` on EXP-018's paired prompt**, to settle whether the
   decode drop it measured (1.88 to 1.38 tok/s) is the cold-start transient it
   looks like. EXP-018 generated 4 tokens, and the swept prefill leaves the
@@ -1049,10 +1310,21 @@ are neither now, and they should not come back without new evidence.
 - The **cold phase split**. EXP-017's attribution of prefill time to attention
   is warm and uncgrouped; EXP-018 is cold but has no per-phase counters in it.
   Neither says what attention's share is cold, which is the number phase 7
-  should be judged against
+  should be judged against. Phase 7 added the counter half: `forward_token`
+  now emits a `decode split (forward_token):` block on stderr beside the
+  prefill one, always on, at ~1e-4 of a token in overhead. So the cold run
+  itself is all that is missing, and it is EXP-021's
 
 Dropped from the backlog:
 
+- ~~Parallelize and vectorize prefill attention~~: **done, EXP-020**, and the
+  measurement it produced is warm rather than cold, so the item it leaves
+  behind is EXP-021 above. Three steps landed: the f16-to-f32 conversion
+  hoisted out of the GQA group (2.708x arm A / 2.684x arm B, measured), an
+  AVX2 + F16C path for the conversion, the dot and the V reduction (~4.2x on
+  the kernel, measured in process), and fan-out across the compute pool — rows
+  by cost in prefill, kv heads in decode. All bit-neutral, all pinned to the
+  bit. See "Attention: the kernel and its fan-out"
 - ~~Prefill throughput and peak memory for the shipped sweep, cold inside the
   3G cgroup, against the token-major path on the same prompt~~: **done,
   EXP-018.** Prefill 4.23 tok/s against 1.65, a 2.56x paired ratio, cold in

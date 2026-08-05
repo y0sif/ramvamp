@@ -1052,6 +1052,7 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
     // A `generate` is one prefill and then decode, so the whole snapshot is
     // that prefill's span.
     report_prefill_timing(&state, &PhaseStats::take(&state));
+    report_decode_timing(&state);
     Ok(())
 }
 
@@ -1289,6 +1290,15 @@ fn report_prefill_timing(state: &ForwardState, span: &PhaseStats) {
     }
 }
 
+/// The decode phase split, on stderr, under the prefill one.
+///
+/// Silent when nothing has decoded on this state since the last prefill.
+fn report_decode_timing(state: &ForwardState) {
+    for line in decode_timing_lines(&state.decode_timing()) {
+        eprintln!("{line}");
+    }
+}
+
 /// The drive-blocked share of a prefill's expert I/O, from whichever streamer
 /// counter that path feeds.
 ///
@@ -1342,6 +1352,43 @@ fn prefill_timing_lines(timing: &PrefillTiming, blocked_on_drive: Duration) -> V
             String::new()
         };
         lines.push(format!("  {label:>14}: {secs:7.2}s ({pct:5.1}%){note}"));
+    }
+    lines
+}
+
+/// The exact text [`report_decode_timing`] prints.
+///
+/// The decode counterpart of [`prefill_timing_lines`], and it must stay out of
+/// `scripts/cold_bench.py`'s way for the same reason: `TIMING_RE` is anchored
+/// on `prefill:\s*\d+\s*tokens in` and the whole-run line
+/// [`generate_stats_line`] produces, so this heading says
+/// `decode split (...)` and never `decode:`.
+///
+/// Two things differ from a prefill's block. There is no mode, because decode
+/// has no path to choose. And `total` is the sum of the per-token wall times
+/// rather than a span measured around the loop, so it is a little under the
+/// `decode:` figure above it — the sampler, the detokenizer and the stop check
+/// live in the gap. That makes `other` a statement about `forward_token`, and
+/// stating the per-token average is what makes the two comparable at a glance.
+fn decode_timing_lines(timing: &PrefillTiming) -> Vec<String> {
+    if timing.tokens == 0 {
+        return Vec::new();
+    }
+    let total = timing.total.as_secs_f64();
+    let per_token = total / timing.tokens as f64;
+    let mut lines = vec![format!(
+        "decode split (forward_token): {} tokens in {total:.2}s ({:.0} ms/token)",
+        timing.tokens,
+        per_token * 1000.0
+    )];
+    for (label, spent) in timing.phases() {
+        let secs = spent.as_secs_f64();
+        let pct = if total > 0.0 {
+            secs / total * 100.0
+        } else {
+            0.0
+        };
+        lines.push(format!("  {label:>14}: {secs:7.2}s ({pct:5.1}%)"));
     }
     lines
 }
@@ -1839,6 +1886,7 @@ fn chat_turn(
             // this turn; the streaming counters it quotes are not, hence the
             // delta.
             report_prefill_timing(state, &span);
+            report_decode_timing(state);
             Ok((reply, false))
         }
         Err(payload) => {
@@ -1860,6 +1908,7 @@ fn chat_turn(
             let span = PhaseStats::take(state).since(&at_turn_start);
             report_stream_span(state, &span, None);
             report_prefill_timing(state, &span);
+            report_decode_timing(state);
             Ok((reply, interrupted))
         }
     }
@@ -3660,6 +3709,53 @@ mod tests {
 
         // Nothing has prefilled: nothing is printed.
         assert!(prefill_timing_lines(&PrefillTiming::default(), ms(0)).is_empty());
+    }
+
+    /// The decode split has to clear the same bar: `cold_bench.py` searches
+    /// the whole stderr for `prefill: <n> tokens in ... ; decode: <n> tokens
+    /// in ...`, and this block prints in the same stream right underneath it.
+    #[test]
+    fn the_decode_split_cannot_be_mistaken_for_the_timing_line() {
+        let ms = std::time::Duration::from_millis;
+        let timing = PrefillTiming {
+            // Decode has no path to choose, so there is no mode to report and
+            // `tokens` is what says whether anything ran.
+            mode: None,
+            tokens: 64,
+            total: ms(30_000),
+            attention: ms(21_000),
+            projections: ms(3_000),
+            expert_compute: ms(2_500),
+            expert_io: ms(2_000),
+            elementwise: ms(1_000),
+        };
+        let lines = decode_timing_lines(&timing);
+        assert_eq!(lines.len(), 7, "a heading and six phases: {lines:?}");
+        assert_eq!(
+            lines[0],
+            "decode split (forward_token): 64 tokens in 30.00s (469 ms/token)"
+        );
+        for line in &lines {
+            assert!(!line.contains("decode: 64 tokens"), "{line}");
+            assert!(!line.contains("; decode: "), "{line}");
+            assert!(!line.contains("tok/s"), "{line}");
+        }
+        assert_eq!(lines[1], "       attention:   21.00s ( 70.0%)");
+        assert_eq!(lines[6], "           other:    0.50s (  1.7%)");
+
+        // Nothing has decoded: nothing is printed. `mode` stays `None` on this
+        // accumulator, so `ran()` is the wrong question and `tokens` is asked
+        // instead — a decode split gated on `ran()` would never print at all.
+        assert!(decode_timing_lines(&PrefillTiming::default()).is_empty());
+        assert!(
+            decode_timing_lines(&PrefillTiming {
+                tokens: 1,
+                total: ms(500),
+                ..PrefillTiming::default()
+            })
+            .len()
+                == 7
+        );
     }
 
     /// Swept prefill resolves no cache accesses at all, so the old

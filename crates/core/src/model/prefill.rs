@@ -38,9 +38,11 @@
 //!   function, so the pool fan-out is bit-neutral.
 //! - RMSNorm, RoPE, softmax, SwiGLU, `vec_add` and both activation
 //!   quantizers are per row with no cross-row coupling.
-//! - [`attention_at`] is bit-identical to `decode_attention` against a cache
+//! - [`attention_at_in`] is bit-identical to `decode_attention` against a cache
 //!   truncated to the same length, which is what lets a chunk's whole K/V be
-//!   appended before any of its rows attend.
+//!   appended before any of its rows attend. Rows are independent of each
+//!   other too, so [`scatter_attention`] may split them across shards by cost
+//!   rather than by count without moving a bit.
 //!
 //! # Layer-major, and why the K/V goes in first
 //!
@@ -50,7 +52,7 @@
 //!     norm/quantize/Q,K,V for all R rows      (batched GEMV, n_acts = R)
 //!     QK-RMSNorm + RoPE per row at start + r
 //!     append ALL R rows' K/V to kv[layer]     <-- the inversion
-//!     attention_at(row r, positions = start + r + 1)
+//!     attention_at_in(row r, positions = start + r + 1)   (fanned out)
 //!     o_proj, residual, ffn norm, router, top-k for all R rows
 //!     sweep the layer once; per expert, compute its routed rows in one batch
 //!     reduce each row's staging in top-k order
@@ -59,7 +61,7 @@
 //!
 //! Appending the whole chunk's K/V before attending is the point: it is one
 //! pass over the layer instead of R, and the causal mask that makes it correct
-//! is [`attention_at`]'s `positions` argument. Mid-layer the KV cache is
+//! is [`attention_at_in`]'s `positions` argument. Mid-layer the KV cache is
 //! legitimately **ragged** — layer `L` holds `start + R` positions while layer
 //! `L + 1` still holds `start` — so [`crate::kv::KvCache::seq_len`] reports
 //! [`KvError::RaggedLayers`](crate::kv::KvError::RaggedLayers) until the chunk
@@ -91,7 +93,9 @@ use std::time::{Duration, Instant};
 use crate::format::{ArchInfo, ExpertsLayout};
 use crate::io::{PrefillSession, SweepConfig, SweepExpert, SweepPlan};
 use crate::kernels::KernelError;
-use crate::kernels::attention::{AttentionScratch, attention_at};
+use crate::kernels::attention::{
+    AttentionError, attention_at_in, scratch_len as attention_scratch_len,
+};
 use crate::kernels::primitives::{
     rmsnorm, rmsnorm_in_place, rope_neox_heads, softmax, swiglu_combine, vec_add,
 };
@@ -240,8 +244,10 @@ impl PrefillConfig {
 /// thrash in the batched expert GEMV — not to attribute every instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Phase {
-    /// The causal attention over the KV cache: `attention_at` per row on the
-    /// sweep, `decode_attention` per token on the token-major path.
+    /// The causal attention over the KV cache: `attention_at_in` per row on
+    /// the sweep, `decode_attention` per token on the token-major path. Both
+    /// are fanned out across the compute pool, so this is wall time, not core
+    /// time.
     Attention,
     /// GEMVs against resident weights: Q/K/V, `o_proj`, the router matvec
     /// (with its softmax and top-k selection, which it dominates) and
@@ -393,19 +399,60 @@ impl PrefillTiming {
 /// whose iteration count is per expert rather than per row (~128 per layer),
 /// where the resolution is worth ~25 ns.
 pub(super) struct PhaseClock<'a> {
-    /// `None` when this pass charges nowhere, which is every `forward_token`
-    /// a decode step makes: the token-major prefill and decode run the same
-    /// instrumented code, and a decoded token's phases belong to no prefill.
+    /// `None` when this pass charges nowhere.
     timing: Option<&'a mut PrefillTiming>,
     since: Instant,
+    /// When the whole pass began, for a clock that must close its own
+    /// [`PrefillTiming::total`]. `None` for a prefill clock, whose total is
+    /// the whole `prefill_prompt` call and is measured outside this type.
+    whole: Option<Instant>,
 }
 
 impl<'a> PhaseClock<'a> {
     /// Open the first region, charging into `timing` only when `armed`.
+    ///
+    /// Unarmed is every `forward_token` a decode step makes *into the prefill
+    /// accumulator*: the token-major prefill and decode run the same
+    /// instrumented code, and a decoded token's phases belong to no prefill.
     pub(super) fn new(timing: &'a mut PrefillTiming, armed: bool) -> Self {
+        let now = Instant::now();
         Self {
             timing: armed.then_some(timing),
-            since: Instant::now(),
+            since: now,
+            whole: None,
+        }
+    }
+
+    /// A clock over one **decoded token**: the same five phases, plus the
+    /// token's own wall time and the token itself when [`PhaseClock::close`]
+    /// runs.
+    ///
+    /// A prefill is timed from outside `forward_token` by `prefill_prompt`,
+    /// which knows where the pass begins and ends; a decode step has no such
+    /// outer frame, so it closes its own total.
+    pub(super) fn decoding(timing: &'a mut PrefillTiming) -> Self {
+        let now = Instant::now();
+        Self {
+            timing: Some(timing),
+            since: now,
+            whole: Some(now),
+        }
+    }
+
+    /// End the pass: on a [`PhaseClock::decoding`] clock, add everything since
+    /// it was created to [`PrefillTiming::total`] and one to
+    /// [`PrefillTiming::tokens`]. A no-op on any other clock.
+    ///
+    /// Not a `Drop` impl: a pass that failed mid-token leaves a state its
+    /// caller must discard, and charging a token that produced nothing would
+    /// put a lie in the only numbers anyone reads afterwards.
+    pub(super) fn close(self) {
+        let Some(whole) = self.whole else {
+            return;
+        };
+        if let Some(timing) = self.timing {
+            timing.total += whole.elapsed();
+            timing.tokens += 1;
         }
     }
 
@@ -611,6 +658,12 @@ struct Scratch<'a> {
     moe_t: &'a mut [f32],
     /// One row's weighted expert accumulator, `[hidden]`.
     expert_acc: &'a mut [f32],
+    /// Per-shard attention scratch, `[shards][attn_shard]`: one whole
+    /// [`attention_scratch_len`] carve per compute shard, so the per-row
+    /// attention can run on every pinned core at once without a heap byte.
+    /// Constant in `rows` on purpose — [`plan_arena`] recovers the per-row
+    /// slope by differencing [`scratch_bytes`] and needs it to stay affine.
+    attn_shards: &'a mut [f32],
     /// Router logits, `[rows][n_experts]`.
     router_logits: &'a mut [f32],
     /// Router probabilities, `[rows][n_experts]`; top-k selection consumes
@@ -658,6 +711,15 @@ struct PrefillDims {
     moe_q8k: usize,
     /// `max(q_dim, hidden)`: the widest batched-GEMV output `tmat` must hold.
     wide: usize,
+    /// Compute shards the per-row attention is fanned out across, which is
+    /// [`ComputePool::shards`] and therefore counts the submitting thread.
+    /// Here rather than passed to [`scratch_bytes`] so that all of its call
+    /// sites — [`plan_arena`]'s three included — stay unchanged.
+    shards: usize,
+    /// The KV cache's position capacity: the longest row any chunk of this
+    /// prefill can attend over, and so the width the per-shard attention
+    /// carve is sized for once instead of per chunk.
+    max_positions: usize,
 }
 
 /// Weights per Q8_K super-block.
@@ -666,7 +728,28 @@ const QK_K: usize = 256;
 const QK8_0: usize = 32;
 
 impl PrefillDims {
-    /// Read the chunk geometry off `arch`.
+    /// One compute shard's attention scratch, in f32.
+    ///
+    /// Sized from [`PrefillDims::max_positions`] rather than from the chunk,
+    /// so the carve serves the last row of the last chunk as well as the
+    /// first row of the first one. A slice longer than one call needs is
+    /// accepted by `attention_at_in` and its tail ignored.
+    fn attn_shard(&self) -> usize {
+        attention_scratch_len(
+            self.n_heads,
+            self.n_kv_heads,
+            self.head_dim,
+            self.max_positions,
+        )
+    }
+
+    /// Every shard's attention scratch together, in f32.
+    fn attn_scratch(&self) -> usize {
+        self.shards.saturating_mul(self.attn_shard())
+    }
+
+    /// Read the chunk geometry off `arch`, for a pool of `shards` shards
+    /// against a cache holding `max_positions` positions.
     ///
     /// # Errors
     ///
@@ -675,7 +758,7 @@ impl PrefillDims {
     /// nonsensical router config — the same refusals
     /// [`ForwardState::with_config`] makes, restated because this reads the
     /// *argument* model.
-    fn new(arch: &ArchInfo) -> Result<Self, ForwardError> {
+    fn new(arch: &ArchInfo, shards: usize, max_positions: usize) -> Result<Self, ForwardError> {
         let hidden = arch.hidden as usize;
         let q_dim = arch.n_heads as usize * arch.head_dim as usize;
         let kv_dim = arch.n_kv_heads as usize * arch.head_dim as usize;
@@ -717,6 +800,11 @@ impl PrefillDims {
             attn_q8k: q_dim / QK_K,
             moe_q8k: moe / QK_K,
             wide: q_dim.max(hidden),
+            // A pool always has at least one shard; clamping here means a
+            // caller that passed zero gets a one-shard carve rather than a
+            // zero-length one the fan-out would then index into.
+            shards: shards.max(1),
+            max_positions,
         })
     }
 }
@@ -738,33 +826,43 @@ fn accumulate(total: &mut usize, count: usize, unit: usize) -> Result<(), Forwar
 ///
 /// The arithmetic, in carve order. `H` is hidden, `Q` is `n_heads * head_dim`,
 /// `V` is `n_kv_heads * head_dim`, `M` is `moe_intermediate`, `K` is `top_k`,
-/// `E` is `n_experts`, and `W` is `max(Q, H)`:
+/// `E` is `n_experts`, `W` is `max(Q, H)`, `S` is the compute shard count and
+/// `A` is one shard's [`attention_scratch_len`] carve:
 ///
 /// ```text
 /// f32   rows * (2H + 2Q + 2V + W + K*H + 3M + 2E)   + H            [expert_acc]
+///                                                   + S*A          [attn_shards]
 /// Q8_K  rows * (2 * H/256 + Q/256 + M/256)          blocks of 292 B
 /// Q8_0  rows * (H/32)                               blocks of  36 B
 /// pairs rows * K                                    of 8 B, twice  [topk, index]
 /// u32   2E + 1                                                     [CSR]
 /// ```
 ///
-/// At the v0 pin (`rows` 512, H 2048, Q 4096, V 512, M 768, K 8, E 128):
+/// At the v0 pin (`rows` 512, H 2048, Q 4096, V 512, M 768, K 8, E 128,
+/// `S` 6, `A` = 8 * 4096 + 2 * 128 = 33,024 f32):
 ///
 /// ```text
 /// f32     512 * 36,352 floats           = 74,448,896 B   71.00 MiB
 ///   of which staging (K*H)              = 33,554,432 B   32.00 MiB
 ///   of which q + attn_out (2Q)          = 16,777,216 B   16.00 MiB
 /// expert_acc                            =      8,192 B
+/// attn_shards  6 * 33,024 * 4 B         =    792,576 B    0.76 MiB
 /// Q8_K    512 * 35 blocks * 292 B       =  5,232,640 B    4.99 MiB
 /// Q8_0    512 * 64 blocks *  36 B       =  1,179,648 B    1.13 MiB
 /// topk + index  2 * 512 * 8 * 8 B       =     65,536 B
 /// CSR     257 * 4 B                     =      1,028 B
-/// total                                 = 80,935,940 B   77.19 MiB
+/// total                                 = 81,728,516 B   77.94 MiB
 /// ```
 ///
 /// against a ~1,438 MiB slab whose sweep ring costs a further ~46.7 MiB at the
 /// default dials. The 3 GiB contract is not touched: these bytes are the slot
-/// pool's, already resident, borrowed for the length of the prefill.
+/// pool's, already resident, borrowed for the length of the prefill. That is
+/// why the sharded attention scratch lives here and not on the heap — a
+/// prefill costs no *additional* bytes, whatever the headroom happens to be.
+///
+/// **`S*A` is constant in `rows`.** [`plan_arena`] recovers the per-row slope
+/// as `scratch_bytes(2) - scratch_bytes(1)` and divides the budget by it, which
+/// only answers the question while this function stays affine in `rows`.
 ///
 /// # Errors
 ///
@@ -789,6 +887,7 @@ fn scratch_bytes(dims: &PrefillDims, rows: usize) -> Result<usize, ForwardError>
         accumulate(&mut total, rows.saturating_mul(width), f32_bytes)?;
     }
     accumulate(&mut total, dims.hidden, f32_bytes)?;
+    accumulate(&mut total, dims.attn_scratch(), f32_bytes)?;
     accumulate(&mut total, rows.saturating_mul(dims.n_experts), f32_bytes)?;
     accumulate(&mut total, rows.saturating_mul(dims.n_experts), f32_bytes)?;
     // Activation blocks.
@@ -845,6 +944,7 @@ fn carve<'a>(
         up: c.take(rows * dims.moe)?,
         moe_t: c.take(rows * dims.moe)?,
         expert_acc: c.take(dims.hidden)?,
+        attn_shards: c.take(dims.attn_scratch())?,
         router_logits: c.take(rows * dims.n_experts)?,
         router_probs: c.take(rows * dims.n_experts)?,
         acts_hidden: c.take(rows * dims.hidden_q8k)?,
@@ -865,7 +965,11 @@ fn carve<'a>(
 // ---------------------------------------------------------------------------
 
 /// A raw pointer shared across shards.
-struct SendPtr(*mut f32);
+///
+/// `pub(super)` because [`super::forward`]'s decode-side attention fan-out
+/// splits buffers across shards the same way and there is no reason for two
+/// copies of the same soundness argument.
+pub(super) struct SendPtr(pub(super) *mut f32);
 
 impl SendPtr {
     /// The wrapped pointer.
@@ -874,17 +978,26 @@ impl SendPtr {
     /// capture disjoint *fields*, so reading `base.0` inside the shard body
     /// would capture a bare `*mut f32` and defeat the `Send`/`Sync` impls
     /// below. Going through `&self` captures the whole wrapper.
-    fn get(&self) -> *mut f32 {
+    pub(super) fn get(&self) -> *mut f32 {
         self.0
     }
 }
 
-// SAFETY: the pointer is only ever used to rebuild disjoint sub-slices, one
-// per shard, of a slice the submitting thread holds `&mut` to for the whole
-// call; `ComputePool::run` does not return until every shard has dropped its
-// slice. This is `threads::ComputePool::scatter`'s argument, re-made here
-// because the batched kernels shard over *weight rows* while `scatter` shards
-// over output *elements*, and one weight row is `n_acts` of them.
+// SAFETY: the pointer names a slice the submitting thread holds `&mut` to for
+// the whole call, and `ComputePool::run` does not return until every shard has
+// dropped whatever it rebuilt from it. Every use in this module rebuilds
+// **disjoint** sub-slices, one per shard. This is
+// `threads::ComputePool::scatter`'s argument, re-made here because the batched
+// kernels shard over *weight rows* while `scatter` shards over output
+// *elements*, and one weight row is `n_acts` of them.
+//
+// `super::forward::pool_decode_attention` used to be an exception: the kv-range
+// attention kernel addressed query heads absolutely, so every shard rebuilt a
+// view of the *whole* `out` and the soundness argument rested on the kernel
+// reading nothing from it. Miri rejected that under both Stacked and Tree
+// Borrows — overlapping `&mut` is UB whether or not the writes collide — so the
+// kernel now takes only its range's sub-slice and that use is disjoint like
+// every other. There is no exception left.
 unsafe impl Send for SendPtr {}
 // SAFETY: as above.
 unsafe impl Sync for SendPtr {}
@@ -921,9 +1034,10 @@ where
     if n_acts == 0 || out_dim == 0 {
         return Ok(());
     }
-    let failure: Mutex<Option<KernelError>> = Mutex::new(None);
+    let failure: Mutex<Option<(usize, KernelError)>> = Mutex::new(None);
     let base = SendPtr(out.as_mut_ptr());
     pool.run(out_dim, |shard| {
+        let index = shard.index;
         let start = shard.rows.start * n_acts;
         let len = shard.rows.len() * n_acts;
         // SAFETY: `shard_range` yields disjoint sub-ranges of `0..out_dim`,
@@ -933,7 +1047,7 @@ where
         // call, and `run` joins before returning.
         let chunk = unsafe { std::slice::from_raw_parts_mut(base.get().add(start), len) };
         if let Err(err) = f(shard.rows.clone(), chunk) {
-            record(&failure, err);
+            record(&failure, index, err);
         }
     });
     taken(failure)
@@ -969,6 +1083,213 @@ fn pool_batched_q8_0(
     scatter_rows(pool, out, out_dim, n_acts, |rows, chunk| {
         gemv_q8_0_batched(weight, in_dim, out_dim, acts, n_acts, rows, chunk)
     })
+}
+
+/// Attention work a chunk's first `r` rows cost, in units of one
+/// position-times-head.
+///
+/// Row `r` of a chunk starting at absolute position `start` attends
+/// `start + r + 1` positions, so the cumulative cost of rows `0..r` is
+/// `r * start + r * (r + 1) / 2`. `u128` because the product of two
+/// `usize`-sized dimensions is not a `usize` claim anyone should make; the
+/// real values are tiny (~2.2 million at the v0 pin).
+fn attention_cost(rows: usize, start: usize) -> u128 {
+    let rows = rows as u128;
+    rows * start as u128 + rows * (rows + 1) / 2
+}
+
+/// The rows shard `index` of `shards` owns, split by attention *cost* rather
+/// than by row count.
+///
+/// A pure function of `(rows, start, shards, index)` — nothing about the pool,
+/// the wall clock or the order shards finish in reaches it — so the partition
+/// is reproducible, and it is contiguous and ascending like
+/// [`crate::threads::shard_range`], which it replaces here.
+///
+/// **Why not an equal-row split.** Row `r` attends `start + r + 1` positions,
+/// so the last shard of an equal-row split does far more work than the first
+/// and the makespan is set by that last shard. For the first 512-row chunk of
+/// a prompt (`start = 0`) over six shards, the equal-row split gives the last
+/// shard 39,950 of the 131,328 total cost units against an ideal 21,888 — a
+/// 3.3x speedup where 6x was available. Balancing the cost instead gives every
+/// shard within one row of `total / shards`.
+///
+/// **It cannot move a bit.** Rows are independent: each one is a separate
+/// `attention_at_in` call reading an immutable `q` and an immutable cache and
+/// writing only its own `[q_dim]` output. There is no cross-row reduction to
+/// reassociate, so *any* partition of `0..rows` produces the same bytes as the
+/// serial loop — which is why the split is free to be cost-balanced rather
+/// than merely deterministic.
+fn attention_shard_range(rows: usize, start: usize, shards: usize, index: usize) -> Range<usize> {
+    if shards == 0 || index >= shards {
+        return 0..0;
+    }
+    if shards == 1 {
+        return 0..rows;
+    }
+    let total = attention_cost(rows, start);
+    let lo = attention_boundary(rows, start, total, shards, index);
+    let hi = attention_boundary(rows, start, total, shards, index + 1);
+    lo..hi
+}
+
+/// The first row at which `index / shards` of the chunk's attention cost has
+/// been paid: the lower edge of shard `index`'s range.
+///
+/// [`attention_cost`] is strictly increasing in `rows`, so this is a binary
+/// search, and the targets ascend with `index`, so consecutive boundaries
+/// never cross.
+fn attention_boundary(
+    rows: usize,
+    start: usize,
+    total: u128,
+    shards: usize,
+    index: usize,
+) -> usize {
+    if index == 0 {
+        return 0;
+    }
+    if index >= shards {
+        return rows;
+    }
+    let target = total * index as u128 / shards as u128;
+    let (mut lo, mut hi) = (0usize, rows);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if attention_cost(mid, start) < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Fan one layer's causal attention out over the compute pool, one row per
+/// call.
+///
+/// EXP-017 measured this loop at 61.3% of a 512-token prefill and 85.2% of an
+/// 1891-token one, running on the submitting thread while the other pinned
+/// cores sat parked. Rows are independent, so this is the parallel region with
+/// the least to argue about in the whole pass: shard `s` calls
+/// [`attention_at_in`] on the rows [`attention_shard_range`] gave it, with its
+/// own scratch slice out of the session arena and its own `[q_dim]` span of
+/// `out`. Nothing is reduced across shards, nothing accumulates in completion
+/// order, and every call is bit-identical to the serial `attention_at` on the
+/// same row.
+///
+/// `scratch` is `shards * shard_scratch` f32 — the [`Scratch::attn_shards`]
+/// carve — and `out` is `rows * q_dim`.
+///
+/// # Errors
+///
+/// [`KernelError::LengthMismatch`] when `q` or `out` is not `rows * q_dim`
+/// long, [`ForwardError::PrefillScratch`] when `scratch` is shorter than the
+/// pool's shard count needs, and [`ForwardError::Attention`] from the
+/// **lowest-indexed** shard that reports one. Lowest index, not first to the
+/// mutex: a whole job can fail at once (a short carve fails on every shard),
+/// and an error picked by thread race would make the same input report
+/// different errors from run to run. The two length checks are what make the
+/// raw-pointer splits below sound; they are not a convenience.
+///
+/// **`out` is not untouched on error**, unlike every other entry point in this
+/// module. Shards write rows into `out` as they finish and a failing shard
+/// abandons its remaining rows where it stands, so an error leaves an arbitrary
+/// prefix of some shards' rows written and the rest holding whatever the arena
+/// carve held. That is deliberate — buffering a chunk's worth of attention
+/// output to make the write atomic would cost `rows * q_dim` f32 that prefill
+/// is not allowed to allocate — and it is harmless because the only caller
+/// propagates the error straight out of the layer loop, and
+/// [`prefill_prompt`]'s own contract already says the state must be assumed
+/// mid-chunk and discarded on any error. Nothing reads `s.attn_out` again on
+/// that path.
+#[allow(clippy::too_many_arguments)]
+fn scatter_attention(
+    pool: &mut ComputePool,
+    kv: &KvCache,
+    layer: usize,
+    start: usize,
+    rows: usize,
+    q_dim: usize,
+    scale: f32,
+    shard_scratch: usize,
+    q: &[f32],
+    scratch: &mut [f32],
+    out: &mut [f32],
+) -> Result<(), ForwardError> {
+    if rows == 0 {
+        return Ok(());
+    }
+    let span = rows.saturating_mul(q_dim);
+    for (what, len) in [
+        ("attention fan-out: q", q.len()),
+        ("attention fan-out: out", out.len()),
+    ] {
+        if len != span {
+            return Err(KernelError::LengthMismatch {
+                what,
+                left: len,
+                right: span,
+            }
+            .into());
+        }
+    }
+    // Checked once, here, rather than inside the shard body: `shard.index <
+    // shard.count <= pool.shards()` always holds, so this single comparison is
+    // what makes `scratch[index * shard_scratch ..]` in-bounds for every shard
+    // — and therefore what makes the raw-pointer split below sound.
+    let need = pool.shards().saturating_mul(shard_scratch);
+    if scratch.len() < need {
+        return Err(ForwardError::PrefillScratch {
+            needed: need as u64,
+            available: scratch.len() as u64,
+        });
+    }
+    let failure: Mutex<Option<(usize, AttentionError)>> = Mutex::new(None);
+    let out_base = SendPtr(out.as_mut_ptr());
+    let scratch_base = SendPtr(scratch.as_mut_ptr());
+    pool.run(rows, |shard| {
+        // `shard.count`, not `pool.shards()`: a job with fewer rows than
+        // shards runs inline as a single shard, and the split must agree with
+        // the shard it is actually running on.
+        let index = shard.index;
+        let mine = attention_shard_range(rows, start, shard.count, index);
+        // SAFETY: shard indices are distinct across the job and each is
+        // visited by exactly one thread, so `index * shard_scratch` names a
+        // disjoint `shard_scratch`-long run per shard; the bound check above
+        // puts every one of them inside `scratch`, which is mutably borrowed
+        // for the whole call and which `run` joins before releasing.
+        let slice = unsafe {
+            std::slice::from_raw_parts_mut(
+                scratch_base.get().add(index * shard_scratch),
+                shard_scratch,
+            )
+        };
+        for r in mine {
+            // SAFETY: `attention_shard_range` partitions `0..rows` into
+            // disjoint contiguous ranges, so row `r` belongs to exactly one
+            // shard and `r * q_dim .. (r + 1) * q_dim` is a disjoint run
+            // inside `out`, whose length the caller pins at `rows * q_dim`.
+            let row_out =
+                unsafe { std::slice::from_raw_parts_mut(out_base.get().add(r * q_dim), q_dim) };
+            if let Err(err) = attention_at_in(
+                &q[r * q_dim..(r + 1) * q_dim],
+                kv,
+                layer,
+                start + r + 1,
+                scale,
+                slice,
+                row_out,
+            ) {
+                // Abandons this shard's remaining rows and leaves `out` part
+                // written; see this function's `# Errors`.
+                record(&failure, index, err);
+                return;
+            }
+        }
+    });
+    taken(failure)?;
+    Ok(())
 }
 
 /// `dst[c * rows + r] = src[r * cols + c]`.
@@ -1138,7 +1459,6 @@ fn scratch_budget(pool_bytes: u64, ring: u64, page: u64) -> u64 {
 /// Everything outside the scratch span that one chunk mutates.
 struct ChunkState<'a> {
     kv: &'a mut KvCache,
-    attn_scratch: &'a mut AttentionScratch,
     pool: &'a mut ComputePool,
     plan: &'a mut SweepPlan,
     /// Deduplicated routed expert ids for the layer being swept. Owned
@@ -1236,7 +1556,10 @@ fn prefill_sweep(
 ) -> Result<(), ForwardError> {
     let arch = model.arch();
     state.check_arch(arch)?;
-    let dims = PrefillDims::new(arch)?;
+    // The shard count and the context cap are part of the carve: the per-row
+    // attention runs one shard per pinned core, each with its own scratch
+    // slice, and the widest row any chunk can attend is the cache's capacity.
+    let dims = PrefillDims::new(arch, state.shards(), state.context_cap())?;
     let config = state.prefill_config().validate()?;
 
     // The whole prompt is checked against the cap up front, not row by row:
@@ -1272,7 +1595,6 @@ fn prefill_sweep(
     let timing = parts.timing;
     let mut chunk_state = ChunkState {
         kv: parts.kv,
-        attn_scratch: parts.attn_scratch,
         pool: parts.pool,
         plan: parts.sweep_plan,
         routed: parts.routed,
@@ -1443,21 +1765,24 @@ fn run_chunk(
             // (f) Causal attention: row r sees positions 0..=start + r and
             // nothing of the rows queued behind it.
             //
-            // Charged once around the whole loop, not per row: at a 512-row
-            // chunk this is 512 calls per layer, and the boundary is worth
-            // ~25 ns each while the loop is the phase under investigation.
+            // Charged once around the whole parallel region, not per row: at a
+            // 512-row chunk this is 512 calls per layer, and the boundary is
+            // worth ~25 ns each while the region is the phase under
+            // investigation.
             clock.charge(Phase::Elementwise);
-            for r in 0..n {
-                attention_at(
-                    &s.q[r * q_dim..(r + 1) * q_dim],
-                    state.kv,
-                    layer_idx,
-                    start + r + 1,
-                    scale,
-                    state.attn_scratch,
-                    &mut s.attn_out[r * q_dim..(r + 1) * q_dim],
-                )?;
-            }
+            scatter_attention(
+                state.pool,
+                state.kv,
+                layer_idx,
+                start,
+                n,
+                q_dim,
+                scale,
+                dims.attn_shard(),
+                &s.q[..n * q_dim],
+                s.attn_shards,
+                &mut s.attn_out[..n * q_dim],
+            )?;
 
             clock.charge(Phase::Attention);
 
@@ -2346,7 +2671,7 @@ mod tests {
     #[test]
     fn the_wide_geometry_separates_every_width() {
         let (_fx, model) = load_wide("prefill-wide-geometry");
-        let dims = PrefillDims::new(model.arch()).unwrap();
+        let dims = PrefillDims::new(model.arch(), 2, 64).unwrap();
 
         let widths = [dims.hidden, dims.q_dim, dims.kv_dim, dims.moe];
         for (i, a) in widths.iter().enumerate() {
@@ -2761,6 +3086,8 @@ mod tests {
             attn_q8k: 1,
             moe_q8k: 1,
             wide: 256,
+            shards: 2,
+            max_positions: 8,
         };
         let rows = 6usize;
         let mut bytes = vec![0u8; scratch_bytes(&dims, rows).unwrap()];
@@ -2863,6 +3190,8 @@ mod tests {
             attn_q8k: 1,
             moe_q8k: 1,
             wide: 256,
+            shards: 2,
+            max_positions: 8,
         };
         let mut bytes = vec![0u8; scratch_bytes(&dims, 1).unwrap()];
         let (mut s, _) = carve(&mut bytes, &dims, 1).unwrap();
@@ -2907,6 +3236,8 @@ mod tests {
             attn_q8k: 1,
             moe_q8k: 1,
             wide: 4,
+            shards: 2,
+            max_positions: 8,
         };
         let mut bytes = vec![0u8; scratch_bytes(&dims, 1).unwrap()];
         let (mut s, _) = carve(&mut bytes, &dims, 1).unwrap();
@@ -2972,11 +3303,18 @@ mod tests {
             attn_q8k: 3,
             moe_q8k: 1,
             wide: 768,
+            // Two shards over a 16-position cache: `attn_shard` is
+            // `3 * 16 + 2 * 128 = 304` f32, so the carve is small enough that
+            // the overlap and packing tests still run on a few KiB.
+            shards: 2,
+            max_positions: 16,
         }
     }
 
     /// The v0 dims, so the arithmetic quoted on [`scratch_bytes`] is a
-    /// checked claim rather than a comment that rots.
+    /// checked claim rather than a comment that rots. Six shards is the
+    /// shipped pin (six P-cores, the submitting thread among them) and 4096
+    /// is the shipped context cap; both are part of the carve now.
     fn qwen3_30b_a3b_dims() -> PrefillDims {
         PrefillDims {
             hidden: 2048,
@@ -2993,22 +3331,31 @@ mod tests {
             attn_q8k: 16,
             moe_q8k: 3,
             wide: 4096,
+            shards: 6,
+            max_positions: 4096,
         }
     }
 
-    /// The documented v0 figures, to the byte. A 512-row chunk costs 77.19
+    /// The documented v0 figures, to the byte. A 512-row chunk costs 77.94
     /// MiB of the ~1,438 MiB slot slab, of which the `[rows][top_k][hidden]`
-    /// staging that makes the reduction order-independent is 32 MiB.
+    /// staging that makes the reduction order-independent is 32 MiB and the
+    /// six per-shard attention carves are 0.76 MiB.
     #[test]
     fn the_documented_v0_scratch_arithmetic_holds() {
         let dims = qwen3_30b_a3b_dims();
-        assert_eq!(scratch_bytes(&dims, 512).unwrap(), 80_935_940);
-        // Just under 77.19 MiB.
-        assert_eq!(80_935_940 / 1024 / 1024, 77);
+        assert_eq!(scratch_bytes(&dims, 512).unwrap(), 81_728_516);
+        // Just under 77.94 MiB.
+        assert_eq!(81_728_516 / 1024 / 1024, 77);
         // Staging alone, and the pair of `[rows][q_dim]` planes.
         assert_eq!(512 * dims.top_k * dims.hidden * 4, 33_554_432);
         assert_eq!(2 * 512 * dims.q_dim * 4, 16_777_216);
-        // Affine in rows, which `plan_arena` divides by.
+        // The attention carve: `(32/4) * 4096 + 2 * 128` f32 per shard, six
+        // shards, which is exactly what the previous total grew by.
+        assert_eq!(dims.attn_shard(), 33_024);
+        assert_eq!(dims.attn_scratch() * 4, 792_576);
+        assert_eq!(80_935_940 + 792_576, 81_728_516);
+        // Affine in rows, which `plan_arena` divides by: the attention carve
+        // is per *shard*, not per row, so the slope is untouched.
         let per_row = scratch_bytes(&dims, 2).unwrap() - scratch_bytes(&dims, 1).unwrap();
         assert_eq!(per_row, 145_408 + 35 * 292 + 64 * 36 + 2 * 8 * 8);
         assert_eq!(
@@ -3016,12 +3363,105 @@ mod tests {
             scratch_bytes(&dims, 1).unwrap() + 511 * per_row
         );
 
-        // Beside the default sweep ring, against the shipped slab: 124 MiB
+        // Beside the default sweep ring, against the shipped slab: 125 MiB
         // of 1,438, so neither dial is anywhere near the constraint.
         let shipped = layout_of(&[(3_059_712, 128), (2_654_208, 128)]);
         let ring = ring_bytes(&shipped, 8, 2);
         assert_eq!(ring, 48_955_392);
-        assert!(ring + 80_935_940 < 1_438 * 1024 * 1024);
+        assert!(ring + 81_728_516 < 1_438 * 1024 * 1024);
+    }
+
+    // ---- the attention split ---------------------------------------------
+
+    /// [`attention_shard_range`] is a partition: contiguous, ascending, every
+    /// row in exactly one shard, and no shard reaching past `rows`.
+    ///
+    /// The parallel attention region's whole soundness argument rests on this
+    /// — a row visited twice would be two threads writing one `[q_dim]` span,
+    /// and a row visited never would be a silently wrong answer.
+    #[test]
+    fn the_attention_split_partitions_every_row() {
+        for rows in [0usize, 1, 2, 5, 6, 7, 8, 63, 512, 1891] {
+            for start in [0usize, 1, 7, 512, 4095] {
+                for shards in [1usize, 2, 3, 6, 8, 16] {
+                    let mut seen = vec![0u32; rows];
+                    let mut next = 0usize;
+                    for index in 0..shards {
+                        let mine = attention_shard_range(rows, start, shards, index);
+                        assert!(mine.start <= mine.end, "{mine:?} is reversed");
+                        assert_eq!(mine.start, next, "shards {shards} index {index} not flush");
+                        assert!(mine.end <= rows, "{mine:?} runs past {rows}");
+                        next = mine.end;
+                        for r in mine {
+                            seen[r] += 1;
+                        }
+                    }
+                    assert_eq!(next, rows, "rows {rows} shards {shards} left a tail");
+                    assert!(
+                        seen.iter().all(|&hits| hits == 1),
+                        "rows {rows} start {start} shards {shards}: {seen:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The split is a pure function of `(rows, start, shards, index)`.
+    ///
+    /// Purity is not what makes the region bit-neutral — rows are independent,
+    /// so *any* partition gives the same bytes — but it is what makes a run
+    /// reproducible, and reproducibility is what makes a bit-identity failure
+    /// debuggable instead of a coin flip.
+    #[test]
+    fn the_attention_split_is_a_pure_function() {
+        for (rows, start, shards) in [(512usize, 0usize, 6usize), (355, 1536, 6), (17, 512, 3)] {
+            for index in 0..shards {
+                let once = attention_shard_range(rows, start, shards, index);
+                for _ in 0..4 {
+                    assert_eq!(attention_shard_range(rows, start, shards, index), once);
+                }
+            }
+        }
+    }
+
+    /// The split balances *cost*, not row count: row `r` attends
+    /// `start + r + 1` positions, so an equal-row split leaves the last shard
+    /// of the first 512-row chunk with 39,950 of 131,328 cost units against an
+    /// ideal 21,888 — a 3.3x makespan where 6x was available. This is the
+    /// assertion that a future edit reverting to `shard_range` would fail.
+    #[test]
+    fn the_attention_split_balances_cost_not_rows() {
+        let (rows, start, shards) = (512usize, 0usize, 6usize);
+        let total = attention_cost(rows, start);
+        assert_eq!(total, 131_328);
+        let ideal = total / shards as u128;
+
+        let mut widest = 0u128;
+        for index in 0..shards {
+            let mine = attention_shard_range(rows, start, shards, index);
+            let cost = attention_cost(mine.end, start) - attention_cost(mine.start, start);
+            // Every shard within one row's worth of the ideal, which at this
+            // chunk is at most 512 units against an ideal of 21,888.
+            let slack = cost.abs_diff(ideal);
+            assert!(
+                slack <= (start + rows) as u128,
+                "shard {index} {mine:?} costs {cost}, ideal {ideal}"
+            );
+            widest = widest.max(cost);
+        }
+        // Cost-balanced means row-unbalanced, and deliberately so: the cheap
+        // early rows come in bulk and the expensive late ones do not.
+        let first = attention_shard_range(rows, start, shards, 0).len();
+        let last = attention_shard_range(rows, start, shards, shards - 1).len();
+        assert!(first > last * 2, "{first} rows against {last}");
+
+        // The equal-row split's last shard, for contrast: 39,950 cost units
+        // against the balanced split's 22,175 makespan, an ideal of 21,888.
+        let naive = attention_cost(rows, start) - attention_cost(rows - rows / shards, start);
+        assert!(
+            widest * 3 < naive * 2,
+            "cost balancing bought too little: {widest} vs {naive}"
+        );
     }
 
     /// The carve consumes exactly what [`scratch_bytes`] promised. The two
@@ -3073,6 +3513,7 @@ mod tests {
             s.q.fill(f32::from_bits(0x0303_0303));
             s.staged.fill(f32::from_bits(0x0404_0404));
             s.expert_acc.fill(f32::from_bits(0x0505_0505));
+            s.attn_shards.fill(f32::from_bits(0x0808_0808));
             s.index_start.fill(0x0606_0606);
             s.index_cursor.fill(0x0707_0707);
         }
@@ -3084,10 +3525,12 @@ mod tests {
         assert!(s.q.iter().all(|v| v.to_bits() == 0x0303_0303));
         assert!(s.staged.iter().all(|v| v.to_bits() == 0x0404_0404));
         assert!(s.expert_acc.iter().all(|v| v.to_bits() == 0x0505_0505));
+        assert!(s.attn_shards.iter().all(|v| v.to_bits() == 0x0808_0808));
         assert!(s.index_start.iter().all(|&v| v == 0x0606_0606));
         assert!(s.index_cursor.iter().all(|&v| v == 0x0707_0707));
         assert_eq!(s.residual.len(), rows * dims.hidden);
         assert_eq!(s.staged.len(), rows * dims.top_k * dims.hidden);
+        assert_eq!(s.attn_shards.len(), dims.shards * dims.attn_shard());
         assert_eq!(s.index_start.len(), dims.n_experts + 1);
     }
 

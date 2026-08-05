@@ -32,9 +32,29 @@ What it checks, and why each check exists:
 
 4. `memory.events` alone is not sufficient evidence of a clean run. A
    measured run showed `max 0` while 2.4 GiB had already been silently
-   reclaimed. So the verdict keys on `pgsteal` from `memory.stat`: any
-   nonzero `pgsteal*` means the run hit reclaim, the working set did not
-   fit, and the timing is not a clean 3 GB measurement.
+   reclaimed. So the verdict keys on `pgsteal` from `memory.stat` — but on
+   the *pressure* reclaimers only, not on the bare total.
+
+   `pgsteal_khugepaged` is excluded, and that is a correction rather than
+   a loosening. khugepaged is the transparent-hugepage daemon: it wakes on
+   its own 10-second timer, scans a bounded number of pages, and frees the
+   base pages it collapses into 2 MiB hugepages. That freeing lands in
+   `pgsteal_khugepaged` while nothing about the workload is under memory
+   pressure. Measured here: 11 runs across two sessions came back
+   "reclaimed under pressure" with `pgsteal_khugepaged` accounting for
+   100% of it and `kswapd`, `direct` and `proactive` all zero, on a
+   machine whose Normal zone sat 16x above the watermark that wakes
+   kswapd. `pgscan == pgsteal` exactly in every one, a 100% steal rate
+   that is the signature of targeted freeing rather than LRU scanning
+   under pressure. Wall times were statistically identical to the clean
+   runs (mean 309.13 s dirty against 310.35 s clean over 12 runs of one
+   workload), which is the expected sign: collapsing to hugepages helps
+   the TLB.
+
+   Everything that is not khugepaged still counts as pressure, including
+   any reclaimer this script does not know the name of, and a `memory.stat`
+   with no breakdown at all still counts the whole total — unknown stays
+   DIRTY.
 
 5. Bytes actually fetched from the block layer are reported. `read_bytes`
    in `/proc/<pid>/io` is per-task and is *not* inherited by the parent
@@ -550,6 +570,24 @@ def pg_total(pg: dict[str, int], prefix: str) -> int:
     return sum(v for k, v in pg.items() if k.startswith(prefix + "_"))
 
 
+def pg_split(pg: dict[str, int], prefix: str) -> tuple[int, int]:
+    """Split `pgscan`/`pgsteal` into (pressure, khugepaged).
+
+    khugepaged is subtracted from the total rather than the pressure
+    reclaimers being summed, so a reclaimer this script has never heard of
+    counts as pressure instead of vanishing. A `memory.stat` carrying no
+    `<prefix>_*` breakdown cannot be split, so all of it counts as
+    pressure — unknown is DIRTY, not clean.
+
+    See item 4 in the module docstring for why khugepaged is not pressure.
+    """
+    total = pg_total(pg, prefix)
+    if not any(k.startswith(prefix + "_") for k in pg):
+        return total, 0
+    khugepaged = pg.get(prefix + "_khugepaged", 0)
+    return total - khugepaged, khugepaged
+
+
 # Problem severities. HARD invalidates the measurement; SOFT is reported
 # but survivable. The severity travels with the problem as a field, so
 # rewording a message can never change a verdict — the previous version
@@ -585,8 +623,8 @@ def classify(run: dict, want_max: int) -> tuple[str, list[dict]]:
                    "clean (this is the unknown state, not a clean one)")
         steal = scan = 0
     else:
-        steal = pg_total(pg, "pgsteal")
-        scan = pg_total(pg, "pgscan")
+        steal, steal_thp = pg_split(pg, "pgsteal")
+        scan, scan_thp = pg_split(pg, "pgscan")
         if steal:
             note(HARD,
                  f"pgsteal {steal} pages ({mib(steal * PAGE)}) reclaimed "
@@ -596,6 +634,16 @@ def classify(run: dict, want_max: int) -> tuple[str, list[dict]]:
             # Pressure the kernel survived: worth reporting, but it did not
             # cost the run any resident page, so the timing still stands.
             note(SOFT, f"pgscan {scan} pages with no steal (pressure, no loss)")
+        if steal_thp or scan_thp:
+            # Not pressure, and not a defect. Reported so a run is never
+            # silently credited as clean when something did touch its pages,
+            # and so the exclusion stays auditable from the output alone.
+            note(SOFT,
+                 f"khugepaged collapsed hugepages during the run "
+                 f"(pgsteal_khugepaged {steal_thp}, pgscan_khugepaged "
+                 f"{scan_thp}, {mib(steal_thp * PAGE)}) — the THP daemon's "
+                 f"own bookkeeping, not memory pressure, and excluded from "
+                 f"the verdict")
 
     events = run.get("memory_events")
     if not events:
@@ -746,6 +794,51 @@ def median_of(runs: list[dict], key: str):
     return statistics.median(values) if values else None
 
 
+def reverdict(paths: list[str]) -> int:
+    """Re-classify recorded summaries against the current rules.
+
+    Prints the old verdict beside the new one so a rule change is visible as
+    a diff rather than as a number that quietly improved. Exits 1 if any
+    run is still DIRTY, 0 if all are clean, 2 if a file could not be read —
+    the same convention as a live run.
+    """
+    worst = 0
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                summary = json.load(fh)
+        except (OSError, ValueError) as err:
+            print(f"{path}: could not read ({err})", file=sys.stderr)
+            worst = max(worst, 2)
+            continue
+
+        runs = summary.get("runs") or []
+        scored = [r for r in runs if not str(r.get("label", "")).startswith("warmup")]
+        if not scored:
+            scored = runs
+        want_max = parse_size(summary.get("memory_max", "3G"))
+
+        redone, dirty = [], []
+        for run in scored:
+            verdict, problems = classify(run, want_max)
+            redone.append((run, verdict, problems))
+            if verdict == "DIRTY":
+                dirty.append(run)
+
+        was = summary.get("hygiene", "?")
+        now = "PASS" if not dirty else "DIRTY"
+        print(f"\n{path}")
+        print(f"  recorded: {was}    re-classified: {now}")
+        for run, verdict, problems in redone:
+            label = run.get("label", "?")
+            print(f"    {label:<10} {run.get('hygiene', '?'):<6} -> {verdict}")
+            for p in problems:
+                print(f"      [{p['severity']}] {p['message']}")
+        if now == "DIRTY":
+            worst = max(worst, 1)
+    return worst
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--inner", action="store_true",
@@ -792,7 +885,16 @@ def main() -> int:
     parser.add_argument("--workdir", default="scratch/cold-bench",
                         help="where per-run JSON lands")
     parser.add_argument("--json", help="write the full summary here")
+    parser.add_argument("--reverdict", metavar="SUMMARY.json", nargs="+",
+                        help="re-classify already-recorded runs against the "
+                             "current rules and print the verdicts, without "
+                             "running anything. Every counter the verdict "
+                             "depends on is already in the summary, so a rule "
+                             "correction does not cost another cold run.")
     args = parser.parse_args()
+
+    if args.reverdict:
+        return reverdict(args.reverdict)
     sys.stdout.reconfigure(line_buffering=True)
 
     if args.inner:
