@@ -56,6 +56,7 @@ which is the reason their claims are credible.
 - [EXP-017: The prefill phase split, and attention is the wall](#exp-017-the-prefill-phase-split-and-attention-is-the-wall) — NEUTRAL
 - [EXP-018: Cold paired prefill, the swept path against the token-major path at 512 tokens](#exp-018-cold-paired-prefill-the-swept-path-against-the-token-major-path-at-512-tokens) — KEEP
 - [EXP-019: O_DIRECT bandwidth under rule 2, and EXP-008 refuted](#exp-019-o_direct-bandwidth-under-rule-2-and-exp-008-refuted) — NEUTRAL
+- [EXP-020: The attention kernel rebuilt in three waves, measured warm](#exp-020-the-attention-kernel-rebuilt-in-three-waves-measured-warm) — NEUTRAL
 
 Entries EXP-007 through EXP-013 were measured on a machine that was not
 quiet, and most are microbenchmarks rather than end-to-end runs. Under rule 2
@@ -1866,3 +1867,277 @@ they are, as the record of what was believed when phase 5 was designed.
      honoured. That is worth recording because it is a precondition for every
      number in this entry, and because EXP-009 established that a silent
      fallback is the one failure the 3 GB budget cannot survive.
+
+## EXP-020: The attention kernel rebuilt in three waves, measured warm
+
+- Date / commit: 2026-08-05 / `da9034b`..`aade585` (`feat/attention`). The
+  baseline arm is `da9034b` itself, materialized with `git archive` into a
+  private `CARGO_TARGET_DIR` — no checkout, no branch switch, no working-tree
+  change.
+- Hypothesis: EXP-017 measured attention at **61.3%** of a 512-token prefill
+  and **85.2%** of an 1891-token one, and named two bit-neutral levers with no
+  number attached to either: parallelize over rows, and vectorize the f16
+  conversion and the dot. EXP-017 Note 6 asked for them to be measured
+  separately. This entry does that, and adds a third the measurement itself
+  produced: hoisting the f16-to-f32 conversion out of the GQA group.
+- Method: the decode-attention context sweep in
+  `crates/core/benches/kernels.rs` (`cargo bench -p ramvamp-core`), two arms
+  over the v0 pin (`n_layers` 48, 32 q heads : 4 kv heads, `head_dim` 128,
+  `scale` 1/sqrt(128), cap 4096, so GQA `group` = 8):
+
+  - **Arm A — 1 layer**, 8 MiB of KV planes, timed unit = one
+    `decode_attention` call. The pure kernel curve, largely cache-resident.
+  - **Arm B — 48 layers**, 384 MiB of planes (the KV tenant's whole v0
+    budget), timed unit = a sweep of all 48 layers, i.e. one decoded token's
+    worth of attention.
+
+  Context ladder N in {64, 128, 256, 512, 1024, 2048, 4096}; the three rungs
+  tabulated below are the ends and the middle. Medians of an odd number of
+  timed runs after untimed warmups (arm A 31/5 at every rung; arm B
+  31/31/21/15/11/7/5 with warmups 3/3/2/2/1/1/1, because one baseline arm-B
+  unit at 4096 is ~2.5 s). `q`, the K/V fill and the scratch are outside the
+  timed region.
+
+  **Rule-2 status, stated head-on: none of this is publishable.** Every number
+  in this entry is **warm, in process, single-threaded and diagnostic**. Rule 2
+  requires published throughput to come from a cold run inside `memory.max=3G`
+  with `memory.swap.max=0`; this bench allocates its KV planes in process, does
+  no I/O, touches no model file and reuses a warm process. It measures the
+  kernel's shape, not the runtime's behaviour. EXP-017 is the precedent and it
+  is the same shape of entry: warm, NEUTRAL, explicitly not publishable.
+
+  **The cold rule-2 measurement is owed and is scheduled.** The runbook is
+  committed at `scratch/phase7/wave3-runbook.md` — paired cold prefill at
+  `--repeats 5`, paired cold decode at `--max-new 256`, the 4K-context
+  `memory.peak` run, and the full numerics gate. **EXP-021 is reserved for it**
+  (Note 9). Nothing in this phase may be quoted as a throughput result until
+  that entry exists.
+
+  How the columns were paired, because the two halves are not equally strong:
+
+  - The **baseline** and **wave 1** columns are one hardened measurement.
+    `crates/core/benches/kernels.rs` as modified in this phase was copied
+    byte-for-byte into the `da9034b` archive, so the two sides differ in the
+    kernel and in nothing else; four runs in palindromic order (before, after
+    ‖ after, before) so a monotonic machine-warming ramp cancels; every arm-B
+    drift-control ratio inside 0.999x-1.003x. Run-to-run spread better than
+    ±1.1% on every cell but one, which is disclosed as contaminated and
+    replaced by its own drift repeat.
+  - The **wave 2** column is medians of **3** runs taken later, on a machine
+    that was **not quiet**, and its drift controls are **mixed**: of the twelve
+    control ratios printed across those runs, **seven** — 1.147x, 1.020x,
+    1.022x, 0.891x, 0.987x, 1.085x and 0.904x — fall outside the 0.99x-1.01x
+    band the bench's own guidance says to discard on, and no single one of the
+    three runs is clean on all four. Treat that column, and therefore the
+    cumulative ratios, as **approximate**. Putting it on one line with the
+    paired baseline is a cross-session combination inside one entry; it is done
+    here because both sides are this phase's own instrument on this phase's own
+    machine, and it is flagged rather than hidden. The wave-1 figure is the one
+    with a real pairing behind it.
+
+  Raw output: `scratch/phase7/attn-base-fixed.txt`,
+  `attn-base-fixed-run2.txt`, `attn-w1-fixed.txt`, `attn-w1-fixed-run2.txt`,
+  `attn-w2.txt`, `attn-w2-run2.txt`, `attn-w2-run3.txt`. Full working notes in
+  `scratch/phase7/attention-measurements.md`. `attn-final.txt` is kept for the
+  record and **must not be read as data**: all four of its drift-control
+  ratios are outside the band (1.169x, 1.276x, 0.685x, 0.982x) and its arm A
+  jumps 4.4x for a 2x context step between 1024 and 2048.
+- Baseline: the `da9034b` kernel — head-major loop order, scalar throughout,
+  one f16-to-f32 conversion per query head per element — measured on the same
+  instrument in the same session as the wave-1 column. It is the kernel
+  EXP-017 measured at 61.3% of prefill.
+- Result:
+
+  **Arm B, 48 layers, ns per token's worth of attention** (medians):
+
+  | context | baseline `da9034b` | wave 1 `8fc3c4a` | wave 2 `8bd079e` | cumulative |
+  | ---: | ---: | ---: | ---: | ---: |
+  | 64 | 36,904,308 | 13,560,338 | 4,073,820 | **9.1x** |
+  | 512 | 298,586,546 | 112,125,892 | 37,925,280 | **7.9x** |
+  | 4096 | 2,445,361,068 | 911,485,605 | 382,866,372 | **6.4x** |
+
+  **Arm A, 1 layer, ns per `decode_attention` call** (medians):
+
+  | context | baseline `da9034b` | wave 1 `8fc3c4a` | wave 2 `8bd079e` | cumulative |
+  | ---: | ---: | ---: | ---: | ---: |
+  | 64 | 759,794 | 281,071 | 73,849 | **10.3x** |
+  | 512 | 6,092,496 | 2,241,654 | 576,323 | **10.6x** |
+  | 4096 | 49,378,095 | 18,208,422 | 5,158,669 | **9.6x** |
+
+  Arm A holds ~10x at every rung. Arm B decays from 9.1x to 6.4x across the
+  ladder, and the decay is the finding, not the noise — see Note 3.
+
+  **What each piece was worth**, every figure labelled:
+
+  | piece | figure | status |
+  | --- | ---: | --- |
+  | Wave 1, GQA conversion hoist (`8fc3c4a`) | 2.708x arm A, 2.684x arm B | **measured**, paired, hardened instrument |
+  | Wave 2, AVX2+F16C on the kernel (`8bd079e`) | ~4.2x | **measured** in process by the implementing lane, not through this bench |
+  | Wave 2 as this bench sees it, arm B | 3.33x at 64, 2.96x at 512, 2.38x at 4096 | **derived** from the two columns above, cross-session |
+  | Decode fan-out over kv heads (`066f539`) | 2.4x at 4096, 1.9x at 64 | **measured** on a loaded machine, so a lower bound |
+  | Prefill fan-out over rows (`c78981e`) | ~5.9x on the attention region | **estimated** from a cost-balanced makespan |
+  | Prefill fan-out, whole prefill | ~2.0x at 512 tokens, ~3.4x at 1891 | **estimated**, Amdahl on EXP-017's shares |
+  | `primitives::softmax` share at 4096 positions | 23.5% (1,059 µs of 4,499 µs) | **measured** in process |
+  | AVX2 K-widening redundancy | `ceil(group / 8)`: 1.00x to group 8, 2.00x at 9, 3.00x at 17, 4.00x at 32 | **measured**; v0 is group 8, so 1.00x |
+
+  The prefill estimate is a makespan on the row cost model, not a timing: row
+  `r` attends `start + r + 1` positions, so a 512-row chunk is 131,328 cost
+  units, an even six-way split would be 21,888 each, and the cost-balanced
+  split's longest shard carries **22,175** — 1.3% off ideal, hence
+  131,328 / 22,175 = **5.9x**. Amdahl on EXP-017's measured shares then gives
+  1 / (0.387 + 0.613/5.923) = **2.04x** at 512 tokens and
+  1 / (0.148 + 0.852/5.923) = **3.43x** at 1891. Both are estimates on top of
+  a warm measurement; neither is a prediction this entry stands behind, and
+  EXP-021 is what replaces them.
+
+  **Memory.** Prefill costs **zero additional heap bytes**, which is the
+  standing rule and is unchanged: its six per-shard score buffers are carved
+  from the `PrefillSession` arena, so the scratch half of the carve went
+  **80,935,940 B (77.19 MiB) to 81,728,516 B (77.94 MiB)** of the 1,438.59 MiB
+  slab — six carves of 132,096 B. Decode has no arena, so its scratch is heap:
+  **+387 KiB of new anonymous memory**, field total 516 KiB, charged against
+  the ~111 MiB of headroom `docs/architecture.md` already marks
+  **provisional** and that EXP-018's unexplained 99-105 MiB residual already
+  eats into.
+- Verdict: NEUTRAL (nothing here satisfies rule 2, so nothing here publishes;
+  the changes ship on bit identity, and the cold measurement is owed)
+- Notes:
+  1. **The instrument had a real defect, it did not fire, and the baseline is
+     not retracted.** The bench committed in `da9034b` timed a closure that
+     consumed `out[0]` — 1 of 4096 output floats — so under `lto = "thin"` and
+     `codegen-units = 1` the other 31 heads and their softmaxes were
+     eliminable dead stores in any `decode_attention` cheap enough to inline.
+     `47176d6` fixed it (`black_box` on the whole output slice, on `q` and on
+     the cache). Whether it had been firing is answered by measurement, not by
+     argument: the fixed instrument against the defective one, **same kernel on
+     both sides**, moves every cell by less than ±2%, with **mixed signs**, and
+     on the wave-1 side — the side that would have been inflated — the fixed
+     instrument reads slightly *slower*, which is the direction a `black_box`
+     barrier moves things and not the direction removing a fabrication moves
+     them. So the committed 2.7x was not fabricated and the baseline column
+     stands as measured. The fix is a **guard for the next run**, and the
+     danger is entirely in the next run: optimizing the kernel is exactly what
+     makes it small enough to inline. `47176d6` also added a drift control —
+     each arm re-measures its cheap rungs after the ladder at identical
+     context and sample counts — which earned itself twice, catching a 12%
+     transient in one cell and settling the residency-versus-thermal question
+     by measurement (all eight arm-B control ratios across the four paired runs
+     sit in 0.999x-1.003x, so the ladder's own upward drift is footprint, not
+     clock).
+  2. **The EXP-017 cross-check is not a validation, and rule 3 is why.**
+     `prefill_token_major` is `for token in prompt { forward_token(...) }`
+     hitting this same `decode_attention` with `positions = t` for t = 1..N, so
+     the `attention` row of a token-major prefill at N tokens is the integral
+     of the arm-B curve and `Σ c·t = c·N(N+1)/2` is the right form for it.
+     That mechanism was checked and is correct. EXP-017 records the token-major
+     512-token attention row at **82.38 s** (the 76.23 s in the same table is
+     the *sweep* row, a different path, and is not the comparable figure).
+     Against `Σ_{t=1..512} t = 131,328`, the baseline arm-B curve predicts
+     **76.59 s** taking the flat constant at the N=512 cell, **76.39 s** by
+     piecewise-linear interpolation and **75.77 s** by least squares — all
+     **derived**, and all 7.0% to 8.0% below the measured row. That comparison
+     puts a synthetic in-process microbench from this session on one curve with
+     a figure measured in a different session on a different (pre-`da9034b`)
+     kernel on a machine EXP-017's own Method records as busy, which is exactly
+     what **rule 3** forbids; EXP-017 invokes rule 3 itself to refuse a
+     *smaller* combination, declining to put its own 131 s and 124.27 s
+     512-token sweep runs on one curve. The gap also sits inside the **5.4%**
+     run-to-run spread those two runs document, so it is not resolvable at this
+     precision anyway. The only statement licensed is: **the synthetic arm-B
+     curve is not inconsistent with EXP-017's measured attention row.** No lane
+     may cite it as validation.
+  3. **Linearity in context broke, and that is a real finding.** The baseline
+     kernel's cost was linear in context: `max(ns/pos) / min(ns/pos)` over all
+     seven rungs is **1.016x** on arm A and **1.031x** on arm B, and arm B's
+     `ns/pos/layer` climbs only 12,027 to 12,395 across the whole ladder. After
+     wave 2 the same statistic reads **1.097x / 1.253x / 1.117x** on arm A and
+     **1.572x / 1.400x / 1.484x** on arm B over the three runs, with arm B's
+     `ns/pos/layer` climbing 1,326 to 1,968 on the run whose controls were
+     least bad. Nothing got slower — the arithmetic got roughly 10x cheaper and
+     the memory traffic did not move at all, so the memory term went from a
+     rounding error to a third of the cost at the long end. This is why arm B's
+     cumulative speedup decays 9.1x to 6.4x while arm A holds ~10x: arm A's
+     8 MiB of planes stay cache-resident and arm B's 384 MiB do not.
+     **Attention is drifting memory-bound at long context**, which changes what
+     the next lever should be — blocking or tiling rather than more arithmetic.
+  4. **Softmax is the new wall, and the Amdahl bound in `8bd079e`'s commit
+     message is stated on the wrong side.** `primitives::softmax` is **23.5%**
+     of the kernel at 4096 positions (1,059 µs of 4,499 µs, measured). It is
+     `f64::exp` once per (query head, position) — 32 x 4096 = 131,072 of them
+     per call — plus an f64 normalizer accumulated serially, and `primitives`
+     is frozen. Two Amdahl bounds follow, both **derived**, and they are not
+     interchangeable: perfecting **softmax alone** buys at most
+     `1 / (1 - 0.235)` = **1.31x** on the kernel, while leaving softmax frozen
+     and driving **everything else** to zero buys at most `1 / 0.235` =
+     **4.26x**. `8bd079e`'s message ("softmax ... is frozen, which caps
+     anything further at 1.31x") attaches the first bound's number to the
+     second bound's claim. No measurement moves, and softmax is still the next
+     thing in the way; what changes is how much room is left behind it, and
+     4.26x is the number a future lane should plan against. Vectorizing softmax
+     bit-neutrally is not a patch either: it means reproducing libm's
+     `f64::exp` lane-for-lane, and the normalizer is a serial f64 chain that
+     cannot be lane-split without reassociating it.
+  5. **Decode's fan-out ceiling is `n_kv_heads` = 4, and it is structural.**
+     `066f539` split decode attention over kv heads after review measured the
+     first attempt — a strided slab of query heads — fighting the
+     vectorization it was meant to compose with: `x86::dot_block` puts its
+     eight lanes on the GQA group, so a one-head slab issues a full group's
+     vector-op count with seven lanes carrying zeros (whole `group = 8` call
+     4,293.8 µs, `group = 1` slab 1,981.1 µs, so eight slabs are ~15.8 ms of
+     CPU against 4.3 ms — derived from those measurements). End to end that was
+     1.8x at six shards for 3.1x the CPU, and it **inverted** at short context,
+     0.46x at 64 positions, which is where EXP-014's decode baseline sits. The
+     kv-head split gives 2.4x at 4096 and 1.9x at 64 instead. It also cannot go
+     past 4 units at the v0 pin, because there are 4 kv heads. Going wider
+     needs an axis that is neither the group (measured worse) nor positions
+     (that needs the forbidden rescaled softmax).
+  6. **"Each element widened once per kv head" is true on the scalar path and
+     `ceil(group / 8)` on the AVX2 one.** `x86::qk_scores` walks the group in
+     chunks of 8 lanes and the whole position sweep, K widening included, sits
+     *inside* that chunk loop. Counted directly: K is **1.00x** for group 1-8,
+     **2.00x** for 9-16, **3.00x** for 17-24 and **4.00x** for 25-32, while V
+     is 1.00x throughout and the scalar path is 1.00x throughout. **v0 is
+     group 8, where the ratio is exactly 1**, and so is this bench's geometry,
+     so no number in this entry moves. It is written down because the
+     correctness sweep now carries groups 9, 12, 17 and 32, and an unqualified
+     claim would have sat next to its own disproof. Not hoisted, deliberately:
+     hoisting needs the position axis outer and the group axis inner, which
+     makes the transposed query block hold the whole group — a size bounded by
+     nothing in the geometry — or re-transpose once per position block.
+  7. **`crates/core/src/kernels/attention/x86.rs` is entirely outside Miri's
+     reach.** Miri takes the scalar path, because `is_x86_feature_detected!` is
+     false under it, so no `unsafe` block in that file is ever executed by the
+     tool. Its soundness rests on inspection (every load and store is an
+     unaligned form; every slice bound is argued at the call site) and on the
+     bit-identity sweep, which proves the *results* match the scalar reference
+     on every geometry it covers — **not** on tooling. Miri did earn its keep
+     elsewhere in this phase: on the pre-`65b0b3a` tree it rejected the decode
+     fan-out three separate ways (Stacked Borrows against the `Unique` held by
+     the kernel body, Stacked Borrows against the `SharedReadOnly` held by its
+     validation parameter, and Tree Borrows as an outright data race), all from
+     shards rebuilding a `&mut` over the whole output vector. The writes were
+     disjoint and every test passed; it was still UB. `out` is now the shard's
+     own sub-slice indexed from zero, so disjointness is structural.
+  8. **Bit identity held at every step, which is the only reason any of this
+     was allowed.** Wave 1 is pinned against the pre-restructure loop nest,
+     kept verbatim as a test-only reference; wave 2 is pinned against the
+     scalar path with **zero tolerance**, including a sweep of all 65,536 f16
+     bit patterns through `_mm256_cvtph_ps` (signalling NaN scoped out, since a
+     non-finite activation means the pass already failed upstream); the
+     fan-outs are pinned by a union test asserting that disjoint kv ranges
+     reproduce the whole call bit for bit. **No FMA anywhere in `x86.rs`**, and
+     that is load-bearing rather than cautious: `acc += qv * kv` is two
+     roundings and `_mm256_fmadd_ps` makes it one. Injecting an FMA at each of
+     the two sites in an isolated copy broke four tests each time, which also
+     proves the vector path is genuinely taken rather than silently falling
+     back.
+  9. **EXP-021 is reserved for the cold rule-2 measurement of this work**, and
+     this entry does not pay it. What EXP-021 owes: paired cold prefill at 512
+     tokens with `--repeats 5` (which also closes EXP-018 Note 5's unbounded
+     spread), paired cold decode at `--max-new 256` (which settles the EXP-018
+     cold-start question, since at `--max-new 4` almost everything measured was
+     the transient), the 4K-context `memory.peak` run that is the last open
+     item on the 11-slot dial, and the numerics gate. The runbook is
+     `scratch/phase7/wave3-runbook.md`. Until EXP-021 exists, the honest
+     summary of phase 7 is "the kernel got roughly 6 to 10x faster warm, on a
+     microbenchmark, and nobody has measured what that did to a token."

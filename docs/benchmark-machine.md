@@ -11,13 +11,23 @@ guessed at. Update this file when any of it changes.
 | CPU | Intel Core Ultra 9 185H: 6 P-cores (SMT), 8 E-cores, 2 LP E-cores, 22 threads |
 | P-core primaries | 0, 1, 3, 6, 8, 10 (SMT pairs are 0-5, 1-2, 3-4, 6-7, 8-9, 10-11) |
 | E-cores with L3 | 12-19. LP E-cores 20-21 are on the SoC tile with no L3 |
-| RAM | 15.3 GiB |
+| CPU ISA | `avx`, `avx2`, `f16c`, `fma`, `avx_vnni`, `bmi1`, `bmi2`, `sha_ni`. **No AVX-512 of any flavour** — Meteor Lake ships none, and `/proc/cpuinfo` carries zero `avx512*` flags |
+| RAM | 15.3 GiB (`MemTotal` reads 15,711,132 kB = **14.98 GiB**; the 15.3 figure is the older reading and the two have never been reconciled — use `MemTotal` for arithmetic) |
 | Swap | zram, 7.5 GiB. Counts as swap, so benchmark runs set `memory.swap.max=0` |
 | Storage | Micron 2400 `MTFDKBA1T0QFM-1BD1AABGB`, DRAM-less QLC, PCI `1344:5413`, Gen4 x4 |
 | Filesystem | btrfs on `/dev/nvme0n1p2`, `compress=zstd:3,ssd,discard=async`, data profile `single` |
-| Kernel | 7.0.12-arch1-1 |
+| Kernel | 7.1.5-arch1-1 (verified `uname -r`, 2026-08-05). This file recorded 7.0.12-arch1-1 until then, so every entry through EXP-019 was most likely taken on that kernel; the upgrade point was not recorded, which is exactly why cross-entry curves are already forbidden by rule 3 |
 | `RLIMIT_MEMLOCK` | 8 MiB soft **and** hard (systemd default; the hard limit needs `CAP_SYS_RESOURCE`) |
 | earlyoom | active |
+
+**The ISA row is load-bearing from phase 7 onward.** `crates/core/src/kernels/
+attention/x86.rs` is gated on `avx2` **and** `f16c` — separate CPUID bits, so it
+is not the same probe `quants::avx2` uses — and it deliberately does **not**
+enable `fma`, because a fused multiply-add is one rounding where the scalar
+reference has two and the bit-identity gate would fail. `avx_vnni` is present
+and unused. The absence of AVX-512 is why the vector width in every kernel here
+is 8 f32 and why nothing is written against a 16-lane assumption; a machine with
+AVX-512 would run the same code, not faster code.
 
 The drive is not the one the design doc originally assumed. **EXP-019** is what
 it actually sustains, measured cold and in-cgroup on the installed layer files:
