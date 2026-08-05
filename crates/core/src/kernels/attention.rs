@@ -32,6 +32,26 @@
 //! Alignment: reads assume nothing beyond the natural 2-byte alignment of
 //! `&[u16]`; every conversion is a scalar element load, no wide loads (per
 //! the kernels module's alignment rule).
+//!
+//! Loop order: **kv-head outer, query head inner**. Each K and each V
+//! element is converted from f16 exactly once and then reused by every query
+//! head in its GQA group (8 of them at the v0 pin) out of a `head_dim`-long
+//! f32 buffer. The head-major order this replaced re-converted every element
+//! once per query head in the group, and phase 7's wave-0 bench measured
+//! that conversion plus the serial f32 accumulate as the whole cost of the
+//! kernel — 1.54 ns per element against only 0.17 GB/s of unique K+V bytes,
+//! i.e. compute-bound, not memory-bound.
+//!
+//! The restructure is bit-neutral by construction, which is the only reason
+//! it is allowed here. `h = kv_head * group + g` with `kv_head` outer and
+//! `g` inner visits the query heads in the same ascending order as the old
+//! `kv_head = h / group`; [`f16_to_f32`] is an exact widening, so a buffered
+//! element is bit-for-bit the value the inline conversion produced; the QK
+//! dot still accumulates over `i` ascending into one f32 with separate
+//! multiply and add (no FMA — the two roundings are load-bearing); and the V
+//! reduction still accumulates over `t` ascending, per output element. Same
+//! operands, same order, same roundings
+//! (`restructured_kernel_is_bit_identical_to_head_major_reference`).
 
 use super::KernelError;
 use super::primitives::softmax;
@@ -98,22 +118,80 @@ pub enum AttentionError {
         /// The layer with nothing to attend over.
         layer: usize,
     },
+
+    /// A caller-provided scratch slice ([`attention_at_in`] /
+    /// [`decode_attention_in`]) is shorter than this call's geometry needs.
+    /// Reported, never worked around: silently attending over fewer
+    /// positions would be a wrong answer, and panicking is not an option in
+    /// this crate. Size the slice with [`scratch_len`].
+    #[error("attention: scratch length {len}, need {need} f32 for this geometry")]
+    ScratchTooShort {
+        /// Length of the slice the caller passed.
+        len: usize,
+        /// Length [`scratch_len`] requires for this call.
+        need: usize,
+    },
 }
 
-/// Reusable per-position score buffer for [`decode_attention`] and
-/// [`attention_at`].
+/// The f32 scratch one attention call needs at a given geometry:
 ///
-/// Holds one f32 per *attended* position — the full cached length for
-/// [`decode_attention`], `p + 1` for [`attention_at`]. The buffer grows to
-/// the high-water sequence length and is then reused as-is, so a scratch
-/// constructed once (ideally via [`Self::with_capacity`] at the cache's
-/// capacity, 4096 for v0) allocates at most once and never again on the
-/// decode or prefill path. Shrinking for a shorter row only truncates, and
-/// every retained entry is overwritten before it is read, so a short call
-/// after a long one can never pick up a stale score.
+/// ```text
+/// scratch_len = (n_q_heads / n_kv_heads) * max_positions + 2 * head_dim
+/// ```
+///
+/// The first term is the **group-major score block**: one contiguous
+/// `max_positions`-long run per query head in the GQA group, so [`softmax`]
+/// always receives a contiguous slice and never a strided view (a strided
+/// softmax would be a different reduction, and this kernel's output is
+/// pinned to the bit). The second term is the two `head_dim`-long f32
+/// conversion buffers — one K row and one V row, each widened from f16 once
+/// per position and then reused by the whole group.
+///
+/// At the v0 pin (32 q heads : 4 kv heads, `head_dim` 128, `max_positions`
+/// 4096, so `group` = 8) that is `8 * 4096 + 2 * 128 = 33_024` f32 =
+/// **129 KiB**: 128 KiB of scores and 1 KiB of conversion buffers. A caller
+/// carving per-shard scratch out of the prefill arena sizes each shard's
+/// slice from this function.
+///
+/// Saturating and division-safe, so a nonsensical geometry returns a length
+/// rather than panicking: `n_kv_heads == 0` contributes no score block, and
+/// an overflowing product saturates (the length check in
+/// [`attention_at_in`] then rejects the call).
+pub fn scratch_len(
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_positions: usize,
+) -> usize {
+    let group = n_q_heads.checked_div(n_kv_heads).unwrap_or(0);
+    scratch_len_of(group, head_dim, max_positions)
+}
+
+/// [`scratch_len`] from an already-derived GQA group size — the one place
+/// the carve arithmetic is written down.
+fn scratch_len_of(group: usize, head_dim: usize, max_positions: usize) -> usize {
+    group
+        .saturating_mul(max_positions)
+        .saturating_add(head_dim.saturating_mul(2))
+}
+
+/// Reusable owning scratch for [`decode_attention`] and [`attention_at`].
+///
+/// Holds the whole carve [`scratch_len`] describes: the group-major score
+/// block plus the two conversion buffers. The buffer is sized on the first
+/// call from the cache's *capacity* rather than that call's position count,
+/// so it reaches its final length immediately and is then reused as-is for
+/// every later call, however long the sequence grows — one allocation, then
+/// never again on the decode or prefill path. Every entry is overwritten
+/// before it is read, so a short call after a long one can never pick up a
+/// stale score.
+///
+/// Wave-2 shard code wants scratch carved from the prefill arena instead of
+/// the heap; that is what [`attention_at_in`] and [`decode_attention_in`]
+/// are for. This type is the owning convenience wrapper over them.
 #[derive(Debug, Default)]
 pub struct AttentionScratch {
-    scores: Vec<f32>,
+    buf: Vec<f32>,
 }
 
 impl AttentionScratch {
@@ -122,19 +200,25 @@ impl AttentionScratch {
         Self::default()
     }
 
-    /// A scratch preallocated for `positions` cached positions, so the hot
-    /// path never allocates at all.
-    pub fn with_capacity(positions: usize) -> Self {
+    /// A scratch with `slots` f32 reserved up front.
+    ///
+    /// This is a *lower bound*, not the final length: the buffer holds
+    /// [`scratch_len`]'s whole carve, which at the v0 pin is `group` (8)
+    /// times the position count plus the conversion buffers. Passing a
+    /// position count therefore still costs one growth on the first call.
+    /// To allocate exactly once, pass
+    /// `scratch_len(n_q_heads, n_kv_heads, head_dim, cache.capacity())`.
+    pub fn with_capacity(slots: usize) -> Self {
         Self {
-            scores: Vec::with_capacity(positions),
+            buf: Vec::with_capacity(slots),
         }
     }
 
-    /// The score buffer resized to `len` (reallocates only past the
-    /// high-water mark).
-    fn scores_mut(&mut self, len: usize) -> &mut [f32] {
-        self.scores.resize(len, 0.0);
-        &mut self.scores[..len]
+    /// The buffer resized to `len` (reallocates only past the high-water
+    /// mark).
+    fn buf_mut(&mut self, len: usize) -> &mut [f32] {
+        self.buf.resize(len, 0.0);
+        &mut self.buf[..len]
     }
 }
 
@@ -165,7 +249,31 @@ pub fn decode_attention(
     // `None` = "every position the layer holds", which is the decode
     // invariant above. Delegating means the masked and unmasked paths cannot
     // drift apart (`decode_attention_matches_attention_at_at_full_length`).
-    attention_impl(q, cache, layer, None, scale, scratch, out)
+    attention_owned(q, cache, layer, None, scale, scratch, out)
+}
+
+/// [`decode_attention`] against caller-provided scratch instead of an owning
+/// [`AttentionScratch`].
+///
+/// Same arithmetic, same result, bit for bit — only where the scores and the
+/// f16-to-f32 conversion buffers live changes. Size `scratch` with
+/// [`scratch_len`]; anything longer is accepted and the tail ignored, so one
+/// arena carve sized at the cache's capacity serves every call.
+///
+/// # Errors
+///
+/// Everything [`decode_attention`] returns, plus
+/// [`AttentionError::ScratchTooShort`] when `scratch` is smaller than
+/// [`scratch_len`] requires. `out` is untouched on error.
+pub fn decode_attention_in(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    scale: f32,
+    scratch: &mut [f32],
+    out: &mut [f32],
+) -> Result<(), AttentionError> {
+    attention_borrowed(q, cache, layer, None, scale, scratch, out)
 }
 
 /// Position-limited GQA attention for one layer: exactly
@@ -207,23 +315,71 @@ pub fn attention_at(
     scratch: &mut AttentionScratch,
     out: &mut [f32],
 ) -> Result<(), AttentionError> {
-    attention_impl(q, cache, layer, Some(positions), scale, scratch, out)
+    attention_owned(q, cache, layer, Some(positions), scale, scratch, out)
 }
 
-/// The one attention body. `limit` is `Some(positions)` for the causal
-/// prefill form and `None` for "the whole layer" (decode).
-fn attention_impl(
+/// [`attention_at`] against caller-provided scratch instead of an owning
+/// [`AttentionScratch`].
+///
+/// This is the entry point for sharded prefill: rows are independent, so a
+/// shard per compute thread needs a scratch per shard, and the project rule
+/// is that prefill costs no additional bytes against the memory budget — so
+/// the scratch comes from the prefill arena, which cannot hand out a `Vec`.
+/// Size the carve with [`scratch_len`]; anything longer is accepted and the
+/// tail ignored.
+///
+/// The scores and the conversion buffers are the only state a call keeps, so
+/// two calls with disjoint scratch slices and disjoint `out` slices are
+/// independent — and each one is bit-identical to the single-threaded
+/// [`attention_at`] on the same row.
+///
+/// # Errors
+///
+/// Everything [`attention_at`] returns, plus
+/// [`AttentionError::ScratchTooShort`] when `scratch` is smaller than
+/// [`scratch_len`] requires. `out` is untouched on error.
+pub fn attention_at_in(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    positions: usize,
+    scale: f32,
+    scratch: &mut [f32],
+    out: &mut [f32],
+) -> Result<(), AttentionError> {
+    attention_borrowed(q, cache, layer, Some(positions), scale, scratch, out)
+}
+
+/// The validated geometry of one attention call: what the shape checks
+/// establish, computed once and handed to the body.
+struct Plan {
+    head_dim: usize,
+    kv_dim: usize,
+    /// Query heads per kv head, `n_q_heads / n_kv_heads` (>= 1).
+    group: usize,
+    /// Positions actually attended over — the causal limit.
+    positions: usize,
+}
+
+impl Plan {
+    /// The scratch this exact call needs.
+    fn scratch_len(&self) -> usize {
+        scratch_len_of(self.group, self.head_dim, self.positions)
+    }
+}
+
+/// Every shape and range check, in the order the entry points promise: `q`,
+/// then the GQA grouping, then `out`, then the layer, then `positions`.
+/// Nothing is written before this returns `Ok`.
+fn plan(
     q: &[f32],
     cache: &KvCache,
     layer: usize,
     limit: Option<usize>,
-    scale: f32,
-    scratch: &mut AttentionScratch,
-    out: &mut [f32],
-) -> Result<(), AttentionError> {
+    out: &[f32],
+) -> Result<Plan, AttentionError> {
     let head_dim = cache.head_dim();
     let n_kv_heads = cache.n_kv_heads();
-    let kv_dim = cache.kv_dim();
 
     if q.is_empty() || q.len() % head_dim != 0 {
         return Err(AttentionError::QLenIndivisible {
@@ -258,41 +414,146 @@ fn attention_impl(
             len,
         }));
     }
+    Ok(Plan {
+        head_dim,
+        kv_dim: cache.kv_dim(),
+        group: n_q_heads / n_kv_heads,
+        positions,
+    })
+}
+
+/// The owning-scratch path: validate, size the `Vec`, run the body.
+fn attention_owned(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    limit: Option<usize>,
+    scale: f32,
+    scratch: &mut AttentionScratch,
+    out: &mut [f32],
+) -> Result<(), AttentionError> {
+    let plan = plan(q, cache, layer, limit, out)?;
+    // Size from the cache's capacity, not this call's `positions`: capacity
+    // is the high-water mark of every call this cache can ever serve, so the
+    // buffer is allocated once on the first call and never grown again as
+    // the sequence advances. `.max` is belt and braces — `positions <=
+    // cache.len(layer) <= cache.capacity()` already holds here.
+    let need = scratch_len_of(
+        plan.group,
+        plan.head_dim,
+        cache.capacity().max(plan.positions),
+    );
+    let buf = scratch.buf_mut(need);
+    attention_body(q, cache, layer, &plan, scale, buf, out)
+}
+
+/// The borrowed-scratch path: validate, check the carve fits, run the body.
+fn attention_borrowed(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    limit: Option<usize>,
+    scale: f32,
+    scratch: &mut [f32],
+    out: &mut [f32],
+) -> Result<(), AttentionError> {
+    let plan = plan(q, cache, layer, limit, out)?;
+    let need = plan.scratch_len();
+    if scratch.len() < need {
+        return Err(AttentionError::ScratchTooShort {
+            len: scratch.len(),
+            need,
+        });
+    }
+    attention_body(q, cache, layer, &plan, scale, scratch, out)
+}
+
+/// The one attention body, kv-head outer. `scratch` is at least
+/// `plan.scratch_len()` long; anything past the carve is ignored.
+///
+/// The causal limit lives entirely in `plan.positions`: it is the length of
+/// each per-head score run and the trip count of both `t` loops, so every
+/// later row of the layer is absent from the scores, from the softmax
+/// normalizer, and from the V sum — not zero-weighted, absent. That is what
+/// makes the limited call bit-identical to an unlimited call against a
+/// `positions`-row cache, and it is why there is no online or flash-style
+/// rescaled softmax here.
+fn attention_body(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    plan: &Plan,
+    scale: f32,
+    scratch: &mut [f32],
+    out: &mut [f32],
+) -> Result<(), AttentionError> {
+    let &Plan {
+        head_dim,
+        kv_dim,
+        group,
+        positions,
+    } = plan;
     let k_plane = cache.k_layer(layer)?;
     let v_plane = cache.v_layer(layer)?;
 
-    let group = n_q_heads / n_kv_heads;
-    // The causal limit lives entirely in this length. Both reductions below
-    // zip the layer's rows against `scores`, so they stop after `positions`
-    // rows and every later row is absent from the score buffer, the softmax
-    // normalizer, and the V sum — not zero-weighted, absent. That is what
-    // makes the limited call bit-identical to an unlimited call against a
-    // `positions`-row cache.
-    let scores = scratch.scores_mut(positions);
+    // The carve: a group-major score block (one contiguous `positions`-long
+    // run per query head in the group, so `softmax` gets a contiguous slice)
+    // then one K and one V conversion row. Both splits are in range because
+    // the callers checked `scratch.len() >= scratch_len_of(..)`.
+    let (scores, conv) = scratch.split_at_mut(group * positions);
+    let (kbuf, vbuf) = conv.split_at_mut(head_dim);
+    let vbuf = &mut vbuf[..head_dim];
 
-    for (h, out_h) in out.chunks_exact_mut(head_dim).enumerate() {
-        let kv_head = h / group;
+    let group_dim = group * head_dim;
+    for (kv_head, (q_group, out_group)) in q
+        .chunks_exact(group_dim)
+        .zip(out.chunks_exact_mut(group_dim))
+        .enumerate()
+    {
         let col = kv_head * head_dim;
-        let q_h = &q[h * head_dim..(h + 1) * head_dim];
 
-        // scores[t] = scale * (q_h . K[t, kv_head]), f32 accumulate.
-        for (row, score) in k_plane.chunks_exact(kv_dim).zip(scores.iter_mut()) {
-            let k_th = &row[col..col + head_dim];
-            let mut acc = 0.0f32;
-            for (&qv, &kb) in q_h.iter().zip(k_th) {
-                acc += qv * f16_to_f32(kb);
+        // Phase 1 — scores for the whole group. K[t, kv_head] is widened
+        // once per element here and read by all `group` query heads.
+        // scores[g][t] = scale * (q_{kv_head*group+g} . K[t, kv_head]),
+        // accumulated over `i` ascending in one f32, scaled once at the end.
+        for (t, k_row) in k_plane.chunks_exact(kv_dim).take(positions).enumerate() {
+            let k_th = &k_row[col..col + head_dim];
+            for (dst, &bits) in kbuf.iter_mut().zip(k_th) {
+                *dst = f16_to_f32(bits);
             }
-            *score = scale * acc;
+            for (q_h, run) in q_group
+                .chunks_exact(head_dim)
+                .zip(scores.chunks_exact_mut(positions))
+            {
+                let mut acc = 0.0f32;
+                for (&qv, &kv) in q_h.iter().zip(kbuf.iter()) {
+                    acc += qv * kv;
+                }
+                run[t] = scale * acc;
+            }
         }
 
-        softmax(scores)?;
+        for run in scores.chunks_exact_mut(positions) {
+            softmax(run)?;
+        }
 
-        // out_h = sum_t scores[t] * V[t, kv_head].
-        out_h.fill(0.0);
-        for (row, &w) in v_plane.chunks_exact(kv_dim).zip(scores.iter()) {
-            let v_th = &row[col..col + head_dim];
-            for (o, &vb) in out_h.iter_mut().zip(v_th) {
-                *o += w * f16_to_f32(vb);
+        // Phase 2 — out[h] = sum_t scores[g][t] * V[t, kv_head], with V
+        // widened once per element and every output element still
+        // accumulated over `t` ascending.
+        out_group.fill(0.0);
+        for (t, v_row) in v_plane.chunks_exact(kv_dim).take(positions).enumerate() {
+            let v_th = &v_row[col..col + head_dim];
+            for (dst, &bits) in vbuf.iter_mut().zip(v_th) {
+                *dst = f16_to_f32(bits);
+            }
+            for (out_h, run) in out_group
+                .chunks_exact_mut(head_dim)
+                .zip(scores.chunks_exact(positions))
+            {
+                let w = run[t];
+                for (o, &vv) in out_h.iter_mut().zip(vbuf.iter()) {
+                    *o += w * vv;
+                }
             }
         }
     }
@@ -645,17 +906,48 @@ mod tests {
 
     /// The scratch buffer reaches its high-water mark once and is then
     /// reused without reallocating, including for shorter sequences.
+    ///
+    /// The reservation is now the whole carve, not just the positions: at
+    /// 32:4 heads, head_dim 8 and 17 positions that is `8 * 17 + 2 * 8 = 152`
+    /// f32. Constructed at that size, the buffer must never allocate again —
+    /// pointer identity and capacity are pinned across grow / shrink /
+    /// regrow, which is the one thing this test exists to guarantee.
     #[test]
     fn scratch_reuses_allocation() {
-        let mut scratch = AttentionScratch::with_capacity(17);
-        let ptr = scratch.scores.as_ptr();
-        assert_eq!(scratch.scores_mut(17).len(), 17);
-        assert_eq!(scratch.scores.as_ptr(), ptr);
-        assert_eq!(scratch.scores_mut(3).len(), 3);
-        assert_eq!(scratch.scores.as_ptr(), ptr);
-        assert_eq!(scratch.scores_mut(17).len(), 17);
-        assert_eq!(scratch.scores.as_ptr(), ptr);
-        assert_eq!(scratch.scores.capacity(), 17);
+        let need = scratch_len(32, 4, 8, 17);
+        assert_eq!(need, 8 * 17 + 2 * 8);
+        let mut scratch = AttentionScratch::with_capacity(need);
+        let ptr = scratch.buf.as_ptr();
+        assert_eq!(scratch.buf_mut(need).len(), need);
+        assert_eq!(scratch.buf.as_ptr(), ptr);
+        assert_eq!(scratch.buf_mut(scratch_len(32, 4, 8, 3)).len(), 8 * 3 + 16);
+        assert_eq!(scratch.buf.as_ptr(), ptr);
+        assert_eq!(scratch.buf_mut(need).len(), need);
+        assert_eq!(scratch.buf.as_ptr(), ptr);
+        assert_eq!(scratch.buf.capacity(), need);
+    }
+
+    /// The same guarantee through the public entry point: a scratch built at
+    /// `scratch_len(.., cache.capacity())` allocates once and then holds its
+    /// pointer across a growing sequence, because the first call sizes it
+    /// from the cache's capacity rather than that call's position count.
+    #[test]
+    fn scratch_allocates_once_across_a_growing_sequence() {
+        let (n_kv, n_q, head_dim, cap) = (2usize, 8usize, 16usize, 32usize);
+        let mut rng = Rng::new(0x00A1_10C1);
+        let (cache, _rows) = random_cache(&mut rng, 1, n_kv, head_dim, cap);
+        let q = rng.vec_in(n_q * head_dim, -1.0, 1.0);
+        let mut out = vec![0.0f32; q.len()];
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let need = scratch_len(n_q, n_kv, head_dim, cap);
+        let mut scratch = AttentionScratch::with_capacity(need);
+        let ptr = scratch.buf.as_ptr();
+        for positions in 1..=cap {
+            attention_at(&q, &cache, 0, positions, scale, &mut scratch, &mut out).unwrap();
+            assert_eq!(scratch.buf.as_ptr(), ptr, "reallocated at {positions}");
+            assert_eq!(scratch.buf.len(), need);
+        }
     }
 
     /// Geometries for the position-limited gates: `(n_layers, n_kv_heads,
@@ -852,5 +1144,328 @@ mod tests {
 
         // No error path wrote anything.
         assert!(out.iter().all(|&x| x == 7.0));
+    }
+
+    /// The pre-restructure kernel body, copied verbatim from the head-major
+    /// loop nest this wave replaced: query head outer, `kv_head = h / group`,
+    /// and the f16->f32 conversion inline in both reduction loops, so every
+    /// K and V element is re-converted once per query head in its GQA group.
+    /// The causal limit is the length of `scores`, which both reductions zip
+    /// against — exactly as it was.
+    ///
+    /// This exists only as the reference for
+    /// `restructured_kernel_is_bit_identical_to_head_major_reference`. It is
+    /// deliberately *not* factored against the live kernel: the whole point
+    /// is that it is the old arithmetic, written the old way.
+    fn head_major_reference(
+        q: &[f32],
+        cache: &KvCache,
+        layer: usize,
+        positions: usize,
+        scale: f32,
+        out: &mut [f32],
+    ) {
+        let head_dim = cache.head_dim();
+        let n_kv_heads = cache.n_kv_heads();
+        let kv_dim = cache.kv_dim();
+        let n_q_heads = q.len() / head_dim;
+        let group = n_q_heads / n_kv_heads;
+        let k_plane = cache.k_layer(layer).unwrap();
+        let v_plane = cache.v_layer(layer).unwrap();
+        let mut scores = vec![0.0f32; positions];
+
+        for (h, out_h) in out.chunks_exact_mut(head_dim).enumerate() {
+            let kv_head = h / group;
+            let col = kv_head * head_dim;
+            let q_h = &q[h * head_dim..(h + 1) * head_dim];
+
+            for (row, score) in k_plane.chunks_exact(kv_dim).zip(scores.iter_mut()) {
+                let k_th = &row[col..col + head_dim];
+                let mut acc = 0.0f32;
+                for (&qv, &kb) in q_h.iter().zip(k_th) {
+                    acc += qv * f16_to_f32(kb);
+                }
+                *score = scale * acc;
+            }
+
+            softmax(&mut scores).unwrap();
+
+            out_h.fill(0.0);
+            for (row, &w) in v_plane.chunks_exact(kv_dim).zip(scores.iter()) {
+                let v_th = &row[col..col + head_dim];
+                for (o, &vb) in out_h.iter_mut().zip(v_th) {
+                    *o += w * f16_to_f32(vb);
+                }
+            }
+        }
+    }
+
+    /// Gate 10 (phase 7 wave 1, the central claim of the restructure): the
+    /// kv-head-outer kernel, which widens each K and V element from f16 once
+    /// per position instead of once per query head, is **bit-identical** to
+    /// the head-major nest it replaced.
+    ///
+    /// That is the whole argument for the hoist. `f16_to_f32` is an exact
+    /// widening, so a buffered element is the value the inline conversion
+    /// produced; `h = kv_head * group + g` visits the same query heads as
+    /// `kv_head = h / group`; the QK dot still runs over `i` ascending in one
+    /// f32 with the scale applied once at the end; the V sum still runs over
+    /// `t` ascending per output element. Nothing reassociates, so `to_bits()`
+    /// equality must hold with zero tolerance. Introducing an FMA, folding
+    /// the scale per element, transposing the reduction, or letting softmax
+    /// see anything but a contiguous per-head run all break this test.
+    ///
+    /// Coverage: all four `LIMITED_GEOMETRIES` (GQA groups 8, 1, 8 and 2 —
+    /// group 1 is the degenerate case where the group-major score block is a
+    /// single run) plus the real v0 pin (32 q heads : 4 kv heads, head_dim
+    /// 128) at a prime full length; every layer; position counts 1, the
+    /// primes up to the geometry's length, and the full length; and all four
+    /// entry points, owning and borrowed, limited and unlimited.
+    #[test]
+    fn restructured_kernel_is_bit_identical_to_head_major_reference() {
+        let mut rng = Rng::new(0x0401_57ED);
+        let mut geometries = LIMITED_GEOMETRIES.to_vec();
+        geometries.push((1, 4, 32, 128, 67));
+
+        for (n_layers, n_kv, n_q, head_dim, n_pos) in geometries {
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let (cache, _rows) = random_cache(&mut rng, n_layers, n_kv, head_dim, n_pos);
+            let q = rng.vec_in(n_q * head_dim, -1.0, 1.0);
+            let mut owned = AttentionScratch::new();
+
+            let mut lengths: Vec<usize> = [1usize, 2, 3, 5, 7, 11, 13, 31, 61]
+                .into_iter()
+                .filter(|&p| p < n_pos)
+                .collect();
+            lengths.push(n_pos);
+
+            for layer in 0..n_layers {
+                for &positions in &lengths {
+                    let mut want = vec![0.0f32; q.len()];
+                    head_major_reference(&q, &cache, layer, positions, scale, &mut want);
+
+                    // Owning scratch, limited form.
+                    let mut got = vec![0.0f32; q.len()];
+                    attention_at(&q, &cache, layer, positions, scale, &mut owned, &mut got)
+                        .unwrap();
+
+                    // Borrowed scratch, sized exactly by `scratch_len`.
+                    let need = scratch_len(n_q, n_kv, head_dim, positions);
+                    let mut carve = vec![0.0f32; need];
+                    let mut got_in = vec![0.0f32; q.len()];
+                    attention_at_in(&q, &cache, layer, positions, scale, &mut carve, &mut got_in)
+                        .unwrap();
+
+                    // The unlimited forms, where the limit is the whole layer.
+                    let mut got_decode = vec![0.0f32; q.len()];
+                    let mut got_decode_in = vec![0.0f32; q.len()];
+                    if positions == n_pos {
+                        decode_attention(&q, &cache, layer, scale, &mut owned, &mut got_decode)
+                            .unwrap();
+                        decode_attention_in(
+                            &q,
+                            &cache,
+                            layer,
+                            scale,
+                            &mut carve,
+                            &mut got_decode_in,
+                        )
+                        .unwrap();
+                    } else {
+                        got_decode.copy_from_slice(&got);
+                        got_decode_in.copy_from_slice(&got);
+                    }
+
+                    for (i, &w) in want.iter().enumerate() {
+                        let label = format!(
+                            "geometry ({n_layers}, {n_kv}, {n_q}, {head_dim}) layer {layer} \
+                             positions {positions} elem {i}"
+                        );
+                        assert_eq!(
+                            got[i].to_bits(),
+                            w.to_bits(),
+                            "{label}: attention_at {:e} vs head-major reference {w:e}",
+                            got[i]
+                        );
+                        assert_eq!(
+                            got_in[i].to_bits(),
+                            w.to_bits(),
+                            "{label}: attention_at_in {:e} vs head-major reference {w:e}",
+                            got_in[i]
+                        );
+                        assert_eq!(got_decode[i].to_bits(), w.to_bits(), "{label}: decode");
+                        assert_eq!(
+                            got_decode_in[i].to_bits(),
+                            w.to_bits(),
+                            "{label}: decode_in"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `scratch_len` is the pinned carve arithmetic — a later lane sizes an
+    /// arena from it, so the formula is a contract, not an implementation
+    /// detail. It is also total: no division by zero, no overflow panic.
+    #[test]
+    fn scratch_len_pins_the_carve() {
+        // v0 pin: 8 * 4096 scores + 2 * 128 conversion = 33 024 f32 = 129 KiB.
+        assert_eq!(scratch_len(32, 4, 128, 4096), 33_024);
+        assert_eq!(scratch_len(32, 4, 128, 4096) * 4, 132_096);
+        // Group 1 (MHA): the score block is a single positions-long run.
+        assert_eq!(scratch_len(8, 8, 64, 100), 100 + 128);
+        // Group 8 over one kv head (MQA).
+        assert_eq!(scratch_len(8, 1, 8, 7), 8 * 7 + 16);
+        // Total on nonsense: no panic, no wraparound.
+        assert_eq!(scratch_len(4, 0, 8, 10), 16);
+        assert_eq!(scratch_len(usize::MAX, 1, 1, usize::MAX), usize::MAX);
+        assert_eq!(scratch_len(2, 1, usize::MAX, 4), usize::MAX);
+    }
+
+    /// A short borrowed scratch is a typed error: not a panic, and not a
+    /// silent truncation to however many positions happen to fit — that
+    /// would be a wrong answer wearing a right answer's shape. Shape errors
+    /// still take priority over it, and no error path writes `out`.
+    #[test]
+    fn attention_in_typed_errors_on_short_scratch() {
+        let (n_kv, n_q, head_dim, n_pos) = (2usize, 8usize, 16usize, 5usize);
+        let mut rng = Rng::new(0x05C2_47C4);
+        let (cache, _rows) = random_cache(&mut rng, 1, n_kv, head_dim, n_pos);
+        let q = rng.vec_in(n_q * head_dim, -1.0, 1.0);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut out = vec![7.0f32; q.len()];
+
+        let need = scratch_len(n_q, n_kv, head_dim, n_pos);
+        assert_eq!(need, 4 * n_pos + 2 * head_dim);
+
+        // One short, empty, and short by only the conversion buffers.
+        for len in [0usize, 1, need - 1, 4 * n_pos] {
+            let mut carve = vec![0.0f32; len];
+            assert_eq!(
+                attention_at_in(&q, &cache, 0, n_pos, scale, &mut carve, &mut out).unwrap_err(),
+                AttentionError::ScratchTooShort { len, need }
+            );
+            assert_eq!(
+                decode_attention_in(&q, &cache, 0, scale, &mut carve, &mut out).unwrap_err(),
+                AttentionError::ScratchTooShort { len, need }
+            );
+        }
+
+        // A shorter row needs a shorter carve, and the error says so.
+        let mut carve = vec![0.0f32; 4 * 2];
+        assert_eq!(
+            attention_at_in(&q, &cache, 0, 2, scale, &mut carve, &mut out).unwrap_err(),
+            AttentionError::ScratchTooShort {
+                len: 8,
+                need: scratch_len(n_q, n_kv, head_dim, 2),
+            }
+        );
+
+        // Shape and range checks come first: a bad `q` is a `q` error even
+        // with an empty scratch, and `positions` past the end is still the
+        // cache's error.
+        let mut empty: Vec<f32> = Vec::new();
+        assert_eq!(
+            attention_at_in(&q[..3], &cache, 0, n_pos, scale, &mut empty, &mut out).unwrap_err(),
+            AttentionError::QLenIndivisible { q_len: 3, head_dim }
+        );
+        assert_eq!(
+            attention_at_in(&q, &cache, 0, n_pos + 1, scale, &mut empty, &mut out).unwrap_err(),
+            AttentionError::Kv(KvError::PositionOutOfRange {
+                layer: 0,
+                pos: n_pos,
+                len: n_pos,
+            })
+        );
+
+        // Nothing above wrote to `out`.
+        assert!(out.iter().all(|&x| x == 7.0));
+
+        // Exactly `scratch_len` is enough, and a longer carve is accepted
+        // with the tail ignored — both bit-identical to the owning form.
+        let mut owned = AttentionScratch::new();
+        let mut want = vec![0.0f32; q.len()];
+        attention_at(&q, &cache, 0, n_pos, scale, &mut owned, &mut want).unwrap();
+        for len in [need, need + 1, need * 3] {
+            let mut carve = vec![-1.0f32; len];
+            let mut got = vec![0.0f32; q.len()];
+            attention_at_in(&q, &cache, 0, n_pos, scale, &mut carve, &mut got).unwrap();
+            for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "carve {len} elem {i}");
+            }
+        }
+    }
+
+    /// Group 1 (`n_q_heads == n_kv_heads`, plain MHA) is the degenerate case
+    /// of the group-major score layout: one run, no stride, and each query
+    /// head reads its own kv head. It is easy to get wrong by assuming the
+    /// group is the outer stride, so it gets its own gate — against the
+    /// head-major reference, through every entry point, and with the head
+    /// mapping checked directly by giving each kv head a distinct winner.
+    #[test]
+    fn group_of_one_maps_each_query_head_to_its_own_kv_head() {
+        let (n_kv, n_q, head_dim, n_pos) = (4usize, 4usize, 8usize, 6usize);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut rng = Rng::new(0x0612_00F1);
+        let (cache, _rows) = random_cache(&mut rng, 2, n_kv, head_dim, n_pos);
+        let q = rng.vec_in(n_q * head_dim, -1.0, 1.0);
+
+        assert_eq!(
+            scratch_len(n_q, n_kv, head_dim, n_pos),
+            n_pos + 2 * head_dim
+        );
+
+        let mut owned = AttentionScratch::new();
+        for layer in 0..2 {
+            for positions in 1..=n_pos {
+                let mut want = vec![0.0f32; q.len()];
+                head_major_reference(&q, &cache, layer, positions, scale, &mut want);
+
+                let mut got = vec![0.0f32; q.len()];
+                attention_at(&q, &cache, layer, positions, scale, &mut owned, &mut got).unwrap();
+                let mut carve = vec![0.0f32; scratch_len(n_q, n_kv, head_dim, positions)];
+                let mut got_in = vec![0.0f32; q.len()];
+                attention_at_in(&q, &cache, layer, positions, scale, &mut carve, &mut got_in)
+                    .unwrap();
+
+                for (i, &w) in want.iter().enumerate() {
+                    assert_eq!(got[i].to_bits(), w.to_bits(), "layer {layer} elem {i}");
+                    assert_eq!(got_in[i].to_bits(), w.to_bits(), "layer {layer} elem {i}");
+                }
+            }
+        }
+
+        // Head mapping, independent of the reference: kv head j wins at
+        // position j and carries marker 10j + t, so query head h (== kv head
+        // h at group 1) must come back with marker(h, h).
+        let mut marked = KvCache::new(1, n_kv, head_dim, n_kv).unwrap();
+        let marker = |j: usize, t: usize| (10 * j + t) as f32 * 0.01;
+        for t in 0..n_kv {
+            let mut k = vec![0.0f32; n_kv * head_dim];
+            let mut v = vec![0.0f32; n_kv * head_dim];
+            for j in 0..n_kv {
+                let sign = if t == j { 1.0f32 } else { -1.0 };
+                for i in 0..head_dim {
+                    k[j * head_dim + i] = sign * 8.0 / head_dim as f32;
+                    v[j * head_dim + i] = marker(j, t);
+                }
+            }
+            marked.append(0, &k, &v).unwrap();
+        }
+        let ones = vec![1.0f32; n_q * head_dim];
+        let mut out = vec![0.0f32; ones.len()];
+        let mut carve = vec![0.0f32; scratch_len(n_q, n_kv, head_dim, n_kv)];
+        decode_attention_in(&ones, &marked, 0, 1.0, &mut carve, &mut out).unwrap();
+        for h in 0..n_q {
+            for i in 0..head_dim {
+                let got = out[h * head_dim + i];
+                let want = marker(h, h);
+                assert!(
+                    (got - want).abs() < 1e-3,
+                    "q head {h} elem {i}: got {got}, want kv head {h} marker {want}"
+                );
+            }
+        }
     }
 }
