@@ -3,10 +3,12 @@
 //! activation quantizers, plus the decode-attention context sweep.
 //!
 //! Deliberately no criterion (keeps the dependency tree lean): a plain
-//! `std::time::Instant` harness with warmup and median-of-31 runs. Numbers
-//! from here are diagnostics per the experiment-log rules — published
-//! end-to-end numbers come from cold runs inside the 3 GB cgroup, not from
-//! this harness.
+//! `std::time::Instant` harness with untimed warmups and an odd-count median.
+//! The dot and quantizer table runs 31/5 everywhere; the attention arms dial
+//! the counts down as one timed unit grows into the seconds, and print the
+//! `runs`/`warmup` they actually used per rung. Numbers from here are
+//! diagnostics per the experiment-log rules — published end-to-end numbers
+//! come from cold runs inside the 3 GB cgroup, not from this harness.
 //!
 //! Run with `cargo bench -p ramvamp-core`.
 
@@ -179,6 +181,25 @@ const ARM_A_SAMPLES: [(usize, usize); 7] = [(RUNS, WARMUP); 7];
 const ARM_B_SAMPLES: [(usize, usize); 7] =
     [(31, 3), (31, 3), (21, 2), (15, 2), (11, 1), (7, 1), (5, 1)];
 
+/// Ladder rungs re-measured at the end of each arm as a **time-into-run
+/// control**. Must be a subset of [`CONTEXT_LADDER`], ascending.
+///
+/// The ladder is walked strictly ascending, so "slower at the top rung" and
+/// "slower later in the run" are perfectly confounded: a 48-layer arm is
+/// ~44 s of continuous single-core FP work, which is the same order as this
+/// laptop part's PL1 time constant, and a thermal/DVFS ramp has the same
+/// sign and monotonicity as a residency effect. Re-running a cheap early
+/// rung *after* the expensive ones separates them: if the repeat matches the
+/// original, the clock held and the ladder's drift is footprint; if the
+/// repeat is materially slower at identical context and identical read set,
+/// the drift is time-into-run and the residency reading is contaminated.
+///
+/// The repeat is set up to read exactly the bytes the original rung read:
+/// the planes are allocated at [`ATTN_CAP`] up front and never move, so
+/// [`KvCache::clear`] plus a refill to `context` leaves the kernel walking
+/// the same leading rows of the same allocation.
+const DRIFT_RUNGS: [usize; 2] = [64, 512];
+
 /// One ladder rung of one arm.
 struct AttnRow {
     /// Cached positions the kernel attended over.
@@ -187,6 +208,8 @@ struct AttnRow {
     layers: usize,
     /// Timed runs the median came from.
     runs: usize,
+    /// Untimed warmup units run before the timed ones.
+    warmup: usize,
     /// Median wall nanoseconds per timed unit.
     ns_per_unit: f64,
 }
@@ -195,8 +218,12 @@ impl AttnRow {
     /// Wall milliseconds for one token's worth of attention: arm B measures
     /// that directly, arm A is scaled by the model's layer count so the two
     /// arms sit in the same units.
+    ///
+    /// The layer ratio is taken in f64: as integer division it is silently
+    /// correct only for `layers` in {1, 48} and under-reports by 32x at,
+    /// say, `layers = 32`.
     fn ms_per_token(&self) -> f64 {
-        self.ns_per_unit * (ATTN_LAYERS / self.layers) as f64 / 1e6
+        self.ns_per_unit * (ATTN_LAYERS as f64 / self.layers as f64) / 1e6
     }
 
     /// Nanoseconds per cached position per timed unit. Flat across the
@@ -218,16 +245,134 @@ impl AttnRow {
     }
 }
 
+/// One [`DRIFT_RUNGS`] rung measured twice: once in ladder order, once again
+/// after the whole arm has run.
+struct DriftRow {
+    /// Cached positions, identical in both measurements.
+    context: usize,
+    /// Timed runs, identical in both measurements.
+    runs: usize,
+    /// Untimed warmups, identical in both measurements.
+    warmup: usize,
+    /// The ladder's original median for this rung.
+    first_ns: f64,
+    /// The end-of-arm repeat's median for the same rung.
+    repeat_ns: f64,
+}
+
+impl DriftRow {
+    /// `repeat / first`. Above 1.0, the same work at the same context got
+    /// slower purely by running later — a clock/thermal effect, not a
+    /// footprint effect.
+    fn ratio(&self) -> f64 {
+        self.repeat_ns / self.first_ns
+    }
+}
+
+/// Everything one timed attention unit needs except the cache, so the ladder
+/// and the drift control time byte-identical closures.
+struct AttnUnit<'a> {
+    layers: usize,
+    q: &'a [f32],
+    scale: f32,
+    scratch: AttentionScratch,
+    out: Vec<f32>,
+}
+
+impl AttnUnit<'_> {
+    /// Median wall ns for one timed unit: `layers` back-to-back
+    /// [`decode_attention`] calls over `cache`.
+    ///
+    /// Both `black_box`es are load-bearing, not decoration. `black_box(&out)`
+    /// makes the whole output buffer escape, so none of the 4096 output
+    /// stores (nor the 32 softmaxes behind them) can be proved dead — the
+    /// root manifest builds benches with `lto = "thin"` and
+    /// `codegen-units = 1`, so `decode_attention` is inlinable across the
+    /// crate boundary and a version cheap enough to inline is a version
+    /// whose dead stores LLVM can see. Observing `out[0]` alone would leave
+    /// 31 of 32 heads eliminable, which would read as a speedup. Summing the
+    /// buffer instead would also work but costs a serial 4096-add chain per
+    /// call: ~1.7% at the shortest arm-A rung and ~0.03% at the longest, a
+    /// per-call constant that would tilt the linearity probe. `black_box` on
+    /// the reference is free.
+    ///
+    /// `black_box(q)` and `black_box(cache)` stop the inputs from being
+    /// treated as loop-invariant across the `layers` calls. In the real
+    /// decode loop `q` is different at every layer, so this is also the
+    /// faithful shape.
+    fn median_ns(&mut self, cache: &KvCache, runs: usize, warmup: usize) -> f64 {
+        let layers = self.layers;
+        let q = self.q;
+        let scale = self.scale;
+        let scratch = &mut self.scratch;
+        let out = &mut self.out;
+        median_ns_n(runs, warmup, || {
+            let mut sink = 0f32;
+            for layer in 0..layers {
+                decode_attention(
+                    std::hint::black_box(q),
+                    std::hint::black_box(cache),
+                    layer,
+                    scale,
+                    scratch,
+                    out,
+                )
+                .expect("decode_attention");
+                sink += std::hint::black_box(&out[..])[0];
+            }
+            sink
+        })
+    }
+}
+
+/// Append positions to every layer until each cursor reaches `context`.
+///
+/// Values are uniform in [-1, 1), which keeps the QK scores near unit scale:
+/// no denormals, no softmax overflow, and nothing value-dependent for the
+/// kernel to branch on.
+fn fill_to(
+    cache: &mut KvCache,
+    layers: usize,
+    filled: &mut usize,
+    context: usize,
+    k_row: &mut [f32],
+    v_row: &mut [f32],
+    rng: &mut Lcg,
+) {
+    while *filled < context {
+        for layer in 0..layers {
+            for (k, v) in k_row.iter_mut().zip(v_row.iter_mut()) {
+                *k = rng.next_f32();
+                *v = rng.next_f32();
+            }
+            cache.append(layer, k_row, v_row).unwrap();
+        }
+        *filled += 1;
+    }
+}
+
 /// Sweep [`decode_attention`] over [`CONTEXT_LADDER`] on a `layers`-deep
-/// cache, timing one call per layer per unit.
+/// cache, timing one call per layer per unit, then re-measure
+/// [`DRIFT_RUNGS`] at the end as a time-into-run control.
 ///
 /// Arm A (`layers = 1`, 8 MiB of planes) is the pure kernel curve, mostly
 /// cache-resident. Arm B (`layers = ATTN_LAYERS`, **384 MiB** of planes —
 /// the KV tenant's whole v0 budget, so this arm alone dominates the bench's
 /// footprint) makes one timed unit a full 48-layer sweep, i.e. exactly one
-/// decoded token's attention: by the time layer `L` comes round again its
-/// planes have not been touched since the previous unit, which is the
-/// residency the real decode loop sees.
+/// decoded token's attention.
+///
+/// What arm B is and is not: it is a **lower bound on the eviction the real
+/// decode loop inflicts between two attention calls on the same layer**, not
+/// a reproduction of it. Between consecutive `decode_attention` calls the
+/// real loop runs that layer's four quantized GEMVs, an f32 router matvec
+/// and `stream_experts` staging 8 experts x 3 `[2048, 768]` matrices — tens
+/// of MiB of streamed weights against the ~8 MiB of KV one layer's attention
+/// touches at the top rung. Arm B runs 48 attention calls back to back and
+/// nothing else, so it evicts strictly less. The bound is close to tight at
+/// large `context`, where the 384 MiB of planes alone overrun every cache;
+/// below roughly `context = 1024` the whole live plane set fits in L3 and
+/// arm B is measuring a cache-resident sweep that the real loop never gets.
+/// Read its residency tax as a floor, and only at the long end.
 ///
 /// The query vector, the K/V fill and the scratch are all built outside the
 /// timed region, and the scratch is preallocated at the context cap so it
@@ -236,65 +381,95 @@ fn bench_attention_arm(
     layers: usize,
     schedule: &[(usize, usize); 7],
     rng: &mut Lcg,
-) -> Vec<AttnRow> {
+) -> (Vec<AttnRow>, Vec<DriftRow>) {
     let kv_dim = ATTN_KV_HEADS * ATTN_HEAD_DIM;
     let scale = 1.0 / (ATTN_HEAD_DIM as f32).sqrt();
     let mut cache = KvCache::new(layers, ATTN_KV_HEADS, ATTN_HEAD_DIM, ATTN_CAP).unwrap();
     let q: Vec<f32> = (0..ATTN_Q_HEADS * ATTN_HEAD_DIM)
         .map(|_| rng.next_f32())
         .collect();
-    let mut out = vec![0.0f32; q.len()];
-    let mut scratch = AttentionScratch::with_capacity(ATTN_CAP);
+    let mut unit = AttnUnit {
+        layers,
+        q: &q,
+        scale,
+        scratch: AttentionScratch::with_capacity(ATTN_CAP),
+        out: vec![0.0f32; ATTN_Q_HEADS * ATTN_HEAD_DIM],
+    };
     let mut k_row = vec![0.0f32; kv_dim];
     let mut v_row = vec![0.0f32; kv_dim];
 
     let mut filled = 0usize;
     let mut rows = Vec::with_capacity(CONTEXT_LADDER.len());
     for (&context, &(runs, warmup)) in CONTEXT_LADDER.iter().zip(schedule) {
-        // Grow the cache to this rung. Values are uniform in [-1, 1), which
-        // keeps the QK scores near unit scale: no denormals, no softmax
-        // overflow, and nothing value-dependent for the kernel to branch on.
-        while filled < context {
-            for layer in 0..layers {
-                for (k, v) in k_row.iter_mut().zip(v_row.iter_mut()) {
-                    *k = rng.next_f32();
-                    *v = rng.next_f32();
-                }
-                cache.append(layer, &k_row, &v_row).unwrap();
-            }
-            filled += 1;
-        }
-
-        let ns_per_unit = median_ns_n(runs, warmup, || {
-            let mut sink = 0f32;
-            for layer in 0..layers {
-                decode_attention(&q, &cache, layer, scale, &mut scratch, &mut out)
-                    .expect("decode_attention");
-                sink += out[0];
-            }
-            sink
-        });
+        fill_to(
+            &mut cache,
+            layers,
+            &mut filled,
+            context,
+            &mut k_row,
+            &mut v_row,
+            rng,
+        );
+        let ns_per_unit = unit.median_ns(&cache, runs, warmup);
         rows.push(AttnRow {
             context,
             layers,
             runs,
+            warmup,
             ns_per_unit,
         });
     }
-    rows
+
+    // Time-into-run control. `clear` only rewinds the per-layer cursors —
+    // the planes stay put — so refilling to an early rung leaves the kernel
+    // reading the same leading rows of the same allocation it read the first
+    // time, with the same call, the same sample counts and the same geometry.
+    // The only difference between the two measurements is when they ran.
+    cache.clear();
+    filled = 0;
+    let mut drift = Vec::with_capacity(DRIFT_RUNGS.len());
+    for &context in &DRIFT_RUNGS {
+        let Some((runs, warmup, first_ns)) = rows
+            .iter()
+            .find(|r| r.context == context)
+            .map(|r| (r.runs, r.warmup, r.ns_per_unit))
+        else {
+            continue;
+        };
+        fill_to(
+            &mut cache,
+            layers,
+            &mut filled,
+            context,
+            &mut k_row,
+            &mut v_row,
+            rng,
+        );
+        let repeat_ns = unit.median_ns(&cache, runs, warmup);
+        drift.push(DriftRow {
+            context,
+            runs,
+            warmup,
+            first_ns,
+            repeat_ns,
+        });
+    }
+
+    (rows, drift)
 }
 
 fn print_attn_table(arm: &str, rows: &[AttnRow]) {
     println!("{arm}");
     println!(
-        "{:>7} {:>5} {:>14} {:>10} {:>10} {:>14} {:>10}",
-        "context", "runs", "ns/unit", "ms/token", "ns/pos", "ns/pos/layer", "eff GB/s"
+        "{:>7} {:>5} {:>7} {:>14} {:>10} {:>10} {:>14} {:>10}",
+        "context", "runs", "warmup", "ns/unit", "ms/token", "ns/pos", "ns/pos/layer", "eff GB/s"
     );
     for r in rows {
         println!(
-            "{:>7} {:>5} {:>14.0} {:>10.3} {:>10.1} {:>14.3} {:>10.2}",
+            "{:>7} {:>5} {:>7} {:>14.0} {:>10.3} {:>10.1} {:>14.3} {:>10.2}",
             r.context,
             r.runs,
+            r.warmup,
             r.ns_per_unit,
             r.ms_per_token(),
             r.ns_per_pos(),
@@ -304,22 +479,53 @@ fn print_attn_table(arm: &str, rows: &[AttnRow]) {
     }
 }
 
-/// `ns/pos` at context 4096 over `ns/pos` at context 512 — 1.0 means the
-/// cost is exactly linear in context.
+fn print_drift_table(arm: &str, drift: &[DriftRow]) {
+    println!(
+        "drift control {arm}: early rungs re-measured after the whole arm, same context, \
+         same read set,\nsame sample counts. ratio > 1 means identical work got slower by \
+         running later (clock/thermal),\nwhich is the alternative explanation for the ladder's \
+         own upward ns/pos drift."
+    );
+    println!(
+        "{:>7} {:>5} {:>7} {:>14} {:>14} {:>8}",
+        "context", "runs", "warmup", "first ns/unit", "repeat ns/unit", "ratio"
+    );
+    for d in drift {
+        println!(
+            "{:>7} {:>5} {:>7} {:>14.0} {:>14.0} {:>7.3}x",
+            d.context,
+            d.runs,
+            d.warmup,
+            d.first_ns,
+            d.repeat_ns,
+            d.ratio(),
+        );
+    }
+}
+
+/// `max(ns/pos) / min(ns/pos)` over every measured rung — 1.0 means the cost
+/// is exactly linear in context.
+///
+/// Deliberately not a two-point ratio: anchoring on N=512 and N=4096 threw
+/// away five of seven measured cells and put half the statistic's weight on
+/// one cell whose ~2% run-to-run noise swung the printed figure between
+/// 0.997x and 1.021x with no kernel change. max/min over the whole ladder is
+/// what the results doc computed by hand anyway.
 fn linearity_ratio(rows: &[AttnRow]) -> Option<f64> {
-    let at = |context: usize| {
-        rows.iter()
-            .find(|r| r.context == context)
-            .map(AttnRow::ns_per_pos)
-    };
-    Some(at(4096)? / at(512)?)
+    let mut it = rows.iter().map(AttnRow::ns_per_pos);
+    let first = it.next()?;
+    let (lo, hi) = it.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v)));
+    Some(hi / lo)
 }
 
 fn main() {
     println!(
-        "kernels microbench: warm-cache, single-thread, median of {RUNS} runs \
-         ({WARMUP} warmup); avx2+fma detected: {}",
+        "kernels microbench: warm-cache, single-thread; avx2+fma detected: {}",
         avx2::avx2_fma_available()
+    );
+    println!(
+        "dot + quantizer table below: median of {RUNS} runs ({WARMUP} warmup). The attention \
+         tables do NOT use that\nregime — they print their own runs and warmup per rung."
     );
     println!("GB/s = packed row bytes / ns per row (quantizers: f32 input bytes)\n");
 
@@ -455,26 +661,34 @@ fn main() {
          columns once per query head in its group, so the bytes it actually\ntouches are 8x this.\n"
     );
 
-    let arm_a = bench_attention_arm(1, &ARM_A_SAMPLES, &mut rng);
+    let (arm_a, drift_a) = bench_attention_arm(1, &ARM_A_SAMPLES, &mut rng);
     print_attn_table(
         "arm A: 1 layer (8 MiB planes), timed unit = one decode_attention call",
         &arm_a,
     );
     println!();
-    let arm_b = bench_attention_arm(ATTN_LAYERS, &ARM_B_SAMPLES, &mut rng);
+    print_drift_table("arm A", &drift_a);
+    println!();
+    let (arm_b, drift_b) = bench_attention_arm(ATTN_LAYERS, &ARM_B_SAMPLES, &mut rng);
     print_attn_table(
-        "arm B: 48 layers (384 MiB planes), timed unit = one token (all 48 layers)",
+        "arm B: 48 layers (384 MiB planes), timed unit = one token (all 48 layers). Its \
+         residency is a\nLOWER bound on the real decode loop's: the real loop also runs that \
+         layer's GEMVs, the router\nand 8 streamed experts between two attention calls. \
+         Optimistic below context ~1024.",
         &arm_b,
     );
+    println!();
+    print_drift_table("arm B", &drift_b);
 
     println!();
     for (arm, rows) in [("arm A", &arm_a), ("arm B", &arm_b)] {
         match linearity_ratio(rows) {
             Some(ratio) => println!(
-                "linearity {arm}: ns/pos(4096) / ns/pos(512) = {ratio:.3}x \
-                 (1.0 = cost linear in context)"
+                "linearity {arm}: max(ns/pos) / min(ns/pos) over all {} rungs = {ratio:.3}x \
+                 (1.0 = cost linear in context)",
+                rows.len()
             ),
-            None => println!("linearity {arm}: ladder is missing 512 or 4096, no ratio"),
+            None => println!("linearity {arm}: no measured rungs, no ratio"),
         }
     }
 }
