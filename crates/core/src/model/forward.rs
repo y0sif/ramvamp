@@ -91,7 +91,9 @@ use crate::io::{
     ExpertStream, ExpertView, IoError, StreamMode, StreamPhase, StreamStats, SweepError, SweepPlan,
 };
 use crate::kernels::KernelError;
-use crate::kernels::attention::{AttentionError, AttentionScratch, decode_attention};
+use crate::kernels::attention::{
+    AttentionError, decode_attention_in, scratch_len as attention_scratch_len,
+};
 use crate::kernels::primitives::{
     rmsnorm, rmsnorm_in_place, rope_neox_heads, softmax, swiglu_combine, vec_add,
 };
@@ -100,11 +102,11 @@ use crate::kernels::quants::{
 };
 use crate::kernels::{gemv_q8_0_rows, gemv_q8_k_rows};
 use crate::kv::{KvCache, KvError};
-use crate::threads::{ComputePool, PoolConfig};
+use crate::threads::{ComputePool, PoolConfig, shard_range};
 use thiserror::Error;
 
 use super::error::ModelError;
-use super::prefill::{Phase, PhaseClock, PrefillConfig, PrefillMode, PrefillTiming};
+use super::prefill::{Phase, PhaseClock, PrefillConfig, PrefillMode, PrefillTiming, SendPtr};
 use super::weights::Model;
 
 /// Default total expert-cache budget: 1,440 MiB.
@@ -431,7 +433,24 @@ pub struct ForwardState {
     /// the model [`forward_token`] is handed, once per token.
     arch: ArchFingerprint,
     kv: KvCache,
-    attn_scratch: AttentionScratch,
+    /// Per-shard attention scratch, `[shards][attention_scratch_len]`.
+    ///
+    /// One whole carve per compute shard rather than one shared buffer,
+    /// because [`pool_decode_attention`] runs a slab of query heads on every
+    /// shard at once and the scores are the only state a call keeps. Sized
+    /// from the context cap up front, so nothing on the decode path ever
+    /// reallocates. At the v0 pin this is 6 x 129 KiB = 774 KiB — the one
+    /// piece of new anonymous memory Wave 2 adds, and the reason prefill's
+    /// equivalent comes out of the session arena instead (see
+    /// `prefill::scratch_bytes`).
+    attn_scratch: Vec<f32>,
+    /// Query heads gathered into slab order for [`pool_decode_attention`],
+    /// `[n_heads * head_dim]`. Exactly one copy of `q`, permuted: the slabs
+    /// partition the heads, so the shards' regions tile this buffer.
+    attn_slab_q: Vec<f32>,
+    /// The slab-order attention output, scattered back into `attn_out` after
+    /// the fan-out joins. Same length and same tiling as `attn_slab_q`.
+    attn_slab_out: Vec<f32>,
     /// Residual stream (`[hidden]`).
     hidden: Vec<f32>,
     /// RMSNorm output (`[hidden]`), reused by every norm site.
@@ -502,6 +521,18 @@ pub struct ForwardState {
     /// `forward_token` charges into it too, but only while a prefill has armed
     /// it, which is what keeps decode out of a prefill's numbers.
     prefill_timing: PrefillTiming,
+    /// Where the decode that followed the last prefill spent its wall time.
+    ///
+    /// The same five phases and the same `PhaseClock`, charged by the same
+    /// [`forward_token`] — the only difference is which accumulator the clock
+    /// points at, which `prefill_charging` decides. Unlike `prefill_timing`
+    /// this one *accumulates* across tokens: a per-token split would be noise,
+    /// and the question it answers ("what share of decode is attention now")
+    /// is a question about a run.
+    ///
+    /// Zeroed when a prefill is armed, so it describes the decode belonging to
+    /// the most recent prompt rather than a whole chat session.
+    decode_timing: PrefillTiming,
     /// Whether [`forward_token`] should charge phases into `prefill_timing`.
     ///
     /// True only while [`crate::model::prefill_prompt`] is running the
@@ -606,10 +637,23 @@ impl ForwardState {
             "decode runtime ready"
         );
 
+        // One whole attention carve per shard, sized from the context cap and
+        // never grown: `scratch_len` is the *whole* buffer the kernel needs
+        // (a group-major score block plus two conversion rows), not just the
+        // score count, so passing the cap alone would under-reserve by the
+        // GQA group factor and cost a reallocation on the first token.
+        let attn_shard = attention_scratch_len(
+            arch.n_heads as usize,
+            arch.n_kv_heads as usize,
+            arch.head_dim as usize,
+            context_cap,
+        );
         Ok(Self {
             arch: ArchFingerprint::of(arch),
             kv,
-            attn_scratch: AttentionScratch::with_capacity(context_cap),
+            attn_scratch: vec![0.0; attn_shard.saturating_mul(pool.shards())],
+            attn_slab_q: vec![0.0; q_dim],
+            attn_slab_out: vec![0.0; q_dim],
             hidden: vec![0.0; hidden],
             normed: vec![0.0; hidden],
             acts_q8k_hidden: vec![BlockQ8K::default(); hidden / QK_K],
@@ -637,6 +681,7 @@ impl ForwardState {
             sweep_plan: SweepPlan::new(),
             routed: Vec::with_capacity(n_experts),
             prefill_timing: PrefillTiming::default(),
+            decode_timing: PrefillTiming::default(),
             prefill_charging: false,
         })
     }
@@ -699,6 +744,7 @@ impl ForwardState {
     pub fn reset(&mut self) {
         self.kv.clear();
         self.prefill_timing = PrefillTiming::default();
+        self.decode_timing = PrefillTiming::default();
         self.prefill_charging = false;
     }
 
@@ -710,7 +756,6 @@ impl ForwardState {
     pub(super) fn prefill_parts(&mut self) -> PrefillParts<'_> {
         PrefillParts {
             kv: &mut self.kv,
-            attn_scratch: &mut self.attn_scratch,
             topk: &mut self.topk,
             logits: &mut self.logits,
             pool: &mut self.pool,
@@ -728,6 +773,10 @@ impl ForwardState {
     /// decode token's phases into a prompt that is already over.
     pub(super) fn arm_prefill_timing(&mut self, mode: PrefillMode, tokens: usize) {
         self.prefill_timing = PrefillTiming::started(mode, tokens);
+        // The decode split is dropped with the prefill split it belongs
+        // beside: in a chat session the numbers under this turn's heading must
+        // be this turn's, not the session's running total.
+        self.decode_timing = PrefillTiming::default();
         self.prefill_charging = true;
     }
 
@@ -765,7 +814,6 @@ impl ForwardState {
 /// can be held at the same time.
 pub(super) struct PrefillParts<'a> {
     pub(super) kv: &'a mut KvCache,
-    pub(super) attn_scratch: &'a mut AttentionScratch,
     /// `(expert, weight)` staging for the route sink.
     pub(super) topk: &'a mut Vec<(u32, f32)>,
     pub(super) logits: &'a mut Vec<f32>,
@@ -867,6 +915,28 @@ impl ForwardState {
         self.prefill_timing
     }
 
+    /// Where the decode **since the last prefill** spent its wall time, split
+    /// by the same phases.
+    ///
+    /// The counterpart to [`ForwardState::prefill_timing`], and read the same
+    /// way, with three differences worth knowing:
+    ///
+    /// - [`PrefillTiming::mode`] is always `None` — decode has no path choice
+    ///   to report — so [`PrefillTiming::ran`] is not the question to ask
+    ///   here. [`PrefillTiming::tokens`] is: it counts tokens decoded, and is
+    ///   zero when nothing has.
+    /// - [`PrefillTiming::total`] is the sum of the per-token wall times, so
+    ///   it excludes whatever the sampler and the generation loop do between
+    ///   tokens. It is therefore slightly under the decode wall time a caller
+    ///   measures around the loop, and [`PrefillTiming::other`] stays a
+    ///   statement about `forward_token` rather than about the whole loop.
+    /// - It survives across the whole generation and is zeroed by the next
+    ///   prefill (and by [`ForwardState::reset`]), because the question is
+    ///   what a *run* spent, not what one token did.
+    pub fn decode_timing(&self) -> PrefillTiming {
+        self.decode_timing
+    }
+
     /// Attribute every expert request from the next [`forward_token`] on to
     /// `phase`.
     ///
@@ -903,9 +973,13 @@ pub(super) fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     acc
 }
 
-/// Remember the first kernel error any shard reported, without panicking
-/// out of a worker thread.
-pub(super) fn record(slot: &Mutex<Option<KernelError>>, err: KernelError) {
+/// Remember the first error any shard reported, without panicking out of a
+/// worker thread.
+///
+/// Generic over the error because the GEMV fan-outs report
+/// [`KernelError`] and the attention fan-outs report
+/// [`AttentionError`]; the bookkeeping is the same either way.
+pub(super) fn record<E>(slot: &Mutex<Option<E>>, err: E) {
     let mut held = slot.lock().unwrap_or_else(PoisonError::into_inner);
     if held.is_none() {
         *held = Some(err);
@@ -913,7 +987,7 @@ pub(super) fn record(slot: &Mutex<Option<KernelError>>, err: KernelError) {
 }
 
 /// Take whatever [`record`] stored.
-pub(super) fn taken(slot: Mutex<Option<KernelError>>) -> Result<(), KernelError> {
+pub(super) fn taken<E>(slot: Mutex<Option<E>>) -> Result<(), E> {
     match slot.into_inner().unwrap_or_else(PoisonError::into_inner) {
         Some(err) => Err(err),
         None => Ok(()),
@@ -959,6 +1033,181 @@ fn pool_gemv_q8_0(
         }
     });
     taken(failure)
+}
+
+/// One decode step's GQA attention for one layer, fanned out across the
+/// compute pool as **query-head slabs**.
+///
+/// # Why slabs, and not "a shard gets some query heads"
+///
+/// `decode_attention_in` derives the GQA grouping from `q.len() / head_dim`
+/// against the cache's `n_kv_heads`, and maps sub-head `h` to kv head
+/// `h / group`. Handing a shard a *contiguous* slice of query heads would
+/// therefore silently re-map them: eight heads of a 4-kv-head cache is
+/// `group = 2`, so heads that all belong to kv head 0 would attend kv heads
+/// 0..3. The only sub-call that preserves the mapping takes the **same
+/// offsets out of every kv group**: `k` offsets is a legal `n_kv_heads * k`
+/// head query with `group = k`, in which sub-head `kv * k + j` attends kv
+/// head `kv` — exactly the head it attends in the whole call. That is a slab,
+/// and the slabs partition the query heads, so `slab_q` and `slab_out` are
+/// one permuted copy of `q` and of the output, not `shards` copies.
+///
+/// # Bit-neutrality
+///
+/// A slab call performs the same f32 operations in the same order as the
+/// whole call does for those heads. Per kv head it converts the same K and V
+/// rows, accumulates each score over `i` ascending in one f32, scales once,
+/// runs the same whole-row [`softmax`] over the same contiguous
+/// `positions`-long run, and accumulates each output element over `t`
+/// ascending. Query heads share nothing but the conversion buffers, which are
+/// recomputed identically per slab. Nothing is reduced across shards, nothing
+/// accumulates in completion order, and `shard_range` is pure — so the gather
+/// and scatter are the only new operations, and they are `copy_from_slice`.
+///
+/// # What this costs
+///
+/// Every slab converts **all** of K and V for its `positions`, because every
+/// slab spans every kv head. That is the price of the frozen API: the kernel
+/// was made kv-head-outer precisely so each K/V element is widened once per
+/// group instead of once per head, and an `S`-way slab split reinstates `S`
+/// of those conversions. From Wave 1's measured 2.7x, conversion is ~24% of
+/// the current kernel (derived), so the ceiling here is
+/// `1 / (0.24 + 0.76 / U)` for `U` equal-sized slabs — not `U`. At the v0 pin
+/// `group` is 8 and the pool is 6 shards, so `shard_range(8, 6, ·)` gives
+/// slabs of 2,2,1,1,1,1 and the makespan is the 2-offset shard's:
+/// **~2.3x, estimated**. Six shards do not buy six.
+///
+/// The fan-out is skipped entirely when it cannot pay: fewer than two shards,
+/// a group too small to split, or a group smaller than the shard count (which
+/// [`ComputePool::run`] would run inline as a single shard anyway).
+///
+/// # Errors
+///
+/// [`ForwardError::PrefillScratch`] when `scratch` is not
+/// `shards * shard_scratch` long, and [`ForwardError::Attention`] for the
+/// first shard that reports one.
+#[allow(clippy::too_many_arguments)]
+fn pool_decode_attention(
+    pool: &mut ComputePool,
+    kv: &KvCache,
+    layer: usize,
+    scale: f32,
+    head_dim: usize,
+    q: &[f32],
+    slab_q: &mut [f32],
+    slab_out: &mut [f32],
+    scratch: &mut [f32],
+    out: &mut [f32],
+) -> Result<(), ForwardError> {
+    let n_kv_heads = kv.n_kv_heads();
+    let shards = pool.shards();
+    // Division-safe rather than validated: a degenerate geometry falls to the
+    // single call below, which is the entry point that owns the shape errors.
+    let heads = q.len().checked_div(head_dim).unwrap_or(0);
+    let group = heads.checked_div(n_kv_heads).unwrap_or(0);
+    // The whole buffer is handed to the single call below; a slice longer
+    // than one call needs is accepted and its tail ignored.
+    let shard_scratch = scratch.len() / shards.max(1);
+    // Anything the split cannot serve falls through to the single call, which
+    // is the entry point that owns the shape refusals: a mismatched `out` gets
+    // `AttentionError::OutLenMismatch` from there rather than a panic here,
+    // and the check is also what makes the safe slicing in the scatter below
+    // infallible.
+    if group < 2
+        || shards < 2
+        || group < shards
+        || out.len() != q.len()
+        || slab_q.len() < q.len()
+        || slab_out.len() < q.len()
+    {
+        decode_attention_in(q, kv, layer, scale, scratch, out)?;
+        return Ok(());
+    }
+    if scratch.len() < shards.saturating_mul(shard_scratch) {
+        return Err(ForwardError::PrefillScratch {
+            needed: shards.saturating_mul(shard_scratch) as u64,
+            available: scratch.len() as u64,
+        });
+    }
+
+    // Gather, on this thread: `q_dim` f32 of `copy_from_slice` per layer is
+    // noise beside an attention call that walks the whole K and V planes, and
+    // doing it here keeps two raw pointers out of the shard body.
+    for index in 0..shards {
+        for (dst, src) in slab_positions(group, n_kv_heads, head_dim, shards, index) {
+            slab_q[dst..dst + head_dim].copy_from_slice(&q[src..src + head_dim]);
+        }
+    }
+
+    let slab_q: &[f32] = &slab_q[..q.len()];
+    let failure: Mutex<Option<AttentionError>> = Mutex::new(None);
+    let out_base = SendPtr(slab_out.as_mut_ptr());
+    let scratch_base = SendPtr(scratch.as_mut_ptr());
+    pool.run(group, |shard| {
+        let offsets = shard.rows.clone();
+        if offsets.is_empty() {
+            return;
+        }
+        let start = n_kv_heads * offsets.start * head_dim;
+        let len = n_kv_heads * offsets.len() * head_dim;
+        // SAFETY: `shard_range` yields disjoint sub-ranges of `0..group`, one
+        // per thread, so scaling them by `n_kv_heads * head_dim` yields
+        // disjoint runs of `0..q.len()`, which is inside `slab_out` (checked
+        // above). Shard indices are distinct too, so `index * shard_scratch`
+        // names a disjoint run of `scratch`, whose length was just checked
+        // against `shards * shard_scratch`. Both buffers are mutably borrowed
+        // for the whole call and `run` joins before returning.
+        let slab = unsafe { std::slice::from_raw_parts_mut(out_base.get().add(start), len) };
+        let mine = unsafe {
+            std::slice::from_raw_parts_mut(
+                scratch_base.get().add(shard.index * shard_scratch),
+                shard_scratch,
+            )
+        };
+        if let Err(err) =
+            decode_attention_in(&slab_q[start..start + len], kv, layer, scale, mine, slab)
+        {
+            record(&failure, err);
+        }
+    });
+    taken(failure)?;
+
+    // Scatter: the same permutation, read the other way round.
+    for index in 0..shards {
+        for (src, dst) in slab_positions(group, n_kv_heads, head_dim, shards, index) {
+            out[dst..dst + head_dim].copy_from_slice(&slab_out[src..src + head_dim]);
+        }
+    }
+    Ok(())
+}
+
+/// Every `(slab offset, whole-query offset)` head pair shard `index` owns, in
+/// element units.
+///
+/// The one place the slab permutation is written down, so the gather and the
+/// scatter cannot disagree about it. Shard `index` owns query-head offsets
+/// `shard_range(group, shards, index)` inside every kv group; within its slab
+/// the head at `(kv, off)` sits at `kv * k + (off - lo)`, and the slab itself
+/// starts at head `n_kv_heads * lo` — which tiles the buffer exactly, because
+/// the offset ranges tile `0..group`.
+fn slab_positions(
+    group: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    shards: usize,
+    index: usize,
+) -> impl Iterator<Item = (usize, usize)> {
+    let offsets = shard_range(group, shards, index);
+    let (lo, k) = (offsets.start, offsets.len());
+    let base = n_kv_heads * lo;
+    (0..n_kv_heads).flat_map(move |kv| {
+        offsets.clone().enumerate().map(move |(j, off)| {
+            (
+                (base + kv * k + j) * head_dim,
+                (kv * group + off) * head_dim,
+            )
+        })
+    })
 }
 
 /// The three MoE dimensions the expert phase needs, bundled so the phase
@@ -1223,6 +1472,8 @@ pub fn forward_token_traced<'s>(
         arch: _,
         kv,
         attn_scratch,
+        attn_slab_q,
+        attn_slab_out,
         hidden: residual,
         normed,
         acts_q8k_hidden,
@@ -1251,14 +1502,20 @@ pub fn forward_token_traced<'s>(
         sweep_plan: _,
         routed: _,
         prefill_timing,
+        decode_timing,
         prefill_charging,
     } = state;
 
-    // Charges nothing unless `prefill_prompt` armed the timing, which it does
-    // only for `PrefillMode::TokenMajor`. A decode step therefore pays exactly
-    // one `Instant::now()` for the whole token and a predicted-not-taken
-    // branch per boundary; see `PhaseClock`.
-    let mut clock = PhaseClock::new(prefill_timing, *prefill_charging);
+    // The same instrumented pass, charging into whichever accumulator this
+    // call belongs to: the prompt's while `prefill_prompt` is running the
+    // token-major path, the run's decode split otherwise. One accumulator or
+    // the other, never both — a token counted twice would make the two splits
+    // sum past the wall time they are read against.
+    let mut clock = if *prefill_charging {
+        PhaseClock::new(prefill_timing, true)
+    } else {
+        PhaseClock::decoding(decode_timing)
+    };
 
     let expected = kv.seq_len()?;
     if position != expected {
@@ -1318,7 +1575,18 @@ pub fn forward_token_traced<'s>(
 
         kv.append(layer_idx, k, v)?;
         clock.charge(Phase::Elementwise);
-        decode_attention(q, kv, layer_idx, scale, attn_scratch, attn_out)?;
+        pool_decode_attention(
+            pool,
+            kv,
+            layer_idx,
+            scale,
+            head_dim,
+            q,
+            attn_slab_q,
+            attn_slab_out,
+            attn_scratch,
+            attn_out,
+        )?;
         clock.charge(Phase::Attention);
 
         // Output projection (q5_k, Q8_K activations) and residual add.
@@ -1419,6 +1687,7 @@ pub fn forward_token_traced<'s>(
     }
 
     if !want_logits {
+        clock.close();
         return Ok(None);
     }
     rmsnorm(residual, model.final_norm(), eps, normed)?;
@@ -1435,6 +1704,7 @@ pub fn forward_token_traced<'s>(
         logits,
     )?;
     clock.charge(Phase::Projections);
+    clock.close();
     Ok(Some(logits))
 }
 
@@ -1557,6 +1827,101 @@ mod tests {
             }
         }
         unreachable!("last token always requests logits");
+    }
+
+    /// A cheap deterministic spread; the split under test is a permutation,
+    /// so what matters is that the values differ, not what they are.
+    fn spread(i: usize) -> f32 {
+        ((i * 37 % 101) as f32 - 50.0) / 64.0
+    }
+
+    /// The slab permutation is a bijection over query heads: every slab slot
+    /// is written once and every query head is read once.
+    ///
+    /// [`pool_decode_attention`]'s gather and scatter are the same iterator
+    /// read in opposite directions, so a permutation that lost or doubled a
+    /// head would leave a stale head in the output rather than failing loudly.
+    #[test]
+    fn the_slab_permutation_is_a_bijection() {
+        for (group, n_kv_heads, shards) in
+            [(8usize, 4usize, 6usize), (4, 3, 2), (5, 2, 3), (2, 1, 2)]
+        {
+            let heads = group * n_kv_heads;
+            let (mut into, mut from) = (vec![0u32; heads], vec![0u32; heads]);
+            for index in 0..shards {
+                for (dst, src) in slab_positions(group, n_kv_heads, 1, shards, index) {
+                    into[dst] += 1;
+                    from[src] += 1;
+                }
+            }
+            assert!(
+                into.iter().all(|&n| n == 1) && from.iter().all(|&n| n == 1),
+                "group {group} kv {n_kv_heads} shards {shards}: {into:?} {from:?}"
+            );
+        }
+    }
+
+    /// The sharded decode attention is bit-identical to the single whole-`q`
+    /// call, on every shard count.
+    ///
+    /// The decode half of the parallel-attention argument, isolated from the
+    /// forward pass so a failure names the split rather than the model. A slab
+    /// is `k` query-head offsets taken out of *every* kv group, which is a
+    /// legal `n_kv_heads * k`-head query whose sub-head `kv * k + j` attends kv
+    /// head `kv` — the same head, the same K and V rows, the same softmax over
+    /// the same contiguous run. `to_bits`, no tolerance: the point is that no
+    /// reduction was reassociated, and a tolerance would hide exactly that.
+    #[test]
+    fn the_slab_split_is_bit_identical_to_the_whole_call() {
+        let (n_kv_heads, head_dim, group, positions) = (3usize, 8usize, 4usize, 17usize);
+        let n_heads = n_kv_heads * group;
+        let (q_dim, kv_dim) = (n_heads * head_dim, n_kv_heads * head_dim);
+
+        let mut kv = KvCache::new(1, n_kv_heads, head_dim, positions).unwrap();
+        for t in 0..positions {
+            let k: Vec<f32> = (0..kv_dim).map(|i| spread(t * 7 + i)).collect();
+            let v: Vec<f32> = (0..kv_dim).map(|i| spread(t * 11 + i + 3)).collect();
+            kv.append(0, &k, &v).unwrap();
+        }
+        let q: Vec<f32> = (0..q_dim).map(|i| spread(i * 5 + 1)).collect();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let carve = attention_scratch_len(n_heads, n_kv_heads, head_dim, positions);
+
+        let mut want = vec![0.0f32; q_dim];
+        decode_attention_in(&q, &kv, 0, scale, &mut vec![0.0; carve], &mut want).unwrap();
+        assert!(
+            want.iter().any(|v| *v != 0.0),
+            "the reference is degenerate"
+        );
+
+        for shards in [1usize, 2, 3, 4] {
+            let mut pool = ComputePool::with_config(PoolConfig {
+                shards: Some(shards),
+                pin: false,
+                pin_caller: false,
+                inline_caller: true,
+            });
+            let mut scratch = vec![0.0f32; carve * pool.shards()];
+            let mut slab_q = vec![0.0f32; q_dim];
+            let mut slab_out = vec![0.0f32; q_dim];
+            let mut got = vec![0.0f32; q_dim];
+            pool_decode_attention(
+                &mut pool,
+                &kv,
+                0,
+                scale,
+                head_dim,
+                &q,
+                &mut slab_q,
+                &mut slab_out,
+                &mut scratch,
+                &mut got,
+            )
+            .unwrap();
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "shards {shards}, element {i}");
+            }
+        }
     }
 
     #[test]
