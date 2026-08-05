@@ -345,6 +345,25 @@ slots/layer), fewer slots/layer. A global slot pool shared across layers is
   `preadv`, not io_uring, so it says nothing about `SINGLE_ISSUER` /
   `DEFER_TASKRUN` submission behaviour. An io_uring queue-depth experiment
   inside the runtime is on the backlog for exactly those two gaps.
+
+  **The submission queue is not the binding constraint on the decode path, and
+  that half is closed by geometry rather than by measurement.** `RING_ENTRIES`
+  is 8 (`crates/core/src/io/stream.rs:172`) and `top_k` is 8, so a decode layer
+  can request at most 8 experts and therefore submit at most 8 miss reads;
+  `ExpertStream::begin_layer` submits exactly one read per miss and **refuses
+  to start a step while any earlier read is outstanding**
+  (`crates/core/src/io/stream.rs:1455-1530`), so only one layer of one token
+  ever has reads in flight. Every miss a decode layer can ever have therefore
+  fits the ring simultaneously, and raising `RING_ENTRIES` **cannot** increase
+  decode's bytes in flight. Only more concurrent misses could, and that needs
+  speculative cross-layer prefetch, which is forbidden (measured ~7%
+  predictability). **Derived from code geometry, not measured**, which is
+  exactly why it settles the submission-side half and nothing else: it does not
+  close the **drive-side** question at the decode block size. Whether 24.5 MB
+  of single-blob reads at QD8 is where this drive wants to be is still
+  unmeasured at that geometry, since EXP-019 swept depth only at the 8-blob
+  block size. The phase-8 sweep's `scripts/io_probe.py` step
+  (`scripts/phase8_decode_sweep.sh:1120`) is what addresses that half.
   Deeper queues also buy latency rather than bandwidth: measured per-blob p50
   is 2.34 ms at QD1 and 15.56 ms at QD8 (**still provisional, still EXP-008**;
   EXP-019 timed whole blocks, not individual blobs, so it does not replace
@@ -838,9 +857,36 @@ that is **already independent**, so none of them reassociates a reduction:
   it is written down. The group's eight accumulators are already independent:
   transpose the group's queries once per kv head into `[i][lane]`, broadcast
   each converted K element across them, and lane `g` still walks `i` ascending
-  in its own f32. Positions are blocked by `T_BLOCK = 4` purely to run four
+  in its own f32. Positions are blocked by `T_BLOCK = 8` purely to run eight
   *independent* chains and fill the vector add's latency; each (position, lane)
   pair still keeps a single chain over `i`.
+
+  The position sweep is **stepped**: `T_BLOCK` while a whole block fits, then
+  **at most one** `T_TAIL_BLOCK = 4`, then 1-wide. The middle rung is what
+  makes widening safe rather than a trade, and the argument is exact rather
+  than empirical. After the eight-loop the remainder is below 8, so a single
+  `if` reaches the four-rung, and the scalar rung then runs
+  `p mod 8 mod 4 = p mod 4` positions, **exactly the count `T_BLOCK = 4` ran,
+  at every `p`**, while every position outside that tail sits in a block of
+  four or eight rather than four. No geometry can be worse than the shipped
+  code. A `const` assert pins both halves the argument needs
+  (`T_BLOCK % T_TAIL_BLOCK == 0`, which collapses the scalar count, and
+  `T_BLOCK <= 2 * T_TAIL_BLOCK`, which makes the single `if` enough);
+  `T_TAIL_BLOCK < T_BLOCK` alone is far too weak, since 3 would pass it and
+  leave a scalar tail of up to 4. Measured warm at 1.00x to 1.07x across the
+  64-to-4096 ladder on the 48-layer arm, KEEP, **cold measurement owed**
+  (EXP-022).
+
+  Eight is the ceiling of the technique, read out of the linked release build
+  rather than assumed: the accumulators live in `ymm8`-`ymm15` with the
+  transposed query in `ymm0`, no spill and no stack store in the loop body,
+  and the same probe at sixteen chains spills (17 stack moves). The cost is
+  stack. `qk_scores`'s two buffers go 12 KiB to **16 KiB**, taking the frame to
+  **17,144 B** of `sub` plus 48 B of pushes and crossing four guard pages, so
+  the prologue emits four inline stack probes where it emitted three. That
+  figure comes from the linked binary because the release profile is
+  `lto = "thin"` with `codegen-units = 1`; a per-CU asm probe reports 16,936 B
+  for the same function before LTO.
 - **The V reduction.** Lanes over `head_dim`, which is elementwise and
   therefore exact; `t` stays strictly sequential, with the accumulator loaded
   from and stored back to `out` on every `t`, so element `i` sees exactly the
@@ -1245,16 +1291,19 @@ are neither now, and they should not come back without new evidence.
   holds peak to ~100 MB and loses 15 to 18 percent past ~170 MB, so the useful
   region is `windows_in_flight` up to 4 at 8 experts, or `experts_per_window`
   up to 16 at 2 windows (EXP-008, EXP-013, EXP-015, EXP-019)
-- **An io_uring queue-depth experiment inside the runtime.** EXP-019 measured
-  the drive through a threaded-`preadv` queue, not io_uring, and swept queue
-  depth only at the 8-blob block size, so the decode geometry (single blobs
-  through `RING_ENTRIES = 8`) has no queue-depth curve of its own on either
-  the drive side or the submission side. What EXP-019 does establish is that
-  the shipped depth sits inside the flat part of the drive's curve at 24.5 MB
-  outstanding, so this experiment is about confirming that through
-  `SINGLE_ISSUER` / `DEFER_TASKRUN` rather than about an expected win.
-  `RING_ENTRIES` must not be changed on the strength of EXP-019 alone
-  (EXP-019)
+- **An io_uring queue-depth experiment inside the runtime, drive side only.**
+  EXP-019 measured the drive through a threaded-`preadv` queue, not io_uring,
+  and swept queue depth only at the 8-blob block size, so the decode geometry
+  (single blobs through `RING_ENTRIES = 8`) has no queue-depth curve of its
+  own on the **drive** side. What EXP-019 does establish is that the shipped
+  depth sits inside the flat part of the drive's curve at 24.5 MB outstanding,
+  so this experiment is about confirming that through `SINGLE_ISSUER` /
+  `DEFER_TASKRUN` rather than about an expected win. `RING_ENTRIES` must not
+  be changed on the strength of EXP-019 alone. **The submission-side half of
+  this item is closed**, by geometry rather than by measurement: `top_k` is 8
+  and `begin_layer` refuses a step while any read is outstanding, so a decode
+  layer's misses always fit the 8-entry ring and a deeper ring cannot put more
+  bytes in flight. See "Expert streaming and cache", queue depth (EXP-019)
 - E-cores in compute pool for non-barrier expert GEMVs
 - `fadvise`/`readahead` tuning for the prefill sequential sweep
 - Prefill chunk size sweep: 128 vs 256 vs 512 vs 1024. 512 is the point
@@ -1288,11 +1337,6 @@ are neither now, and they should not come back without new evidence.
   the arithmetic got roughly 10x cheaper and the memory traffic did not move
   at all. That is the next structural lever, and it is not more arithmetic
   (EXP-020)
-- **`T_BLOCK` in `x86::dot_block`, 4 to 8.** The implementing lane called it
-  the cheapest remaining win in that file, roughly 1.5-2x on the QK dot, at 8
-  more live ymm registers and 16 KiB of stack. **Estimated, never measured**,
-  and it must stay bit-neutral: more independent position chains is legal,
-  splitting one chain over `i` is not (EXP-020)
 - **A wider decode attention axis than the kv head.** The fan-out ceiling at
   the v0 pin is `n_kv_heads` = 4 against six pinned cores. The query-head split
   was tried and measured worse (it narrows the axis the SIMD lanes ride), and
@@ -1317,6 +1361,19 @@ are neither now, and they should not come back without new evidence.
 
 Dropped from the backlog:
 
+- ~~`T_BLOCK` in `x86::dot_block`, 4 to 8~~: **done, EXP-022**, landed with a
+  `T_TAIL_BLOCK = 4` rung between the wide block and the scalar tail. The
+  bit-neutrality constraint that licensed it is unchanged and stays recorded:
+  **more independent position chains is legal, splitting one chain over `i` is
+  not**, so `T_BLOCK` is the only constant in that file that may be widened
+  for parallelism. What the entry retires is the *number*: EXP-020's backlog
+  carried an **estimated** "roughly 1.5-2x on the QK dot", and the whole-kernel
+  measurement is 1.00x to 1.07x across the 64-to-4096 ladder, growing
+  monotonically with context because attention is memory-bound at the long end
+  (EXP-020 Note 3). The estimate is superseded by measurement, not merely
+  unconfirmed; do not re-quote 1.5-2x. Warm, so **the cold pair is owed and
+  EXP-023 is reserved for it**. See "AVX2 + F16C, and why the obvious axis is
+  illegal"
 - ~~Parallelize and vectorize prefill attention~~: **done, EXP-020**, and the
   measurement it produced is warm rather than cold, so the item it leaves
   behind is EXP-021 above. Three steps landed: the f16-to-f32 conversion

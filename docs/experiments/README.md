@@ -58,6 +58,7 @@ which is the reason their claims are credible.
 - [EXP-019: O_DIRECT bandwidth under rule 2, and EXP-008 refuted](#exp-019-o_direct-bandwidth-under-rule-2-and-exp-008-refuted) — NEUTRAL
 - [EXP-020: The attention kernel rebuilt in three waves, measured warm](#exp-020-the-attention-kernel-rebuilt-in-three-waves-measured-warm) — NEUTRAL
 - [EXP-021: Phase 7 measured cold: prefill, decode and 4K context under rule 2](#exp-021-phase-7-measured-cold-prefill-decode-and-4k-context-under-rule-2) — KEEP
+- [EXP-022: T_BLOCK 4 to 8 with a stepped position tail, measured warm](#exp-022-t_block-4-to-8-with-a-stepped-position-tail-measured-warm) — KEEP
 
 Entries EXP-007 through EXP-013 were measured on a machine that was not
 quiet, and most are microbenchmarks rather than end-to-end runs. Under rule 2
@@ -2488,3 +2489,217 @@ they are, as the record of what was believed when phase 5 was designed.
       regression. And the phase-7 512-token prefill and decode splits were not
       captured — the sidecars were overwritten — so the only phase split this
       entry carries is the 4K one in Note 9.
+
+## EXP-022: T_BLOCK 4 to 8 with a stepped position tail, measured warm
+
+- Date / commit: 2026-08-05 / on top of `d329890` (`feat/decode`, pre-commit).
+  One runtime file moves,
+  `crates/core/src/kernels/attention/x86.rs`: `T_BLOCK` 4 to 8, plus a new
+  `T_TAIL_BLOCK = 4` rung, so the position sweep runs 8-wide while a whole
+  block fits, then **at most one** 4-wide, then 1-wide. The dispatch sweep in
+  `crates/core/src/kernels/attention.rs` grew to cover the remainder classes
+  the new rung created; that is a test change and it is Note 3.
+- Hypothesis: EXP-020's backlog named `T_BLOCK = 4` the cheapest remaining win
+  in that file at an **estimated** "roughly 1.5-2x on the QK dot", with no
+  measurement behind it. Eight positions per block runs eight independent
+  accumulator chains where four ran before, which covers the vector add's
+  ~4-cycle latency twice over, and eight is the last width that still fits
+  AVX2's sixteen ymm registers. The arithmetic is unchanged and only
+  instruction-level parallelism moves, so the question here is narrow: does it
+  show up in a token's worth of attention.
+- Method: two source trees differing in exactly that one file (`T_BLOCK 4`
+  with no tail rung against `T_BLOCK 8` + `T_TAIL_BLOCK 4`), both otherwise
+  byte-identical to `main` at `d329890` (`diff -rq` confirmed), built into
+  separate `CARGO_TARGET_DIR`s and run as `cargo bench -p ramvamp-core`. The
+  instrument is EXP-020's decode-attention context sweep over the v0 pin
+  (`n_layers` 48, 32 q heads : 4 kv heads, `head_dim` 128, GQA `group` = 8):
+  **arm A** one layer, timed unit one `decode_attention` call; **arm B** all
+  48 layers, timed unit one token's worth of attention. Context ladder N in
+  {64, 128, 256, 512, 1024, 2048, 4096}. **Six runs, interleaved** across
+  ~25 minutes on an otherwise idle machine (loadavg 0.3-1.5) with 90-180 s of
+  settle before each: three per arm, labelled A1-A3 (`T_BLOCK 4`) and B1-B3
+  (`T_BLOCK 8`).
+
+  **Rule-2 status, stated head-on: none of this is publishable.** It is warm,
+  in process, single-threaded and uncgrouped; it allocates its KV planes in
+  process, does no I/O and touches no model file. It exists to decide whether
+  `T_BLOCK = 8` is worth carrying into a cold sweep, and for nothing else.
+  EXP-017 and EXP-020 are the precedents and this is the same shape of entry.
+
+  **The cold rule-2 measurement is owed and is specified.** The paired cold
+  arms are `scripts/phase8_decode_sweep.sh`, two rungs (512 and 3,961 prompt
+  tokens) run twice, once on the branch binary and once on the banked
+  reference below. **EXP-023 is reserved for it** (Note 6).
+
+  The working notes behind this entry were never committed, so the entry
+  carries the whole ladder itself rather than citing a raw file.
+- Baseline: the `T_BLOCK = 4` kernel, which is the code EXP-020 shipped, a
+  plain `::<T_BLOCK>` loop with a `::<1>` tail. It was built from the same
+  tree in the same session as the `T_BLOCK = 8` arm, so the two differ in that
+  constant and in nothing else.
+
+  For the owed cold pair the same baseline is a **banked binary**:
+  `scratch/phase7-ref/ramvamp`, banked at `d329890` with its own `COMMIT` and
+  `SHA256` beside it, sha256
+  `d56dc034ebd3e94e83b59ad64503adf289baf22af112752593ec59068a586e66`. **Those
+  are the bytes EXP-021 measured**, which records `d56dc034ebd3...` for its
+  phase-7 arm at `aade585`; `d329890` is the merge that carries that same
+  runtime, and EXP-021 already establishes `aade585` as the last commit
+  touching `crates/`. So the reference arm is not a lookalike rebuild of
+  phase 7, it is the same executable phase 7 published from, and that is
+  worth stating plainly because it removes a whole class of doubt: no
+  toolchain drift, no profile drift, no "it should be equivalent". The sha256
+  is checked twice at run time, against the `SHA256` file beside the binary
+  and against a constant pinned independently at
+  `scripts/phase8_decode_sweep.sh:191`, because a re-banked reference would
+  agree with a regenerated sidecar file and still not be phase 7's binary.
+- Result:
+
+  **Drift verdicts first**, because they decide what the rest is worth. The
+  bench re-measures its cheap rungs after the ladder at identical context and
+  sample counts; a control ratio outside 0.99x-1.01x means discard, not
+  interpret (GOTCHA 3 in `docs/handoff-phase8.md`):
+
+  | run | `T_BLOCK` | arm A ctl (64 / 512) | arm B ctl (64 / 512) | arm B usable |
+  | --- | --- | --- | --- | --- |
+  | A1 | 4 | 1.001x / **1.149x** | 0.996x / 1.002x | yes |
+  | A2 | 4 | 0.996x / **1.093x** | **1.090x** / **1.013x** | no |
+  | A3 | 4 | 0.998x / **1.096x** | 1.000x / 1.009x | yes |
+  | B1 | 8 | 1.000x / 1.000x | 0.998x / 0.999x | yes |
+  | B2 | 8 | 0.999x / **1.094x** | 1.000x / **0.977x** | no |
+  | B3 | 8 | 1.001x / **1.095x** | 0.998x / **1.012x** | no |
+
+  **Arm B, 48 layers, ns per token's worth of attention, every run:**
+
+  | ctx | A1 (T4) | A2 (T4) | A3 (T4) | B1 (T8) | B2 (T8) | B3 (T8) |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 64 | 3,482,246 | 3,481,450 | 3,424,909 | 3,467,931 | 3,520,981 | 3,470,224 |
+  | 128 | 7,026,379 | 6,956,720 | 6,865,715 | 6,883,976 | 7,008,652 | 7,025,442 |
+  | 256 | 16,738,816 | 16,334,850 | 16,044,447 | 15,917,198 | 16,067,438 | 15,971,978 |
+  | 512 | 35,731,384 | 35,518,286 | 35,034,213 | 33,979,205 | 34,751,336 | 34,172,745 |
+  | 1024 | 90,242,577 | 82,110,584 | 82,200,148 | 77,785,586 | 78,092,117 | 77,310,049 |
+  | 2048 | 175,050,397 | 172,405,781 | 171,806,569 | 161,788,343 | 162,078,146 | 162,137,193 |
+  | 4096 | 363,785,086 | 358,728,098 | 360,529,316 | 335,757,015 | 335,632,540 | 334,116,139 |
+
+  **Medians, and whether the two arms' full ranges overlap:**
+
+  | ctx | T4 median | T8 median | ratio | ranges overlap? |
+  | ---: | ---: | ---: | ---: | --- |
+  | 64 | 3,481,450 | 3,470,224 | 1.003x | yes |
+  | 128 | 6,956,720 | 7,008,652 | 0.993x | yes |
+  | 256 | 16,334,850 | 15,971,978 | 1.023x | marginally |
+  | 512 | 35,518,286 | 34,172,745 | 1.039x | no |
+  | 1024 | 82,200,148 | 78,092,117 | 1.053x | no |
+  | 2048 | 172,405,781 | 162,137,193 | 1.063x | no |
+  | 4096 | 360,529,316 | 335,632,540 | 1.074x | no |
+
+  **`T_BLOCK = 8` is neutral at 64 and 128 and worth 4 to 7 percent at 512 and
+  above, on the 48-layer arm, warm.** The conclusion does not depend on the
+  drift verdicts: restricted to the three runs whose arm-B controls are clean
+  (A1, A3, B1) it is the same shape, and with all six included the two
+  populations do not overlap at any rung from 512 up. At 64 and 128 the ranges
+  interleave and no effect is claimed; the 0.7% the wrong way at 128 is inside
+  the noise and is not a regression.
+
+  **Arm A is not quotable here**, and Note 1 is why: five of its six runs fail
+  its own 512 drift control. Its 4096 rung read 4,556,288 (A1) against
+  4,540,599 (B1), a 0.3% difference, quoted only to say that the effect on the
+  cache-resident arm is not large.
+- Verdict: KEEP, and the cold measurement is **owed**, not optional. Nothing
+  here satisfies rule 2, so nothing here publishes. The change ships on three
+  things instead: it regresses no rung, its bit identity is pinned by the
+  gates in Note 3, and the stepped tail is a strict superset of the old sweep
+  by construction rather than by benchmark (Note 4). The reason to keep it is
+  that it is free at short context and positive at long; the reason not to
+  quote 1.07x anywhere is that this is warm and rule 2 governs what ships.
+- Notes:
+  1. **The drift control this bench leans on is close to useless at arm A's
+     512 rung, and finding that out cost a wrong conclusion first.** The
+     arm-A 512 control failed in **5 of 6 runs**, on both binaries, at
+     1.093x-1.149x, with only B1 at 1.000x. An earlier reading of the same
+     data called that failure systematic to `T_BLOCK = 4`, on the strength of
+     three failures on the `T_BLOCK 4` arm against one clean run on the other,
+     which is a tempting 3-vs-1 story. **B2 and B3 refuted it**: both are `T_BLOCK = 8`
+     and both fail the same control at 1.094x and 1.095x. So it is an
+     instrument property, not a property of the kernel under test, and as
+     banded it discards most of arm A on a signal that is not about arm A. It
+     should be re-examined before any future lane leans on arm A. This is why
+     the Result above rests on arm B, whose controls fail in 3 of 6 and whose
+     conclusion survives dropping those three.
+  2. **The backlog's estimated 1.5-2x on the QK dot did not appear end to end,
+     and it is superseded by measurement rather than merely unconfirmed.**
+     EXP-020's backlog item carried "roughly 1.5-2x on the QK dot" as an
+     **estimate** from the implementing lane. The whole-kernel measurement
+     above is 1.00x to 1.07x. Both can be true and the gap is not a
+     contradiction: the QK dot is one term of the kernel, and phase 7 already
+     measured attention drifting **memory-bound** at long context. EXP-020
+     Note 3 records `max(ns/pos) / min(ns/pos)` on the 48-layer arm going 1.03x
+     to 1.40-1.57x as the arithmetic got roughly 10x cheaper and the memory
+     traffic did not move. A gain that grows monotonically with context, 0% at
+     64 to 7% at 4096, is exactly what a modest arithmetic win looks like
+     underneath a memory-bound ceiling. What matters for the record is the
+     status change, not the size: the number in the backlog was an estimate
+     with nothing behind it, it has now been measured on the quantity that
+     ships, and no future lane should re-quote the 1.5-2x. `docs/architecture.md`
+     and `docs/handoff-phase8.md` are updated accordingly.
+  3. **The bit-identity gates were not covering the code they were meant to
+     cover, and that was found by breaking it on purpose.** Which rungs of the
+     stepped sweep a call runs is decided entirely by `positions % T_BLOCK`,
+     and the `T_TAIL_BLOCK` rung fires only for classes 4..=7. The dispatch
+     length list was `[1, 2, 3, 4, 5, 7, 8, 9, 11, 12, 13, 16, 31, 61]`, whose
+     union of remainders is `{0, 1, 2, 3, 4, 5, 7}`: **class 6 was absent**,
+     and poisoning the tail rung for `positions % 8 == 6` left both designated
+     gates green. Three changes close it. `dispatch_lengths` now carries 6, 14,
+     15, 17, 23, 24 and 25, so every remainder class and every block boundary
+     with one either side is swept.
+     `restructured_kernel_is_bit_identical_to_head_major_reference` was
+     repointed off its own private length list onto `dispatch_lengths`, so
+     there is one list to keep honest rather than two. And a new guard test,
+     `dispatch_lengths_cover_every_position_block_remainder`, asserts the
+     coverage property directly against `x86::T_BLOCK`, so widening the
+     constant again fails *that* test with the dark class named instead of
+     silently unpinning a rung. This is GOTCHA 7 recurring on the same file
+     that produced it.
+  4. **The stepped tail's safety is an exactness argument, not a benchmark
+     result.** With the middle rung in, the sweep runs `⌊p/8⌋` eight-blocks,
+     then at most one four-block, then `p mod 8 mod 4 = p mod 4` one-blocks,
+     **exactly the number of scalar blocks `T_BLOCK = 4` ran, at every `p`**,
+     while every position outside that tail sits in a block of four or eight
+     instead of four. So no geometry can be worse than the shipped code, which
+     is what makes this a strict superset rather than a trade. `if` rather than
+     `while` for the middle rung is deliberate: the remainder after the
+     eight-loop is below 8, so a second four-block is unreachable. A `const`
+     assert pins both halves the argument needs, `T_BLOCK % T_TAIL_BLOCK == 0`
+     (which is what collapses the scalar count) and `T_BLOCK <= 2 *
+     T_TAIL_BLOCK` (which is what makes a single `if` enough), because
+     `T_TAIL_BLOCK < T_BLOCK` alone is far too weak: 3 would pass it and leave
+     a scalar tail of up to 4, worse than the code being replaced. The rung
+     matters at real geometries rather than at contrived ones: prefill row `r`
+     attends `start + r + 1` positions so every remainder occurs, and decode's
+     fan-out gate opens at 8 cached positions.
+  5. **The register and stack claims are read out of the shipping binary, and
+     they are what bound the technique at eight.** In the linked release build
+     the inlined `head_dim` loop of `x86::qk_scores` holds the eight
+     accumulators in `ymm8`-`ymm15`, the transposed query vector in `ymm0` and
+     the broadcast-and-product temporary in `ymm1`, with **no spill and no
+     stack store at all in the loop body**. The same probe at 16 chains spills:
+     16 accumulators plus two temporaries against 16 registers, and the loop
+     grows 17 stack moves. So 8 is the ceiling of this technique rather than a
+     midpoint. The cost is stack: the pair of buffers in `qk_scores` goes
+     **12 KiB to 16 KiB**, taking the whole frame to **17,144 B** of `sub` plus
+     48 B of callee-saved pushes, which crosses four guard pages and so emits
+     **four inline stack probes** where it emitted three. That figure is read
+     from the **linked** binary on purpose: the workspace release profile is
+     `lto = "thin"` with `codegen-units = 1`, and a per-CU
+     `cargo rustc --release --lib -- --emit asm` probe reports 16,936 B for the
+     same function before LTO. If a later reader measures the smaller number,
+     that is why. Zero-initialization of the buffers is real rather than
+     elided: two `memset(_, 0, 8192)` calls per call, four kv heads, so 64 KiB
+     zeroed at ~2000 cycles against a call that does milliseconds of work at
+     full context.
+  6. **EXP-023 is reserved for the cold rule-2 measurement of the phase-8
+     decode work**, including the paired `T_BLOCK` arms this entry owes.
+     It has not been run and this entry invents no number for it. Until it
+     exists, the honest summary of `T_BLOCK = 8` is "no rung got slower, the
+     long end got a few percent warm, and nobody has measured what that did to
+     a token."
