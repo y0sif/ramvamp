@@ -967,7 +967,7 @@ fn carve<'a>(
 /// A raw pointer shared across shards.
 ///
 /// `pub(super)` because [`super::forward`]'s decode-side attention fan-out
-/// rebuilds disjoint sub-slices the same way and there is no reason for two
+/// splits buffers across shards the same way and there is no reason for two
 /// copies of the same soundness argument.
 pub(super) struct SendPtr(pub(super) *mut f32);
 
@@ -983,12 +983,20 @@ impl SendPtr {
     }
 }
 
-// SAFETY: the pointer is only ever used to rebuild disjoint sub-slices, one
-// per shard, of a slice the submitting thread holds `&mut` to for the whole
-// call; `ComputePool::run` does not return until every shard has dropped its
-// slice. This is `threads::ComputePool::scatter`'s argument, re-made here
-// because the batched kernels shard over *weight rows* while `scatter` shards
-// over output *elements*, and one weight row is `n_acts` of them.
+// SAFETY: the pointer names a slice the submitting thread holds `&mut` to for
+// the whole call, and `ComputePool::run` does not return until every shard has
+// dropped whatever it rebuilt from it. Every use in this module rebuilds
+// **disjoint** sub-slices, one per shard. This is
+// `threads::ComputePool::scatter`'s argument, re-made here because the batched
+// kernels shard over *weight rows* while `scatter` shards over output
+// *elements*, and one weight row is `n_acts` of them.
+//
+// `super::forward::pool_decode_attention` has one use that is not disjoint: the
+// kv-range attention kernel addresses query heads absolutely and so takes the
+// *whole* `out`, giving every shard an overlapping view. It carries its own
+// argument at the call site — the kernel reads nothing from `out` and the
+// ranges it writes are disjoint — and that argument, not this one, is what
+// makes it sound.
 unsafe impl Send for SendPtr {}
 // SAFETY: as above.
 unsafe impl Sync for SendPtr {}
@@ -1025,9 +1033,10 @@ where
     if n_acts == 0 || out_dim == 0 {
         return Ok(());
     }
-    let failure: Mutex<Option<KernelError>> = Mutex::new(None);
+    let failure: Mutex<Option<(usize, KernelError)>> = Mutex::new(None);
     let base = SendPtr(out.as_mut_ptr());
     pool.run(out_dim, |shard| {
+        let index = shard.index;
         let start = shard.rows.start * n_acts;
         let len = shard.rows.len() * n_acts;
         // SAFETY: `shard_range` yields disjoint sub-ranges of `0..out_dim`,
@@ -1037,7 +1046,7 @@ where
         // call, and `run` joins before returning.
         let chunk = unsafe { std::slice::from_raw_parts_mut(base.get().add(start), len) };
         if let Err(err) = f(shard.rows.clone(), chunk) {
-            record(&failure, err);
+            record(&failure, index, err);
         }
     });
     taken(failure)
@@ -1175,9 +1184,24 @@ fn attention_boundary(
 ///
 /// [`KernelError::LengthMismatch`] when `q` or `out` is not `rows * q_dim`
 /// long, [`ForwardError::PrefillScratch`] when `scratch` is shorter than the
-/// pool's shard count needs, and [`ForwardError::Attention`] for the first
-/// shard that reports one. The two length checks are what make the raw-pointer
-/// splits below sound; they are not a convenience.
+/// pool's shard count needs, and [`ForwardError::Attention`] from the
+/// **lowest-indexed** shard that reports one. Lowest index, not first to the
+/// mutex: a whole job can fail at once (a short carve fails on every shard),
+/// and an error picked by thread race would make the same input report
+/// different errors from run to run. The two length checks are what make the
+/// raw-pointer splits below sound; they are not a convenience.
+///
+/// **`out` is not untouched on error**, unlike every other entry point in this
+/// module. Shards write rows into `out` as they finish and a failing shard
+/// abandons its remaining rows where it stands, so an error leaves an arbitrary
+/// prefix of some shards' rows written and the rest holding whatever the arena
+/// carve held. That is deliberate — buffering a chunk's worth of attention
+/// output to make the write atomic would cost `rows * q_dim` f32 that prefill
+/// is not allowed to allocate — and it is harmless because the only caller
+/// propagates the error straight out of the layer loop, and
+/// [`prefill_prompt`]'s own contract already says the state must be assumed
+/// mid-chunk and discarded on any error. Nothing reads `s.attn_out` again on
+/// that path.
 #[allow(clippy::too_many_arguments)]
 fn scatter_attention(
     pool: &mut ComputePool,
@@ -1220,14 +1244,15 @@ fn scatter_attention(
             available: scratch.len() as u64,
         });
     }
-    let failure: Mutex<Option<AttentionError>> = Mutex::new(None);
+    let failure: Mutex<Option<(usize, AttentionError)>> = Mutex::new(None);
     let out_base = SendPtr(out.as_mut_ptr());
     let scratch_base = SendPtr(scratch.as_mut_ptr());
     pool.run(rows, |shard| {
         // `shard.count`, not `pool.shards()`: a job with fewer rows than
         // shards runs inline as a single shard, and the split must agree with
         // the shard it is actually running on.
-        let mine = attention_shard_range(rows, start, shard.count, shard.index);
+        let index = shard.index;
+        let mine = attention_shard_range(rows, start, shard.count, index);
         // SAFETY: shard indices are distinct across the job and each is
         // visited by exactly one thread, so `index * shard_scratch` names a
         // disjoint `shard_scratch`-long run per shard; the bound check above
@@ -1235,7 +1260,7 @@ fn scatter_attention(
         // for the whole call and which `run` joins before releasing.
         let slice = unsafe {
             std::slice::from_raw_parts_mut(
-                scratch_base.get().add(shard.index * shard_scratch),
+                scratch_base.get().add(index * shard_scratch),
                 shard_scratch,
             )
         };
@@ -1255,7 +1280,9 @@ fn scatter_attention(
                 slice,
                 row_out,
             ) {
-                record(&failure, err);
+                // Abandons this shard's remaining rows and leaves `out` part
+                // written; see this function's `# Errors`.
+                record(&failure, index, err);
                 return;
             }
         }

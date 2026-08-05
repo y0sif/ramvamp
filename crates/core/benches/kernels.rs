@@ -14,7 +14,7 @@
 
 use std::time::Instant;
 
-use ramvamp_core::kernels::attention::{AttentionScratch, decode_attention};
+use ramvamp_core::kernels::attention::{AttentionScratch, decode_attention, scratch_len};
 use ramvamp_core::kernels::quants::{
     BlockQ8_0, BlockQ8K, QuantFormat, avx2, f32_to_f16, quantize_row_q8_0, quantize_row_q8_k,
 };
@@ -194,10 +194,14 @@ const ARM_B_SAMPLES: [(usize, usize); 7] =
 /// repeat is materially slower at identical context and identical read set,
 /// the drift is time-into-run and the residency reading is contaminated.
 ///
-/// The repeat is set up to read exactly the bytes the original rung read:
+/// The repeat is set up to touch exactly the bytes the original rung touched:
 /// the planes are allocated at [`ATTN_CAP`] up front and never move, so
-/// [`KvCache::clear`] plus a refill to `context` leaves the kernel walking
-/// the same leading rows of the same allocation.
+/// [`KvCache::clear`] plus a refill to `context` leaves the kernel walking the
+/// same leading rows of the same allocation. The *addresses* are identical; the
+/// *values* are not, because the refill draws fresh f16s from the same RNG
+/// stream rather than replaying the old ones. Nothing in this kernel branches
+/// on a value and both fills are uniform in [-1, 1), so the comparison holds —
+/// but "same read set" here means same footprint, not byte-for-byte replay.
 const DRIFT_RUNGS: [usize; 2] = [64, 512];
 
 /// One ladder rung of one arm.
@@ -238,8 +242,18 @@ impl AttnRow {
         self.ns_per_pos() / self.layers as f64
     }
 
-    /// Unique K+V bytes the timed unit walks: `layers * context * kv_dim`
-    /// f16 elements across two planes.
+    /// K+V bytes the timed unit walks: `layers * context * kv_dim` f16
+    /// elements across two planes.
+    ///
+    /// This is both the *unique* byte count and the *touched* byte count, and
+    /// the two have been the same number since 8fc3c4a made the kernel
+    /// kv-head-outer: each K and V head slice is widened from f16 once per
+    /// position and reused across that head's whole GQA group. The
+    /// pre-8fc3c4a kernel re-read every kv head's columns once per query head,
+    /// so its touched count was `group` (8) times this one. Anything derived
+    /// from `eff GB/s` — the "0.17 GB/s, therefore compute-bound" reading in
+    /// particular — has to use this figure as printed and must not be scaled
+    /// by the group.
     fn bytes(&self) -> usize {
         self.layers * self.context * ATTN_KV_HEADS * ATTN_HEAD_DIM * 2 * 2
     }
@@ -375,8 +389,14 @@ fn fill_to(
 /// Read its residency tax as a floor, and only at the long end.
 ///
 /// The query vector, the K/V fill and the scratch are all built outside the
-/// timed region, and the scratch is preallocated at the context cap so it
-/// never reallocates mid-measurement.
+/// timed region, and the scratch is reserved at the **whole carve**
+/// [`scratch_len`] describes for this geometry at [`ATTN_CAP`], so it never
+/// reallocates — not in the timed region and not in warmup either. Reserving
+/// `ATTN_CAP` alone would be an 8x under-reserve (the carve is `group * cap +
+/// 2 * head_dim` = 33,024 f32, not 4,096), which is verbatim the mistake
+/// `with_capacity`'s own doc warns about; the growth would land in warmup and
+/// corrupt no published number, but the sentence claiming it cannot happen
+/// would still be false.
 fn bench_attention_arm(
     layers: usize,
     schedule: &[(usize, usize); 7],
@@ -392,7 +412,12 @@ fn bench_attention_arm(
         layers,
         q: &q,
         scale,
-        scratch: AttentionScratch::with_capacity(ATTN_CAP),
+        scratch: AttentionScratch::with_capacity(scratch_len(
+            ATTN_Q_HEADS,
+            ATTN_KV_HEADS,
+            ATTN_HEAD_DIM,
+            ATTN_CAP,
+        )),
         out: vec![0.0f32; ATTN_Q_HEADS * ATTN_HEAD_DIM],
     };
     let mut k_row = vec![0.0f32; kv_dim];
@@ -482,9 +507,14 @@ fn print_attn_table(arm: &str, rows: &[AttnRow]) {
 fn print_drift_table(arm: &str, drift: &[DriftRow]) {
     println!(
         "drift control {arm}: early rungs re-measured after the whole arm, same context, \
-         same read set,\nsame sample counts. ratio > 1 means identical work got slower by \
-         running later (clock/thermal),\nwhich is the alternative explanation for the ladder's \
-         own upward ns/pos drift."
+         same sample counts,\nsame ADDRESSES — `clear` rewinds the cursors and the planes stay \
+         put, so the repeat walks the same\nbytes of the same allocation. NOT the same VALUES: \
+         the refill draws fresh RNG f16s into those\nrows, so the repeat attends a different \
+         random K/V. That is immaterial to this kernel (no data-\ndependent branching, no \
+         denormals, uniform [-1,1) either way) but it is not a byte-for-byte replay.\nratio > 1 \
+         means the same work at the same footprint got slower by running later \
+         (clock/thermal),\nwhich is the alternative explanation for the ladder's own upward \
+         ns/pos drift."
     );
     println!(
         "{:>7} {:>5} {:>7} {:>14} {:>14} {:>8}",
@@ -657,8 +687,12 @@ fn main() {
     println!(
         "ms/token normalizes both arms to one token's {ATTN_LAYERS} layers; ns/pos = ns per timed \
          unit / context;\neff GB/s counts the unique K+V bytes of the walked planes \
-         (layers * context * kv_dim * 2 B * 2 planes) — the\nkernel re-reads each kv head's \
-         columns once per query head in its group, so the bytes it actually\ntouches are 8x this.\n"
+         (layers * context * kv_dim * 2 B * 2 planes). Since 8fc3c4a\nthe kernel is kv-head-outer \
+         and widens each K/V head slice exactly ONCE per position, reusing it\nacross the whole \
+         GQA group, so this is the exact byte count it touches — not one eighth of it.\nThe \
+         pre-8fc3c4a kernel re-read each kv head's columns once per query head, i.e. 8x this; any\n\
+         reading that divides an eff GB/s figure by 8 (or multiplies a byte count by it) is \
+         reading a\nkernel that no longer exists.\n"
     );
 
     let (arm_a, drift_a) = bench_attention_arm(1, &ARM_A_SAMPLES, &mut rng);

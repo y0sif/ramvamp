@@ -74,6 +74,32 @@
 //! is two roundings and `_mm256_fmadd_ps` would make it one. The full
 //! argument lives in [`x86`]'s module docs.
 //!
+//! Sharding: the axis a compute pool fans this kernel across is the **kv
+//! head** ([`decode_attention_kv_range_in`], [`attention_at_kv_range_in`]),
+//! and it is the only axis that costs nothing. The kv-head-outer loop already
+//! widens each K and V element exactly once per kv head, so cutting there
+//! duplicates no conversion; the `group` query heads of one kv head are
+//! contiguous and disjoint in both `q` and `out`, so a shard needs no gather,
+//! no scatter and no permutation; and the AVX2 QK dot keeps all eight of its
+//! lanes on the GQA group, which stays whole. Cutting the **query head** axis
+//! instead — a strided slab of heads per shard — narrows the group, and the
+//! group is exactly what those lanes ride. Measured on a 185H (warm, `n_kv`
+//! 4, `head_dim` 128, 4096 positions, min of 9): the whole `group = 8` call
+//! took 4293.8 µs, a `group = 2` slab 2659.0 µs, a `group = 1` slab 1981.1
+//! µs. Eight `group = 1` slabs therefore total ~15.8 ms of CPU against 4.3 ms
+//! for the one whole call (derived from those measurements) — seven of the
+//! eight lanes carry zeros.
+//!
+//! `group` is consequently derived from the **full** `q` and never from the
+//! range: a shard is handed the whole query vector and told *which* kv heads
+//! to compute, not a narrowed view of it. Narrowing `q` would re-derive a
+//! smaller `n_q_heads`, hence a smaller `group`, and silently re-map the
+//! remaining query heads onto the wrong kv heads. Each shard writes only
+//! `kv_heads.start * group * head_dim .. kv_heads.end * group * head_dim` of
+//! `out` and leaves the rest untouched, so calls over disjoint ranges with
+//! disjoint scratch are independent, and their union is the whole call bit for
+//! bit (`kv_range_union_is_bit_identical_to_the_whole_call`).
+//!
 //! Dispatch follows the convention `quants::avx2` set: the path is chosen by
 //! a runtime CPUID probe ([`avx2_f16c_available`]) and can be pinned with a
 //! `force_scalar` parameter threaded through the `*_dispatch` entry points,
@@ -84,6 +110,7 @@ use super::KernelError;
 use super::primitives::softmax;
 use super::quants::f16_to_f32;
 use crate::kv::{KvCache, KvError};
+use core::ops::Range;
 use thiserror::Error;
 
 #[cfg(target_arch = "x86_64")]
@@ -91,7 +118,7 @@ mod x86;
 
 /// The largest `head_dim` the AVX2 path covers.
 ///
-/// [`x86::qk_scores`] carves its transposed query block and its K conversion
+/// `x86::qk_scores` carves its transposed query block and its K conversion
 /// block from fixed stack arrays sized by this constant, rather than from the
 /// caller's scratch: [`scratch_len`] is a pinned contract that a later lane
 /// sizes a prefill arena from, and widening it to fund a vectorization detail
@@ -200,6 +227,27 @@ pub enum AttentionError {
     EmptyLayer {
         /// The layer with nothing to attend over.
         layer: usize,
+    },
+
+    /// A kv-head range ([`decode_attention_kv_range_in`] /
+    /// [`attention_at_kv_range_in`]) is reversed (`start > end`) or reaches
+    /// past the cache's kv heads. Reported rather than clamped: a shard
+    /// silently computing fewer heads than it was assigned leaves the rest of
+    /// `out` holding whatever was there before, which is a wrong answer with a
+    /// right answer's shape. An *empty* in-range request (`start == end <=
+    /// n_kv_heads`) is not this error — it is the legal no-op a surplus shard
+    /// gets.
+    #[error(
+        "attention: kv head range {start}..{end} is not a sub-range of \
+         0..{n_kv_heads}"
+    )]
+    KvHeadRangeOutOfRange {
+        /// First kv head requested.
+        start: usize,
+        /// One past the last kv head requested.
+        end: usize,
+        /// The cache's kv head count.
+        n_kv_heads: usize,
     },
 
     /// A caller-provided scratch slice ([`attention_at_in`] /
@@ -380,7 +428,17 @@ pub fn decode_attention_in(
     scratch: &mut [f32],
     out: &mut [f32],
 ) -> Result<(), AttentionError> {
-    attention_borrowed(q, cache, layer, None, scale, scratch, out, false)
+    attention_borrowed(
+        q,
+        cache,
+        layer,
+        None,
+        scale,
+        0..cache.n_kv_heads(),
+        scratch,
+        out,
+        false,
+    )
 }
 
 /// [`decode_attention_in`] with the kernel path pinned instead of probed; see
@@ -398,7 +456,99 @@ pub fn decode_attention_in_dispatch(
     out: &mut [f32],
     force_scalar: bool,
 ) -> Result<(), AttentionError> {
-    attention_borrowed(q, cache, layer, None, scale, scratch, out, force_scalar)
+    attention_borrowed(
+        q,
+        cache,
+        layer,
+        None,
+        scale,
+        0..cache.n_kv_heads(),
+        scratch,
+        out,
+        force_scalar,
+    )
+}
+
+/// As [`decode_attention_in`], but computing only the query heads belonging to
+/// the kv heads in `kv_heads`.
+///
+/// This is the shard entry point: the compute pool fans decode attention
+/// across threads by **kv head**, one contiguous range per shard. See the
+/// module docs for why that axis and not the query head; the short version is
+/// that it is the only cut that duplicates no f16-to-f32 conversion, needs no
+/// gather or scatter, and leaves the AVX2 dot's eight lanes full.
+///
+/// `q` and `out` are the **full** vectors — all `n_q_heads` heads, exactly as
+/// [`decode_attention_in`] takes them. `group` is therefore derived from the
+/// full `q` and is the same on every shard; handing this function a narrowed
+/// `q` instead would re-derive a smaller `group` and re-map the heads onto the
+/// wrong kv heads. Only the output slice for query heads
+/// `kv_heads.start * group .. kv_heads.end * group` is written; the rest of
+/// `out` is left untouched, so shards can share one `out` through disjoint
+/// mutable views without a reduction step.
+///
+/// `scratch` is sized exactly as [`decode_attention_in`]'s, by
+/// [`scratch_len`] at the **full** geometry — the score block and the two
+/// conversion rows are reused from one kv head to the next, so the
+/// requirement does not shrink with the range and one uniform carve serves
+/// every shard.
+///
+/// An empty `kv_heads` (`start == end`, in range) is a legal no-op for surplus
+/// shards: it writes nothing and computes nothing. It is still validated like
+/// any other call, so a shard handed a broken geometry reports it rather than
+/// returning `Ok` by accident.
+///
+/// The union of any partition of `0..n_kv_heads` reproduces
+/// [`decode_attention_in`]'s output **bit for bit**
+/// (`kv_range_union_is_bit_identical_to_the_whole_call`): each kv head's
+/// arithmetic depends on nothing but its own slice of `q` and the cache, so
+/// dropping the other kv heads' iterations changes no operand and no order.
+///
+/// # Errors
+///
+/// Everything [`decode_attention_in`] returns, plus
+/// [`AttentionError::KvHeadRangeOutOfRange`] when `kv_heads` is reversed or
+/// reaches past the cache's kv heads. `out` is untouched on error.
+pub fn decode_attention_kv_range_in(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    scale: f32,
+    kv_heads: Range<usize>,
+    scratch: &mut [f32],
+    out: &mut [f32],
+) -> Result<(), AttentionError> {
+    attention_borrowed(q, cache, layer, None, scale, kv_heads, scratch, out, false)
+}
+
+/// [`decode_attention_kv_range_in`] with the kernel path pinned instead of
+/// probed; see [`decode_attention_dispatch`].
+///
+/// # Errors
+///
+/// Exactly [`decode_attention_kv_range_in`]'s.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_attention_kv_range_in_dispatch(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    scale: f32,
+    kv_heads: Range<usize>,
+    scratch: &mut [f32],
+    out: &mut [f32],
+    force_scalar: bool,
+) -> Result<(), AttentionError> {
+    attention_borrowed(
+        q,
+        cache,
+        layer,
+        None,
+        scale,
+        kv_heads,
+        scratch,
+        out,
+        force_scalar,
+    )
 }
 
 /// Position-limited GQA attention for one layer: exactly
@@ -501,7 +651,17 @@ pub fn attention_at_in(
     scratch: &mut [f32],
     out: &mut [f32],
 ) -> Result<(), AttentionError> {
-    attention_borrowed(q, cache, layer, Some(positions), scale, scratch, out, false)
+    attention_borrowed(
+        q,
+        cache,
+        layer,
+        Some(positions),
+        scale,
+        0..cache.n_kv_heads(),
+        scratch,
+        out,
+        false,
+    )
 }
 
 /// [`attention_at_in`] with the kernel path pinned instead of probed; see
@@ -527,6 +687,82 @@ pub fn attention_at_in_dispatch(
         layer,
         Some(positions),
         scale,
+        0..cache.n_kv_heads(),
+        scratch,
+        out,
+        force_scalar,
+    )
+}
+
+/// [`decode_attention_kv_range_in`] with an explicit causal `positions` limit
+/// — the prefill shape of the shard entry point.
+///
+/// This is [`attention_at_in`] restricted to the query heads of `kv_heads`,
+/// exactly as [`decode_attention_kv_range_in`] restricts
+/// [`decode_attention_in`]. Every clause of that function's contract applies
+/// unchanged: `q` and `out` are the full vectors, `group` comes from the full
+/// `q`, only query heads `kv_heads.start * group .. kv_heads.end * group` are
+/// written, `scratch` is sized by [`scratch_len`] at the full geometry, and an
+/// empty in-range `kv_heads` is a validated no-op.
+///
+/// The two limits compose without interacting: `positions` bounds the `t`
+/// axis and `kv_heads` bounds the kv-head axis, so this call is bit-identical
+/// to the sub-range of [`attention_at_in`]'s output at the same `positions`.
+///
+/// # Errors
+///
+/// Everything [`attention_at_in`] returns, plus
+/// [`AttentionError::KvHeadRangeOutOfRange`] when `kv_heads` is reversed or
+/// reaches past the cache's kv heads. `out` is untouched on error.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_at_kv_range_in(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    positions: usize,
+    scale: f32,
+    kv_heads: Range<usize>,
+    scratch: &mut [f32],
+    out: &mut [f32],
+) -> Result<(), AttentionError> {
+    attention_borrowed(
+        q,
+        cache,
+        layer,
+        Some(positions),
+        scale,
+        kv_heads,
+        scratch,
+        out,
+        false,
+    )
+}
+
+/// [`attention_at_kv_range_in`] with the kernel path pinned instead of probed;
+/// see [`decode_attention_dispatch`].
+///
+/// # Errors
+///
+/// Exactly [`attention_at_kv_range_in`]'s.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_at_kv_range_in_dispatch(
+    q: &[f32],
+    cache: &KvCache,
+    layer: usize,
+    positions: usize,
+    scale: f32,
+    kv_heads: Range<usize>,
+    scratch: &mut [f32],
+    out: &mut [f32],
+    force_scalar: bool,
+) -> Result<(), AttentionError> {
+    attention_borrowed(
+        q,
+        cache,
+        layer,
+        Some(positions),
+        scale,
+        kv_heads,
         scratch,
         out,
         force_scalar,
@@ -538,27 +774,44 @@ pub fn attention_at_in_dispatch(
 struct Plan {
     head_dim: usize,
     kv_dim: usize,
-    /// Query heads per kv head, `n_q_heads / n_kv_heads` (>= 1).
+    /// Query heads per kv head, `n_q_heads / n_kv_heads` (>= 1). Always
+    /// derived from the **full** `q`, never from `kv_heads` — see the module
+    /// docs on sharding.
     group: usize,
     /// Positions actually attended over — the causal limit.
     positions: usize,
+    /// The kv heads this call computes, a validated sub-range of
+    /// `0..n_kv_heads`. Empty means "compute nothing".
+    kv_heads: Range<usize>,
 }
 
 impl Plan {
     /// The scratch this exact call needs.
+    ///
+    /// Deliberately independent of [`Plan::kv_heads`]: the score block and the
+    /// two conversion rows are reused from one kv head to the next, so a shard
+    /// computing a single kv head needs exactly what a shard computing all of
+    /// them needs. That is what lets one carve sized by [`scratch_len`] at the
+    /// full geometry serve every shard, whatever range it is given.
     fn scratch_len(&self) -> usize {
         scratch_len_of(self.group, self.head_dim, self.positions)
     }
 }
 
 /// Every shape and range check, in the order the entry points promise: `q`,
-/// then the GQA grouping, then `out`, then the layer, then `positions`.
-/// Nothing is written before this returns `Ok`.
+/// then the GQA grouping, then `out`, then the layer, then `positions`, then
+/// `kv_heads`. Nothing is written before this returns `Ok`.
+///
+/// `kv_heads` is checked **last** on purpose: the earlier checks are pinned by
+/// the typed-error tests, and the whole-vector entry points pass
+/// `0..n_kv_heads`, which can never fail this one (`KvCache::new` rejects a
+/// zero `n_kv_heads`), so their observable error behaviour is unchanged.
 fn plan(
     q: &[f32],
     cache: &KvCache,
     layer: usize,
     limit: Option<usize>,
+    kv_heads: Range<usize>,
     out: &[f32],
 ) -> Result<Plan, AttentionError> {
     let head_dim = cache.head_dim();
@@ -597,11 +850,19 @@ fn plan(
             len,
         }));
     }
+    if kv_heads.start > kv_heads.end || kv_heads.end > n_kv_heads {
+        return Err(AttentionError::KvHeadRangeOutOfRange {
+            start: kv_heads.start,
+            end: kv_heads.end,
+            n_kv_heads,
+        });
+    }
     Ok(Plan {
         head_dim,
         kv_dim: cache.kv_dim(),
         group: n_q_heads / n_kv_heads,
         positions,
+        kv_heads,
     })
 }
 
@@ -617,7 +878,9 @@ fn attention_owned(
     out: &mut [f32],
     force_scalar: bool,
 ) -> Result<(), AttentionError> {
-    let plan = plan(q, cache, layer, limit, out)?;
+    // The owning form is whole-vector only: there is no sharded caller that
+    // wants a `Vec` per shard, so the range is always the full sweep.
+    let plan = plan(q, cache, layer, limit, 0..cache.n_kv_heads(), out)?;
     // Size from the cache's capacity, not this call's `positions`: capacity
     // is the high-water mark of every call this cache can ever serve, so the
     // buffer is allocated once on the first call and never grown again as
@@ -640,11 +903,16 @@ fn attention_borrowed(
     layer: usize,
     limit: Option<usize>,
     scale: f32,
+    kv_heads: Range<usize>,
     scratch: &mut [f32],
     out: &mut [f32],
     force_scalar: bool,
 ) -> Result<(), AttentionError> {
-    let plan = plan(q, cache, layer, limit, out)?;
+    // Validation runs in full even for an empty range, so a surplus shard is
+    // told about a bad geometry exactly as its busy siblings are, and the
+    // scratch requirement it reports is the range-independent one. Only the
+    // *work* is skipped, in `attention_body`'s loop.
+    let plan = plan(q, cache, layer, limit, kv_heads, out)?;
     let need = plan.scratch_len();
     if scratch.len() < need {
         return Err(AttentionError::ScratchTooShort {
@@ -665,6 +933,14 @@ fn attention_borrowed(
 /// makes the limited call bit-identical to an unlimited call against a
 /// `positions`-row cache, and it is why there is no online or flash-style
 /// rescaled softmax here.
+///
+/// The shard limit lives entirely in `plan.kv_heads`, which is the trip count
+/// of the outer loop and nothing else. One iteration reads only `q`'s and
+/// writes only `out`'s `group_dim`-long window for its own kv head, and it
+/// overwrites the whole score carve before reading any of it, so iterations
+/// neither observe nor disturb one another. Dropping iterations therefore
+/// leaves the surviving ones bit-identical to the whole sweep, and an empty
+/// range is a loop that runs zero times: nothing written, no error.
 #[allow(clippy::too_many_arguments)]
 fn attention_body(
     q: &[f32],
@@ -681,6 +957,7 @@ fn attention_body(
         kv_dim,
         group,
         positions,
+        ..
     } = plan;
     // `plan` proved `positions <= cache.len(layer)`, and `k_layer`/`v_layer`
     // return exactly `len(layer)` rows of `kv_dim`, so these are the first
@@ -699,11 +976,14 @@ fn attention_body(
     let vbuf = &mut vbuf[..head_dim];
 
     let group_dim = group * head_dim;
-    for (kv_head, (q_group, out_group)) in q
-        .chunks_exact(group_dim)
-        .zip(out.chunks_exact_mut(group_dim))
-        .enumerate()
-    {
+    for kv_head in plan.kv_heads.clone() {
+        // In range without a bounds check to spare: `plan` proved
+        // `kv_heads.end <= n_kv_heads` and `out.len() == q.len() ==
+        // n_kv_heads * group * head_dim`, so `lo + group_dim <= q.len()` for
+        // every `kv_head` this loop yields, and the product cannot overflow.
+        let lo = kv_head * group_dim;
+        let q_group = &q[lo..lo + group_dim];
+        let out_group = &mut out[lo..lo + group_dim];
         let col = kv_head * head_dim;
 
         // Phase 1 — scores for the whole group. K[t, kv_head] is widened
@@ -1884,14 +2164,61 @@ mod tests {
     /// Geometries for the wave-2 dispatch gates: the four
     /// [`LIMITED_GEOMETRIES`] (GQA groups 8 / 1 / 8 / 2, `head_dim` 128 / 16 /
     /// 8 / 4), the real v0 pin at a length that exercises the position
-    /// blocking *and* its tail (67 = 16 blocks of 4, then 3), and two odd
+    /// blocking *and* its tail (67 = 16 blocks of 4, then 3), two odd
     /// `head_dim` geometries whose head slices cannot be better than 2-byte
-    /// aligned.
+    /// aligned, and the group / `head_dim` rows below.
+    ///
+    /// # The `group > LANES` rows
+    ///
+    /// `x86::qk_scores` walks the GQA group in chunks of
+    /// `x86::LANES` (`while base < group { .. base += LANES }`) and
+    /// `x86::store_block` offsets its stores by `base`. Every group in the
+    /// original sweep was 8 or less, so that loop ran **exactly once** on
+    /// every tested geometry and the `base != 0` arm of the store never
+    /// executed — while an MQA-shaped model reaches it straight through the
+    /// public API. These rows execute it:
+    ///
+    /// - `(1, 1, 32, 128, 9)` — MQA at the v0 `head_dim`: group 32, so four
+    ///   chunks at `base` 0 / 8 / 16 / 24, three of them storing at a nonzero
+    ///   base, all with a full eight lanes.
+    /// - `(1, 2, 34, 16, 13)` — group 17: three chunks, the last one a
+    ///   **single** lane at `base = 16`, which is the only configuration that
+    ///   combines a nonzero base with the zero-padded lanes whose results must
+    ///   be discarded.
+    /// - `(1, 1, 12, 9, 11)` — group 12 at an odd `head_dim`: two chunks, a
+    ///   short four-lane chunk at `base = 8`, on head slices that are only
+    ///   2-byte aligned and with a scalar tail inside `widen`.
+    ///
+    /// # The `head_dim` boundary rows
+    ///
+    /// `x86::qk_scores` carves both of its stack buffers from
+    /// [`MAX_SIMD_HEAD_DIM`], so the interesting `head_dim` is the bound
+    /// itself, not the v0 pin's 128:
+    ///
+    /// - `(1, 1, 8, 256, 5)` — `head_dim == MAX_SIMD_HEAD_DIM`: `qt` is
+    ///   indexed to its last element (`255 * LANES + 7`) and `widen_rows`
+    ///   fills `kb` exactly. One off-by-one in either carve shows here and
+    ///   nowhere else.
+    /// - `(1, 2, 4, 255, 3)` — one below the bound and odd, so the same
+    ///   near-full carve lands on 2-byte-aligned head slices with a seven-
+    ///   element scalar tail after 31 wide loads.
+    ///
+    /// The other side of that bound (`head_dim = 257`, outside the envelope
+    /// and falling back to the scalar kernel) cannot live here — the sweep
+    /// asserts every row is inside [`avx2_f16c_path_covers`] — so it has its
+    /// own gate, `simd_envelope_boundary_at_max_simd_head_dim`.
     fn dispatch_geometries() -> Vec<(usize, usize, usize, usize, usize)> {
         let mut g = LIMITED_GEOMETRIES.to_vec();
         g.push((1, 4, 32, 128, 67));
         g.push((1, 1, 8, 9, 11));
         g.push((2, 3, 6, 9, 13));
+        // Groups past LANES: the chunk loop and `store_block`'s `base != 0`.
+        g.push((1, 1, 32, 128, 9));
+        g.push((1, 2, 34, 16, 13));
+        g.push((1, 1, 12, 9, 11));
+        // The `MAX_SIMD_HEAD_DIM` boundary, on it and just under it.
+        g.push((1, 1, 8, 256, 5));
+        g.push((1, 2, 4, 255, 3));
         g
     }
 
@@ -1911,7 +2238,10 @@ mod tests {
     /// are bit-identical to the pre-wave-1 head-major nest.
     ///
     /// Every f32 the kernel produces is pinned with `to_bits()` and zero
-    /// tolerance, through all four entry points, on all seven geometries, at
+    /// tolerance, through all four entry points, on every geometry in
+    /// [`dispatch_geometries`] — including the GQA groups past
+    /// `x86::LANES` that drive the chunk loop and the `head_dim` sitting
+    /// exactly on [`MAX_SIMD_HEAD_DIM`] — at
     /// every position count in [`dispatch_lengths`], on every layer. That is
     /// the whole argument for the vectorization: `vcvtph2ps` is an exact
     /// widening, the QK dot's eight lanes ride the GQA group (whose
@@ -2102,5 +2432,525 @@ mod tests {
         // Announced, not asserted: on a host without the instructions the
         // loop above compared the scalar kernel with itself.
         let _ = paths;
+    }
+
+    /// Both sides of the AVX2 envelope's upper bound.
+    ///
+    /// `head_dim = MAX_SIMD_HEAD_DIM` is *inside* it — `dispatch_geometries`
+    /// sweeps 256 end to end, which is where the stack-buffer carves in
+    /// `x86::qk_scores` are indexed to their last element. `head_dim` one past
+    /// the bound is *outside* it, and the contract there is a silent, correct
+    /// fallback to the scalar kernel, which nothing tested: a geometry that
+    /// large cannot live in the dispatch sweep, because that sweep asserts
+    /// every row is inside the envelope precisely so `force_scalar` never
+    /// compares the scalar kernel with itself.
+    ///
+    /// So the fallback is pinned here instead, against the pre-vectorization
+    /// head-major nest, so that raising or lowering `MAX_SIMD_HEAD_DIM` cannot
+    /// quietly change what a large-`head_dim` model computes.
+    #[test]
+    fn simd_envelope_boundary_at_max_simd_head_dim() {
+        // On a host with the instructions, 256 dispatches to AVX2 and 257 does
+        // not. On a host without them, neither does, and the first assertion
+        // still holds because both sides are false.
+        assert_eq!(avx2_f16c_path_covers(256), avx2_f16c_available());
+        assert!(!avx2_f16c_path_covers(257));
+        assert!(!avx2_f16c_path_covers(usize::MAX));
+
+        let (n_layers, n_kv, n_q, head_dim, n_pos) = (2usize, 2usize, 4usize, 257usize, 3usize);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut rng = Rng::new(0x2011_B0DD);
+        let (cache, _rows) = random_cache(&mut rng, n_layers, n_kv, head_dim, n_pos);
+        let q = rng.vec_in(n_q * head_dim, -1.0, 1.0);
+        let mut owned = AttentionScratch::new();
+
+        for layer in 0..n_layers {
+            for positions in 1..=n_pos {
+                let mut want = vec![0.0f32; q.len()];
+                head_major_reference(&q, &cache, layer, positions, scale, &mut want);
+                let mut got = vec![0.0f32; q.len()];
+                attention_at(&q, &cache, layer, positions, scale, &mut owned, &mut got).unwrap();
+                for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "head_dim {head_dim} layer {layer} positions {positions} elem {i}: \
+                         fallback {g:e} vs head-major reference {w:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------- kv-head range form (wave 3)
+
+    /// Gate 12 (phase 7 wave 3, the claim the shard fan-out rests on): the
+    /// union of per-kv-head range calls is **bit-identical** to one
+    /// whole-vector call, and a range call writes nothing outside its own
+    /// window.
+    ///
+    /// This is what makes fanning attention across the compute pool by kv head
+    /// a scheduling change and not a numerical one. It holds because `group`
+    /// is derived from the full `q` on every shard — so shard `k` computes
+    /// query heads `k * group .. (k + 1) * group` against kv head `k`, exactly
+    /// the heads the whole sweep's `k`th iteration computes — and because that
+    /// iteration reads only its own `group_dim` window of `q`, overwrites the
+    /// whole score carve before reading any of it, and zeroes its own `out`
+    /// window. Nothing is carried between kv heads, so dropping the other
+    /// iterations changes no operand and no order.
+    ///
+    /// Swept over every geometry in [`dispatch_geometries`] (GQA groups 1
+    /// through 32, `head_dim` 4 through 256), every layer, every position
+    /// count in [`dispatch_lengths`] including 1 and the full length, and both
+    /// kernel paths — because a shard split that were bit-exact on the scalar
+    /// path and not on the AVX2 one would be the same defect.
+    ///
+    /// Four statements per point: each single-kv-head shard in isolation, an
+    /// uneven two-shard partition sharing one `out`, an empty range writing
+    /// nothing, and the unlimited (decode) form at full length.
+    #[test]
+    fn kv_range_union_is_bit_identical_to_the_whole_call() {
+        let paths = kernel_paths("the kv-head range entry points against the AVX2+F16C path");
+        let mut rng = Rng::new(0x5EA5_0EDF);
+        // Not a value attention can produce here: `out` is a convex
+        // combination of f16-round-tripped V rows drawn from [-1, 1].
+        const SENTINEL: f32 = -7.5;
+
+        for (n_layers, n_kv, n_q, head_dim, n_pos) in dispatch_geometries() {
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let (cache, _rows) = random_cache(&mut rng, n_layers, n_kv, head_dim, n_pos);
+            let q = rng.vec_in(n_q * head_dim, -1.0, 1.0);
+            let group_dim = (n_q / n_kv) * head_dim;
+
+            for layer in 0..n_layers {
+                for &positions in &dispatch_lengths(n_pos) {
+                    // The carve is the *full* geometry's, not the range's:
+                    // that is the contract a sharded caller sizes its arena
+                    // from, so every shard below gets exactly this much.
+                    let need = scratch_len(n_q, n_kv, head_dim, positions);
+
+                    for &force_scalar in paths.flags() {
+                        let label = format!(
+                            "geometry ({n_layers}, {n_kv}, {n_q}, {head_dim}) layer {layer} \
+                             positions {positions} force_scalar {force_scalar}"
+                        );
+
+                        let mut carve = vec![0.0f32; need];
+                        let mut want = vec![0.0f32; q.len()];
+                        attention_at_in_dispatch(
+                            &q,
+                            &cache,
+                            layer,
+                            positions,
+                            scale,
+                            &mut carve,
+                            &mut want,
+                            force_scalar,
+                        )
+                        .unwrap();
+
+                        // (1) One shard per kv head, each in isolation into a
+                        // sentinel-filled buffer. Its window must be the whole
+                        // call's bits; everything else must still be the
+                        // sentinel. The windows partition `out`, so this is
+                        // both the union claim and the untouched claim.
+                        for kv_head in 0..n_kv {
+                            let mut shard = vec![0.0f32; need];
+                            let mut got = vec![SENTINEL; q.len()];
+                            attention_at_kv_range_in_dispatch(
+                                &q,
+                                &cache,
+                                layer,
+                                positions,
+                                scale,
+                                kv_head..kv_head + 1,
+                                &mut shard,
+                                &mut got,
+                                force_scalar,
+                            )
+                            .unwrap();
+                            let window = kv_head * group_dim..(kv_head + 1) * group_dim;
+                            for (i, &g) in got.iter().enumerate() {
+                                let w = if window.contains(&i) {
+                                    want[i]
+                                } else {
+                                    SENTINEL
+                                };
+                                assert_eq!(
+                                    g.to_bits(),
+                                    w.to_bits(),
+                                    "{label} kv head {kv_head} elem {i}: range {g:e} vs \
+                                     {} {w:e}",
+                                    if window.contains(&i) {
+                                        "whole call"
+                                    } else {
+                                        "untouched sentinel"
+                                    }
+                                );
+                            }
+                        }
+
+                        // (2) An uneven two-shard partition sharing one `out`,
+                        // which is how the pool actually uses this: the split
+                        // point is not a head boundary of any other axis, and
+                        // the two calls must still reassemble the whole call.
+                        let split = n_kv / 2;
+                        let mut got = vec![SENTINEL; q.len()];
+                        for range in [0..split, split..n_kv] {
+                            let mut shard = vec![0.0f32; need];
+                            attention_at_kv_range_in_dispatch(
+                                &q,
+                                &cache,
+                                layer,
+                                positions,
+                                scale,
+                                range,
+                                &mut shard,
+                                &mut got,
+                                force_scalar,
+                            )
+                            .unwrap();
+                        }
+                        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                            assert_eq!(
+                                g.to_bits(),
+                                w.to_bits(),
+                                "{label} split at {split} elem {i}: {g:e} vs whole call {w:e}"
+                            );
+                        }
+
+                        // (3) The surplus-shard case: an empty range is a
+                        // no-op, not an error and not a write.
+                        let mut idle = vec![SENTINEL; q.len()];
+                        let mut shard = vec![0.0f32; need];
+                        for range in [0..0, n_kv..n_kv] {
+                            attention_at_kv_range_in_dispatch(
+                                &q,
+                                &cache,
+                                layer,
+                                positions,
+                                scale,
+                                range,
+                                &mut shard,
+                                &mut idle,
+                                force_scalar,
+                            )
+                            .unwrap();
+                        }
+                        assert!(
+                            idle.iter().all(|&x| x.to_bits() == SENTINEL.to_bits()),
+                            "{label}: an empty kv range wrote to `out`"
+                        );
+
+                        // (4) The unlimited (decode) form of the same claim,
+                        // where the limit is the layer's whole length.
+                        if positions == n_pos {
+                            let mut want_decode = vec![0.0f32; q.len()];
+                            decode_attention_in_dispatch(
+                                &q,
+                                &cache,
+                                layer,
+                                scale,
+                                &mut carve,
+                                &mut want_decode,
+                                force_scalar,
+                            )
+                            .unwrap();
+                            let mut got_decode = vec![SENTINEL; q.len()];
+                            for kv_head in 0..n_kv {
+                                let mut shard = vec![0.0f32; need];
+                                decode_attention_kv_range_in_dispatch(
+                                    &q,
+                                    &cache,
+                                    layer,
+                                    scale,
+                                    kv_head..kv_head + 1,
+                                    &mut shard,
+                                    &mut got_decode,
+                                    force_scalar,
+                                )
+                                .unwrap();
+                            }
+                            for (i, (&g, &w)) in got_decode.iter().zip(&want_decode).enumerate() {
+                                assert_eq!(
+                                    g.to_bits(),
+                                    w.to_bits(),
+                                    "{label} decode elem {i}: range union {g:e} vs whole \
+                                     call {w:e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The range form derives `group` from the **full** `q`, never from the
+    /// range — the trap the query-head slab design fell into, and the one
+    /// mistake here that would still produce plausible-looking numbers.
+    ///
+    /// A shard handed a *narrowed* `q` would re-derive `n_q_heads` from that
+    /// slice and hence a smaller `group`, silently re-mapping the surviving
+    /// query heads onto the wrong kv heads. This pins the correct mapping
+    /// directly rather than through a reference implementation that could
+    /// share the bug: kv head `j` wins at position `j` and its V rows carry
+    /// the marker `10j + t`, so a call restricted to `j..j+1` must fill query
+    /// heads `j * group .. (j + 1) * group` with `marker(j, j)` and nothing
+    /// else. Any other derivation of `group` lands on a different marker,
+    /// 0.1 apart against a 1e-3 gate.
+    #[test]
+    fn kv_range_derives_group_from_the_full_query() {
+        let (n_kv, n_q, head_dim) = (4usize, 32usize, 16usize);
+        let group = n_q / n_kv;
+        let kv_dim = n_kv * head_dim;
+        let mut cache = KvCache::new(1, n_kv, head_dim, n_kv).unwrap();
+        let marker = |j: usize, t: usize| (10 * j + t) as f32 * 0.01;
+        for t in 0..n_kv {
+            let mut k = vec![0.0f32; kv_dim];
+            let mut v = vec![0.0f32; kv_dim];
+            for j in 0..n_kv {
+                let sign = if t == j { 1.0f32 } else { -1.0 };
+                for i in 0..head_dim {
+                    k[j * head_dim + i] = sign * 8.0 / head_dim as f32;
+                    v[j * head_dim + i] = marker(j, t);
+                }
+            }
+            cache.append(0, &k, &v).unwrap();
+        }
+
+        let q = vec![1.0f32; n_q * head_dim];
+        let need = scratch_len(n_q, n_kv, head_dim, n_kv);
+        for kv_head in 0..n_kv {
+            let mut carve = vec![0.0f32; need];
+            let mut out = vec![f32::NAN; q.len()];
+            decode_attention_kv_range_in(
+                &q,
+                &cache,
+                0,
+                1.0,
+                kv_head..kv_head + 1,
+                &mut carve,
+                &mut out,
+            )
+            .unwrap();
+            for h in 0..n_q {
+                for i in 0..head_dim {
+                    let got = out[h * head_dim + i];
+                    if h / group == kv_head {
+                        let want = marker(kv_head, kv_head);
+                        assert!(
+                            (got - want).abs() < 1e-3,
+                            "kv head {kv_head} q head {h} elem {i}: got {got}, want \
+                             marker {want} — `group` was not derived from the full q"
+                        );
+                    } else {
+                        assert!(
+                            got.is_nan(),
+                            "kv head {kv_head} wrote q head {h} elem {i} ({got}), which \
+                             belongs to kv head {}",
+                            h / group
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every bad kv range is a typed error, `out` is untouched, and the
+    /// existing error precedence is undisturbed: shapes, then the layer, then
+    /// `positions`, then the range. A shard is never told about its range when
+    /// something earlier is wrong, and — the point of the ordering — the
+    /// whole-vector entry points cannot reach this error at all.
+    ///
+    /// The scratch requirement is pinned here too, because a sharded caller
+    /// sizes one uniform arena carve from it: a single-kv-head range needs
+    /// exactly [`scratch_len`] at the **full** geometry, not a range-scaled
+    /// fraction of it, and one f32 short is reported against that same number.
+    // A reversed range is the input under test, not a mistake in writing one:
+    // `clippy::reversed_empty_ranges` exists to catch `3..1` where `1..3` was
+    // meant, and here `3..1` is exactly what a caller must be told about.
+    #[allow(clippy::reversed_empty_ranges)]
+    #[test]
+    fn kv_range_typed_errors_and_scratch_contract() {
+        let (n_layers, n_kv, n_q, head_dim, n_pos) = (2usize, 4usize, 8usize, 8usize, 5usize);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut rng = Rng::new(0x0BAD_2A46);
+        let (cache, _rows) = random_cache(&mut rng, n_layers, n_kv, head_dim, n_pos);
+        let q = rng.vec_in(n_q * head_dim, -1.0, 1.0);
+        let need = scratch_len(n_q, n_kv, head_dim, n_pos);
+        let mut carve = vec![0.0f32; need];
+        let mut out = vec![7.0f32; q.len()];
+
+        // Reversed, one past the end, empty but past the end, and the
+        // saturating case. All four are the range error, none is a panic.
+        for range in [3..1, 0..n_kv + 1, n_kv..n_kv + 1, n_kv + 1..n_kv + 1, 1..0] {
+            let (start, end) = (range.start, range.end);
+            assert_eq!(
+                decode_attention_kv_range_in(
+                    &q,
+                    &cache,
+                    0,
+                    scale,
+                    range.clone(),
+                    &mut carve,
+                    &mut out
+                )
+                .unwrap_err(),
+                AttentionError::KvHeadRangeOutOfRange {
+                    start,
+                    end,
+                    n_kv_heads: n_kv,
+                }
+            );
+            assert_eq!(
+                attention_at_kv_range_in(&q, &cache, 0, n_pos, scale, range, &mut carve, &mut out)
+                    .unwrap_err(),
+                AttentionError::KvHeadRangeOutOfRange {
+                    start,
+                    end,
+                    n_kv_heads: n_kv,
+                }
+            );
+        }
+        assert_eq!(
+            decode_attention_kv_range_in(&q, &cache, 0, scale, usize::MAX..0, &mut carve, &mut out)
+                .unwrap_err(),
+            AttentionError::KvHeadRangeOutOfRange {
+                start: usize::MAX,
+                end: 0,
+                n_kv_heads: n_kv,
+            }
+        );
+
+        // Precedence: everything the whole-vector form checks still comes
+        // first, so a shard with a broken geometry is told what is actually
+        // broken. The range is deliberately invalid in all four.
+        let bad = 9..9;
+        assert_eq!(
+            decode_attention_kv_range_in(
+                &q[..3],
+                &cache,
+                0,
+                scale,
+                bad.clone(),
+                &mut carve,
+                &mut out
+            )
+            .unwrap_err(),
+            AttentionError::QLenIndivisible { q_len: 3, head_dim }
+        );
+        assert_eq!(
+            decode_attention_kv_range_in(
+                &q[..3 * head_dim],
+                &cache,
+                0,
+                scale,
+                bad.clone(),
+                &mut carve,
+                &mut out
+            )
+            .unwrap_err(),
+            AttentionError::GqaGroupMismatch {
+                n_q_heads: 3,
+                n_kv_heads: n_kv,
+            }
+        );
+        assert_eq!(
+            decode_attention_kv_range_in(
+                &q,
+                &cache,
+                0,
+                scale,
+                bad.clone(),
+                &mut carve,
+                &mut out[..7]
+            )
+            .unwrap_err(),
+            AttentionError::OutLenMismatch {
+                out_len: 7,
+                expected: q.len(),
+            }
+        );
+        assert_eq!(
+            decode_attention_kv_range_in(
+                &q,
+                &cache,
+                n_layers,
+                scale,
+                bad.clone(),
+                &mut carve,
+                &mut out
+            )
+            .unwrap_err(),
+            AttentionError::Kv(KvError::LayerOutOfRange {
+                layer: n_layers,
+                n_layers,
+            })
+        );
+        assert_eq!(
+            attention_at_kv_range_in(
+                &q,
+                &cache,
+                0,
+                n_pos + 1,
+                scale,
+                bad.clone(),
+                &mut carve,
+                &mut out
+            )
+            .unwrap_err(),
+            AttentionError::Kv(KvError::PositionOutOfRange {
+                layer: 0,
+                pos: n_pos,
+                len: n_pos,
+            })
+        );
+        assert_eq!(
+            attention_at_kv_range_in(&q, &cache, 0, 0, scale, bad.clone(), &mut carve, &mut out)
+                .unwrap_err(),
+            AttentionError::EmptyLayer { layer: 0 }
+        );
+
+        // The scratch requirement does not shrink with the range: a shard
+        // computing one kv head of four still needs the whole carve, and the
+        // shortfall is reported against it — including for an empty range, so
+        // a surplus shard is held to the same contract as a busy one.
+        for range in [0..1, 0..n_kv, 2..2] {
+            for len in [0usize, need - 1] {
+                let mut short = vec![0.0f32; len];
+                assert_eq!(
+                    attention_at_kv_range_in(
+                        &q,
+                        &cache,
+                        0,
+                        n_pos,
+                        scale,
+                        range.clone(),
+                        &mut short,
+                        &mut out
+                    )
+                    .unwrap_err(),
+                    AttentionError::ScratchTooShort { len, need },
+                    "range {range:?} carve {len}"
+                );
+            }
+            // Exactly `scratch_len` is enough for any range.
+            let mut exact = vec![0.0f32; need];
+            attention_at_kv_range_in(
+                &q,
+                &cache,
+                0,
+                n_pos,
+                scale,
+                range,
+                &mut exact,
+                &mut out.clone(),
+            )
+            .unwrap();
+        }
+
+        // No error path above wrote anything.
+        assert!(out.iter().all(|&x| x == 7.0));
     }
 }
