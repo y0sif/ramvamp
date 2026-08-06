@@ -59,6 +59,7 @@ which is the reason their claims are credible.
 - [EXP-020: The attention kernel rebuilt in three waves, measured warm](#exp-020-the-attention-kernel-rebuilt-in-three-waves-measured-warm) — NEUTRAL
 - [EXP-021: Phase 7 measured cold: prefill, decode and 4K context under rule 2](#exp-021-phase-7-measured-cold-prefill-decode-and-4k-context-under-rule-2) — KEEP
 - [EXP-022: T_BLOCK 4 to 8 with a stepped position tail, measured warm](#exp-022-t_block-4-to-8-with-a-stepped-position-tail-measured-warm) — KEEP
+- [EXP-023: The cold decode sweep: the phase split against context, the 11-slot hit rate, the slot dial and T_BLOCK](#exp-023-the-cold-decode-sweep-the-phase-split-against-context-the-11-slot-hit-rate-the-slot-dial-and-t_block) — KEEP
 
 Entries EXP-007 through EXP-013 were measured on a machine that was not
 quiet, and most are microbenchmarks rather than end-to-end runs. Under rule 2
@@ -2612,6 +2613,22 @@ they are, as the record of what was believed when phase 5 was designed.
   by construction rather than by benchmark (Note 4). The reason to keep it is
   that it is free at short context and positive at long; the reason not to
   quote 1.07x anywhere is that this is warm and rule 2 governs what ships.
+
+  **Superseded in part by EXP-023 (2026-08-06):** the owed cold pair has been
+  run and the verdict above stands. The numbers in this entry are unchanged
+  and none of them is retracted. What changes is only the status of the debt.
+  Cold, paired against the banked reference, medians of 3 scored runs:
+  `T_BLOCK = 8` moves decode **1.44 to 1.46 tok/s at 3,961 prompt tokens
+  (1.014x)** and is **not distinguishable at 512**, where the two arms' scored
+  ranges overlap (1.94-1.98 against 1.91-1.98) and the medians run 3.5% the
+  wrong way, which EXP-023 Note 8 states is not a regression. Prefill is
+  unmoved at both rungs, 0.999x and 0.996x. **The warm 4-7% above remains the
+  correct figure for the kernel**; what it is worth to a token is about 1.4% at
+  4K context and nothing measurable at 512, because EXP-023 measures attention
+  at 31.6% and 6.4% of decode at those two rungs and 4-7% of those shares is
+  1.3-2.2% and 0.26-0.45%. So the two entries agree, and the sentence Note 6
+  left as a placeholder is now answered: somebody has measured what it did to
+  a token.
 - Notes:
   1. **The drift control this bench leans on is close to useless at arm A's
      512 rung, and finding that out cost a wrong conclusion first.** The
@@ -2703,3 +2720,501 @@ they are, as the record of what was believed when phase 5 was designed.
      exists, the honest summary of `T_BLOCK = 8` is "no rung got slower, the
      long end got a few percent warm, and nobody has measured what that did to
      a token."
+
+     **Correction (2026-08-06):** EXP-023 exists and the reservation is
+     discharged. The quoted summary was written before the measurement and is
+     superseded by the block at the end of the Verdict above; keep it here as
+     the record of what was known when this entry shipped.
+
+## EXP-023: The cold decode sweep: the phase split against context, the 11-slot hit rate, the slot dial and T_BLOCK
+
+- Date / commit: 2026-08-06 / `c78122b` (`feat/decode`). Branch arm:
+  `target/release/ramvamp` sha256
+  `d36036b6485b00e741b7448e8d963e8a0916eb0aeb36b69c48c89ea857eb8b4c`, built by
+  the sweep itself and asserted newer than every tracked source under
+  `crates/`. Reference arm: `scratch/phase7-ref/ramvamp`, sha256
+  `d56dc034ebd3e94e83b59ad64503adf289baf22af112752593ec59068a586e66`, which is
+  the same executable EXP-021 measured (EXP-022 Baseline records why that
+  matters), checked against its own `SHA256` sidecar and against a constant
+  pinned in the sweep script.
+- Hypothesis: four things are owed and one is offered. Owed: the paired cold
+  `T_BLOCK` arms EXP-022 Note 6 reserved this number for; the hit rate at the
+  shipped 11 slots/layer, which `docs/architecture.md` records as never
+  measured; a slot-dial measurement, since the 12-slot row of the memory
+  contract is a provisional prediction that says 12 does not fit; and a
+  512-token cold phase split, which `docs/handoff-phase8.md` carries as
+  uncaptured. Offered: decode's phase split as a **curve against context**
+  rather than the single 4K point EXP-021 Note 9 left behind, because
+  `docs/handoff-phase8.md` records that point as a seven-token post-prefill
+  transient and warns a phase-8 lane not to choose a lever from it.
+- Method: one unattended sweep, `bash scripts/phase8_decode_sweep.sh`, started
+  2026-08-06 16:53:22 and finished 19:34:11, driven end to end by a committed
+  harness. Logs and `SUMMARY.txt` in
+  `scratch/phase8/sweep-20260806-165322/`; per-arm summaries in
+  `scratch/cold-bench/p8-20260806-165322-*.json`; the io_probe result in
+  `scratch/io-probe/p8-20260806-165322-decode-qd.json` and its `.md`.
+
+  Nine cold arms, each `scripts/cold_bench.py --warmup 1 --repeats 3
+  --max-new 64 --skip-hashes --greedy`: five context rungs on the branch
+  binary at the shipped dial (64, 512, 1,024, 2,048 and 3,961 prompt tokens),
+  two `T_BLOCK = 4` reference arms at 512 and 3,961, and three slot-dial arms
+  (512 and 3,961 at `--cache-bytes 1570M`, 512 at `1701M`). Every arm evicts
+  all 53 model files with `posix_fadvise(POSIX_FADV_DONTNEED)` and proves the
+  eviction with `mincore`, then launches under `systemd-run --user --wait -p
+  MemoryMax=3G -p MemorySwapMax=0 -p MemoryAccounting=yes` and reads
+  `memory.peak`, `memory.events`, `memory.stat` and `/proc/self/io`
+  `read_bytes` from inside the cgroup before exit. Before each arm the harness
+  waits for `MemAvailable` to hold above 6,000 MiB for four consecutive
+  samples; it settled in 45 s every time, at 11,089 to 11,310 MiB.
+
+  **Rule-2 status, stated head on: all nine cold arms are `measurement
+  hygiene: PASS`** and every one of the 36 runs returned 0 with
+  `memory.swap.peak` 0 and every `memory.events` counter 0. Of the 36 runs, 35
+  are CLEAN under the `4b39104` rule and the one exception is the 3,961 rung's
+  **discarded warmup**, which is Note 13. All reclaim on the 35 clean runs is
+  `pgsteal_khugepaged` with `pgsteal_kswapd`, `_direct` and `_proactive` all
+  zero, 0 to 716 pages, which is the pattern EXP-021 Note 1 characterised.
+
+  **The dial each arm actually got was asserted, not assumed.** A committed
+  checker (`scratch/phase8/sweep-20260806-165322/check_slots.py`, self-tested
+  6 of 6 before the sweep on its own fixtures) reads the slots/layer line out
+  of every run's stderr and fails the step if any of the four runs disagrees
+  with the label. All ten checks pass: 11 slots on the seven default arms, 12
+  at `1570M`, 13 at `1701M`. A budget buying a different dial than the label
+  claims is the failure this exists to catch.
+
+  Prompts are fixed files with recorded sha256: 64 tokens from
+  `scratch/phase8/prompts/ctx64.txt`, 512 from
+  `models/llamacpp-ref/llamacpp_ref/long_00.txt` (`d1b6c407c55a...`, the same
+  workload EXP-018 and EXP-021 used), 1,024 and 2,048 from
+  `scratch/phase8/prompts/`, and 3,961 from `scratch/ctx4k/p4k.txt`
+  (`68582aae37b9...`, EXP-021's 4K workload).
+
+  One tenth step, `scripts/io_probe.py --block-ks 1 --fixed-k 1 --fixed-qd 8
+  --queue-depths 1,2,4,8,16 --patterns rand,seq --repeats 3`, is a drive-side
+  probe and is scoped in Note 10.
+- Baseline: three, and they are kept apart on purpose.
+
+  1. For `T_BLOCK`, the reference arm of each rung, run back to back with the
+     branch arm on the same prompt with the same dials in the same session.
+     That pair is paired, and rule 3 is satisfied inside this entry.
+  2. For the slot dial, the 11-slot arm of the same context rung on the same
+     binary in the same session.
+  3. For the hit rate and the memory contract, the **predictions** in
+     `docs/architecture.md`, which are arithmetic and simulation rather than
+     measurements, so what follows corrects a prediction rather than
+     contradicting a measurement.
+
+  Figures from EXP-014, EXP-018, EXP-019 and EXP-021 appear below only where
+  they are named as the prior being corrected or the caveat being carried.
+  **None of them is put on a curve with anything measured here.**
+- Result:
+
+  **Headline, medians of 3 scored runs per arm.** `read_bytes` is the cgroup's
+  own counter, and **the three scored runs of every arm agree on it to the
+  byte**, which is what a deterministic greedy workload over an evicted cache
+  should do. Two warmups read slightly more than their scored runs (589,824 B
+  at ctx 64 and 16,384 B at ctx 2,048); the warmups are discarded and are not
+  in these medians.
+
+  | arm | ctx | slots | binary | prefill tok/s | decode tok/s | wall s | `memory.peak` MiB | `read_bytes` MiB |
+  | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+  | decode-64 | 64 | 11 | branch | 4.10 | **2.19** | 47.420 | 2,507.9 | 44,703.0 |
+  | decode-512 | 512 | 11 | branch | 11.25 | **1.91** | 80.798 | 2,601.0 | 48,191.3 |
+  | decode-1024 | 1,024 | 11 | branch | 11.25 | **1.82** | 128.046 | 2,653.4 | 65,617.4 |
+  | decode-2048 | 2,048 | 11 | branch | 10.82 | **1.75** | 229.908 | 2,760.6 | 95,539.8 |
+  | decode-3961 | 3,961 | 11 | branch | 9.87 | **1.46** | 447.710 | 2,929.3 | 163,794.9 |
+  | tblock4-512 | 512 | 11 | reference | 11.26 | 1.98 | 79.824 | 2,600.0 | 48,191.3 |
+  | tblock4-3961 | 3,961 | 11 | reference | 9.91 | 1.44 | 445.782 | 2,928.9 | 163,794.9 |
+  | slots-512-1570M | 512 | 12 | branch | 11.36 | 2.00 | 78.926 | 2,742.5 | 46,825.5 |
+  | slots-512-1701M | 512 | 13 | branch | 11.42 | 2.06 | 78.072 | 2,862.3 | 45,630.5 |
+  | slots-3961-1570M | 3,961 | 12 | branch | 9.95 | 1.52 | 442.543 | **3,058.4** | 162,539.4 |
+
+  **The decode phase split against context**, the reason this entry exists.
+  Every cell is that rung's **first scored run**, warmup excluded, and Note 1
+  is why that convention matters and where it costs something. 63
+  `forward_token` calls per run (`--max-new 64` costs `N - 1` instrumented
+  calls). `other` is 0.00 s and 0.0% at every rung and is omitted.
+
+  | ctx | decode s | ms/token | attention | expert compute | expert io | projections | elementwise |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 64 | 32.95 | 523 | 0.48 s (**1.5%**) | 8.67 s (26.3%) | 17.84 s (**54.1%**) | 5.10 s (15.5%) | 0.86 s (2.6%) |
+  | 512 | 33.55 | 532 | 2.14 s (**6.4%**) | 9.73 s (29.0%) | 14.91 s (**44.4%**) | 5.90 s (17.6%) | 0.87 s (2.6%) |
+  | 1,024 | 34.42 | 546 | 3.77 s (**11.0%**) | 9.10 s (26.5%) | 15.51 s (**45.1%**) | 5.16 s (15.0%) | 0.87 s (2.5%) |
+  | 2,048 | 35.30 | 560 | 6.92 s (**19.6%**) | 8.86 s (25.1%) | 13.49 s (**38.2%**) | 5.14 s (14.6%) | 0.88 s (2.5%) |
+  | 3,961 | 42.82 | 680 | 13.52 s (**31.6%**) | 9.02 s (21.1%) | 14.23 s (**33.2%**) | 5.18 s (12.1%) | 0.87 s (2.0%) |
+
+  **Expert io is the largest single term at every rung measured, and its share
+  falls from 54.1% at 64 tokens of context to 33.2% at 3,961 while attention's
+  rises from 1.5% to 31.6%.** In seconds, expert io is flat (17.84 down to
+  14.23 s over 63 tokens) and attention is what grows (0.48 to 13.52 s, 28x
+  over a 62x context increase). Note 2 bounds the "largest at every rung"
+  claim, which is tighter than it looks at 3,961.
+
+  **The prefill phase split over the same ladder**, same runs, same
+  convention. This is the 512-token cold split `docs/handoff-phase8.md`
+  carries as uncaptured, plus four more rungs.
+
+  | ctx | prefill s | attention | expert compute | expert io | projections | elementwise |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 64 | 15.61 | 0.09 s (0.6%) | 5.74 s (36.7%) | 5.10 s (**32.7%**) | 3.84 s (24.6%) | 0.85 s (5.4%) |
+  | 512 | 45.83 | 2.83 s (6.2%) | 21.94 s (47.9%) | 1.26 s (2.8%) | 13.47 s (29.4%) | 6.34 s (13.8%) |
+  | 1,024 | 91.00 | 8.22 s (9.0%) | 42.41 s (46.6%) | 2.46 s (2.7%) | 25.29 s (27.8%) | 12.62 s (13.9%) |
+  | 2,048 | 189.34 | 25.54 s (13.5%) | 85.26 s (45.0%) | 4.86 s (2.6%) | 48.43 s (25.6%) | 25.25 s (13.3%) |
+  | 3,961 | 402.12 | 83.46 s (20.8%) | 168.27 s (41.8%) | 9.95 s (2.5%) | 91.51 s (22.8%) | 48.93 s (12.2%) |
+
+  At every rung from 512 up the ordering is **expert compute, then
+  projections, then attention**, which is the ordering EXP-021 Note 9 reported
+  at 4K in a different session (42.1 / 22.8 / 20.4 against 41.8 / 22.8 / 20.8
+  here). Attention is third everywhere on this ladder, never second. Those are
+  two entries and two sessions and they are not one curve; the agreement is
+  quoted as a reproduction of an ordering, not of a number. The 64-token row
+  is a different regime and is Note 3.
+
+  **Decode cache statistics**, identical across all four runs of each rung to
+  the request, because `--greedy` makes routing deterministic and the arms
+  share a prompt. `io wait` is the first scored run's.
+
+  | ctx | requests | hits | hit % | misses | cold | eviction | GiB read | io wait s |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 64 | 24,192 | 14,341 | **59.3** | 9,851 | 2,905 | 6,946 | 26.5 | 17.66 |
+  | 512 | 24,192 | 13,074 | **54.0** | 11,118 | 3,106 | 8,012 | 29.8 | 14.74 |
+  | 1,024 | 24,192 | 12,830 | **53.0** | 11,362 | 3,149 | 8,213 | 30.5 | 15.36 |
+  | 2,048 | 24,192 | 14,129 | **58.4** | 10,063 | 2,650 | 7,413 | 27.0 | 13.34 |
+  | 3,961 | 24,192 | 13,662 | **56.5** | 10,530 | 2,899 | 7,631 | 28.3 | 14.05 |
+
+  24,192 is `63 tokens x 48 layers x top_k 8` exactly, which is the arithmetic
+  that says the instrumented window is the whole decode phase minus its first
+  token.
+
+  **The slot dial.** Scored range is the full range of the three scored runs.
+
+  | ctx | slots | `--cache-bytes` | decode tok/s (median) | scored range | hit % | `read_bytes` MiB | `memory.peak` MiB | under 3,072 |
+  | ---: | ---: | --- | ---: | --- | ---: | ---: | ---: | ---: |
+  | 512 | 11 | default | 1.91 | 1.91-1.98 | 54.0 | 48,191.3 | 2,601.0 | 471.0 |
+  | 512 | 12 | 1570M | 2.00 | 1.96-2.03 | 56.1 | 46,825.5 | 2,742.5 | 329.5 |
+  | 512 | 13 | 1701M | 2.06 | 2.05-2.08 | 57.9 | 45,630.5 | 2,862.3 | 209.7 |
+  | 3,961 | 11 | default | 1.46 | 1.44-1.49 | 56.5 | 163,794.9 | 2,929.3 | 142.7 |
+  | 3,961 | 12 | 1570M | 1.52 | 1.51-1.54 | 58.4 | 162,539.4 | **3,058.4** | **13.6** |
+
+  **12 slots/layer fits at 3,961 tokens of context**, at 3,058.4 MiB with 13.6
+  MiB spare, hygiene PASS, no OOM, on all four runs. `docs/architecture.md`
+  predicts 3,091.82 MiB and **19.8 MiB over**. Note 7 works out where the
+  33.4 MiB of overprediction goes and why the shipped dial still does not
+  move.
+
+  **The paired `T_BLOCK` arms**, which discharge what EXP-022 Note 6 reserved
+  this entry for. Both arms of a rung ran back to back on the same prompt with
+  the same dials, so the ratio is `T_BLOCK` and nothing else.
+
+  | rung | metric | `T_BLOCK` 4 | `T_BLOCK` 8 | 8/4 |
+  | ---: | --- | ---: | ---: | ---: |
+  | 512 | decode tok/s | 1.98 | 1.91 | 0.965x |
+  | 512 | prefill tok/s | 11.26 | 11.25 | **0.999x** |
+  | 512 | wall s | 79.824 | 80.798 | 1.012x |
+  | 3,961 | decode tok/s | 1.44 | **1.46** | **1.014x** |
+  | 3,961 | prefill tok/s | 9.91 | 9.87 | **0.996x** |
+  | 3,961 | wall s | 445.782 | 447.710 | 1.004x |
+
+  Every scored run, because the medians alone are misleading at 512:
+
+  | rung | `T_BLOCK` 4 scored | `T_BLOCK` 8 scored |
+  | ---: | --- | --- |
+  | 512 | 1.98 / 1.94 / 1.98 | 1.91 / 1.98 / 1.91 |
+  | 3,961 | 1.44 / 1.44 / 1.43 | 1.49 / 1.44 / 1.46 |
+
+  **No end-to-end effect is distinguishable at 512, and the effect at 3,961 is
+  about 1.4%.** At 512 the two ranges overlap at 1.98 and the median gap runs
+  the wrong way by 3.5%, which is not a regression claim and must not be
+  quoted as one (Note 8). At 3,961 the ranges touch at 1.44 and every other
+  `T_BLOCK = 8` run is at or above every `T_BLOCK = 4` run. Prefill is
+  unmoved at both rungs, 0.999x and 0.996x, which is the control this pair
+  needed: `T_BLOCK` is an attention constant, prefill runs the same attention
+  kernel, and a prefill ratio that moved would mean something other than
+  `T_BLOCK` moved.
+
+  **The drive-side single-blob queue-depth curve**, K=1, which is the block
+  size decode actually issues. Medians of 3 scored runs after 1 discarded
+  warmup, GB/s = 10^9 B/s, hygiene PASS. **This is `threaded-pread`, not
+  io_uring** (Note 10).
+
+  | QD | layer_00 seq | layer_20 seq | layer_06 seq | layer_21 seq | layer_00 rand | layer_20 rand | layer_06 rand | layer_21 rand |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 1.370 | 1.821 | 1.594 | 1.865 | 1.380 | 1.899 | 1.346 | 1.798 |
+  | 2 | 1.602 | 3.387 | 2.409 | 3.163 | 1.599 | 3.265 | 1.627 | 3.198 |
+  | 4 | 1.602 | 3.470 | 2.434 | 3.521 | 1.598 | 3.415 | 1.676 | 3.475 |
+  | 8 | 1.591 | 3.462 | 2.417 | 3.533 | 1.568 | 3.455 | 1.654 | 3.469 |
+  | 16 | 1.596 | 3.430 | 2.446 | 3.485 | 1.580 | 3.413 | 1.697 | 3.455 |
+
+  `filefrag` reports the same extent geometry as EXP-019 recorded: 398 / 398 /
+  398 / 390 extents, mean 984,027 / 984,027 / 853,614 / 871,124 B, zero
+  physically adjacent pairs and **zero compressed extents** on all four files.
+  `btrfs device stats` is unchanged across the session at its 138,407
+  `corruption_errs` baseline with all four other counters 0.
+- Verdict: KEEP. One shipped change is gated here and it stays: `T_BLOCK = 8`
+  costs nothing at 512 and is worth about 1.4% at 3,961 cold, which is what
+  EXP-022's warm 4-7% predicts once attention's share of a token is applied
+  (Note 8). Everything else in this entry is characterisation that changes no
+  dial: **the shipped default stays 11 slots/layer and `--cache-bytes` is
+  unchanged.** What the entry does change is the status of four figures in
+  `docs/architecture.md`, from predicted to measured, and one of them changes
+  sign.
+- Notes:
+  1. **Every split in the Result comes from its rung's first scored run, not
+     from its median run, and at ctx 64 that costs something worth naming.**
+     `cold_bench.py` reports medians per metric, so no single run is "the
+     median run", and a split is a decomposition of one run's wall rather than
+     a set of independently medianable numbers. Taking the first scored run
+     everywhere is the convention that keeps each column of the split table
+     internally consistent. At ctx 64 the first scored run is **1.94 tok/s
+     against a 2.19 median and is the slowest of the three** (1.94 / 2.23 /
+     2.19), so its 54.1% expert io is the slow run's share and not the median
+     run's: the third scored run of the same rung reads 44.1% expert io over a
+     29.14 s decode. The full scored spreads and where the chosen run sits in
+     each, so a reader can price the convention rather than trust it:
+
+     | ctx | scored decode tok/s | median | spread | first scored run is |
+     | ---: | --- | ---: | ---: | --- |
+     | 64 | 1.94 / 2.23 / 2.19 | 2.19 | 1.149x | the **slowest** |
+     | 512 | 1.91 / 1.98 / 1.91 | 1.91 | 1.037x | tied slowest |
+     | 1,024 | 1.86 / 1.81 / 1.82 | 1.82 | 1.028x | the fastest |
+     | 2,048 | 1.81 / 1.57 / 1.75 | 1.75 | 1.153x | the fastest |
+     | 3,961 | 1.49 / 1.44 / 1.46 | 1.46 | 1.035x | the fastest |
+
+     So two rungs carry a 15% spread (64 and 2,048) and three sit inside 4%,
+     and the convention picks the slowest run at 64 and the fastest at 2,048.
+     Neither of those is the median run, and no split in this entry should be
+     read as one. The 2,048 outlier is its second scored run, whose `io wait`
+     jumped to 17.49 s from the 13.34 s the other two recorded on identical
+     byte counts, which is the same kind of variance the 64 rung shows.
+     One consequence for a reader checking this entry against the raw
+     data: `SUMMARY.txt` in `scratch/phase8/sweep-20260806-165322/` renders the
+     **last** scored run's split, not the first, so its per-rung split blocks
+     will not match the table above cell for cell. Both are in the JSONs;
+     `runs[].stderr` carries all four.
+  2. **"Expert io is the largest single term at every rung" is true on the
+     first-scored-run reading and is inside the run-to-run spread at 3,961.**
+     At 64, 512, 1,024 and 2,048 the margin over the next term is large (54.1
+     against 26.3, 44.4 against 29.0, 45.1 against 26.5, 38.2 against 25.1) and
+     survives every scored run of those rungs, including the slow ones Note 1
+     tabulates. At 3,961 it is 33.2% against attention's
+     31.6% in the first scored run, and **the ordering inverts in the other
+     two**: run 2 reads attention 34.2% against expert io 31.7% and run 3 reads
+     33.5% against 32.8%. So the honest statement at the long end is that the
+     two terms have **crossed, or are crossing**, and no run separates them by
+     more than about 2.5 points. Nothing here licenses "expert io dominates at
+     4K"; what it licenses is "expert io dominates below 2,048 and is level
+     with attention at 3,961".
+  3. **The 64-token rung is a different regime in prefill and should not be
+     read as a point on the prefill curve.** Its prefill is 4.10 tok/s against
+     11.25 at 512 and its expert io is 32.7% of prefill against 2.8%, because
+     the layer-major sweep reads every expert of every layer once per chunk
+     regardless of how many tokens are in the chunk: 768 windows and 16.3 GiB
+     at 64 tokens is the same 768 windows and 16.3 GiB as at 512 tokens. The
+     fixed cost is amortized over 8x fewer tokens, which is the sweep working
+     as designed and not a finding. It is tabulated because omitting a rung
+     from a curve is worse than labelling it.
+  4. **The `expert io` bucket is a residual and understates how long the drive
+     is busy, and this sweep pins that reading again.**
+     `stage_expert_phases` (`crates/core/src/model/forward.rs:1565-1591`) runs
+     the hit plan, charges it to `expert compute`, and only then blocks in
+     `await_misses()`, which is the sole contributor to `expert io`. The miss
+     reads were submitted by `begin_layer` and are in flight throughout that
+     hit compute, which is the entire point of the two-phase shape. The
+     coincidence that pins it: at 3,961 the streamer's independently counted
+     `io wait` is **14.05 s** against the split's **14.23 s** `expert io`
+     bucket, a 1.3% gap, and the same pairing holds at every rung (14.74
+     against 14.91 at 512, 15.36 against 15.51 at 1,024, 13.34 against 13.49 at
+     2,048, 17.66 against 17.84 at 64). So the bucket is that block and nothing
+     else. **Anyone sizing an I/O lever off the shares in this entry is sizing
+     it off a lower bound on drive-busy time.** This restates a finding
+     `docs/handoff-phase8.md` derived from code structure; what is new is that
+     it now holds on five measured rungs rather than one.
+  5. **The hit rate at the shipped 11 slots/layer is measured for the first
+     time: 53.0% to 59.3% across the ladder, with no trend in context.**
+     `docs/architecture.md` (lines 281-283 at the time of writing) states that
+     it "has not been measured" and brackets it by 50.02% and 54.48%. **The
+     measurement lands at or above the top of that bracket at three of the five
+     rungs** (59.3, 58.4 and 56.5 against a 54.48% ceiling), and the other two
+     land inside it and near its top (54.0 and 53.0). **No rung falls below the
+     bracket's floor.** The sequence is not monotone in context, so it is a
+     scatter around roughly 56% rather than a curve. Two
+     provenance corrections belong with that, because getting them backwards
+     would overstate the agreement. First, the bracket's endpoints are **not**
+     simulator output: 50.02% at 10 slots and 54.48% at 12 come from replaying
+     the shipped `io/cache.rs` over EXP-005's four routing traces. It is
+     `scripts/lfu_sim.py` that gives 44.8% and 49.9%, and the documented gap of
+     roughly 5 points is between the simulator and that replay, so the
+     simulator is the ~5-point underestimate and the bracket is already
+     corrected for it. Second, the bracket is a trace replay over 556 decode
+     tokens of recorded routing and this is a live decode of 63 tokens per run
+     on five different prompts, so they are different populations and the
+     agreement is in level and order rather than like for like. The bracket
+     should be recorded as superseded at 11 slots, not as confirmed.
+  6. **One extra slot buys about 2 points of hit rate and about 4% of decode
+     tok/s, and only two of the three measured steps separate at three runs
+     each.** 11 to 12 is +2.1 points at 512 (54.0 to 56.1) and +1.9 at 3,961
+     (56.5 to 58.4); 12 to 13 at 512 is a further +1.8 (56.1 to 57.9). In
+     throughput the medians give 1.047x at 512 and 1.041x at 3,961 for 11 to
+     12, and 1.079x at 512 for 11 to 13. **The 512 rung's 11-to-12 step does
+     not separate**: scored ranges 1.91-1.98 against 1.96-2.03 overlap. The
+     3,961 rung's does (1.44-1.49 against 1.51-1.54) and so does 512's
+     11-to-13 (1.91-1.98 against 2.05-2.08). `read_bytes` falls monotonically
+     with the dial at both rungs, which is the mechanism and is not subject to
+     the same spread: 48,191.3 to 46,825.5 to 45,630.5 MiB at 512 and 163,794.9
+     to 162,539.4 MiB at 3,961. For the record and not as a curve,
+     `docs/architecture.md` puts 10 to 12 at +4.46 points from the replay,
+     which is the same ~2 points per slot this measures.
+  7. **The memory contract's 12-slot row is wrong in sign, and the error is a
+     constant rather than a slope.** Measured at 3,961 prompt tokens plus 64
+     generated, 12 slots/layer peaks at **3,058.4 MiB**, which is 13.6 MiB
+     **under** the 3,072 MiB cap, against a predicted 3,091.82 MiB and 19.8 MiB
+     **over**: a 33.4 MiB overprediction. The same rung at the shipped 11 slots
+     peaks at 2,929.3 MiB against a predicted 2,961.03, a 31.7 MiB
+     overprediction. **Two nearly equal overpredictions one slot apart is the
+     signature of a wrong constant in the fixed-tenant sum, not of wrong
+     per-slot arithmetic**, and the per-slot arithmetic corroborates that
+     directly: the table's 130.79 MiB per slot against a measured 129.05 MiB
+     between the two 3,961 arms (and 141.48 and 119.83 MiB for the two 512
+     steps, which bracket it). **Derived**, and only partly: about 6.7 MiB of
+     the 33.4 is the KV cache, which is allocated at the 4,096-position
+     capacity and faulted lazily, so at the 4,025-position high-water mark it
+     holds 377.34 MiB of its 384 MiB row. That leaves roughly 27 MiB
+     unaccounted, and the only provisional row in the sum is the 115.1 MiB of
+     runtime anonymous memory, which `docs/architecture.md` already records as
+     failing rule 2 and as a floor rather than a ceiling. So the licensed
+     statement is "the fixed-tenant sum is about 27 MiB high and the anon row
+     is where to look", **not** "the anon row is 82 MiB". Its re-measurement,
+     which EXP-012 asks for, is still owed and this entry does not take it.
+     **The dial does not move on this.** 13.6 MiB of margin at 4K is smaller
+     than EXP-018's unexplained 99-105 MiB residual, smaller than the 33.4 MiB
+     this note is correcting, and measured on one prompt in one session; and
+     the 13-slot arm has **no 4K run at all**, so there is no measurement that
+     could support going past 12 either.
+  8. **EXP-022's warm 4-7% is not contradicted by an end-to-end 1.4%; it is
+     what an end-to-end 1.4% predicts once attention's share of a token is
+     applied.** This entry measures attention at **6.4% of decode at 512** and
+     **31.6% at 3,961**. A kernel gain of 4-7% on that term alone predicts
+     0.26-0.45% end to end at 512 and 1.3-2.2% at 3,961. Measured: nothing
+     separable at 512, and 1.4% at 3,961. Both rungs land where the
+     decomposition says they should, so the two entries agree and neither
+     needs discounting. Two things must not be read out of the 512 row. It is
+     **not a regression**: the medians differ by 3.5% the wrong way, but the
+     `T_BLOCK = 8` range of 1.91-1.98 sits inside the `T_BLOCK = 4` range of
+     1.94-1.98 and the two share their top value, so three runs an arm cannot
+     order them. And it is
+     **not a null result about the kernel**: 6.4% of a token is too small a
+     term for a 4-7% change in it to clear this instrument's spread, so the
+     512 rung has no power to detect what EXP-022 measured. The honest summary
+     that replaces EXP-022 Note 6's placeholder is: `T_BLOCK = 8` costs
+     nothing anywhere measured, is worth about 1.4% of a token at 4K context,
+     and the warm 4-7% remains the correct figure for the kernel rather than
+     for a token.
+  9. **The reference arm reproduces EXP-021's machine, which is the one
+     cross-entry check this sweep licenses and it is a check rather than a
+     curve.** The `T_BLOCK = 4` arm is byte-identical to EXP-021's binary, so
+     a disagreement between its numbers here and EXP-021's is a statement about
+     the two sessions. At 3,961 prompt tokens it reads prefill **9.91 tok/s**
+     here against EXP-021's 9.89 and 9.86 across two sessions, a 0.5% spread
+     over three sessions a day apart. `read_bytes` at 512 is 50,532,257,792 B
+     on every one of the eight runs of both 512 arms. The machine is
+     reproducing. This licenses nothing else: EXP-021's decode figures were
+     taken at `--max-new 256` and `--max-new 8` against this entry's
+     `--max-new 64`, and its 4K `memory.peak` of 2,920.4-2,924.2 MiB is a
+     different token count from this entry's 2,929.3 MiB. Those are not one
+     series.
+  10. **The queue-depth curve is `threaded-pread`, not io_uring, so it
+      characterises the drive and the filesystem and not the runtime's
+      submission path.** Queue depth is emulated with N OS threads each issuing
+      a blocking `preadv`; the runtime submits through io_uring with
+      `SINGLE_ISSUER` and `DEFER_TASKRUN`. This is the same bound EXP-019 Note
+      5 states and it is restated rather than inherited, because this entry
+      finally supplies the missing half of what EXP-019 licensed: EXP-019 swept
+      queue depth at K=8 only, so the decode operating point had **no
+      queue-depth curve of its own**, and this is it. What it does not supply is
+      the io_uring measurement, so `RING_ENTRIES` still must not move on the
+      strength of a probe. `docs/handoff-phase8.md` separately closes the
+      submission side by geometry: `RING_ENTRIES` is 8, `top_k` is 8, and a
+      decode layer submits at most 8 reads, so every miss a step can have
+      already fits the ring.
+  11. **Per-file bandwidth spread at the single-blob size is 2.21x, and
+      `layer_00` is the file that does not move.** At K=1, QD 8, random, the
+      four files read 1.568, 3.455, 1.654 and 3.469 GB/s, a 2.21x spread
+      (2.22x sequential). `layer_20` and `layer_21` roughly double from QD 1 to
+      QD 2 (1.821 to 3.387 and 1.865 to 3.163) and plateau at 3.4-3.5 GB/s;
+      `layer_06` gains half again (1.594 to 2.409) and plateaus near 2.42;
+      `layer_00` gains 17% (1.370 to 1.602) and then sits at 1.59-1.60 across
+      the entire sweep. Extent geometry is identical between `layer_00` and
+      `layer_20` to the byte (398 extents, mean 984,027 B, median 884,736 B,
+      zero adjacent pairs), so fragmentation as `filefrag` reports it still
+      does not predict it, exactly as EXP-019 Note 7 found. **Two things must
+      not be inferred from putting this beside EXP-019.** EXP-019's spread of
+      1.44x is `layer_00` at 1.578 against `layer_20` at 2.271 at K=1 QD 8
+      **sequential**, not at K=8 as it is easy to misread; and its
+      decode-shaped cell (K=1, random, QD 8) read 1.55-1.69 GB/s across all
+      four files where this entry reads 1.57-3.47, so **the two fast files
+      roughly doubled between the two sessions on the same cell**. That is a
+      large session-to-session difference on a drive whose per-file behaviour
+      both entries record as unexplained. Rule 3 forbids one curve through the
+      two, and the correct reading is that each entry's spread is a fact about
+      its own session.
+  12. **Decode is not queue-starved; it is dragged by the slow files.**
+      **Derived** from the measured counters. Effective rate: 28.3 GiB of
+      expert reads against 14.05 s of `io wait` at the 3,961 rung is **2.16
+      GB/s** (2.01 GiB/s), and because reads are in flight during hit compute
+      the drive's true average delivery rate over the window it was busy is
+      **at most** that, so 2.16 GB/s is an upper bound rather than a point
+      (Note 4). Concurrency: 10,530 misses over `63 tokens x 48 layers` is
+      **3.48 misses per layer step**, and since `begin_layer` submits every
+      miss of a step at once and refuses to open the next step while any read
+      is outstanding, that average **is** decode's queue depth. The other four
+      rungs give 3.26, 3.68, 3.76 and 3.33 by the same arithmetic, so the
+      operating point is between QD 3 and QD 4 at every context measured. The
+      curve in Note 11 is already at its plateau by QD 2 on three files and by
+      QD 4 on the fourth, so **more queue depth is not available to buy**: it
+      would take more concurrent misses, which needs the cross-layer prefetch
+      CLAUDE.md forbids. Meanwhile 2.16 GB/s sits between the slow files'
+      1.57-1.65 and the fast files' 3.46-3.47 in the same K=1, random, QD 8
+      cell, which is where an aggregate over 48 files of both kinds should sit.
+      The lever this points at is the per-file spread, not the queue.
+  13. **The 3,961 rung's discarded warmup recorded `pgsteal_kswapd` 2,817, and
+      EXP-014's discarded first attempt recorded the same integer; nobody has
+      explained the coincidence.** Recorded as unexplained and
+      reproducible-looking, not as a diagnosis. What is measured: run 0 of
+      `p8-20260806-165322-decode-3961.json` is `hygiene: DIRTY` with
+      `pgscan 2817` and `pgsteal 2817`, **all of it `pgsteal_kswapd`** and none
+      of it khugepaged, so it is genuine pressure under the `4b39104` rule and
+      not the bookkeeping that rule was written to excuse. It was the warmup,
+      so it is discarded and no number in this entry rests on it; the arm's
+      three scored runs are CLEAN and the arm is PASS. What is odd: EXP-014
+      records a discarded first attempt whose two DIRTY runs read `pgsteal`
+      **2,817 and 2,946** pages, and 2,817 is the same integer two days and one
+      workload apart (EXP-014 is dated 2026-08-04 and this sweep 2026-08-06).
+      It is **not** the same rung, and saying so matters:
+      EXP-014's prompt was five tokens ("The capital of France is") on a
+      different binary at a different commit, where this is a 3,961-token
+      prompt. So the two share a number and nothing else. EXP-014 attributed
+      its own two to the operator opening a terminal mid-run, and this one has
+      no such cause recorded: the sweep was unattended and its settle loop had
+      just read `MemAvailable` at 11,101 MiB. EXP-021 Note 10 already records
+      that EXP-014's JSONs were overwritten, so the classification of its two
+      cannot be rechecked and this coincidence cannot be chased backwards.
+      What it would take to make this a finding rather than a curiosity is a
+      third occurrence with its counters kept, and the exact-integer repeat is
+      the reason to keep them.
+  14. **What this entry does not settle.** Three scored runs per arm is a
+      spread control, not an error bar, and Note 6 shows one of the five dial
+      comparisons failing to separate under it. Every arm is `--max-new 64`, so
+      the decode splits cover tokens 2 to 64 after a sweep-emptied cache and
+      the post-prefill transient `docs/handoff-phase8.md` identifies is inside
+      that window rather than excluded from it; the split curve is therefore a
+      curve of "the first 63 tokens after a prompt", which is the decode a
+      short reply consists of and is not steady state at 256 tokens and beyond.
+      The 13-slot arm has **no 4K run**, so nothing here says whether 13 fits
+      at full context, and Note 7 says why the 12-slot fit is not by itself a
+      licence to move the dial. The anon-row re-measurement EXP-012 asks for is
+      still owed and Note 7 narrows it rather than taking it. No numerics gate
+      was run in this sweep: `T_BLOCK = 8`'s bit identity rests on EXP-022 Note
+      3's tests and on EXP-021's gates, and this entry adds nothing to it.
+      And the io_uring queue-depth measurement inside the runtime, which
+      EXP-019 Note 5 called for, is still not taken (Note 10).

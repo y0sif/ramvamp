@@ -219,7 +219,7 @@ exact count depends on its blob stride and has not been computed.
 | KV cache FP16 | 384 MiB @ 4K | 96 KiB/token; linear append, 48 layers; allocated zeroed at full capacity and faulted lazily |
 | Expert slot pool | 1,438.59 MiB | 11 slots x 48 layers at the real per-layer strides, page-aligned, allocated once, every page faulted at construction |
 | Runtime anonymous memory | 115.1 MiB (**provisional**, EXP-012) + 387 KiB (phase 7) | activations and scratch, tokenizer, thread stacks, allocator arenas; peak `anon` sampled from inside the cgroup on a live decode run whose context length, token count and page-cache state were not recorded — it fails rule 2, so it is a floor for this tenant, not a ceiling. See Open risk below. The 387 KiB is decode's per-shard attention scratch, `min(n_kv_heads, shards)` carves of 132,096 B for 528,384 B total against the one 132,096 B carve that preceded it (EXP-020); it is exact arithmetic on top of a provisional figure, so it does not make the row less provisional |
-| Subtotal | **2,961.0 MiB** (**provisional**) | 111.0 MiB headroom under `memory.max=3G` (3,072 MiB), also provisional: both cells inherit the provenance of the anon row above, and neither may be published until that row is re-measured |
+| Subtotal | **2,961.0 MiB** (**provisional**) | 111.0 MiB headroom under `memory.max=3G` (3,072 MiB), also provisional: both cells inherit the provenance of the anon row above, and neither may be published until that row is re-measured. **Correction (EXP-023):** measured cold at 3,961 prompt tokens plus 64 generated, the cgroup peaks at **2,929.3 MiB**, so this row overpredicts by 31.7 MiB. The prediction is not edited, because the overshoot is not yet attributed; see the Correction under the slot table below |
 
 **The prefill sweep is not a fifth row.** Its streaming ring is a
 sub-allocation of the expert slot pool above, borrowed while the pool is
@@ -255,15 +255,50 @@ those 1,522.44 MiB is provisional, so the `subtotal MiB` and
 `vs 3,072 MiB` columns below are **provisional** too, including the 19.8
 MiB overshoot that moved the dial.
 
-| slots/layer | pool MiB | subtotal MiB | vs 3,072 MiB |
-| ---: | ---: | ---: | ---: |
-| 10 | 1,307.81 | 2,830.25 | 241.75 spare |
-| 11 | 1,438.59 | 2,961.03 | 111.0 spare |
-| 12 | 1,569.38 | 3,091.82 | **19.8 over** |
+| slots/layer | pool MiB | subtotal MiB | vs 3,072 MiB | measured `memory.peak` at 3,961 + 64 tokens (EXP-023) |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 1,307.81 | 2,830.25 | 241.75 spare | not measured |
+| 11 | 1,438.59 | 2,961.03 | 111.0 spare | **2,929.3 MiB**, 142.7 spare |
+| 12 | 1,569.38 | 3,091.82 | **19.8 over** | **3,058.4 MiB**, 13.6 spare |
 
 That 19.8 MiB is why the dial moved back: **12 slots/layer does not fit**
 once anonymous runtime memory is counted, and EXP-005's fit arithmetic
 counted only the mmap'd core and the KV cache.
+
+**Correction (2026-08-06, EXP-023): the 12-slot row is wrong in sign. 12
+slots/layer fits.** Measured cold inside `memory.max=3G` with
+`memory.swap.max=0` at 3,961 prompt tokens plus 64 generated, hygiene PASS on
+all four runs, no OOM: 3,058.4 MiB, which is 13.6 MiB **under** the cap rather
+than 19.8 MiB over. The predicted column overshoots by 33.4 MiB at 12 slots
+and by 31.7 MiB at 11, and two near-equal overshoots one slot apart are the
+signature of a wrong constant in the fixed-tenant sum rather than of wrong
+per-slot arithmetic. The per-slot arithmetic corroborates that: this table's
+130.79 MiB per slot against 129.05 MiB measured between the two arms above.
+**Derived**, and only partly: about 6.7 MiB of the 33.4 is the KV cache, which
+is allocated at the 4,096-position capacity and faulted lazily, so at the
+4,025-position high-water mark it holds 377.34 MiB of its 384 MiB row. Roughly
+27 MiB is unaccounted, and the 115.1 MiB anonymous row is the only provisional
+tenant in the sum, so it is where to look. That is not a licence to rewrite it
+to 88 MiB: it still needs the rule-2 re-measurement EXP-012 asks for, and this
+correction narrows that job rather than doing it.
+
+**The dial does not move on this, and the shipped default stays 11
+slots/layer with `--cache-bytes` unchanged.** 13.6 MiB of margin at full
+context is smaller than EXP-018's unexplained 99-105 MiB residual and smaller
+than the 33.4 MiB error this correction is fixing, and it is one prompt in one
+session. EXP-023 also measures the throughput the extra slot buys, which is
+what a future decision would weigh against that margin: **+4.7% decode at 512
+tokens and +4.1% at 3,961**, with the 512 step's scored ranges overlapping and
+only the 3,961 step separating at three runs each.
+
+**13 slots/layer was measured at 512 tokens only and has no 4K run, so it is
+not a candidate.** EXP-023 records it at 2,862.3 MiB and 2.06 tok/s at 512
+prompt tokens, which is +7.9% decode over 11 slots and the only step in that
+sweep whose ranges separate cleanly. Extrapolating its 4K peak from the
+12-slot arm would put it near 3,189 MiB, over the cap, but **that is
+arithmetic on a corrected constant that has not itself been re-measured** and
+no 13-slot run at full context exists. Nothing may be decided about 13 until
+one is taken.
 
 Hit-rate provenance matters more here than the hit rates themselves.
 `scripts/lfu_sim.py` resolves a routing step one expert at a time, so it
@@ -278,9 +313,33 @@ is **+4.46 points for 261 MiB**, not the +5.1 the simulator suggested. There
 is still no knee: marginal value falls monotonically, so the cgroup ceiling
 is the binding constraint rather than diminishing returns.
 
-**The hit rate at the shipped 11 slots/layer has not been measured.** It is
+~~**The hit rate at the shipped 11 slots/layer has not been measured.** It is
 bracketed by 50.02% and 54.48%; interpolation is not a measurement, and the
-sweep is re-run at 11 before any hit rate is attached to the dial.
+sweep is re-run at 11 before any hit rate is attached to the dial.~~
+
+**Correction (2026-08-06, EXP-023): it is measured, at 53.0% to 59.3%.** Five
+cold decode runs at 64, 512, 1,024, 2,048 and 3,961 prompt tokens, hygiene
+PASS, at the shipped dial with the slot count asserted per run: **59.3 / 54.0
+/ 53.0 / 58.4 / 56.5 percent** of 24,192 expert requests each. The sequence is
+not monotone in context, so read it as a scatter around roughly 56% rather
+than a curve. **Three of the five rungs land at or above the top of the
+50.02-54.48 bracket** (59.3, 58.4, 56.5), the other two land inside it near
+its top (54.0, 53.0), and none falls below its floor. So the bracket is
+superseded at 11 slots rather than confirmed by it.
+
+Two provenance points survive the correction and getting them backwards would
+overstate the agreement. The bracket's endpoints are **replay** figures, not
+simulator output: 50.02% and 54.48% come from replaying the shipped
+`io/cache.rs` over EXP-005's four routing traces. It is `scripts/lfu_sim.py`
+that gives 44.8% and 49.9%, so **the simulator is the roughly 5-point
+underestimate and the bracket above is already corrected for it**; that record
+stands and is the reason a simulated hit rate is never quoted here directly.
+And the bracket is a replay over 556 decode tokens of recorded routing while
+EXP-023 is a live decode of 63 tokens per run across five different prompts,
+so the two are different populations and agree in level and order rather than
+like for like. The slot dial is now measured either side of 11 as well: 56.1%
+at 12 slots and 57.9% at 13 at 512 tokens, and 58.4% at 12 slots at 3,961, so
+one extra slot is worth roughly 2 points.
 
 **Open risk:** the 115.1 MiB was sampled on a decode run whose context length
 and token count are not recorded, and the KV cache faults lazily, so that
@@ -345,6 +404,16 @@ slots/layer), fewer slots/layer. A global slot pool shared across layers is
   `preadv`, not io_uring, so it says nothing about `SINGLE_ISSUER` /
   `DEFER_TASKRUN` submission behaviour. An io_uring queue-depth experiment
   inside the runtime is on the backlog for exactly those two gaps.
+
+  **Update (2026-08-06, EXP-023): the first gap is closed and the second is
+  not.** EXP-023 swept queue depth at K=1, the single-blob size decode issues,
+  on the same four files: the curve rises from QD 1 to QD 2 and is flat from
+  QD 2 on `layer_20`, `layer_06` and `layer_21`, and from QD 4 on `layer_00`.
+  Decode's own concurrency **derives** to 3.26-3.76 misses per layer step
+  across five context rungs, which sits on that plateau, so the shipped depth
+  is confirmed at the decode geometry and not merely at the sweep's. The queue
+  is still `threaded-pread`, so the io_uring question is exactly as open as it
+  was and `RING_ENTRIES` still must not move on a probe.
 
   **The submission queue is not the binding constraint on the decode path, and
   that half is closed by geometry rather than by measurement.** `RING_ENTRIES`
@@ -1114,14 +1183,21 @@ withdrawn.
 - Decode I/O volume: worst case **1,097 MB/token** (1.02 GiB: 8 experts x 48
   layers, 24 layers at a 3,059,712 B stride and 24 at 2,654,208 B). This one
   is exact arithmetic on audited strides, not a measurement.
-- Decode hit rate: **simulated, not measured end to end**, and the two
-  available figures are a lower bound and a replay of the shipped code, not
-  one number. `scripts/lfu_sim.py` gives 44.8% at 10 slots and 49.9% at 12
-  (EXP-005, 556 decode tokens of real routing traces, simulation only);
-  replaying the shipped `io/cache.rs` over the identical traces the way the
-  runtime actually calls it gives **50.02% at 10 and 54.48% at 12** (EXP-005
-  Correction). At the shipped 11 slots/layer the hit rate has **not** been
-  measured and is bracketed by those two.
+- Decode hit rate: **measured end to end as of EXP-023.** At the shipped 11
+  slots/layer, five cold rungs give **53.0% to 59.3%** (59.3 / 54.0 / 53.0 /
+  58.4 / 56.5 at 64 / 512 / 1,024 / 2,048 / 3,961 prompt tokens), with no
+  trend in context. The dial is measured either side of 11 too: **56.1% at 12
+  and 57.9% at 13** at 512 tokens, **58.4% at 12** at 3,961. The older figures
+  stay on the record as the prior this corrects, and they are simulation and
+  replay rather than measurement: `scripts/lfu_sim.py` gives 44.8% at 10 slots
+  and 49.9% at 12 (EXP-005, 556 decode tokens of real routing traces,
+  simulation only); replaying the shipped `io/cache.rs` over the identical
+  traces the way the runtime actually calls it gives **50.02% at 10 and 54.48%
+  at 12** (EXP-005 Correction), which is where the roughly 5-point
+  simulator underestimate is recorded. **The table below is not re-derived at
+  the measured rate**, because its rows are dial points from the replay and
+  mixing a measured rate into them would put two entries on one curve; see the
+  correction under it.
 - Decode I/O time, derived rather than measured. Miss bytes are estimated as
   `(1 - hit) x 1,097 MB`, which assumes misses are spread across the two
   stride classes in proportion to accesses; on the one point where EXP-005
@@ -1144,15 +1220,58 @@ withdrawn.
   EXP-008 bandwidths gave. **What is and is not now measured**: the bandwidth
   is measured and rule-2 clean, but through a threaded-`preadv` queue rather
   than io_uring (EXP-019), so it characterises the drive and not the runtime's
-  submission path. The hit rates are still a trace replay rather than a decode
-  run, and the shipped 11-slot dial still has no point of its own. The 1,097
-  MB/token is still exact arithmetic. So the table is one grade less
-  provisional than it was, not measured end to end.
+  submission path. The hit rates in **this table** are still a trace replay
+  rather than a decode run, which is why the table is not re-derived: as of
+  EXP-023 the shipped 11-slot dial does have a measured point of its own
+  (53.0-59.3%), and so do 12 and 13, but those are a different entry and a
+  different session and putting them in these rows would make one curve out of
+  two. The 1,097 MB/token is still exact arithmetic. So the table is one grade
+  less provisional than it was, not measured end to end, and it is now a
+  derivation that a measurement has overtaken rather than the best available
+  answer.
 
   The width of the band is per-file bandwidth variance, not measurement noise:
   EXP-019 finds a 1.44x spread between two layer files with identical extent
   geometry, and a real decode touches all 48, so the true aggregate sits
-  somewhere inside rather than at either end.
+  somewhere inside rather than at either end. That 1.44x is `layer_00` at
+  1.578 against `layer_20` at 2.271 GB/s at **K=1, sequential, QD 8**, which
+  is easy to misread as a K=8 figure and is not one.
+
+  **Correction (2026-08-06, EXP-023): decode's own effective rate is now
+  measured, and it is above this band.** The band above stays where it is,
+  because it is a derivation from EXP-019 at EXP-019's bandwidths and rewriting
+  it with a number from another entry is exactly the curve rule 3 forbids. What
+  EXP-023 adds is decode's own figure, **derived** from its own measured
+  counters on one run: at 3,961 prompt tokens the streamer reads **28.3 GiB of
+  experts against 14.05 s of `io wait`**, which is **2.16 GB/s** (2.01 GiB/s).
+  Read it as an **upper bound** rather than a point: miss reads are in flight
+  during hit compute, so the drive's average delivery rate over the window it
+  was actually busy is at most that (see EXP-023 Note 4 on why `expert io` is a
+  residual). 2.16 GB/s sits between the slow files' 1.57-1.65 and the fast
+  files' 3.46-3.47 in EXP-023's own probe at the same K=1, random, QD 8 cell,
+  which is where an aggregate over 48 files of both kinds belongs.
+
+  **Decode is not queue-starved.** EXP-023 derives its concurrency from the
+  same counters: 10,530 misses over `63 tokens x 48 layers` is **3.48 misses
+  per layer step**, and because `begin_layer` submits every miss of a step at
+  once and will not open the next step while a read is outstanding, that
+  average *is* decode's queue depth. The other four rungs give 3.26 to 3.76.
+  EXP-023's single-blob queue-depth curve is already at plateau by QD 2 on
+  three of four files and by QD 4 on the fourth, so there is no queue depth
+  left to buy: more would take more concurrent misses, which needs the
+  cross-layer prefetch that is closed as a no.
+
+  **The per-file spread is the larger lever and it is bigger at K=1 than
+  EXP-019 saw.** EXP-023 measures 1.568 / 3.455 / 1.654 / 3.469 GB/s on the
+  same four files at K=1, random, QD 8, a **2.21x spread**, with `layer_00`
+  flat at 1.59-1.60 across the whole sweep. EXP-019's decode-shaped cell read
+  1.55-1.69 GB/s across all four, so the two fast files roughly doubled between
+  the two sessions. **Those are different entries and different sessions and
+  must not be drawn as one curve**; each spread is a fact about its own
+  session, and what both sessions agree on is that the spread exists, is large,
+  and is not predicted by extent geometry. Both probes are `threaded-pread`
+  rather than io_uring, so neither characterises the runtime's submission
+  path.
 - **This band is drive-dependent and must never be published without the
   device.** The same design and the same ~500 MB/token on a 3.5 GB/s drive
   computes to roughly 7 tok/s. The reference machine has a DRAM-less QLC
@@ -1268,11 +1387,23 @@ are neither now, and they should not come back without new evidence.
   ceiling (EXP-012). This is an experiment about larger machines, not a
   tuning step on the reference one. Its hit-rate value is also unquantified
   until the batch-pinned replay is run at 16 slots.
-- Re-run the slot sweep at 11 slots/layer, batch-pinned, so the shipped dial
-  has a hit rate of its own instead of a bracket (EXP-012).
+- ~~Re-run the slot sweep at 11 slots/layer, batch-pinned, so the shipped dial
+  has a hit rate of its own instead of a bracket (EXP-012).~~ **Done, and by
+  a better instrument than this asked for: EXP-023 measures it on live cold
+  decode runs rather than on a trace replay, at 53.0-59.3% across five context
+  rungs, plus 56.1% at 12 slots and 57.9% at 13.** What is still not replayed
+  is 16 slots, which the first bullet needs.
 - Re-measure peak `anon` at 4K context with the slot pool wired in, to prove
   or disprove the 111.0 MiB of headroom the 11-slot dial leaves (EXP-012).
-  **Still open, and now with a better starting point.** EXP-018 records
+  **Still open, and now narrowed by EXP-023 rather than closed by it.** The
+  measured 4K peak at 11 slots is 2,929.3 MiB against a predicted 2,961.03, so
+  the fixed-tenant sum is about 32 MiB high, of which about 7 MiB is the
+  lazily-faulted KV tail. That leaves roughly 27 MiB pointing at this row and
+  it is still a `memory.peak` derivation, not a sampled `anon`. What remains
+  owed is unchanged: the row itself, measured under rule 2. Older context
+  below.
+
+  EXP-018 records
   `memory.peak` at 512 tokens of context on both prefill paths, 2,576.0 MiB
   token-major and 2,570.1 MiB swept against the 3,072 MiB ceiling. That is not
   the 4K run: extrapolating the FP16 KV cache from 512 to 4096 tokens adds
@@ -1291,10 +1422,19 @@ are neither now, and they should not come back without new evidence.
   holds peak to ~100 MB and loses 15 to 18 percent past ~170 MB, so the useful
   region is `windows_in_flight` up to 4 at 8 experts, or `experts_per_window`
   up to 16 at 2 windows (EXP-008, EXP-013, EXP-015, EXP-019)
-- **An io_uring queue-depth experiment inside the runtime, drive side only.**
+- **An io_uring queue-depth experiment inside the runtime.** **The drive-side
+  half is done: EXP-023 swept queue depth at K=1, the block size decode
+  actually issues.** The curve is flat from QD 2 on three of the four probed
+  files and from QD 4 on the fourth, and decode's own concurrency **derives**
+  to 3.26-3.76 misses per layer step, so the operating point already sits on
+  the plateau and there is no depth left to buy. That sweep is still
+  `threaded-pread`, so **the io_uring half of this item is untouched** and
+  `RING_ENTRIES` still must not move on the strength of a probe. The original
+  framing follows.
+
   EXP-019 measured the drive through a threaded-`preadv` queue, not io_uring,
   and swept queue depth only at the 8-blob block size, so the decode geometry
-  (single blobs through `RING_ENTRIES = 8`) has no queue-depth curve of its
+  (single blobs through `RING_ENTRIES = 8`) had no queue-depth curve of its
   own on the **drive** side. What EXP-019 does establish is that the shipped
   depth sits inside the flat part of the drive's curve at 24.5 MB outstanding,
   so this experiment is about confirming that through `SINGLE_ISSUER` /
