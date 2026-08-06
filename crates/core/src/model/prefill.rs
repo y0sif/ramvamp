@@ -2214,22 +2214,11 @@ mod tests {
     /// cannot accidentally agree), `hidden_q8k 2`, `attn_q8k 3`, 16 experts
     /// at `top_k 4`.
     ///
-    /// It lives here rather than beside [`build_install`] because
-    /// `io/testutil.rs` belongs to another lane; the right home for a
-    /// geometry-parameterised builder is there, and this module keeps only
-    /// what the parameterisation would have produced.
+    /// The builder is `io::testutil::build_install_with`; this module is
+    /// only the geometry and the payload policy handed to it.
     mod wide {
-        use std::collections::BTreeMap;
-        use std::fs;
-        use std::path::PathBuf;
-
-        use crate::format::{
-            ArchInfo, CommonTensor, ExpertsLayout, FileEntry, LAYOUT_FILE, LayerLayout, Manifest,
-            Projection, ProjectionName, QuantInfo, RVMP_VERSION, SourceInfo, layer_file_name,
-            sha256_file, testutil::TempDir, write_layout, write_manifest,
-        };
-        use crate::kernels::quants::{QuantFormat, f32_to_f16};
-        use crate::model::testsupport::temper_parts;
+        use crate::io::testutil::{Fixture, Geometry, build_install_with};
+        use crate::model::testsupport::temper_install;
 
         /// Layers in the fixture.
         pub(super) const N_LAYERS: u32 = 2;
@@ -2256,46 +2245,6 @@ mod tests {
         /// Vocabulary size.
         pub(super) const VOCAB: usize = 40;
 
-        /// A complete install in a self-cleaning temp dir.
-        pub(super) struct WideFixture {
-            _tmp: TempDir,
-            /// The install directory.
-            pub(super) root: PathBuf,
-        }
-
-        /// Deterministic filler byte for quantized payloads, as
-        /// `io::testutil` fills them; the scales are re-stamped by
-        /// [`temper_parts`] afterwards.
-        fn pattern_byte(seed: usize, block: usize, byte: usize) -> u8 {
-            (seed.wrapping_mul(31) ^ block.wrapping_mul(7) ^ byte.wrapping_mul(3)) as u8
-        }
-
-        /// Packed bytes for `rows` quantized rows of `in_dim` weights.
-        fn quant_bytes(format: QuantFormat, rows: usize, in_dim: usize, seed: usize) -> Vec<u8> {
-            let row_bytes = format.row_bytes(in_dim).expect("fixture dims divide");
-            let block_bytes = format.block_bytes();
-            let n_blocks = rows * row_bytes / block_bytes;
-            let mut out = vec![0u8; rows * row_bytes];
-            for block in 0..n_blocks {
-                let base = block * block_bytes;
-                for byte in 0..block_bytes {
-                    out[base + byte] = pattern_byte(seed, block, byte);
-                }
-                let d = f32_to_f16(0.5).to_le_bytes();
-                let dmin = f32_to_f16(0.25).to_le_bytes();
-                match format {
-                    QuantFormat::Q4_K | QuantFormat::Q5_K => {
-                        out[base..base + 2].copy_from_slice(&d);
-                        out[base + 2..base + 4].copy_from_slice(&dmin);
-                    }
-                    QuantFormat::Q6_K => out[base + 208..base + 210].copy_from_slice(&d),
-                    QuantFormat::Q8_0 => out[base..base + 2].copy_from_slice(&d),
-                    QuantFormat::Q8_K => unreachable!("activation-only format"),
-                }
-            }
-            out
-        }
-
         /// RMSNorm weight near 1, varying per element.
         ///
         /// `io::testutil`'s ramp reaches 128 at `hidden 512`, which pushes the
@@ -2308,273 +2257,40 @@ mod tests {
         /// Router weight: signed and non-monotonic, so different tokens
         /// genuinely select different experts. A ramp would make every row
         /// route to the same top-k and leave the skip logic untested.
-        fn router_value(index: usize) -> f32 {
+        ///
+        /// Unlike [`norm_value`] this ignores the tensor name; the builder
+        /// passes one for both so a geometry can vary either.
+        fn router_value(_name: &str, index: usize) -> f32 {
             ((((index * 37 + 11) % 29) as f32) - 14.0) / 64.0
         }
 
-        /// LE bytes of `elements` values from `f`.
-        fn f32_bytes(elements: usize, f: impl Fn(usize) -> f32) -> Vec<u8> {
-            let mut out = Vec::with_capacity(elements * 4);
-            for i in 0..elements {
-                out.extend_from_slice(&f(i).to_le_bytes());
-            }
-            out
-        }
-
-        /// The fixture's architecture facts.
-        pub(super) fn arch() -> ArchInfo {
-            ArchInfo {
-                n_layers: N_LAYERS,
-                n_experts: N_EXPERTS,
-                top_k: TOP_K,
-                hidden: HIDDEN as u32,
-                moe_intermediate: MOE as u32,
-                n_heads: N_HEADS as u32,
-                n_kv_heads: N_KV_HEADS as u32,
-                head_dim: HEAD_DIM as u32,
-                vocab: VOCAB as u32,
-                context_length: 4096,
-                rope_theta: 1e7,
-                rms_eps: 1e-6,
-                norm_topk_prob: true,
-                tie_embeddings: false,
-                shared_expert: false,
-                sliding_window: None,
-            }
-        }
-
-        /// One common tensor's dtype and generated payload.
-        struct TensorDef {
-            dtype: &'static str,
-            bytes: Vec<u8>,
-        }
-
-        /// Every common tensor, keyed by GGUF name, with the same per-tensor
-        /// type mix `io::testutil` uses: layer 0 mirrors a Q6_K-down layer,
-        /// layer 1 is pure Q4_K.
-        fn common_defs() -> BTreeMap<String, TensorDef> {
-            let mut defs: BTreeMap<String, TensorDef> = BTreeMap::new();
-            let mut quant = |name: String, format: QuantFormat, rows: usize, in_dim: usize| {
-                let dtype = match format {
-                    QuantFormat::Q4_K => "q4_k",
-                    QuantFormat::Q5_K => "q5_k",
-                    QuantFormat::Q6_K => "q6_k",
-                    QuantFormat::Q8_0 => "q8_0",
-                    QuantFormat::Q8_K => unreachable!("activation-only format"),
-                };
-                let bytes = quant_bytes(format, rows, in_dim, name.len() + rows);
-                defs.insert(name, TensorDef { dtype, bytes });
-            };
-            quant(
-                "token_embd.weight".to_owned(),
-                QuantFormat::Q4_K,
-                VOCAB,
-                HIDDEN,
-            );
-            quant("output.weight".to_owned(), QuantFormat::Q6_K, VOCAB, HIDDEN);
-            for layer in 0..N_LAYERS {
-                quant(
-                    format!("blk.{layer}.attn_q.weight"),
-                    QuantFormat::Q4_K,
-                    Q_DIM,
-                    HIDDEN,
-                );
-                quant(
-                    format!("blk.{layer}.attn_k.weight"),
-                    QuantFormat::Q8_0,
-                    KV_DIM,
-                    HIDDEN,
-                );
-                let v_format = if layer == 0 {
-                    QuantFormat::Q6_K
-                } else {
-                    QuantFormat::Q4_K
-                };
-                quant(
-                    format!("blk.{layer}.attn_v.weight"),
-                    v_format,
-                    KV_DIM,
-                    HIDDEN,
-                );
-                quant(
-                    format!("blk.{layer}.attn_output.weight"),
-                    QuantFormat::Q5_K,
-                    HIDDEN,
-                    Q_DIM,
-                );
-            }
-            let mut f32_def = |name: String, bytes: Vec<u8>| {
-                defs.insert(
-                    name,
-                    TensorDef {
-                        dtype: "f32",
-                        bytes,
-                    },
-                );
-            };
-            f32_def(
-                "output_norm.weight".to_owned(),
-                f32_bytes(HIDDEN, |i| norm_value("output_norm.weight", i)),
-            );
-            for layer in 0..N_LAYERS {
-                for (stem, elements) in [
-                    ("attn_norm", HIDDEN),
-                    ("ffn_norm", HIDDEN),
-                    ("attn_q_norm", HEAD_DIM),
-                    ("attn_k_norm", HEAD_DIM),
-                ] {
-                    let name = format!("blk.{layer}.{stem}.weight");
-                    let bytes = f32_bytes(elements, |i| norm_value(&name, i));
-                    f32_def(name, bytes);
-                }
-                f32_def(
-                    format!("blk.{layer}.ffn_gate_inp.weight"),
-                    f32_bytes(N_EXPERTS as usize * HIDDEN, router_value),
-                );
-            }
-            defs
-        }
+        /// The geometry this fixture hands `io::testutil::build_install_with`.
+        pub(super) const GEOMETRY: Geometry = Geometry {
+            n_layers: N_LAYERS,
+            n_experts: N_EXPERTS,
+            top_k: TOP_K,
+            hidden: HIDDEN,
+            moe_intermediate: MOE,
+            n_heads: N_HEADS,
+            n_kv_heads: N_KV_HEADS,
+            head_dim: HEAD_DIM,
+            vocab: VOCAB,
+            model_id: "fixture-moe-wide-2l",
+            hf_repo: "test/fixture-wide",
+            source_file: "fixture-wide-Q4_K_M.gguf",
+            norm_value,
+            router_value,
+        };
 
         /// Build a complete, tempered install under a fresh temp dir.
         ///
         /// Load it with `skip_hashes`: the tempering rewrites block scales
         /// after the manifest digests are taken, exactly as
         /// `io::testutil` + `temper_install` do for the narrow fixture.
-        pub(super) fn build(tag: &str) -> WideFixture {
-            let tmp = TempDir::new(tag);
-            let root = tmp.path().join("model.rvmp");
-            fs::create_dir_all(root.join("experts")).expect("create install dirs");
-
-            let defs = common_defs();
-            let mut common_tensors = BTreeMap::new();
-            let mut common = Vec::new();
-            for (name, def) in &defs {
-                let offset = (common.len() as u64).next_multiple_of(64);
-                common.resize(offset as usize, 0);
-                common.extend_from_slice(&def.bytes);
-                common_tensors.insert(
-                    name.clone(),
-                    CommonTensor {
-                        offset,
-                        len: def.bytes.len() as u64,
-                        dtype: def.dtype.to_owned(),
-                    },
-                );
-            }
-            fs::write(root.join("common.bin"), &common).expect("write common.bin");
-
-            let mut layers = Vec::new();
-            for layer in 0..N_LAYERS {
-                let down_format = if layer == 0 {
-                    QuantFormat::Q6_K
-                } else {
-                    QuantFormat::Q4_K
-                };
-                let slabs: [(ProjectionName, QuantFormat, usize, usize); 3] = [
-                    (ProjectionName::Gate, QuantFormat::Q4_K, MOE, HIDDEN),
-                    (ProjectionName::Up, QuantFormat::Q4_K, MOE, HIDDEN),
-                    (ProjectionName::Down, down_format, HIDDEN, MOE),
-                ];
-                let mut projections = Vec::new();
-                let mut cursor: u64 = 0;
-                for (name, format, rows, in_dim) in slabs {
-                    let offset_in_blob = cursor.next_multiple_of(4096);
-                    let len = (format.row_bytes(in_dim).unwrap() * rows) as u64;
-                    projections.push(Projection {
-                        name,
-                        offset_in_blob,
-                        len,
-                        quant: match format {
-                            QuantFormat::Q4_K => "q4_k",
-                            QuantFormat::Q6_K => "q6_k",
-                            _ => unreachable!("fixture expert formats"),
-                        }
-                        .to_owned(),
-                    });
-                    cursor = offset_in_blob + len;
-                }
-                let stride = cursor.next_multiple_of(4096);
-
-                let mut file_bytes = vec![0u8; (stride * u64::from(N_EXPERTS)) as usize];
-                for expert in 0..N_EXPERTS {
-                    let blob_base = (u64::from(expert) * stride) as usize;
-                    for (p, ((_, format, rows, in_dim), projection)) in
-                        slabs.iter().zip(&projections).enumerate()
-                    {
-                        let seed = layer as usize * 1009 + expert as usize * 101 + p * 13;
-                        let bytes = quant_bytes(*format, *rows, *in_dim, seed);
-                        let start = blob_base + projection.offset_in_blob as usize;
-                        file_bytes[start..start + bytes.len()].copy_from_slice(&bytes);
-                    }
-                }
-                let file = layer_file_name(layer);
-                fs::write(root.join(&file), &file_bytes).expect("write layer file");
-                layers.push(LayerLayout {
-                    file,
-                    stride,
-                    n_experts: N_EXPERTS,
-                    projections,
-                });
-            }
-            let layout = ExpertsLayout { layers };
-            write_layout(&root, &layout).expect("write layout");
-
-            let mut files = BTreeMap::new();
-            let mut record = |name: String| {
-                let path = root.join(&name);
-                files.insert(
-                    name,
-                    FileEntry {
-                        size: fs::metadata(&path).unwrap().len(),
-                        sha256: sha256_file(&path).unwrap(),
-                    },
-                );
-            };
-            record("common.bin".to_owned());
-            record(LAYOUT_FILE.to_owned());
-            for layer in 0..N_LAYERS {
-                record(layer_file_name(layer));
-            }
-
-            let mut tensor_types: BTreeMap<String, String> = defs
-                .iter()
-                .map(|(name, def)| (name.clone(), def.dtype.to_owned()))
-                .collect();
-            for (layer, layout_layer) in layout.layers.iter().enumerate() {
-                for projection in &layout_layer.projections {
-                    let stem = match projection.name {
-                        ProjectionName::Gate => "ffn_gate_exps",
-                        ProjectionName::Up => "ffn_up_exps",
-                        ProjectionName::Down => "ffn_down_exps",
-                    };
-                    tensor_types.insert(
-                        format!("blk.{layer}.{stem}.weight"),
-                        projection.quant.clone(),
-                    );
-                }
-            }
-
-            let manifest = Manifest {
-                rvmp_version: RVMP_VERSION,
-                model_id: "fixture-moe-wide-2l".to_owned(),
-                source: SourceInfo {
-                    hf_repo: "test/fixture-wide".to_owned(),
-                    revision: "deadbeef".to_owned(),
-                    file: "fixture-wide-Q4_K_M.gguf".to_owned(),
-                    sha256: "0".repeat(64),
-                },
-                arch: arch(),
-                quant: QuantInfo {
-                    scheme: "gguf".to_owned(),
-                    tensor_types,
-                },
-                common_tensors,
-                files,
-            };
-            write_manifest(&root, &manifest).expect("write manifest");
-
-            temper_parts(&root, &manifest.common_tensors, &layout.layers);
-            WideFixture { _tmp: tmp, root }
+        pub(super) fn build(tag: &str) -> Fixture {
+            let fx = build_install_with(tag, &GEOMETRY);
+            temper_install(&fx);
+            fx
         }
     }
 
@@ -2645,7 +2361,7 @@ mod tests {
         }
     }
 
-    fn load_wide(tag: &str) -> (wide::WideFixture, Model) {
+    fn load_wide(tag: &str) -> (Fixture, Model) {
         let fx = wide::build(tag);
         let model = Model::load(&fx.root, SKIP).unwrap();
         (fx, model)
@@ -2672,6 +2388,11 @@ mod tests {
     fn the_wide_geometry_separates_every_width() {
         let (_fx, model) = load_wide("prefill-wide-geometry");
         let dims = PrefillDims::new(model.arch(), 2, 64).unwrap();
+
+        // The builder derives the projection widths from the head counts, so
+        // pin them here: a head-count edit that collapsed `q_dim` onto
+        // `hidden` would otherwise reach the driver as a plausible geometry.
+        assert_eq!((dims.q_dim, dims.kv_dim), (wide::Q_DIM, wide::KV_DIM));
 
         let widths = [dims.hidden, dims.q_dim, dims.kv_dim, dims.moe];
         for (i, a) in widths.iter().enumerate() {

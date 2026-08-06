@@ -4,6 +4,19 @@ Written 2026-08-05, at `feat/attention` = `4b39104` (phase 7 complete and
 measured, not yet merged to `main`). The runtime is unchanged since `aade585`;
 everything after it is harness and docs.
 
+**Amended 2026-08-05 on `feat/decode`, on top of `d329890`**, with what phase 8
+has closed and what it has found. Items struck through below landed in this
+phase; "WHAT PHASE 8 HAS FOUND" and GOTCHAS 9-10 are new. The one runtime
+change so far is `T_BLOCK` (EXP-022) and it is warm-measured only, so nothing
+in the phase-7 summary immediately below is superseded.
+
+**Amended again 2026-08-06 at `c78122b`, after the cold decode sweep. That
+sweep is EXP-023 and it is the only thing to quote for any of it.** Read
+"WHAT PHASE 8 MEASURED" below before reading anything else here: it closes
+five open items, corrects one prediction in `docs/architecture.md` in sign,
+discharges the `T_BLOCK` debt, and adds GOTCHA 11. Nothing in this file was
+deleted to make room; the superseded text is marked where it stands.
+
 ## Where things stand
 
 Phase 7 rebuilt attention, which EXP-017 had measured at **61.3%** of a
@@ -125,6 +138,14 @@ first bullet, which EXP-021 measured and which changes what the rest are worth.
   phase 7 attacked is now third. Decode's split is different again (expert io
   42.0%, attention 29.3%), so prefill and decode no longer want the same
   lever. Measure the split on the workload you actually care about first.
+  **Superseded in part by EXP-023:** that split has now been measured across
+  five context rungs, and the decode half of this bullet should be read from
+  "WHAT PHASE 8 MEASURED" instead. The 42.0% above is near decode's
+  **minimum** expert-io share rather than its peak, which is the opposite of
+  what one point invites; EXP-023 measures 54.1% at 64 tokens of context
+  falling to 33.2% at 3,961. The prefill half stands and is corroborated at
+  five rungs: expert compute is the largest prefill term everywhere from 512
+  up.
 - **Softmax is 23.5% of the kernel** at 4096 positions (1,059 µs of 4,499 µs,
   measured) and `primitives` is frozen. Leaving it frozen caps every other
   attention lever at `1 / 0.235` = **4.26x** on the kernel; perfecting softmax
@@ -140,11 +161,21 @@ first bullet, which EXP-021 measured and which changes what the rest are worth.
   is not the group — the query-head split was tried, measured 1.8x for 3.1x the
   CPU, and *inverted* to 0.46x at 64 positions — and not positions, which needs
   the forbidden rescaled softmax. This is an open question, not a queued task.
-- **`T_BLOCK = 4` in `x86::dot_block` could go to 8.** The implementing lane
-  called it the cheapest remaining win in that file: roughly **1.5-2x** on the
-  QK dot, at 8 more live ymm registers and 16 KiB of stack. **Estimated, never
-  measured.** It stays bit-neutral only because more independent position
-  chains is legal; splitting one chain over `i` is not.
+- ~~**`T_BLOCK = 4` in `x86::dot_block` could go to 8.**~~ **Done, EXP-022.**
+  It landed at 8 with a `T_TAIL_BLOCK = 4` rung between the wide block and the
+  scalar tail, and the constraint that licensed it is unchanged: more
+  independent position chains is legal, splitting one chain over `i` is not.
+  **The 1.5-2x estimate is superseded by measurement, not merely
+  unconfirmed**: the whole kernel moves 1.00x to 1.07x across the 64-to-4096
+  ladder, growing with context because attention is memory-bound at the long
+  end. Do not re-quote 1.5-2x. ~~Warm, so **the cold pair is owed and EXP-023
+  is reserved for it**~~ **The cold pair has been run and it is EXP-023.**
+  `scripts/phase8_decode_sweep.sh` ran it against `scratch/phase7-ref/ramvamp`,
+  byte-identical to the binary EXP-021 measured: **1.014x decode at 3,961
+  prompt tokens and nothing distinguishable at 512**, prefill unmoved at both.
+  The warm 4-7% stays correct about the kernel; what it is worth to a token is
+  about 1.4% at 4K and nothing measurable at 512, which is what attention's
+  31.6% and 6.4% shares of decode predict.
 - **Attention is drifting memory-bound at long context.** `max(ns/pos) /
   min(ns/pos)` over the ladder went from 1.03x to 1.40-1.57x on the 48-layer
   arm — the arithmetic got roughly 10x cheaper and the memory traffic did not
@@ -160,11 +191,20 @@ Left over from item 1, none of it blocking:
   pair got five scored runs. Their only spread control is that two independent
   sessions agree, and the two phase-7 decode figures differ by 8.7% (1.99
   against 1.83 tok/s). A `--repeats 3` decode pair would cost ~35 min.
-- **The 512-token phase split was not captured cold.** `cold_bench.py` writes
-  the child's stderr — which carries the `prefill split` and `decode split`
-  blocks — to `run0N.json.stderr` on a fixed path that the next invocation
-  clobbers, so only the last session's 4K run and phase-5 512 run survive.
-  Copy the sidecars alongside the `--json` summary if the split matters.
+- ~~**The 512-token phase split was not captured cold.**~~ **The clobber is
+  fixed; the 512-token split itself is still uncaptured.** `cold_bench.py` now
+  keeps each run's stderr **verbatim in the `--json` summary**, unfiltered and
+  uncapped, at a measured 607-1,111 bytes per run against summaries that are
+  already 7-38 KB. A `--json` path is chosen per invocation, so that copy
+  survives where the `run0N.json.stderr` sidecar does not: the sidecar path is
+  still `<workdir>/runNN.json.stderr` with `NN` restarting at 0 every
+  invocation, and it is still clobbered. Nothing needs copying by hand any
+  more, but a 512-token cold run still has to be *taken* before its split
+  exists. **Done, EXP-023.** It was taken, along with four other rungs, and
+  the `--json` copy is what carried it: the splits in EXP-023 are read out of
+  `runs[].stderr` in `scratch/cold-bench/p8-20260806-165322-*.json`, and the
+  `runNN.json.stderr` sidecars for that sweep were clobbered exactly as
+  predicted.
 - **The size of the post-sweep cold-start transient is still unmeasured.**
   EXP-021 shows it no longer costs a regression at any window measured; it
   does not measure the transient itself.
@@ -176,6 +216,9 @@ Left over from item 1, none of it blocking:
   uncheckable. EXP-014's *published* run survives at
   `scratch/cold-bench/summary.json` with `pgsteal` 0 on every run, so
   `--reverdict` leaves it PASS either way and its numbers are unaffected.
+  **2,817 has since turned up again**, on the phase-8 3,961 rung's discarded
+  warmup, on a different workload two days later. See GOTCHA 11; it is
+  recorded as unexplained, not as a diagnosis.
 
 Found while testing phase 7, and deliberately deferred:
 
@@ -192,14 +235,27 @@ Found while testing phase 7, and deliberately deferred:
 
 Carried over, untouched by phase 7:
 
-- `crates/core/src/io/testutil.rs` hard-codes one fixture geometry and keeps
-  its `TempDir` private, so `prefill.rs`'s `mod wide` had to copy the install
-  builder. A `build_install_with(geometry)` there would let that copy delete
-  ~360 lines.
-- **io_uring queue-depth curve for the decode geometry.** EXP-019 emulated
-  depth with threaded `preadv` and swept it only at K=8, so single-blob decode
-  reads through `RING_ENTRIES = 8` have no curve on either the drive side or
-  the submission side. `RING_ENTRIES` must not move on EXP-019 alone.
+- ~~`crates/core/src/io/testutil.rs` hard-codes one fixture geometry~~
+  **Done.** A `Geometry` struct and `build_install_with(name, &Geometry)` now
+  live in `testutil.rs`, and `prefill.rs`'s `mod wide` lost its copy of the
+  install builder: **+35 / -314 lines**, net -279. The refactor is proven inert
+  the only way that counts: sha256 of every file of both installs, before and
+  after, byte for byte identical.
+- **io_uring queue-depth curve for the decode geometry, drive side only now.**
+  EXP-019 emulated depth with threaded `preadv` and swept it only at K=8, so
+  single-blob decode reads through `RING_ENTRIES = 8` have no curve of their
+  own on the **drive** side, and `RING_ENTRIES` must not move on EXP-019 alone.
+  The phase-8 sweep's `scripts/io_probe.py` step
+  (`scripts/phase8_decode_sweep.sh:1120`) is what addresses that half.
+  **The submission side is closed, by geometry rather than by measurement**:
+  `RING_ENTRIES` is 8 (`crates/core/src/io/stream.rs:172`), `top_k` is 8, and
+  `ExpertStream::begin_layer` submits one read per miss and refuses to open a
+  step while any earlier read is outstanding
+  (`crates/core/src/io/stream.rs:1455-1530`). So a decode layer submits at
+  most 8 reads, every miss it can ever have fits the ring at once, and raising
+  `RING_ENTRIES` **cannot** increase decode's bytes in flight. Only more
+  concurrent misses could, and that needs the forbidden cross-layer prefetch.
+  **Derived from code geometry, not measured.**
 - **Prefill chunk-size sweep** (128/256/512/1024). One warm data point exists
   (161/143/131 s at 512 tokens) but it is a direction, not the sweep, and it
   does not cover 1024 or the memory peak.
@@ -213,6 +269,169 @@ Carried over, untouched by phase 7:
   nothing identified it. What the 4K run did settle is that the contract
   survives full context, which is a different question. Closing this needs the
   provisional `anon` row in `docs/architecture.md` re-measured under rule 2.
+
+## WHAT PHASE 8 MEASURED
+
+One unattended cold sweep, 2026-08-06 16:53 to 19:34, `bash
+scripts/phase8_decode_sweep.sh` at `c78122b`. Nine cold arms, all
+`measurement hygiene: PASS`, `--warmup 1 --repeats 3 --max-new 64`, inside
+`memory.max=3G` with `memory.swap.max=0`. **It is EXP-023. Quote EXP-023 and
+nothing in this section, which is a summary of it.** Raw material:
+`scratch/phase8/sweep-20260806-165322/SUMMARY.txt`,
+`scratch/cold-bench/p8-20260806-165322-*.json` (each run record now carries
+its `stderr`, so the splits survive the sidecar clobber) and
+`scratch/io-probe/p8-20260806-165322-decode-qd.{json,md}`.
+
+### What it closed
+
+- **The decode phase split exists as a curve against context**, at 64, 512,
+  1,024, 2,048 and 3,961 prompt tokens, which is what the "measure the split
+  on the workload you actually care about" item below was asking for. Expert
+  io is the largest single term at every rung on the first-scored-run reading,
+  and its share **falls** from 54.1% to 33.2% as context grows while
+  attention's **rises** from 1.5% to 31.6%. At 3,961 the two have crossed or
+  are crossing: the ordering flips between that rung's own scored runs, so read
+  the long end as "level", not as "expert io dominates". This replaces the
+  single 4K point from EXP-021 Note 9 that the section below warns against
+  choosing a lever from; it does not extend it, and the two must not be drawn
+  as one curve.
+- **The hit rate at the shipped 11 slots/layer is measured**, 53.0% to 59.3%
+  across the ladder with no trend in context, against a `docs/architecture.md`
+  that said it never had been and bracketed it 50.02-54.48%. The bracket is
+  superseded at 11 slots. Three of the five rungs land at or above its top and
+  none falls below its floor.
+- **The slot dial is measured at 12 and at 13.** One extra slot is worth about
+  2 points of hit rate: 54.0% at 11 slots, 56.1% at 12 and 57.9% at 13 at 512
+  tokens; 56.5% at 11 and 58.4% at 12 at 3,961.
+- **The memory contract's 12-slot prediction is corrected, in sign.** It
+  predicted 3,091.82 MiB and 19.8 MiB over the cap; measured at 3,961 prompt
+  tokens plus 64 generated it is **3,058.4 MiB, 13.6 MiB under**, hygiene
+  PASS, no OOM. The prediction overshoots by 33.4 MiB at 12 slots and 31.7 at
+  11, which is a constant error in the fixed-tenant sum rather than a slope
+  error; about 7 MiB of it is the lazily-faulted KV tail and roughly 27 MiB
+  points at the provisional 115.1 MiB anon row. **The shipped default stays 11
+  slots and `--cache-bytes` is unchanged.**
+- **The `T_BLOCK` debt is discharged.** Cold and paired against phase 7's own
+  binary: 1.44 to 1.46 tok/s at 3,961 (1.014x) and nothing distinguishable at
+  512, where the scored ranges overlap. Prefill unmoved, 0.999x and 0.996x.
+  EXP-022's warm 4-7% remains correct **about the kernel**; attention is 6.4%
+  of decode at 512 and 31.6% at 3,961, so 4-7% of those shares predicts
+  0.26-0.45% and 1.3-2.2%, and that is what was measured. The 512 medians are
+  **not** a regression and must not be quoted as one.
+- **The 512-token cold phase split was taken**, closing the carried item
+  below, along with four other rungs of prefill split.
+
+### What is now open, and what the honest next lever is
+
+Stated as findings, not as a plan. Nobody has decided any of this.
+
+- **The slot dial is the cheapest measured lever and it is one measurement
+  short of a decision.** One extra slot is worth **+4.7% decode at 512 and
+  +4.1% at 3,961**, and 12 slots/layer fits at full context with 13.6 MiB to
+  spare. Two things sit against acting on it. The 512 step's scored ranges
+  overlap (1.91-1.98 against 1.96-2.03), so only the 3,961 step separates at
+  three runs each. And **the 13-slot arm has no 4K run at all**: it is
+  measured only at 512 tokens, where it reads 2.06 tok/s and 2,862.3 MiB, so
+  there is no measurement that says whether it fits. A 13.6 MiB margin is also
+  thinner than EXP-018's unexplained 99-105 MiB residual and thinner than the
+  33.4 MiB prediction error just corrected.
+- **Per-file bandwidth spread at the single-blob size is 2.21x, and it is a
+  larger effect than anything else measured here.** At K=1, random, QD 8 the
+  four probed layer files read 1.568, 3.455, 1.654 and 3.469 GB/s, with
+  `layer_00` stuck at 1.59-1.60 across the entire queue-depth sweep while two
+  files plateau at 3.4-3.5. Decode's own effective rate **derives** to at most
+  2.16 GB/s (28.3 GiB against 14.05 s of `io wait` at 3,961), which sits
+  between the two groups, and its concurrency **derives** to 3.26-3.76 misses
+  per layer step, which is already on the plateau of the measured curve. So
+  **decode is not queue-starved; it is dragged by the slow files.** `filefrag`
+  reports byte-identical extent geometry for `layer_00` at 1.568 GB/s and
+  `layer_20` at 3.455 (398 extents, mean 984,027 B, median 884,736 B, zero
+  adjacent pairs on both), so fragmentation does not predict it, the obvious
+  explanation is eliminated, and no other has been tested. That probe is
+  `threaded-pread`, not io_uring, so it characterises the drive and the
+  filesystem and not the runtime's submission path.
+
+## WHAT PHASE 8 HAS FOUND
+
+Four findings that are load-bearing for choosing a lever and were written down
+nowhere else. Each carries its own label. None of them is a rule-2 number and
+none may be published; they come from committed sources and from the one
+surviving stderr sidecar, `scratch/cold-bench/run00.json.stderr`, which is
+`scratch/` and therefore gitignored, so the counts are quoted here rather
+than cited by path alone.
+
+### The decode split's `expert io` bucket is a residual, and it understates the drive
+
+**Derived from code structure, pinned by a measured coincidence.**
+`stage_expert_phases` (`crates/core/src/model/forward.rs:1569-1593`) runs
+`run_plan(.., stream.hits(), ..)` **before** `await_misses()` and charges it to
+`expert compute`; only the `await_misses()` block is charged to `expert io`.
+The miss reads were submitted by `begin_layer` and are in flight for the whole
+of that hit compute, which is the entire point of the two-phase shape. So the
+split's `expert io` is the **residual** wait after hit compute has already
+covered part of the read, not drive-busy time, and **EXP-021 Note 9's 42.0%
+decode figure understates how much of a token the drive is busy for**. The
+coincidence that pins the reading: on the same run the streamer counted
+**2.44 s** of io wait against the split's **2.45 s** `expert io` bucket, so the
+bucket is that block and nothing else. Anyone sizing an I/O lever off that
+42.0% is sizing it off a lower bound.
+
+### EXP-021 Note 9's decode split is a 7-token post-prefill transient, not steady state
+
+**Measured counts, derived interpretation.** Same sidecar, the session-2 4K
+run. Its decode split header reads `7 tokens in 5.85s`, and the arithmetic
+agrees: **2,688 expert requests / 384 per token** (48 layers x `top_k` 8) =
+**7 tokens**. Of its 1,634 misses, **1,390 are cold** (85%), and its hit rate
+is **39.2%** against EXP-013's measured 52.7% steady state. That is not a
+property of decode; it is the arena. The default `--prefill sweep` takes the
+slot pool as its arena and invalidates every layer's slot occupancy (see
+`docs/architecture.md`, "The prefill arena"), so decode starts with nothing
+resident and the first tokens pay for it. **A phase-8 lane must not choose a
+lever from that split**: seven tokens, at 4K context, with a cold cache, is the
+transient EXP-021 Note 11 says was never measured, and it is not the decode a
+user spends their time in.
+
+**Superseded by EXP-023 as a source of shares, and confirmed as a warning.**
+EXP-023 measures the decode split at five context rungs over 63 tokens each
+rather than 7, and its 4K rung reads expert io **33.2%** against attention
+**31.6%**, where the transient read 42.0% and 29.3%. So the transient does
+overstate expert io, as this finding predicted. What EXP-023 does **not** do
+is escape the arena effect: `--max-new 64` still starts from a sweep-emptied
+cache, so its curve is "the first 63 tokens after a prompt" and steady state
+at 256 tokens and beyond is still unmeasured. Its cold-miss counts show the
+same shape at a smaller scale, 2,650 to 3,149 cold misses per run.
+
+### Decode steady state reads roughly 500 MB per token
+
+**Derived from measured totals. Rule 3: it must not be put on a curve with
+figures from other entries.** Two EXP-021 session-1 phase-7 runs, same binary,
+same prompt, differing only in `--max-new`: at `--max-new 256` the process read
+**146,441,695,232 B**, at `--max-new 4` it read **20,716,994,560 B** (the same
+integer on all six of those runs). `--max-new N` costs `N - 1` `forward_token`
+decode calls, so the difference is **252** decode tokens and
+`125,724,700,672 / 252` = **498.9 MB per decode token**, over roughly the 520th
+to the 770th token of context. The phase-5 arm gives **502.3 MB** by the same
+subtraction (365,898,100,736 less 239,329,693,696, over the same 252), 0.7%
+away, which is the agreement to expect since phase 7 moved no I/O path
+(EXP-021 Note 7). At the installed mean
+blob stride of **2,856,960 B** (24 layers at 3,059,712 and 24 at 2,654,208,
+from `models/qwen3.rvmp/manifest.json`) that is about **175 misses of the 384
+requests** a token makes, so a hit rate near **54.5%**, consistent with
+EXP-013's measured 52.7% without being a re-measurement of it. The strength of
+the derivation is that the subtraction cancels model load and prefill entirely;
+its weakness is the uniform-stride assumption in the last step, which is why
+the hit rate is "near 54.5%" and the byte figure is the one to lean on.
+
+### The reference arm for phase 8 is phase 7's own binary
+
+**Verified, not assumed.** `scratch/phase7-ref/ramvamp` is sha256
+`d56dc034ebd3e94e83b59ad64503adf289baf22af112752593ec59068a586e66`, which is
+what EXP-021 records for the binary it measured. It is the same executable
+rather than a lookalike rebuild, so the phase-8 cold arms carry no toolchain or
+profile drift against phase 7. `scripts/phase8_decode_sweep.sh` checks that
+hash twice, against the `SHA256` file beside the binary and against a constant
+pinned independently at line 191, because a re-banked reference would agree
+with a regenerated sidecar and still be the wrong bytes.
 
 ## PROCESS
 
@@ -289,3 +508,60 @@ These are the ones earned this phase and worth the ink.
    tooling**. Miri is still worth running on anything that shards a buffer: on
    the pre-`65b0b3a` tree it rejected the decode fan-out three separate ways
    while every test passed.
+
+Two more earned in phase 8, both of them the same failure in different
+clothes: a check that reports success while checking nothing.
+
+9. **A bare test name with `-- --exact` matches nothing and still exits 0.**
+   `cargo test -p ramvamp-core <bare_name> -- --exact` prints
+   `running 0 tests` and then `test result: ok. 0 passed; 0 failed; ...; 471
+   filtered out`, and returns **exit status 0**. `--exact` compares against a
+   test's **full module path**, so a bare name matches nothing and libtest
+   calls an empty run a pass. It fooled two independent lanes in this phase,
+   each of whom read that `ok` as "my test passes". The full path is required:
+   `cargo test -p ramvamp-core
+   kernels::attention::tests::dispatch_lengths_cover_every_position_block_remainder
+   -- --exact` runs 1 and passes 1. Read the `N passed` count, never the word
+   `ok`. Verified both ways on this tree.
+10. **`scripts/phase7_overnight.sh:211` greps for a string that is never in
+    the file it greps.** It runs
+    `grep -a -A 9 'decode split' "$OUT/08-cold-decode-p7.log"`, but
+    `cold_bench.py` spools the child's stderr to a sidecar and never echoes it
+    to its own stdout, so the phase split that grep exists to surface has
+    **never appeared in that log**: `grep -c 'decode split'` on phase 7's own
+    `08-cold-decode-p7.log` returns 0. The split it was meant to surface lived
+    only in the clobbered `run0N.json.stderr` sidecar, which is how phase 7
+    came within one overwritten file of losing its single most useful finding.
+    `cold_bench.py` now keeps stderr in the `--json` summary so the data
+    survives, but the grep is still dead and should be pointed at the summary.
+    The general form: a harness check that greps for a string is worth only as
+    much as the last time someone watched it match, because a `grep` that finds
+    nothing is silent.
+
+One more earned in the cold sweep, and it is a coincidence rather than a bug.
+
+11. **`pgsteal 2817` has now been recorded twice, a session and a workload
+    apart, and nobody has explained it.** Recorded as unexplained and
+    reproducible-looking. **Not** a diagnosis, and **not** a claim that the two
+    events share a cause. What is measured: run 0 of
+    `scratch/cold-bench/p8-20260806-165322-decode-3961.json`, the 3,961 rung's
+    **discarded warmup**, is `hygiene: DIRTY` with `pgscan 2817` and `pgsteal
+    2817`, **all of it `pgsteal_kswapd`** with khugepaged, direct and proactive
+    at zero. That is genuine pressure under the `4b39104` rule, not the
+    bookkeeping that rule exists to excuse, and it earned a hard verdict. It
+    was the warmup, so it is discarded, the rung's three scored runs are CLEAN
+    and the arm is PASS; no number in EXP-023 rests on it. What is odd: EXP-014
+    records a discarded first attempt whose two DIRTY runs read `pgsteal`
+    **2,817 and 2,946** pages, and 2,817 is the same integer. **It is not the
+    same rung**, and saying so matters: EXP-014's prompt was five tokens ("The
+    capital of France is") on a different binary at a different commit, where
+    this is a 3,961-token prompt two days later. The two share a number and
+    nothing else. EXP-014 attributed its two to the operator opening a terminal
+    mid-run; this one has no such cause recorded, the sweep was unattended, and
+    its settle loop had just read `MemAvailable` at 11,101 MiB. EXP-021 Note 10
+    records that EXP-014's JSONs were overwritten, so its classification cannot
+    be rechecked and this cannot be chased backwards. The same figure twice is
+    not obviously random pressure, and what would turn it into a finding is a
+    third occurrence with its counters kept, which is the reason to keep them.
+    If you see it again: keep the JSON, and read `pgsteal_kswapd` rather than
+    the bare total.
