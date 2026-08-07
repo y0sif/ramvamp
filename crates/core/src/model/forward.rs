@@ -1023,9 +1023,12 @@ impl ForwardState {
     /// returning, i.e. the compute pool's barrier. Reading the two apart is the
     /// whole point: EXP-023 left ~248 ms of a 532 ms decode token in
     /// [`PrefillTiming::projections`] plus [`PrefillTiming::expert_compute`],
-    /// flat in context and ~7x off EXP-001's single-core kernel throughput, and
-    /// a `wait`-heavy split blames the even row partition on a hybrid part
-    /// while an `own`-heavy one blames the kernel or the memory system.
+    /// flat in context and far under the throughput a single AVX2 core sustains
+    /// on an L2-resident fixture — which phase 9 established is not a valid
+    /// reference for a site that streams its weights cold, see
+    /// [`GemvBucket`] — and a `wait`-heavy split blames the even row partition
+    /// on a hybrid part while an `own`-heavy one blames the kernel or the
+    /// memory system.
     ///
     /// `router` is **not** pooled — it is a serial `dot_f32` loop on the decode
     /// thread — so its `wait` is zero by construction, not measured.
@@ -1157,12 +1160,25 @@ enum GemvSite {
 /// ```
 ///
 /// and `own = t1 - t0`, `wait = t2 - t1`. EXP-023 left ~248 ms/token of GEMV
-/// unexplained at 8.04 GB/s aggregate against EXP-001's 9.61 GB/s on one warm
-/// core, and these two numbers separate the two candidate causes: a `wait` near
-/// zero says the kernel (or the memory system under it) is genuinely slow on
-/// this core, and a large `wait` says the even
+/// unexplained at 8.04 GB/s aggregate, and these two numbers separate the two
+/// candidate causes: a `wait` near zero says the kernel (or the memory system
+/// under it) is genuinely slow on this core, and a large `wait` says the even
 /// [`shard_range`](crate::threads::shard_range) row split is wrong for a hybrid
 /// 6 P + 8 E + 2 LP-E part and the stragglers are the cost.
+///
+/// # What that gap is *not* measured against
+///
+/// It used to be quoted against EXP-001's 9.61 GB/s on one warm core. That
+/// comparison is refuted: EXP-001 dots a matrix small enough to sit in L2,
+/// while decode reads every expert byte once from DRAM, so the two figures are
+/// not the same quantity and the shortfall between them was an artefact of
+/// pairing them. What phase 9 measured on the fused decode instead, warm at
+/// ctx 512 over three runs (pooled GEMV bucket medians): **11.00 GB/s
+/// aggregate**, and forcing a single shard moves that bucket from 11.42 s to
+/// 16.35 s — **six cores buy 1.43x**, not 6x. A dispatch-bound site would scale
+/// with cores; this one does not, so it is bound by the memory system, and the
+/// `own`/`wait` split below is read against that and not against a
+/// cache-resident kernel number.
 ///
 /// # What lands on which side
 ///
@@ -1990,11 +2006,22 @@ struct MoeScratch<'a> {
 /// two cheap `[moe_intermediate]` element-wise steps between them stay on the
 /// decode thread, one expert at a time, exactly as before.
 ///
-/// Phase 9 measured the decode fan-out at ~27 µs of submitter-side set-up
-/// against ~5 µs of per-worker arithmetic, with 64% of pooled GEMV time spent
-/// at the barrier and six cores buying 1.16x; the jobs were too small to pay
-/// for themselves. This is that arithmetic re-packed into fewer, larger jobs,
-/// and it moves no bit: see [`crate::kernels::gemv`]'s fused-row-space docs.
+/// Phase 9 measured the **pre-fusion** decode fan-out at ~27 µs of
+/// submitter-side set-up against ~32 µs of per-worker arithmetic, with 64% of
+/// pooled GEMV time at the barrier and six cores buying only 1.16x over one;
+/// the jobs were too small to pay for themselves. Both µs figures come off the
+/// same warm ctx-512 arms rather than off a stopwatch around one job: fusing
+/// moves no arithmetic, so the 16.35 s a forced single shard spends in the
+/// pooled GEMV bucket is the serial arithmetic, and over the pre-fusion count
+/// of 84,735 fan-outs that is 193 µs a fan-out, one sixth of which — this
+/// core's shard — is ~32 µs; the set-up is what is left of the submitter's own
+/// 5.04 s once that sixth is taken out, `(5.04 - 16.35 / 6) / 84,735`.
+///
+/// This is that arithmetic re-packed into fewer, larger jobs, and it moves no
+/// bit: see [`crate::kernels::gemv`]'s fused-row-space docs. Fused, the same
+/// arm has six cores buying **1.43x**, which is both what the re-packing bought
+/// and what says the site is now bound by the memory system rather than by
+/// dispatch (see [`GemvBucket`]).
 ///
 /// `window` is `(routed index, slot)` in **ascending routed index**, which is
 /// what makes the down job's staging spans ascending and provably disjoint.
@@ -2152,7 +2179,8 @@ fn run_plan(
     // which is what `pool_gemv_q8_k_fused_at` needs before it hands shards
     // raw sub-slices of `staged`. The scan is `top_k` finds over a plan of at
     // most `top_k` entries — 64 integer compares at the v0 pin, against the
-    // ~27 µs a fan-out costs to set up.
+    // ~27 µs of set-up phase 9 measured a fan-out to cost (`run_expert_window`
+    // carries that figure's derivation).
     let mut window = [(0usize, 0u32); MAX_FUSED_EXPERTS];
     let mut base = 0usize;
     while base < dims.top_k {
@@ -2429,7 +2457,8 @@ pub fn forward_token_traced<'s>(
         // `in_dim` 2048. Only the last shard's tail crosses the boundary
         // (4096 Q4_K rows then 512 Q6_K ones at the v0 pin), and one fan-out
         // whose slowest shard is ~30% long still beats two whose set-up costs
-        // ~27 µs each. Noted rather than fixed: a cost-weighted split is a
+        // ~27 µs each (phase 9's measurement; `run_expert_window` carries its
+        // derivation). Noted rather than fixed: a cost-weighted split is a
         // change to `shard_range`, which is not this seam.
         let opened = gemv.open();
         pool_gemv_q8_k_fused(
@@ -3744,6 +3773,171 @@ mod tests {
         }
     }
 
+    /// A window position and a routed index are two different numbers since
+    /// fusion, and the down job stages by the **routed index**.
+    ///
+    /// Before fusion there was no window position: the body ran one expert at a
+    /// time and `index` was the only number in scope, so
+    /// `scratch.staged[index * hidden..]` could not be confused with anything.
+    /// The fused down job carries a parts array, so a slot's position in it
+    /// (`j`, `0..n`) now exists alongside its routed index, and
+    /// `at[j] = index * dims.hidden` is the single line that keeps them apart.
+    ///
+    /// A **complete** plan cannot tell the two apart, which is why the
+    /// bit-identity test above does not.
+    /// [`run_plan`]'s window scan walks `index` ascending and packs its matches
+    /// densely, so when every routed index is present `j == index` identically
+    /// and `at[j] = j * dims.hidden` names the same spans. Swapping the routed
+    /// indices swaps which slot sits at each position and still leaves them
+    /// equal, so `at[j] = j * dims.hidden` survives every test that aims at
+    /// this invariant: measured, that mutation leaves the bit-identity test
+    /// above, the fan-out count test below and the two plan-validation tests
+    /// all green, and the only other test in the crate it fails is
+    /// `prefill::tests::wide_paths_leave_the_same_kv_cache` — which compares
+    /// two prefill paths end to end and so reports "the paths disagree", not
+    /// "the staging span is named by the wrong number".
+    ///
+    /// Decode's two phases are what make them differ: they partition the routed
+    /// set by whatever the cache happened to hold, so a phase whose hits are
+    /// `{1, 3}` runs a window with `j` in `{0, 1}` against `index` in `{1, 3}`.
+    /// Staging by `j` there would weight each expert's output with another
+    /// expert's router probability at the fixed-order reduction and leave the
+    /// routed slots it skipped holding the *previous* layer's bytes: wrong
+    /// logits, no panic, and [`pool_gemv_q8_k_fused_at`]'s disjointness check
+    /// satisfied either way, since `[0, hidden]` is as ascending and disjoint as
+    /// `[hidden, 3 * hidden]` is.
+    ///
+    /// So the plans here are deliberately **partial and non-prefix**: one
+    /// expert at routed index 1, then two at 1 and 3 of a top-4. The one-expert
+    /// case is also the only bit assertion on a **single-part** fused down job,
+    /// a geometry every phase with exactly one expert reaches —
+    /// `a_gapped_fused_fan_out_writes_only_its_own_spans` always fans out three
+    /// parts, and `an_expert_phase_is_two_fan_outs_however_many_experts_it_has`
+    /// runs a one-expert plan but only counts the jobs.
+    #[test]
+    fn a_partial_plan_stages_by_routed_index_and_not_by_window_position() {
+        let (_fx, model) = load_fixture("fwd-fused-partial");
+        let hidden = model.arch().hidden as usize;
+        let mut st = state(&model, 4);
+        plant_activations(&mut st, hidden);
+
+        // A `top_k` the state was not built for, which is the case
+        // `with_expert_scratch` takes the staging buffers from the caller for:
+        // the routed set has to be wide enough for a plan to skip indices, and
+        // the *window* scratch is unaffected because a window is at most as
+        // wide as the plan (one expert, then two).
+        let top_k = 4usize;
+        let dims = dims_with_top_k(&model, top_k);
+        let mut staged = vec![f32::NAN; top_k * hidden];
+        let mut done = vec![false; top_k];
+        let mut want_a = vec![f32::NAN; hidden];
+        let mut want_b = vec![f32::NAN; hidden];
+        let mut one = vec![f32::NAN; top_k * hidden];
+        let mut two = vec![f32::NAN; top_k * hidden];
+
+        with_expert_scratch(&mut st, &mut staged, &mut done, |stream, pool, scratch| {
+            stream.begin_layer(0, &[0, 1]).unwrap();
+            stream.await_misses().unwrap();
+            let mut resident: Vec<(usize, u32)> = stream.hits().to_vec();
+            resident.extend_from_slice(stream.misses());
+            resident.sort_unstable();
+            assert_eq!(resident.len(), 2, "the fixture routes two distinct experts");
+            let (slot_a, slot_b) = (resident[0].1, resident[1].1);
+            assert_ne!(slot_a, slot_b, "two experts, two slots");
+
+            let acts: Vec<BlockQ8K> = scratch.ffn.acts_hidden.to_vec();
+            expert_ffn_unfused(stream, pool, 0, dims, slot_a, &acts, &mut want_a);
+            expert_ffn_unfused(stream, pool, 0, dims, slot_b, &acts, &mut want_b);
+
+            // One expert routed at index 1: window position 0 against routed
+            // index 1, and a down job of exactly one part.
+            scratch.done.fill(false);
+            scratch.staged.fill(f32::NAN);
+            run_plan(
+                stream,
+                pool,
+                0,
+                dims,
+                &[(1, slot_a)],
+                scratch,
+                &mut GemvClock::disarmed(),
+            )
+            .unwrap();
+            assert_eq!(scratch.done, &[false, true, false, false]);
+            one.copy_from_slice(scratch.staged);
+
+            // Two experts routed at 1 and 3: window positions 0 and 1, which is
+            // the shape a phase takes whenever the cache holds some of a
+            // layer's experts and not others.
+            scratch.done.fill(false);
+            scratch.staged.fill(f32::NAN);
+            run_plan(
+                stream,
+                pool,
+                0,
+                dims,
+                &[(1, slot_a), (3, slot_b)],
+                scratch,
+                &mut GemvClock::disarmed(),
+            )
+            .unwrap();
+            assert_eq!(scratch.done, &[false, true, false, true]);
+            two.copy_from_slice(scratch.staged);
+
+            stream.end_layer(0);
+        });
+
+        // The fill is `NAN` and no expert output is one, so "nothing was
+        // written here" and "the wrong expert was written here" cannot be
+        // mistaken for each other.
+        assert!(
+            want_a.iter().chain(&want_b).all(|v| v.is_finite()),
+            "a reference is not finite"
+        );
+        // And the two experts really do stage different vectors, or every
+        // slot-pairing assertion below would hold for the wrong reason.
+        assert!(
+            want_a
+                .iter()
+                .zip(&want_b)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "the fixture's two experts stage the same vector"
+        );
+
+        let slot = |buf: &[f32], i: usize| -> Vec<u32> {
+            buf[i * hidden..(i + 1) * hidden]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        let untouched =
+            |buf: &[f32], i: usize| buf[i * hidden..(i + 1) * hidden].iter().all(|v| v.is_nan());
+
+        // Staged by routed index, the lone expert lands in slot 1. Staged by
+        // window position it would land in slot 0.
+        assert_eq!(
+            slot(&one, 1),
+            slot(&want_a, 0),
+            "a single-part down job staged the wrong slot, or staged it wrong"
+        );
+        for i in [0usize, 2, 3] {
+            assert!(
+                untouched(&one, i),
+                "a plan covering routed index 1 alone wrote staging slot {i}"
+            );
+        }
+
+        // Two experts, two gaps: positions 0 and 1 against indices 1 and 3.
+        assert_eq!(slot(&two, 1), slot(&want_a, 0), "routed index 1");
+        assert_eq!(slot(&two, 3), slot(&want_b, 0), "routed index 3");
+        for i in [0usize, 2] {
+            assert!(
+                untouched(&two, i),
+                "a plan covering routed indices 1 and 3 wrote staging slot {i}"
+            );
+        }
+    }
+
     /// The count the coarse-versus-fine test can no longer pin exactly: an
     /// expert phase is **two** fan-outs — one gate/up job and one down job —
     /// however many experts its plan holds, and an empty plan is none.
@@ -3959,12 +4153,20 @@ mod tests {
             2 * layers * tokens,
             4 * layers * tokens,
         );
-        // The fusion is the point: whatever the cache did, the old
-        // per-expert form would have charged this many.
+        // The fusion is the point, and the bound above is evidence of it only
+        // while the fixture routes enough experts for the pre-fusion form to
+        // have charged more than that bound allows. `3 * top_k` a layer against
+        // a fused at-most-`4` a layer means a `top_k` of 1 makes the two
+        // coincide and the assertion above prove nothing about fusion at all.
+        // So the fixture's own power is what is asserted here; the regression
+        // it would otherwise catch — a return to a fan-out per projection per
+        // expert — already breaks the upper bound above, which is strictly
+        // tighter for every `top_k` this can pass at.
         assert!(
-            experts < 3 * top_k * layers * tokens,
-            "the expert phase is still fanning out per projection per expert: \
-             {split:?}"
+            3 * top_k > 4,
+            "the fixture routes {top_k} expert(s), so the pre-fusion per-expert \
+             form would have charged no more than the fused bound above: that \
+             bound is no longer evidence that anything is fused"
         );
         assert_eq!(
             gemv_scatters(&split, "lm_head"),

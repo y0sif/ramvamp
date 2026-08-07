@@ -1403,12 +1403,19 @@ fn decode_timing_lines(timing: &PrefillTiming) -> Vec<String> {
 ///
 /// EXP-023 put 248 ms of a 532 ms decode token in `expert compute` plus
 /// `projections` and found it flat in context — 8.04 GB/s of weight bytes
-/// across six shards against EXP-001's 9.61 GB/s on one warm core. This block
-/// splits every fan-out on the decode thread into the part that core computed
-/// itself (`own`: job set-up, the publish, and its `1/shards` of the rows) and
-/// the part it spent at the compute pool's barrier (`wait`). An `own`-heavy
-/// split points at the kernel or the memory system under it; a `wait`-heavy one
-/// points at the even row partition on a hybrid part.
+/// across six shards. That used to be quoted against EXP-001's 9.61 GB/s on one
+/// warm core; it is not any more, because EXP-001 dots an L2-resident matrix
+/// while decode reads every expert byte once from DRAM, so the shortfall
+/// between the two was an artefact of pairing them. Phase 9 measured the fused
+/// decode at 11.00 GB/s aggregate with six cores buying 1.43x over one (a
+/// forced single shard puts the pooled GEMV bucket at 16.35 s against 11.42 s),
+/// which says the site is bound by the memory system rather than by dispatch.
+///
+/// This block splits every fan-out on the decode thread into the part that core
+/// computed itself (`own`: job set-up, the publish, and its `1/shards` of the
+/// rows) and the part it spent at the compute pool's barrier (`wait`). An
+/// `own`-heavy split points at the kernel or the memory system under it; a
+/// `wait`-heavy one points at the even row partition on a hybrid part.
 ///
 /// **This is a second block, not a replacement.** The `decode split
 /// (forward_token)` heading above keeps EXP-023's exact five buckets and exact
@@ -1440,8 +1447,12 @@ fn decode_gemv_lines(
         timing.tokens
     )];
     for &(label, own, wait, scatters) in split {
-        // Wall time per fan-out on the decode thread, which is what makes a
-        // bucket comparable against the kernel's own throughput.
+        // Wall time per fan-out on the decode thread. The unit is spelled out
+        // in the line because a fan-out is not a fixed amount of work: since
+        // phase 9 an `experts` fan-out covers a whole phase's routed experts
+        // rather than one matrix, so this column's denominator changed meaning
+        // even where the numerator did not, and an unlabelled `ms` invites a
+        // pre/post comparison that is a unit error.
         let each = if scatters > 0 {
             (own + wait).as_secs_f64() / scatters as f64 * 1000.0
         } else {
@@ -1449,13 +1460,19 @@ fn decode_gemv_lines(
         };
         lines.push(format!(
             "  {label:>14}: own {:7.2}s ({:5.1}%) | wait {:7.2}s ({:5.1}%); \
-             {scatters:>7} scatters at {each:.3} ms",
+             {scatters:>7} fan-outs at {each:.3} ms/fan-out",
             own.as_secs_f64(),
             share(own),
             wait.as_secs_f64(),
             share(wait),
         ));
     }
+    lines.push(
+        "  a fan-out is one pooled job, not one matrix: an experts fan-out is a \
+         whole phase's routed experts, so ms/fan-out is not comparable across \
+         that change"
+            .to_string(),
+    );
     lines.push(
         "  router is serial on the decode thread: its wait is zero by construction, \
          not measured"
@@ -3857,8 +3874,8 @@ mod tests {
         let lines = decode_gemv_lines(&timing, &split);
         assert_eq!(
             lines.len(),
-            6,
-            "a heading, four buckets and a note: {lines:?}"
+            7,
+            "a heading, four buckets and two notes: {lines:?}"
         );
         assert_eq!(
             lines[0],
@@ -3874,24 +3891,33 @@ mod tests {
         }
 
         // 1.8s + 0.7s over 12,288 fan-outs is 0.203 ms each, and the shares are
-        // against the same 30s the block above uses.
+        // against the same 30s the block above uses. The per-fan-out column
+        // names its unit on the line: since phase 9 an `experts` fan-out is a
+        // whole phase's experts rather than one matrix, so a bare `ms` would
+        // read as comparable across that change when it is not.
         assert_eq!(
             lines[1],
             "     projections: own    1.80s (  6.0%) | wait    0.70s (  2.3%);   \
-             12288 scatters at 0.203 ms"
+             12288 fan-outs at 0.203 ms/fan-out"
         );
         assert_eq!(
             lines[3],
             "         lm_head: own    0.20s (  0.7%) | wait    0.05s (  0.2%);      \
-             64 scatters at 3.906 ms"
+             64 fan-outs at 3.906 ms/fan-out"
         );
         assert_eq!(
             lines[4],
             "          router: own    0.40s (  1.3%) | wait    0.00s (  0.0%);    \
-             3072 scatters at 0.130 ms"
+             3072 fan-outs at 0.130 ms/fan-out"
         );
         assert_eq!(
             lines[5],
+            "  a fan-out is one pooled job, not one matrix: an experts fan-out is \
+             a whole phase's routed experts, so ms/fan-out is not comparable \
+             across that change"
+        );
+        assert_eq!(
+            lines[6],
             "  router is serial on the decode thread: its wait is zero by \
              construction, not measured"
         );
@@ -3907,7 +3933,7 @@ mod tests {
             ("lm_head", Duration::ZERO, Duration::ZERO, 0),
             ("router", Duration::ZERO, Duration::ZERO, 0),
         ];
-        assert!(decode_gemv_lines(&timing, &idle)[1].ends_with("0 scatters at 0.000 ms"));
+        assert!(decode_gemv_lines(&timing, &idle)[1].ends_with("0 fan-outs at 0.000 ms/fan-out"));
     }
 
     /// Swept prefill resolves no cache accesses at all, so the old

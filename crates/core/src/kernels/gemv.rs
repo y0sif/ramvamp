@@ -88,9 +88,16 @@
 //!
 //! Decode wants this because its jobs are too small to pay for themselves: a
 //! layer runs gate, up and down as a separate fan-out per routed expert, and
-//! phase 9 measured ~27 µs of submitter-side set-up against ~5 µs of
-//! per-worker arithmetic per fan-out (`docs/experiments/README.md`). Nothing
-//! in the row-range argument above says a fan-out may cover only *one*
+//! phase 9 measured ~27 µs of submitter-side set-up against ~32 µs of
+//! per-worker arithmetic on each of those pre-fusion fan-outs. Both figures
+//! are derived from the same warm ctx-512 arms — 16.35 s of serial GEMV
+//! arithmetic over 84,735 fan-outs is 193 µs a fan-out, of which one core
+//! computes a sixth, and the set-up is the remainder of the submitter's own
+//! 5.04 s, `(5.04 - 16.35 / 6) / 84,735`. `model::forward`'s
+//! `run_expert_window` is the caller those arms were measured on and repeats
+//! the derivation next to the code it justifies.
+//!
+//! Nothing in the row-range argument above says a fan-out may cover only *one*
 //! matrix, so the fix is to give one job more rows rather than to make the
 //! job cheaper.
 //!
