@@ -26,14 +26,19 @@ user's decision), inside a cgroup with `memory.max=3G`
 and `memory.swap.max=0` (zram counts as swap), cold page cache,
 KL-divergence vs llama.cpp within accepted tolerance on identical weights.
 
-What decode actually does on the reference drive is **MEASURED cold** as of
-EXP-023 and is below that floor: **1.46 to 2.19 tok/s** across five context
-rungs at the shipped 11 slots/layer (2.19 / 1.91 / 1.82 / 1.75 / 1.46 at 64 /
-512 / 1,024 / 2,048 / 3,961 prompt tokens, medians of three scored runs,
-`--max-new 64`). The earlier "~2.8-3.4 tok/s derived I/O-only ceiling" that
-stood here is **withdrawn**; "Performance model" records why, and no
-replacement headline band is offered, because an I/O-only ceiling both
-overstates what is reachable and is not what the floor is written against.
+What decode actually does on the reference drive is **MEASURED cold** and is
+below that floor: **1.46 to 2.19 tok/s** across five context rungs at the
+shipped 11 slots/layer (2.19 / 1.91 / 1.82 / 1.75 / 1.46 at 64 / 512 / 1,024 /
+2,048 / 3,961 prompt tokens, medians of three scored runs, `--max-new 64`,
+EXP-023), and **1.43 to 2.16 tok/s** over the same five rungs on phase 9's
+fused branch in a later session (2.16 / 1.87 / 1.74 / 1.65 / 1.43, EXP-025).
+Those are **two sessions and not one curve**: EXP-025 re-ran EXP-023's
+byte-identical binary on the same prompts and read it 3.1% slower at 512 and
+8.9% slower at 3,961, so a decode tok/s here describes a session as well as a
+device. The earlier "~2.8-3.4 tok/s derived I/O-only ceiling" that stood here
+is **withdrawn**; "Performance model" records why, and no replacement headline
+band is offered, because an I/O-only ceiling both overstates what is reachable
+and is not what the floor is written against.
 
 Reference hardware: Intel Core Ultra 9 185H (6P + 8E + 2 LP-E, AVX2, no
 AVX-512), 16 GB LPDDR5X-7467, **Micron 2400 DRAM-less QLC** NVMe
@@ -609,27 +614,77 @@ staged reduction keeps the result bit-exact regardless of the order experts
 are actually computed in, so the coarse shape costs nothing in determinism and
 buys back the scheduling.
 
+**Compute and I/O trade against each other through this overlap, and that is a
+property of the shape rather than an accident.** Step 4's hit compute is the
+only work hiding step 5's outstanding reads, and the `expert io` bucket
+measures the part of those reads that hit compute did not cover — it is a
+residual, not the drive's busy time (EXP-023 Note 4). So **making the hit
+compute faster does not buy its full saving: it leaves less to hide behind, and
+some of the same read latency becomes visible instead.** MEASURED cold and
+paired at ctx 512 (EXP-025): the fused fan-out handed back 3.32 s of GEMV over
+63 tokens and `expert io` took 1.85 s of it straight back, on **identical**
+request, hit, miss and byte counts in both arms — the drive did exactly the
+same work. That is why a compute win of this size reached the token at 3,961
+tokens of context and did not reach it at 512, and it is why the next lever at
+mid context is overlap rather than more compute. It also bounds every future
+compute change on this path: **price a GEMV saving net of the exposed io it
+uncovers, never gross.**
+
 Sampler defaults come from the checkpoint's generation_config (temp 0.7,
 top_p 0.8, top_k 20); greedy override for validation.
 
 ### How decode's GEMVs fan out, and what phase 9 refuted about them
 
-**Every number in this subsection is MEASURED WARM** — ctx 512, 63 decode
-tokens, three runs per arm, medians with ranges, pooled GEMV bucket =
-`projections + experts + lm_head` (the router is serial and excluded). Warm
-numbers are diagnostics under rule 2 and **none of them may be published as a
-result**. Artifacts: `scratch/phase9/wave0-baseline/*.err` and
-`scratch/phase9/wave1-measure/rep/*.err`. **The cold rule-2 pairing has not
-been run** — the harness is committed at `scripts/phase9_decode_sweep.sh` and
-has only been executed under `--dry-run` — and **EXP-025 is reserved for it**.
+**This subsection carries two kinds of number and they must not be mixed.**
+The *cold* figures are MEASURED cold, in-cgroup, hygiene PASS, paired against
+the phase-8 reference binary in one session (EXP-025); they are results. The
+*warm* figures are MEASURED WARM — ctx 512, 63 decode tokens, three runs per
+arm, medians with ranges, pooled GEMV bucket = `projections + experts +
+lm_head`, the router serial and excluded — and under rule 2 they stay
+**diagnostics**. Artifacts: cold in
+`scratch/phase9/sweep-20260807-203558/` and
+`scratch/cold-bench/p9-20260807-203558-*.json`; warm in
+`scratch/phase9/wave0-baseline/*.err` and
+`scratch/phase9/wave1-measure/rep/*.err`.
 
 Step 4-5's expert work fans out **once per expert phase, not once per matrix**
 (`70cf304`). A phase's routed experts issue one job for every gate and up
 together and one for every down; `attn_q` joins `attn_v` the same way. A layer
 went from 28 fan-outs to five when its plan is all hits or all misses and seven
-when it splits, and a token from 1,345 to between 241 and 337. Fusion stays
-strictly inside one `run_plan` call: crossing the hit/miss boundary would make
-a resident expert's arithmetic wait on a missing expert's read.
+when it splits, and a token from 1,345 to between 241 and 337 — MEASURED cold
+at **332.8 fan-outs a token at ctx 512 and 331.3 at 3,961**, inside that range,
+against the pre-fusion 1,345 (DERIVED: 48 layers x 28 plus one `lm_head`).
+Fusion stays strictly inside one `run_plan` call: crossing the hit/miss
+boundary would make a resident expert's arithmetic wait on a missing expert's
+read.
+
+**Cold, and this is the result (EXP-025).** Decode's phase-split GEMV bucket,
+`expert compute + projections`, medians of 3 scored runs with their scored
+ranges, fused branch against the byte-identical phase-8 reference binary run
+back to back in the same session at 11 slots/layer:
+
+| rung | phase-8 reference | fused fan-out | ratio | ranges |
+| ---: | ---: | ---: | ---: | --- |
+| ctx 512 | 16.25 s (15.68-16.39) | **12.93 s** (12.49-13.96) | **1.257x** | disjoint |
+| ctx 3,961 | 15.39 s (14.71-15.72) | **13.29 s** (13.18-13.31) | **1.158x** | disjoint |
+
+The gain is carried by `expert compute` (1.347x at 512, 1.256x at 3,961,
+disjoint ranges at both). **The `projections` bucket, where the `attn_q` +
+`attn_v` merge lands, does not separate at either rung** (1.134x and 1.025x,
+ranges overlapping), so that half of `70cf304` is measured and unattributed.
+Prefill's own GEMV is unmoved — 0.997x at 512 and 0.991x at 3,961, ranges
+overlapping — which is the control that says the change is decode-only.
+
+**What that is worth on a token is a separate question and the answer depends
+on context.** End to end, cold and paired: **1.011x at ctx 512 with the two
+scored ranges overlapping heavily, which is not a result**, and **1.070x at ctx
+3,961 with disjoint ranges** (reference 47.57-48.76 s of `decode_s` against
+44.47-46.59). EXP-025 Note 1 records that even the 3,961 separation cannot be
+attributed cleanly: the unchanged `attention` bucket moved 1.16-1.18x the same
+way at both rungs, and subtracting it run by run leaves 1.025x. **Quote the
+range 1.025x-1.070x, not the top of it.**
+
+**Warm, and these stay diagnostics.** Same 512 workload, pooled GEMV bucket:
 
 | arm (warm, ctx 512) | pooled GEMV bucket, median | scored range |
 | --- | ---: | --- |
@@ -638,13 +693,16 @@ a resident expert's arithmetic wait on a missing expert's read.
 | **fused fan-out** | **11.42 s** | 11.36-11.48 |
 | fused + adaptive spin | 11.38 s | 11.34-11.51 |
 
-Fusion is worth **1.264x on the pooled GEMV bucket** (14.44 / 11.42, DERIVED
-from the medians above; the two ranges do not overlap). What that is worth on
-a token is **not** in this table and is not derivable from it — the bucket is a
-span inside decode's `projections` and `expert compute` phases, not the token —
-and the paired cold answer is EXP-025's to give.
+Warm fusion is worth **1.264x on the pooled GEMV bucket** (14.44 / 11.42,
+DERIVED from the medians above; the two ranges do not overlap). The cold
+1.257x and this 1.264x are close, **and they are not the same bucket**: the
+pooled GEMV bucket is a set of disjoint spans strictly inside the phase split's
+`projections` and `expert compute`, and the cold pairing could not use it at
+all because the phase-8 reference binary predates that instrument and emits no
+`decode gemv split` block. Two nested measures of the same work agreeing is
+corroboration, not one number measured twice (EXP-025 Note 7).
 
-Four things this refutes, and they matter more than the 1.264x:
+Four things the warm arms refute, and they matter more than the 1.264x:
 
 - **EXP-001's 9.61 GB/s (the `q4_k x q8_k` 2048x2048 row of its table) is not
   a valid reference for decode, and three code comments that used it have been
@@ -690,7 +748,14 @@ Four things this refutes, and they matter more than the 1.264x:
 
 Reported and not fixed: `attn_q` plus `attn_v` is 4,096 q4_k rows then 512 q6_k
 rows, so an even row split leaves the last shard about 30% long. A
-cost-weighted split belongs in `shard_range`.
+cost-weighted split belongs in `shard_range`. **The cold pairing does not
+settle whether that half of the change is worth keeping**: it removes 48
+fan-outs a token, one per layer, out of the roughly 1,012 `70cf304` removes
+(MEASURED cold: the `projections` bucket reports 9,072 fan-outs over 63 tokens,
+144 a token, 3 a layer where the pre-fusion path issued 4), and the bucket it
+lands in does not separate at either measured rung. Settling it needs an arm
+with that half reverted and the expert-phase half kept, which EXP-025 does not
+run.
 
 ## Prefill (sequential sweep, our improvement over TF)
 
@@ -1399,13 +1464,30 @@ withdrawn.
   | expert io share of a token | **54.1% at ctx 64 falling to 33.2% at 3,961** | a **lower** bound on drive-busy time, for the same residual reason |
 
   So the honest statement is: **decode measures 1.46-2.19 tok/s cold on this
-  drive at the shipped dial**, expert I/O is the largest single term below
-  2,048 tokens of context and is level with attention at 3,961, and **no I/O-only
-  ceiling is offered**, because the only one this document knows how to compute
-  overstates. The bandwidth inputs remain rule-2 clean but come through a
-  threaded-`preadv` queue rather than io_uring (EXP-019, EXP-023 Note 10,
-  EXP-024), so they characterise the drive and not the runtime's submission
-  path. The 1,097 MB/token is still exact arithmetic.
+  drive at the shipped dial in the session EXP-023 measured**, expert I/O is
+  the largest single term below 2,048 tokens of context and is level with
+  attention at 3,961, and **no I/O-only ceiling is offered**, because the only
+  one this document knows how to compute overstates. The bandwidth inputs
+  remain rule-2 clean but come through a threaded-`preadv` queue rather than
+  io_uring (EXP-019, EXP-023 Note 10, EXP-024), so they characterise the drive
+  and not the runtime's submission path. The 1,097 MB/token is still exact
+  arithmetic.
+
+  **"in the session EXP-023 measured" is load-bearing, and EXP-025 is why.**
+  EXP-025 re-ran the **byte-identical** EXP-023 binary
+  (sha256 `d36036b6...`) on the **same two prompt files** at the same dial a
+  day later and measured **1.85 tok/s at ctx 512 against EXP-023's 1.91
+  (0.969x) and 1.33 at ctx 3,961 against 1.46 (0.911x)**, MEASURED cold,
+  hygiene PASS on both arms. Same bytes, same workload, 3.1% and 8.9% apart.
+  **So 1.46-2.19 tok/s is a fact about one session and not a property of this
+  build on this drive**, and no entry, doc line or README may quote a decode
+  tok/s from one session against a decode tok/s from another. Per rule 3 that
+  is a statement about the two sessions rather than about either binary; the
+  most likely cause is the drive behaviour EXP-024 characterises as not
+  reproducible across sessions, and EXP-025 Note 5 records that as a hypothesis
+  it did not test. For the record and **not** as a second point on EXP-023's
+  curve, the fused branch measured **2.16 / 1.87 / 1.74 / 1.65 / 1.43 tok/s**
+  over the same five rungs in the EXP-025 session.
 
   The retired band's width was per-file bandwidth variance rather than
   measurement noise, which is one more reason not to resurrect it: the width
@@ -1475,10 +1557,23 @@ withdrawn.
   across that ladder is attention, not the GEMVs. The old phase-4 figures
   (EXP-004's ~2 s/token warm single-threaded, EXP-005's simulated 690 ms) are
   superseded and must not be quoted against these.
+- **The fused decode fan-out is measured cold, and the compute win reaches the
+  token only at long context.** MEASURED cold, in-cgroup, hygiene PASS, paired
+  back to back against the byte-identical phase-8 binary in one session, three
+  scored runs an arm, 11 slots/layer asserted on every arm (EXP-025). On the
+  bucket the change targets, decode's `expert compute + projections`:
+  **1.257x at ctx 512** (16.25 s, range 15.68-16.39, against 12.93 s, range
+  12.49-13.96) and **1.158x at ctx 3,961** (15.39 s, 14.71-15.72, against
+  13.29 s, 13.18-13.31), **disjoint ranges at both**. End to end: **1.011x at
+  512 with ranges overlapping heavily, which is not a result**, and **1.070x at
+  3,961 with disjoint ranges** — of which EXP-025 Note 1 attributes only
+  1.025x-1.070x to the change, because the unchanged `attention` bucket moved
+  1.16-1.18x the same way at both rungs. **Nothing is merged**; the branch stays
+  unmerged and no dial moved.
 - **The compute half is memory-bound, not dispatch-bound, and three of the
   figures previously used to reason about it are refuted.** MEASURED **warm**
-  at ctx 512, so diagnostics rather than results, and the cold rule-2 pairing
-  (EXP-025) has not been run:
+  at ctx 512, so diagnostics rather than results; the cold pairing above
+  corroborates the first of them and touches none of the other three:
   - **EXP-001's 9.61 GB/s is an L2-resident fixture and is not a valid
     reference for decode**, which streams every expert byte once from DRAM.
     Three code comments cited it and have been fixed.
@@ -1492,7 +1587,8 @@ withdrawn.
     expert scatters 6.14x and expert barrier wait 1.47x.
 
   See "How decode's GEMVs fan out, and what phase 9 refuted about them" under
-  "Decode loop" for the arms, ranges and artifacts.
+  "Decode loop" for the arms, ranges and artifacts, cold and warm, and for why
+  the warm 1.264x and the cold 1.257x are not the same bucket.
 - **Floor for success: OPEN, and it is now measured against rather than
   derived against.** The criterion is written as 3 tok/s. Every derived
   I/O-only ceiling this document has carried against it — EXP-008's 2.2-2.7,
@@ -1500,10 +1596,16 @@ withdrawn.
   table above, of which the load-bearing one is that inverting the `expert io`
   residual overstates. What exists instead is the measurement: **1.46 to 2.19
   tok/s, MEASURED cold at the shipped 11-slot dial across five context rungs
-  at `--max-new 64`** (EXP-023). **3 tok/s is not met at any measured rung**,
-  and the gap at ctx 512 is 1.57x. Nothing here says it is unreachable — the
-  ceiling that once said so is withdrawn too, and phase 9's fused fan-out has
-  not been measured cold — but nothing derived may be offered in place of the
+  at `--max-new 64`** (EXP-023), and **1.43 to 2.16 tok/s on the same five
+  rungs on the fused branch in a different session** (EXP-025). Those are two
+  sessions and rule 3 forbids one curve through them; the same binary moved
+  0.969x and 0.911x between them (above), so **the floor must be judged against
+  a range of sessions rather than one ladder**. **3 tok/s is not met at any
+  measured rung of either**, and the gap at ctx 512 is 1.57x on EXP-023's
+  ladder and 1.60x on EXP-025's. Nothing here says it is unreachable — the
+  ceiling that once said so is withdrawn too, and phase 9's fused fan-out is
+  now measured cold and is worth 1.011x at 512 and 1.070x at 3,961, which does
+  not close a 1.6x gap — but nothing derived may be offered in place of the
   number. The decision remains the user's rather than a silent edit, and the
   three options are unchanged: keep 3, restate the floor per-drive, or lower
   it. Recorded here as unresolved.
@@ -1660,13 +1762,17 @@ are neither now, and they should not come back without new evidence.
   decode, the 4K `memory.peak` run and the numerics gate all exist. Kept here
   only so the trail from EXP-020's warm numbers to EXP-021's cold ones is
   legible (EXP-020, EXP-021)
-- **The cold rule-2 measurement of phase 9's fused decode fan-out.** Phase 9's
-  numbers are warm and are diagnostics; the harness for the cold pass is
-  committed at `scripts/phase9_decode_sweep.sh`, pairs the branch against the
-  phase-8 reference binary at ctx 512 and 3,961, and **EXP-025 is reserved for
-  it**. It has been run under `--dry-run` only
-  (`scratch/phase9/sweep-20260807-173501/exitcodes.tsv` is `DRY` on every
-  row). Until it exists, phase 9's compute work has published nothing
+- ~~**The cold rule-2 measurement of phase 9's fused decode fan-out**~~:
+  **done, EXP-025.** The reservation is discharged — seven cold arms, hygiene
+  PASS on all of them, the branch paired back to back against the
+  byte-identical phase-8 binary at ctx 512 and 3,961, the dial asserted at 11
+  slots on every arm. Kept here so the trail from the warm 1.264x to the cold
+  1.257x is legible. **Two follow-ups it opened and did not take**: an arm that
+  isolates the `attn_q` + `attn_v` half (its bucket does not separate at either
+  rung, EXP-025 Note 3), and a control that separates the 1.16-1.18x movement in
+  the *unchanged* attention bucket into session drift or a second-order effect
+  of fusion on pool-worker parking (EXP-025 Note 1). The second is the one that
+  bounds how much of the 3,961 result the change may claim (EXP-023, EXP-025)
 - **Softmax, and unfreezing `primitives`.** `primitives::softmax` is 23.5% of
   the attention kernel at 4096 positions (1,059 µs of 4,499 µs, measured,
   EXP-020) and `primitives` is frozen. Leaving it frozen caps every other
@@ -1705,8 +1811,13 @@ are neither now, and they should not come back without new evidence.
   `projections` and `expert compute` phases into `own` and barrier `wait`
   across projections / experts / lm_head / router; see "Instrumentation" for
   what changed about the counts column and why the router's `wait` is zero by
-  construction. **That second block has been read warm only**, and its cold
-  pairing is EXP-025
+  construction. **That second block has now been read cold too** (EXP-025), but
+  it **cannot be paired**: the phase-8 reference binary predates it and emits
+  no such block, so every cold ratio in EXP-025 is taken on the first block's
+  phase split instead. The second block's cold readings are single-arm
+  characterisation — 332.8 pooled fan-outs a token at ctx 512 and 331.3 at
+  3,961, and an 11.58 s pooled GEMV bucket at 512 (12.61 / 11.14 / 11.58)
+  against 11.42 s warm
 
 Dropped from the backlog:
 

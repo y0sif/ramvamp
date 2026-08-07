@@ -61,15 +61,7 @@ which is the reason their claims are credible.
 - [EXP-022: T_BLOCK 4 to 8 with a stepped position tail, measured warm](#exp-022-t_block-4-to-8-with-a-stepped-position-tail-measured-warm) — KEEP
 - [EXP-023: The cold decode sweep: the phase split against context, the 11-slot hit rate, the slot dial and T_BLOCK](#exp-023-the-cold-decode-sweep-the-phase-split-against-context-the-11-slot-hit-rate-the-slot-dial-and-t_block) — KEEP
 - [EXP-024: The per-file read spread does not reproduce, and it is not filesystem placement](#exp-024-the-per-file-read-spread-does-not-reproduce-and-it-is-not-filesystem-placement) — NEUTRAL
-
-**EXP-025 is reserved for the cold rule-2 measurement of phase 9's fused
-decode fan-out**, paired against the phase-8 reference binary at ctx 512 and
-3,961. The harness is committed (`scripts/phase9_decode_sweep.sh`, stamped
-`scratch/phase9/sweep-20260807-173501/`) and **has only been run under
-`--dry-run`**: every row of that directory's `exitcodes.tsv` reads `DRY`. The
-fusion's warm numbers are diagnostics and appear in `docs/architecture.md`
-labelled as such; they are not published here and the number must not be
-reused for anything else.
+- [EXP-025: The fused decode fan-out paired cold: the GEMV bucket gains, and the token gains only at 4K](#exp-025-the-fused-decode-fan-out-paired-cold-the-gemv-bucket-gains-and-the-token-gains-only-at-4k) — KEEP
 
 Entries EXP-007 through EXP-013 were measured on a machine that was not
 quiet, and most are microbenchmarks rather than end-to-end runs. Under rule 2
@@ -3522,3 +3514,481 @@ they are, as the record of what was believed when phase 5 was designed.
      nothing here re-measures decode: EXP-023's derived 2.16 GB/s effective
      decode rate is untouched by this entry and is still an upper bound for the
      reason EXP-023 Note 4 gives.
+
+## EXP-025: The fused decode fan-out paired cold: the GEMV bucket gains, and the token gains only at 4K
+
+- Date / commit: 2026-08-07 / `0d0cfc9` (`feat/decode-compute`). The change
+  under test is `70cf304`, "fan out once per expert phase, not once per
+  matrix". Branch arm: `target/release/ramvamp` sha256
+  `74822112a1d5967a1c318ffbcecc6002c1d9ec4b3842014ed8b0cfbc1cedf008`, built by
+  the sweep itself and asserted newer than every tracked source under
+  `crates/` (binary mtime 2026-08-07 17:16:07 against the newest tracked
+  source, `crates/core/src/model/forward.rs` at 17:12:49). Reference arm:
+  `scratch/phase8-ref/ramvamp`, sha256
+  `d36036b6485b00e741b7448e8d963e8a0916eb0aeb36b69c48c89ea857eb8b4c`, commit
+  `8e1eee8`, checked against its own banked `SHA256` sidecar and against a
+  constant pinned in the sweep script, and exempt from the freshness assertion
+  by design because it is meant to be older than the tracked sources. **Those
+  are the same bytes EXP-023 published**: EXP-023 records that identical
+  sha256 for its own branch arm, and the runtime did not change between
+  `c78122b` and the `8e1eee8` merge. Result 5 is what that identity buys and
+  Note 5 is what it costs.
+- Hypothesis: `70cf304` is a performance change and owes this log a baseline,
+  a result and a verdict. All it has is warm: **1.264x on the pooled GEMV
+  bucket at ctx 512**, which `docs/architecture.md` carries as a diagnostic
+  and which rule 2 forbids publishing. Two questions, and they are not the
+  same question. (1) Does the compute win survive cold, in-cgroup, against
+  the binary it replaced? (2) Does it reach the token? The fan-out cannot
+  touch attention, and EXP-023 measured attention at 6.4% of a decode token at
+  ctx 512 and 31.6% at 3,961, so the two paired rungs bound the answer from
+  both ends: 512 is where the warm figure was taken and where GEMV has the
+  most of a token to move, 3,961 is where it has the least.
+- Method: one unattended sweep, `bash scripts/phase9_decode_sweep.sh`, started
+  2026-08-07 20:35:58 and finished 22:28:08 (1 h 52 m), driven end to end by a
+  committed harness. Logs, `run.log`, `SUMMARY.txt`, `exitcodes.tsv` and the
+  slot checker in `scratch/phase9/sweep-20260807-203558/`; per-arm summaries in
+  `scratch/cold-bench/p9-20260807-203558-{decode,phase8ref}-<ctx>.json`; stderr
+  sidecars under `scratch/phase9/cold-bench/20260807-203558/`.
+
+  Seven cold arms, each `scripts/cold_bench.py --warmup 1 --repeats 3
+  --max-new 64 --skip-hashes --greedy`: five context rungs on the branch binary
+  at the shipped dial (64, 512, 1,024, 2,048 and 3,961 prompt tokens) and two
+  phase-8 reference arms at 512 and 3,961. **Each reference arm ran back to
+  back with its branch partner**, same prompt file, same `--max-new`, same
+  warmup and repeat counts, nothing between them but their own settle and
+  drain. Every arm evicts all 53 model files with
+  `posix_fadvise(POSIX_FADV_DONTNEED)` and **proves** the eviction with
+  `mincore` (`resident_after` is 0 on all 28 runs, 53 files each), then
+  launches under `systemd-run --user --wait -p MemoryMax=3G -p
+  MemorySwapMax=0 -p MemoryAccounting=yes` and reads `memory.peak`,
+  `memory.events`, `memory.stat` and `/proc/self/io` `read_bytes` from inside
+  the cgroup before exit. Before each arm the harness waits for `MemAvailable`
+  to hold above 6,000 MiB for four consecutive samples; **it settled in 45 s
+  every time, at 11,655 to 11,669 MiB**, with 3,350-3,352 MiB of host swap in
+  use outside the cgroup (`MemorySwapMax=0` holds inside it, and
+  `memory.swap.peak` is 0 on all 28 runs). A 60 s drain follows each step.
+
+  **Rule-2 status, stated head on: all seven cold arms are `measurement
+  hygiene: PASS`, all 28 runs are CLEAN, and all 17 rows of `exitcodes.tsv`
+  exited 0.** Every run returned 0 with `memory.swap.peak` 0 and every one of
+  the seven `memory.events` counters 0. Reclaim is non-zero on 19 of the 28
+  runs and **every page of it on every run is `pgsteal_khugepaged`**, with
+  `pgsteal_kswapd`, `pgsteal_direct` and `pgsteal_proactive` all zero
+  everywhere; per-run totals run 0 to 866 pages. Note 6 is why that matters and
+  what it turned up.
+
+  **The dial each arm actually got was asserted, not assumed.** A committed
+  checker (`scratch/phase9/sweep-20260807-203558/check_slots.py`, self-tested
+  6 of 6 before the sweep on its own fixtures) reads the slots/layer line out
+  of every run's stderr and fails the step if any of the four runs disagrees
+  with the label. **All seven checks read `slots=11 OK`**: 11 expert
+  slots/layer from a 1.4 GiB budget on all 28 runs, branch and reference alike.
+  `--cache-bytes` was left at the `ramvamp-default` on all seven arms, and
+  **no dial is read, set or moved anywhere in this entry**.
+
+  Prompts are **phase 8's fixture files, deliberately**, so these rungs sit on
+  EXP-023's workload rather than a new one. Recorded sha256, all verified in
+  the sweep's own preflight and again in every summary:
+
+  | ctx | file | sha256 | bytes |
+  | ---: | --- | --- | ---: |
+  | 64 | `scratch/phase8/prompts/ctx64.txt` | `90509897ed91916d227c91344e0eb1dc04a61c0b62da8a1e1c926171d08c9382` | 264 |
+  | 512 | `models/llamacpp-ref/llamacpp_ref/long_00.txt` | `d1b6c407c55aa95f10e6a9a44b6278ea1aeb7e74ec3fd5ed7946864318b53fdc` | 2,002 |
+  | 1,024 | `scratch/phase8/prompts/ctx1024.txt` | `643f41879677211d15527f4a67bc826d51fd2e8ec60e5a9784c4265147849fd3` | 4,111 |
+  | 2,048 | `scratch/phase8/prompts/ctx2048.txt` | `c915b18912d2334e36a9fee0495c08a65606659d0c117fbe9ef88f4b528aa894` | 8,752 |
+  | 3,961 | `scratch/ctx4k/p4k.txt` | `68582aae37b920ef7ac8f115e46ca96be878e30688948f53a11af5af067a5f0c` | 17,000 |
+
+  **Rule 3.** These seven arms are one session on one machine and may be
+  combined with each other into one curve. They must **not** be drawn on one
+  curve with EXP-014's, EXP-018's, EXP-019's, EXP-021's, EXP-023's or
+  EXP-024's numbers. Where an EXP-023 figure appears below it is named as the
+  prior being checked, never as a baseline being subtracted — and Result 5 is
+  the whole reason that distinction is not bookkeeping here.
+- Baseline: **the phase-8 reference arm of each paired rung**, run back to back
+  with its branch arm on the same prompt at the same dial in the same session.
+  That is the only baseline this entry subtracts, and it is what makes any
+  ratio below quotable.
+
+  Two priors appear and neither is a baseline. The **warm 1.264x** in
+  `docs/architecture.md` is the claim being tested; it stays labelled a
+  diagnostic and Note 7 records that it is not even the same bucket. **EXP-023's
+  published ladder** appears only in Result 5, where the reference arm's
+  disagreement with it is the finding rather than the error.
+- Result:
+
+  **1. Headline, medians of 3 scored runs per arm.** MEASURED cold, in-cgroup,
+  hygiene PASS. Every median's own scored runs are in table 2; no median in
+  this entry appears without them. `decode s` is the generator's own decode
+  span; `read_bytes` is the cgroup's counter and **the three scored runs of
+  every arm agree on it to the byte**.
+
+  | arm | ctx | slots | binary | prefill tok/s | decode tok/s | decode s | wall s | `memory.peak` MiB | `read_bytes` MiB |
+  | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | decode-64 | 64 | 11 | branch | 4.60 | **2.16** | 29.64 | 45.555 | 2,497.0 | 44,703.0 |
+  | decode-512 | 512 | 11 | branch | 11.07 | **1.87** | 34.24 | 82.507 | 2,584.7 | 48,191.3 |
+  | phase8ref-512 | 512 | 11 | reference | 11.12 | 1.85 | 34.66 | 83.069 | 2,589.1 | 48,191.3 |
+  | decode-1024 | 1,024 | 11 | branch | 10.98 | **1.74** | 36.76 | 131.688 | 2,646.3 | 65,617.4 |
+  | decode-2048 | 2,048 | 11 | branch | 10.66 | **1.65** | 38.71 | 233.700 | 2,747.8 | 95,539.8 |
+  | decode-3961 | 3,961 | 11 | branch | 9.87 | **1.43** | 44.87 | 448.220 | 2,926.7 | 163,794.9 |
+  | phase8ref-3961 | 3,961 | 11 | reference | 9.93 | 1.33 | 48.00 | 449.036 | 2,928.6 | 163,794.9 |
+
+  **2. Every scored run**, because at three runs an arm the medians alone
+  decide nothing. Runs are in execution order after the discarded warmup.
+  MEASURED cold.
+
+  | arm | decode tok/s | decode s | prefill tok/s | `memory.peak` MiB |
+  | --- | --- | --- | --- | --- |
+  | decode-64 | 2.16 / 2.26 / 2.16 | 29.65 / 28.29 / 29.64 | 4.61 / 4.60 / 4.26 | 2,494.6 / 2,497.0 / 2,497.1 |
+  | decode-512 | 1.87 / 1.97 / 1.76 | 34.24 / 32.51 / 36.35 | 11.07 / 11.00 / 11.12 | 2,582.0 / 2,590.0 / 2,584.7 |
+  | phase8ref-512 | 1.85 / 1.78 / 1.87 | 34.66 / 35.92 / 34.19 | 11.14 / 11.12 / 10.94 | 2,584.5 / 2,590.4 / 2,589.1 |
+  | decode-1024 | 1.72 / 1.74 / 1.76 | 37.24 / 36.76 / 36.43 | 11.13 / 10.09 / 10.98 | 2,641.9 / 2,646.3 / 2,652.8 |
+  | decode-2048 | 1.68 / 1.65 / 1.61 | 38.04 / 38.71 / 39.69 | 10.69 / 10.55 / 10.66 | 2,747.3 / 2,748.1 / 2,747.8 |
+  | decode-3961 | 1.44 / 1.43 / 1.37 | 44.47 / 44.87 / 46.59 | 9.86 / 9.87 / 10.09 | 2,929.9 / 2,926.7 / 2,925.9 |
+  | phase8ref-3961 | 1.33 / 1.31 / 1.35 | 48.00 / 48.76 / 47.57 | 9.93 / 9.78 / 9.96 | 2,929.9 / 2,928.6 / 2,928.2 |
+
+  **3. The change did what it claimed on the bucket it targeted, cold, at both
+  rungs.** The decode phase split, `decode split (forward_token)` only — the
+  prefill split shares its bucket names and is a different block. Medians of 3
+  scored runs with all three runs beside them, in execution order. `GEMV` is
+  `expert compute + projections`, which is the phase-split pair the fan-out
+  can move; it is **not** the bucket the warm 1.264x was taken on (Note 7).
+  `other` is 0.00 s on all twelve runs and is omitted. MEASURED cold.
+
+  | rung | bucket | phase-8 reference, median (runs) | fused, median (runs) | ref / fused | ranges |
+  | ---: | --- | --- | --- | ---: | --- |
+  | 512 | **GEMV** | **16.25** (16.25 / 16.39 / 15.68) | **12.93** (13.96 / 12.49 / 12.93) | **1.257x** | **disjoint** |
+  | 512 | expert compute | 10.06 (10.06 / 10.15 / 9.81) | 7.47 (8.02 / 7.37 / 7.47) | **1.347x** | **disjoint** |
+  | 512 | projections | 6.19 (6.19 / 6.24 / 5.87) | 5.46 (5.94 / 5.12 / 5.46) | 1.134x | overlap |
+  | 512 | expert io | 15.47 (15.30 / 16.37 / 15.47) | 17.32 (17.20 / 17.32 / 20.64) | 0.893x | no overlap, 0.83 s apart |
+  | 512 | attention | 2.27 (2.27 / 2.30 / 2.18) | 1.93 (2.23 / 1.87 / 1.93) | 1.176x | overlap |
+  | 512 | elementwise | 0.83 (0.82 / 0.83 / 0.83) | 0.82 (0.82 / 0.81 / 0.82) | 1.012x | overlap |
+  | 3,961 | **GEMV** | **15.39** (14.71 / 15.72 / 15.39) | **13.29** (13.18 / 13.31 / 13.29) | **1.158x** | **disjoint** |
+  | 3,961 | expert compute | 9.67 (9.32 / 9.77 / 9.67) | 7.70 (7.60 / 7.70 / 7.71) | **1.256x** | **disjoint** |
+  | 3,961 | projections | 5.72 (5.39 / 5.95 / 5.72) | 5.58 (5.58 / 5.61 / 5.58) | 1.025x | overlap |
+  | 3,961 | expert io | 14.43 (18.45 / 14.43 / 14.34) | 16.12 (16.14 / 16.12 / 16.12) | 0.895x | overlap |
+  | 3,961 | attention | 16.99 (13.99 / 17.74 / 16.99) | 14.60 (14.30 / 14.60 / 16.34) | 1.164x | overlap |
+  | 3,961 | elementwise | 0.83 (0.84 / 0.83 / 0.83) | 0.82 (0.82 / 0.82 / 0.82) | 1.012x | overlap |
+
+  **The GEMV bucket gains 1.257x at 512 and 1.158x at 3,961 with
+  non-overlapping scored ranges at both rungs**, and the gain is carried
+  entirely by `expert compute` (1.347x and 1.256x, disjoint at both). The
+  `projections` bucket, which is where the `attn_q` + `attn_v` half of the
+  change lands, **does not separate at either rung** — Note 3. And the median
+  ratio on its own does not carry the 3,961 claim: the `attention` bucket, whose
+  code this phase did not touch, shows a **larger** median ratio there (1.164x)
+  than GEMV does (1.158x). **The discriminator in this entry is range
+  separation, never the ratio of two medians**, and Note 1 is what the
+  attention bucket costs.
+
+  **The prefill control says the change is decode-only, as designed.** Prefill's
+  own `expert compute + projections`, same runs, same convention: at 512, ref
+  35.12 s (34.90 / 35.12 / 35.51) against fused 35.21 s (35.21 / 35.57 /
+  35.19), **0.997x**; at 3,961, ref 254.21 s (254.21 / 258.18 / 252.11) against
+  fused 256.47 s (256.47 / 257.63 / 249.28), **0.991x**. Ranges overlap at both
+  and the ratio runs marginally the wrong way, which is what "unmoved" looks
+  like. Prefill runs the same GEMV kernels through a different dispatch path; a
+  prefill GEMV that had moved would mean something other than decode's fan-out
+  moved. End-to-end prefill agrees: 0.996x at 512 (11.07 against 11.12) and
+  0.994x at 3,961 (9.87 against 9.93), both with overlapping ranges.
+
+  **4. End to end it separates at 3,961 and it does not at 512.** MEASURED
+  cold, paired, same session.
+
+  | rung | metric | phase-8 reference, median (runs) | fused, median (runs) | ref / fused | separates? |
+  | ---: | --- | --- | --- | ---: | --- |
+  | 512 | decode tok/s | 1.85 (1.85 / 1.78 / 1.87) | 1.87 (1.87 / 1.97 / 1.76) | 1.011x | **no** |
+  | 512 | `decode_s` | 34.66 (34.66 / 35.92 / 34.19) | 34.24 (34.24 / 32.51 / 36.35) | 1.012x | **no** |
+  | 3,961 | decode tok/s | 1.33 (1.33 / 1.31 / 1.35) | 1.43 (1.44 / 1.43 / 1.37) | 1.075x | **yes** |
+  | 3,961 | `decode_s` | 48.00 (48.00 / 48.76 / 47.57) | 44.87 (44.47 / 44.87 / 46.59) | 1.070x | **yes** |
+
+  At **3,961** both range tests pass and they pass with room: the reference arm
+  reads 1.31-1.35 tok/s against the fused arm's 1.37-1.44, and 47.57-48.76 s of
+  `decode_s` against 44.47-46.59. **Every scored run of the fused arm beat every
+  scored run of the reference arm on both metrics.** 1.075x and 1.070x are the
+  same result twice: the small difference is two-decimal rounding of tok/s
+  (`64 / 48.00` = 1.3333 and `64 / 44.87` = 1.4263), and **1.070x is the honest
+  figure** because it is computed before the rounding.
+
+  At **512 there is no result, and the entry declines to round 1.011x up into
+  one.** The reference arm's 1.78-1.87 tok/s sits **entirely inside** the fused
+  arm's 1.76-1.97, and the fused arm's slowest run (1.76) is slower than the
+  reference arm's slowest (1.78). Three runs an arm cannot order them. A 1.011x
+  median gap at 512 is not a gain, is not a regression, and must not be quoted
+  as either.
+
+  Why 512 does not pay, in one line of arithmetic on the medians of table 3:
+  GEMV gives back 3.32 s and `expert io` takes 1.85 s of it, so the two changed
+  terms net about 1.5 s on a 34 s decode. Note 2 is the mechanism and it is
+  labelled an inference.
+
+  **5. The paired arm is why any of this is quotable, and it prevented a wrong
+  conclusion.** The reference arm is byte-identical to the binary EXP-023
+  published, on the same two prompt files, at the same dial, at the same
+  `--max-new 64`. So its disagreement with EXP-023 is a statement about the two
+  **sessions** and about nothing else. MEASURED cold in both entries; **this is
+  a check, not a curve.**
+
+  | rung | EXP-023, same bytes, 2026-08-06 | this session, same bytes | this / EXP-023 |
+  | ---: | ---: | ---: | ---: |
+  | 512 | 1.91 tok/s | **1.85** | **0.969x** |
+  | 3,961 | 1.46 tok/s | **1.33** | **0.911x** |
+
+  **The machine is 3.1% slower at 512 and 8.9% slower at 3,961 than it was the
+  day before, on the same executable and the same workload.** Put the fused
+  build against EXP-023's published figures instead of against its own
+  same-session baseline and it reads **1.43 against 1.46 at 3,961 — 0.979x, a
+  regression** — where the paired arm says **1.070x faster**. That inversion is
+  the entire value of rule 3 and of running the reference arm, and it is
+  recorded here as the concrete case rather than as a principle. Note 5 ties it
+  to EXP-024.
+- Verdict: **KEEP.** `70cf304` does cold what it claimed warm on the bucket it
+  targeted — 1.257x at ctx 512 and 1.158x at ctx 3,961 on decode's GEMV
+  bucket, non-overlapping scored ranges at both — and it costs nothing anywhere
+  measured. End to end it separates at 3,961 (1.070x, disjoint ranges) and does
+  not separate at 512 (1.011x, ranges overlapping heavily), and Note 1 records
+  that even the 3,961 separation cannot be attributed cleanly to the change.
+
+  **Nothing is merged and nothing ships on this entry.** `feat/decode-compute`
+  stays unmerged by the author's decision; this records a measurement, not a
+  new default. No dial moves: **11 slots/layer, `--cache-bytes` unchanged,
+  `RING_ENTRIES` unchanged, `T_BLOCK` unchanged.** What the entry does change is
+  the status of the fan-out's numbers in `docs/architecture.md`, from warm
+  diagnostics to a cold pairing, and it opens one question it cannot close
+  (Note 1) and hands one lever forward (Note 2).
+- Notes:
+  1. **The `attention` bucket moved 1.16-1.18x in the same direction at both
+     rungs on code this phase did not touch, and it is the largest thing this
+     entry does not settle.** MEASURED: at 512 the medians are 2.27 s reference
+     against 1.93 s fused, at 3,961 they are 16.99 s against 14.60 s — 15.0%
+     and 14.1%, both favouring the fused arm. `70cf304` changes dispatch inside
+     `run_plan`; it does not change the attention kernel, so on the face of it
+     this is the instrument's noise floor on that bucket. Three measurements
+     say it is at least partly that: the scored ranges **overlap at both
+     rungs** (2.18-2.30 against 1.87-2.23, and 13.99-17.74 against
+     14.30-16.34); the reference arm's own within-arm attention spread at 3,961
+     is **1.268x**, larger than the 1.164x between-arm median ratio it would
+     have to explain; and the branch arm ran **first** at both paired rungs
+     (20:41:52 against 20:49:12 at 512, 21:24:44 against 21:56:23 at 3,961), so
+     any monotone session drift favours the branch by construction.
+
+     What that costs the headline is worth pricing rather than waving at.
+     **DERIVED**, subtracting each run's own `attention` from its own
+     `decode split` span — a crude adjustment, and an upper bound on the
+     confound rather than a corrected measurement, since it removes the true
+     variance in that bucket along with the drift:
+
+     | rung | reference, `decode s` - attention (runs) | fused (runs) | ratio of medians | ranges |
+     | ---: | --- | --- | ---: | --- |
+     | 512 | 32.37 (32.37 / 33.60 / 31.99) | 31.98 (31.98 / 30.62 / 34.40) | 1.012x | overlap |
+     | 3,961 | 30.99 (33.99 / 30.99 / 30.56) | 30.22 (30.15 / 30.25 / 30.22) | **1.025x** | disjoint by 0.31 s |
+
+     So **the 3,961 separation survives removing attention entirely** — every
+     adjusted fused run is still faster than every adjusted reference run — but
+     the ratio falls from 1.070x to **1.025x**. The bucket medians of table 3
+     say the same thing a second way: their sums differ by 2.82 s at 3,961
+     (47.64 s reference against 44.82 s fused), and the term-by-term deltas are
+     **attention -2.39 s, GEMV -2.10 s, elementwise -0.01 s, `expert io`
+     +1.69 s** — so the largest single contributor to the end-to-end gap is a
+     bucket the change cannot touch. **The licensed statement is therefore
+     narrow: the fused arm is
+     measurably faster at 3,961 in this session, and how much of that the
+     change may claim is between 1.025x and 1.070x.** Anyone quoting 1.070x as
+     the value of the fan-out is quoting a session as well as a change.
+
+     A second reading cannot be ruled out and is recorded so it is not
+     rediscovered as a surprise: attention **also** fans out across the compute
+     pool (by kv head, above 8 cached positions), so fewer and larger GEMV
+     fan-outs could plausibly leave pool workers less often parked when
+     attention's own fan-out arrives, which would make part of the 14-15% a
+     real second-order effect of fusion rather than drift. This sweep cannot
+     separate the two. What would: a single-shard or fan-out-disabled attention
+     control on both binaries in one session, which is cheap and is not taken
+     here. The `elementwise` bucket is the counter-evidence for a plain
+     global-timer explanation — it reads 0.81-0.84 s on all twelve paired runs
+     and does not move at all (1.012x) — so whatever moved attention is
+     specific to attention.
+  2. **Why 512 does not pay: `expert io` rose about 1.85 s, systematically, and
+     the mechanism is an INFERENCE rather than a measurement.** MEASURED first,
+     so the inference is separable from it. At 512 the bucket goes from a
+     15.47 s median (15.30 / 16.37 / 15.47) to 17.32 s (17.20 / 17.32 / 20.64),
+     a rise of 1.85 s, and **the ranges do not overlap** — though only just,
+     with 0.83 s between the reference arm's 16.37 and the fused arm's 17.20.
+     At 3,961 it goes from 14.43 s (18.45 / 14.43 / 14.34) to 16.12 s (16.14 /
+     16.12 / 16.12), a rise of 1.69 s, and there the **ranges do overlap**
+     because the reference arm's first scored run reads 18.45 s. The streamer's
+     independently counted `io wait` moves the same way and by nearly the same
+     amount: 15.30 s median to 16.93 s at 512, and 14.23 s to 15.71 s at 3,961.
+
+     **The rise is not more I/O, and that is measured, not assumed.** The two
+     arms of a rung are identical in every I/O quantity the runtime counts:
+     24,192 requests, **13,074 hits (54.0%) and 11,118 misses (3,106 cold /
+     8,012 eviction), 29.8 GiB read** on every scored run of both 512 arms, and
+     **13,662 hits (56.5%) and 10,530 misses (2,899 cold / 7,631 eviction),
+     28.3 GiB** on every scored run of both 3,961 arms, with `read_bytes`
+     identical to the byte (48,191.3 and 163,794.9 MiB). The drive did exactly
+     the same work in both arms. Nor does drive drift explain it: the fused arm
+     ran **first** at both rungs, so a drive getting slower over the session
+     would have loaded the reference arm, and it is the fused arm that shows
+     more io.
+
+     **INFERENCE, and it is the reading this entry offers rather than a result
+     it establishes.** The `expert io` bucket is a **residual** (EXP-023 Note
+     4): `stage_expert_phases` runs the hit plan, charges it to `expert
+     compute`, and only then blocks in `await_misses()`, which is the bucket's
+     sole contributor, while the miss reads submitted by `begin_layer` are in
+     flight throughout that hit compute. Make the hit compute faster and there
+     is **less work left to hide the outstanding reads behind**, so more of the
+     same read latency becomes visible. Part of the compute win converts into
+     exposed io wait. The residual reading is pinned again here, the way
+     EXP-023 pinned it: the split's `expert io` bucket sits **0.16 to 0.43 s**
+     above the streamer's own `io wait` on all twelve paired runs, 0.9% to
+     2.7%, so the bucket is that block and nothing else.
+
+     **The lever this points at is overlap, not compute, and it points there at
+     mid context specifically.** At 512 the fan-out handed back 3.32 s of GEMV
+     and the exposed io took 1.85 s of it straight back; a second compute win
+     of the same size would be taxed the same way. What is not taxed is making
+     the reads themselves finish sooner or arrive earlier — and EXP-024 closed
+     the per-file-spread route to the first, and CLAUDE.md closes cross-layer
+     prefetch as the obvious route to the second, so this is a named open
+     problem rather than a queued task.
+  3. **The `attn_q` + `attn_v` half of `70cf304` remains unattributable, and
+     this sweep does not settle whether to keep it.** MEASURED: the merge
+     removes exactly **48 fan-outs a token**, one per layer, and the
+     instrument confirms it — the `projections` bucket of the branch arm's
+     `decode gemv split` reports **9,072 fan-outs over 63 tokens = 144 a
+     token** at both paired rungs, which is 3 a layer across 48 layers where
+     the pre-fusion path issued 4. Total pooled fan-outs a token are **332.8 at
+     512 and 331.3 at 3,961** (MEASURED: 9,072 projections + 11,834 or 11,736
+     experts + 63 lm_head, over 63 tokens; the router is serial and excluded),
+     both inside the 241-337 range `70cf304` predicted, against a pre-fusion
+     **1,345** (DERIVED: 48 layers x 28 + 1 lm_head). So the merge is **48 of
+     the ~1,012 fan-outs a token the change removes**, about 4.7% of them.
+
+     And the bucket it lands in does not separate. `projections` reads 1.134x
+     at 512 with ranges overlapping (5.87-6.24 against 5.12-5.94) and 1.025x at
+     3,961 with ranges overlapping (5.39-5.95 against 5.58-5.61). Both ratios
+     are smaller than the 1.164-1.176x that the **unchanged** attention bucket
+     moved by in the same runs (Note 1), so neither is distinguishable from
+     this instrument's noise. It is also the rung that gained nothing end to
+     end that would have shown it best. **A decision on the uneven row split
+     the commit reports and does not fix — `attn_q` plus `attn_v` is 4,096
+     q4_k rows then 512 q6_k rows, so an even split leaves the last shard about
+     30% long — is open, and nothing here argues either way.** What would settle
+     it is an arm with that half reverted and the expert-phase half kept, which
+     this sweep does not run.
+  4. **The compute half is what carries the result, and it is stable.**
+     `expert compute` is the only bucket in table 3 that separates at both
+     rungs with room to spare: 9.81-10.15 s against 7.37-8.02 at 512 and
+     9.32-9.77 against 7.60-7.71 at 3,961. Its within-arm spread on the fused
+     binary is **1.088x at 512 and 1.014x at 3,961**, and at 3,961 the fused
+     arm is quiet across the board — `expert io` reads 16.14 / 16.12 / 16.12
+     and `projections` 5.58 / 5.61 / 5.58 — where the reference arm at the same
+     rung swings 1.287x on `expert io` and 1.268x on attention. That asymmetry
+     is not explained and is not claimed as an effect of the change; it is
+     recorded because a reader comparing the two arms' ranges will see it.
+  5. **The session moved 3.1% to 8.9% against EXP-023 on identical bytes, and
+     EXP-024 is the most likely reason.** Result 5 measures it; this is what to
+     do with it. **Per rule 3 it is a statement about the two sessions, not
+     about either binary.** EXP-024 established, over four probe arms on
+     2026-08-07, that this drive's per-file read behaviour is **not stable
+     across sessions**: the four-file spread EXP-023 measured at 2.21x
+     re-measured at 1.044x the next day, with the two fast files roughly
+     halving, and a control arm running the byte-identical phase-8 probe script
+     agreed. A decode workload that reads 48 expert files is exactly what a
+     drive whose per-file delivery is not reproducible would move underneath,
+     and the larger drift here is at the rung that reads the most (163,794.9
+     MiB at 3,961 against 48,191.3 at 512), which is the direction that
+     hypothesis predicts. It is a **hypothesis, not a measurement**: this sweep
+     ran no probe and nothing in it isolates the drive. Two consequences that
+     do not depend on the mechanism. First, **the reference arm is not optional
+     overhead** — without it this entry would have published a regression at
+     3,961. Second, **no entry may quote a decode tok/s from one session
+     against a decode tok/s from another**, and the concrete counter-example is
+     now in the record rather than in a rule.
+  6. **All reclaim in this sweep is `pgsteal_khugepaged`; read the per-source
+     counters, never the bare total.** MEASURED on all 28 runs:
+     `pgsteal_kswapd`, `pgsteal_direct` and `pgsteal_proactive` are **0
+     everywhere**, and every non-zero page of `pgsteal` is khugepaged's, 0 to
+     866 pages per run. That is the huge-page daemon compacting, not memory
+     pressure, which is why hygiene stayed CLEAN on 17 runs with a non-zero
+     `pgsteal` total. An entry that read only `pgsteal` would have called those
+     17 runs dirty and thrown away the sweep.
+
+     **A lead, recorded as a lead and nothing more: `pgsteal 147` appears
+     twice, in the second scored run of `decode-512` and the second scored run
+     of `phase8ref-512`** — different binaries, same prompt, arms 7 minutes
+     apart. That is the same "identical integer in two runs" shape as the 2,817
+     that EXP-023 Note 13 and `docs/handoff-phase8.md` GOTCHA 11 record as
+     unexplained. **This is not an explanation of GOTCHA 11 and must not be
+     cited as one**: GOTCHA 11's 2,817 was **all `pgsteal_kswapd` with
+     khugepaged zero**, and both 147s here are **all `pgsteal_khugepaged` with
+     kswapd zero. They are different counters and therefore different events.**
+     What the pair does suggest is that exact-integer repeats of a reclaim
+     counter across independent runs are not rare, which is a reason to weaken
+     rather than strengthen the inference GOTCHA 11 draws from one coincidence.
+     Settling either needs the per-source counters kept, which is the practice
+     this note exists to enforce.
+  7. **The warm 1.264x and the cold 1.257x are close, and they are not the same
+     bucket.** The agreement is real and worth stating — the change transferred
+     from a warm diagnostic to a cold pairing at essentially its full measured
+     size at 512, 1.257x against 1.264x, 0.6% apart. But a reader must not read
+     that as one number measured twice. The warm figure is the **pooled GEMV
+     bucket** of the `decode gemv split` instrument (`projections + experts +
+     lm_head`, own plus wait, from the submitting thread); the cold figure is
+     `expert compute + projections` from the **phase split**, and the first is
+     a set of disjoint spans strictly inside the second. **The cold pairing
+     could not use the warm instrument's bucket at all**: the phase-8 reference
+     binary predates it and emits no `decode gemv split` block, which is
+     verifiable in every one of its stderrs. So the correct reading is that two
+     different, nested measures of the same work agree closely, which
+     corroborates the warm diagnostic without turning it into a result. Warm
+     numbers stay warm numbers. For the record and **not** as a pairing across
+     machine states: the fused arm's own pooled GEMV bucket measures **11.58 s
+     cold** at 512 (12.61 / 11.14 / 11.58 in execution order) against **11.42 s
+     warm** (11.36-11.48), so that bucket barely notices the page cache, which
+     is what a compute bucket should do.
+  8. **The workload is byte-deterministic across binaries and across sessions,
+     and that is the closest thing to a numerics check this sweep took.** Not
+     the rule-4 gate. MEASURED: the two arms of each paired rung agree on
+     `read_bytes` to the byte, on request, hit, miss, cold and eviction counts
+     exactly, and on prefill window counts exactly (768 windows / 0 skipped /
+     16.3 GiB at 512; 6,144 / 1 skipped / 130.8 GiB at 3,961). Routing is
+     determined by the whole forward pass, so **two binaries agreeing on all
+     24,192 top-8 selections of a 63-token greedy decode is a real equivalence
+     signal**. It is not proof of bit-identical logits, and this sweep ran
+     `--skip-hashes`, so **rule 4 is discharged for `70cf304` elsewhere, not
+     here**: the commit records the proof (a seven-part fixture at real v0
+     formats against the unfused sequence, on the AVX2 and scalar paths, under
+     all eight partition schemes, with routed indices swapped to pin expert to
+     intermediate to slot), and this entry adds nothing to it. Separately, and
+     as a session check only: the same five `read_bytes` totals reproduce
+     EXP-023's to the byte at all five rungs (44,703.0 / 48,191.3 / 65,617.4 /
+     95,539.8 / 163,794.9 MiB), which is a determinism check on an exact
+     integer and not a performance comparison.
+  9. **The memory contract is unmoved and the headroom is unchanged.** MEASURED:
+     `memory.peak` at 3,961 is 2,926.7 MiB median (2,925.9-2,929.9) against the
+     3,072 MiB cap, **145.3 MiB spare**; the reference arm at the same rung
+     reads 2,928.6 (2,928.2-2,929.9), so the fused build's 47.99 KiB of
+     one-time shared heap is invisible at this resolution, as its commit
+     predicted. The highest peak anywhere in the sweep is 2,929.9 MiB, 142.1 MiB
+     under the cap, on one run of each 3,961 arm. No OOM, no `memory.events`
+     counter non-zero, `memory.swap.peak` 0 on all 28 runs. **The dial stayed at
+     11 slots/layer on every arm and was asserted on every arm** (Method); this
+     entry offers nothing for or against moving it, and EXP-023 Note 7 remains
+     the last word on the 12-slot question.
+  10. **What this entry does not settle.** Three scored runs an arm is a spread
+      control, not an error bar, and Note 1 shows the single most important
+      attribution in the entry turning on it. The 512 rung produced **no
+      end-to-end result at all** and it was the rung the change was designed
+      against. The `attn_q` + `attn_v` half is unmeasured in isolation (Note 3)
+      and the cost-weighted `shard_range` split its commit reports is still not
+      written. The attention movement of Note 1 has two live explanations and no
+      arm that separates them. Every arm is `--max-new 64`, so these are the
+      first 63 tokens after a prompt from an empty cache and not steady state at
+      256 tokens and beyond; the same caveat EXP-023 Note 14 records. No numerics
+      gate was run (Note 8). No io_probe arm was run, so the drive hypothesis in
+      Note 5 is untested in this session, and the io_uring queue-depth
+      measurement inside the runtime that EXP-019 Note 5 asked for is **still
+      not taken**. And nothing here is merged: the verdict is KEEP on a
+      measurement, on a branch that stays unmerged.
