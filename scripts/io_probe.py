@@ -165,14 +165,29 @@ bandwidth in the same record as per-file dispersion, so "decode pays the
 spread on all 48" can be checked and bandwidth can be regressed on dispersion
 instead of eyeballed against it.
 
-**3. A correlation across files is not a mechanism.** Files differ in age,
-in write history, in which NAND blocks they landed on and in how much of them
-the drive kept in SLC. `--window` reads a bounded byte range *inside one
-file*, so a dense window and a scattered window differ in physical locality
-and in nothing else. A dense window that reads faster is placement; no
-difference kills placement, SLC residency and read-disturb all at once.
-`--list-regions` prints the region map and ready-made `--window` specs, so
-picking the windows is not a hand-parse of `filefrag -v`.
+**3. A correlation across files is not a mechanism.** Files differ in age, in
+write history, in when the installer wrote them and in where they landed.
+`--window` reads a bounded byte range *inside one file*, which removes every
+one of those file-level differences from the comparison: both windows were
+written by the same `install` invocation, at the same time, into the same
+file. What it does **not** remove is per-NAND-block state. Two windows at
+different offsets are on different NAND blocks by construction, so their SLC
+residency and read-disturb histories are *unmeasured*, not held equal. The
+window test therefore isolates "physical placement plus whatever varies from
+one NAND block to the next" against the file-level confounds — a real
+tightening of the cross-file comparison, and not the clean placement-only
+control it would be if the two windows shared cells. `--list-regions` prints
+the region map and ready-made `--window` specs, so picking the windows is not
+a hand-parse of `filefrag -v`.
+
+Positions inside a run are not equivalent — the first case of a run pays
+btrfs extent-tree and allocator warm-up that the later ones do not — and a
+window case issues few enough reads for that to matter. Window mode therefore
+**interleaves** the dense and scattered populations so neither owns the head
+of the run, and **permutes the order every repeat**; the permutation is
+recorded per run (`case_execution_order`) and each case records the position
+it ran at (`exec_position`), so a reader can check for a position artifact
+instead of trusting that there is none.
 
 ## Output
 
@@ -193,6 +208,13 @@ dispersion, all-files and window fields are additions.
      `systemd-run --user`, kernel older than 6.5, eviction failed, O_DIRECT
      refused outright, a `ramvamp` process was already running, or the inner
      run produced no result file.
+
+`--list-regions` reads no data block and has no hygiene verdict, so it maps
+the same three codes onto what its metadata pass managed to collect: 0 when
+every requested file's extent map was read, 1 when some were and some were
+not, and 2 when **none** were — no `filefrag` on PATH, an unreadable extent
+tree, or an empty report. Exiting 0 on a report with nothing in it would let a
+wrapper script record "no dispersion" as a finding.
 
 Python stdlib only. Linux >= 6.5 + cgroup v2 + systemd --user, by design.
 
@@ -296,16 +318,45 @@ DEFAULT_WINDOW_SCAN = "2M,8M"
 LOGICAL_NOT_LBA = ("btrfs LOGICAL bytenr from filefrag, NOT device LBA")
 
 
-def chunk_tree_command(source: str | None) -> str:
+def chunk_tree_command(source: str | None, fstype: str | None = None) -> str:
     """The command a human runs to map btrfs logical bytenr to device LBA.
 
     `findmnt` reports the source of a btrfs subvolume mount as
     `/dev/nvme0n1p2[/@home]`; the chunk tree lives on the device, not the
     subvolume, so the bracket is stripped rather than pasted into a command
     that would fail.
+
+    Only btrfs interposes a logical address space between the file and the
+    device, so only btrfs needs the translation. When the caller knows the
+    filesystem type and it is not btrfs, handing the user a `btrfs
+    inspect-internal` command would be telling them to run something that
+    cannot apply to their filesystem, so a note is returned instead. Callers
+    that do not know the type get the btrfs form, which is what the reference
+    machine runs.
     """
+    if fstype is not None and fstype != "btrfs":
+        return (f"n/a on {fstype}: filefrag already reports device physical "
+                f"block numbers, so there is no filesystem-internal logical "
+                f"space to translate out of")
     device = (source or "/dev/<device>").split("[", 1)[0]
     return f"sudo btrfs inspect-internal dump-tree -t 3 {device}"
+
+
+def physical_units_note(fstype: str | None) -> str:
+    """What `filefrag`'s physical column actually means on this filesystem.
+
+    On btrfs it is a logical bytenr that the chunk tree still has to translate
+    (`LOGICAL_NOT_LBA`). On ext4, XFS and friends there is no such indirection:
+    the number is a genuine device block address, and telling the user
+    otherwise — which this tool did until phase 9's review — misdescribes their
+    own data. Neither is the address the drive's FTL ultimately reads, which is
+    the caveat that survives on every filesystem.
+    """
+    if fstype == "btrfs":
+        return LOGICAL_NOT_LBA
+    return (f"{fstype or 'unknown-fs'} physical block address from filefrag "
+            f"(a device address, not a filesystem-internal logical one; still "
+            f"pre-FTL, so it is not what the NAND sees either)")
 
 
 def dist(value: float | None) -> str:
@@ -678,7 +729,8 @@ def merge_logical_ranges(members: list[dict]) -> list[tuple[int, int]]:
     return ranges
 
 
-def dispersion_stats(extents: list[dict], gap_bytes: int) -> dict:
+def dispersion_stats(extents: list[dict], gap_bytes: int,
+                     units: str = LOGICAL_NOT_LBA) -> dict:
     """Physical dispersion, the axis `filefrag_stats` never measured.
 
     `docs/benchmark-machine.md` rules fragmentation out as the cause of the
@@ -689,11 +741,22 @@ def dispersion_stats(extents: list[dict], gap_bytes: int) -> dict:
     the same sizes and still differ by two orders of magnitude in how far
     apart those extents sit. These are the numbers that tell them apart.
 
-    Every distance here is in btrfs logical bytes (`LOGICAL_NOT_LBA`).
+    Every distance here is in whatever address space `filefrag` reports for
+    this filesystem — btrfs logical bytes by default (`LOGICAL_NOT_LBA`), or
+    the device addresses `physical_units_note` describes when the caller knows
+    the filesystem is not btrfs and says so.
+
+    `median_seek_bytes`, `mean_seek_bytes` and `max_seek_bytes` stay `None`
+    for a file with a single extent: there is no inter-extent seek to take a
+    median of, and inventing a 0 would put a defragmented file and a file
+    whose extents happen to abut in the same bucket. Every caller that prints
+    them must therefore go through `dist()`/`gb()` or its own guard — a bare
+    `/ 1e9` raises `TypeError` on the one-extent file that XFS and
+    `btrfs filesystem defragment` both produce.
     """
     out = {
         "cluster_gap_bytes": gap_bytes,
-        "physical_units": LOGICAL_NOT_LBA,
+        "physical_units": units,
         "physical_min_bytes": None, "physical_max_bytes": None,
         "physical_span_bytes": None, "regions": None,
         "largest_region_bytes": None, "largest_region_fraction": None,
@@ -744,7 +807,8 @@ def dispersion_stats(extents: list[dict], gap_bytes: int) -> dict:
 
 
 def filefrag_stats(path: str, cluster_gap: int = DEFAULT_CLUSTER_GAP,
-                   parsed: dict | None = None) -> dict:
+                   parsed: dict | None = None,
+                   units: str = LOGICAL_NOT_LBA) -> dict:
     """Extent geometry for `path`: count, mean/median extent size, and how
     many extents are physically adjacent to their successor.
 
@@ -769,7 +833,7 @@ def filefrag_stats(path: str, cluster_gap: int = DEFAULT_CLUSTER_GAP,
                  "max_extent_bytes": None, "adjacent_pairs": None,
                  "adjacent_fraction": None, "filefrag_discontiguous": None,
                  "encoded_extents": 0, "unparsed_lines": 0, "flags_seen": []}
-    out_stats.update(dispersion_stats([], cluster_gap))
+    out_stats.update(dispersion_stats([], cluster_gap, units))
     # A caller that already has the parse (the window scanner needs the extent
     # list anyway) passes it in rather than forking `filefrag` twice per file.
     parsed = parsed if parsed is not None else filefrag_extents(path)
@@ -803,7 +867,7 @@ def filefrag_stats(path: str, cluster_gap: int = DEFAULT_CLUSTER_GAP,
         "unparsed_lines": parsed["unparsed_lines"],
         "flags_seen": parsed["flags_seen"],
     })
-    out_stats.update(dispersion_stats(extents, cluster_gap))
+    out_stats.update(dispersion_stats(extents, cluster_gap, units))
     return out_stats
 
 
@@ -812,17 +876,23 @@ def filefrag_stats(path: str, cluster_gap: int = DEFAULT_CLUSTER_GAP,
 # ---------------------------------------------------------------------------
 
 
-def window_locality(extents: list[dict], offset: int, length: int) -> dict:
+def window_locality(extents: list[dict], offset: int, length: int,
+                    units: str = LOGICAL_NOT_LBA) -> dict:
     """How physically dispersed the byte range [offset, offset+length) is.
 
     This is the number the byte-window experiment turns on. A dense window and
-    a scattered window inside the **same file** are the same age, the same
-    NAND, the same SLC-cache history and the same read-disturb history; they
-    differ only in where their bytes sit. If bandwidth tracks this and nothing
-    else, placement is the mechanism.
+    a scattered window inside the **same file** share that file's age, its
+    write history and the single `install` run that wrote both — every
+    file-level confound a cross-file comparison carries. They do **not** share
+    NAND cells: two ranges at different offsets are on different blocks by
+    construction, so per-block SLC residency and read-disturb state are
+    uncontrolled here, merely made irrelevant to the file-level story. Read
+    the result accordingly: bandwidth tracking this column means placement or
+    something that varies block to block, not placement alone.
 
     `extents` must carry a `region` key (i.e. have been through
-    `physical_regions`). Distances are btrfs logical (`LOGICAL_NOT_LBA`).
+    `physical_regions`). Distances are in the address space `units` names,
+    btrfs logical by default (`LOGICAL_NOT_LBA`).
     """
     parts: list[tuple[int, int, int]] = []  # (physical, bytes, region)
     for e in extents:
@@ -854,13 +924,18 @@ def window_locality(extents: list[dict], offset: int, length: int) -> dict:
         "dominant_fraction": round(max(by_region.values()) / covered, 6),
         "physical_span_bytes": (max(p + n for p, n, _ in parts)
                                 - min(p for p, _, _ in parts)),
+        # A window inside one extent has no inter-fragment seek, and 0 is the
+        # true answer there — unlike a whole file's `median_seek_bytes`, which
+        # is None for the same shape because "one extent" and "extents that
+        # abut" are different facts about a file and the same fact about a
+        # window's read pattern.
         "median_seek_bytes": int(statistics.median(seeks)) if seeks else 0,
-        "physical_units": LOGICAL_NOT_LBA,
+        "physical_units": units,
     }
 
 
 def scan_windows(extents: list[dict], size: int, length: int, stride: int,
-                 count: int) -> dict:
+                 count: int, units: str = LOGICAL_NOT_LBA) -> dict:
     """Rank candidate byte windows of `length` by how physically dense they are.
 
     Candidate offsets are the extent starts plus every `stride` multiple, not
@@ -881,7 +956,7 @@ def scan_windows(extents: list[dict], size: int, length: int, stride: int,
     for off in sorted(offsets):
         if off % DIO_ALIGN or off < 0 or off + length > size:
             continue
-        loc = window_locality(extents, off, length)
+        loc = window_locality(extents, off, length, units)
         if loc["ok"]:
             ranked.append(loc)
     ranked.sort(key=lambda w: (w["physical_span_bytes"], w["regions_touched"],
@@ -994,7 +1069,12 @@ def case_seed(base_seed: int, repeat: int, case: dict) -> int:
     # Window cases are distinguished by their offset and block size, appended
     # only when they exist so that the seeds of every pre-phase-9 case — and
     # therefore every published run's access order — are bit-identical.
-    if case.get("offset_base"):
+    # Membership, not truthiness: `scan_windows` emits offset 0 for the densest
+    # window of a file whose first extent is large, and `.get(...)` being falsy
+    # there would have handed that window the *whole-file* seed for the same
+    # (file, pattern, K, QD). Whole-file cases carry no `offset_base` key at
+    # all, so their seeds are untouched by the change.
+    if "offset_base" in case:
         key += f"|{case['offset_base']}|{case['block_bytes']}"
     return int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:8],
                           "big")
@@ -1033,7 +1113,17 @@ def timed_reads(fd: int, offsets: list[int], block_bytes: int,
     from. A benchmark is not allowed to manufacture that again.
 
     Allocation and pre-faulting happen **before** the timer starts, so the
-    reported bandwidth is drive time, not page-fault time.
+    reported bandwidth is drive time, not page-fault time. **So does thread
+    creation, and so does the join.** `threading.Thread.start()` costs on the
+    order of 100 us apiece and `join()` costs a wakeup: negligible against a
+    128-read whole-file case at ~250 ms, but on the order of a third of an
+    8-read 2 MiB window case, which is exactly the measurement that was added
+    to resolve a ~10% difference. Worse, the cost is additive and near-equal
+    across cases, so leaving it in compresses every ratio toward 1.00 — it
+    cannot show a difference that is not there, but it reliably hides one that
+    is. The threads are therefore parked on a barrier until every one of them
+    is running; the clock starts when the barrier releases and stops at the
+    last read's completion, not at the last thread's exit.
     """
     buffers = [AlignedBuffer(block_bytes) for _ in range(qd)]
     misaligned = [b.address for b in buffers if not b.aligned]
@@ -1045,6 +1135,17 @@ def timed_reads(fd: int, offsets: list[int], block_bytes: int,
     latencies: list[float] = []
     errors: list[str] = []
     short_reads = 0
+    finished: list[float] = []
+    started: list[float] = []
+    # qd workers + this thread. A worker that never arrives would hang the
+    # run, so both sides wait with a timeout and a broken barrier aborts the
+    # case loudly instead of silently measuring a subset of the queue. The
+    # barrier's action runs once, in whichever party arrives last, *before*
+    # any of them returns from `wait()` — so it is the one place that can
+    # stamp a start time no thread has yet read a byte after.
+    ready = threading.Barrier(
+        qd + 1, action=lambda: started.append(time.perf_counter()))
+    BARRIER_TIMEOUT_S = 60.0
 
     def worker(buf: AlignedBuffer) -> None:
         nonlocal short_reads
@@ -1052,6 +1153,10 @@ def timed_reads(fd: int, offsets: list[int], block_bytes: int,
         local_short = 0
         local_errors: list[str] = []
         view = buf.view
+        try:
+            ready.wait(BARRIER_TIMEOUT_S)
+        except threading.BrokenBarrierError:
+            return
         while True:
             with lock:
                 index = next(cursor, None)
@@ -1088,21 +1193,43 @@ def timed_reads(fd: int, offsets: list[int], block_bytes: int,
                 if got < block_bytes:
                     local_short += 1
             local.append(time.perf_counter() - t0)
+        done = time.perf_counter()
         with lock:
             latencies.extend(local)
             errors.extend(local_errors)
             short_reads += local_short
+            # Each worker stamps its own finish, so `elapsed` can end at the
+            # last completed read rather than after qd joins.
+            finished.append(done)
 
     threads = [threading.Thread(target=worker, args=(buf,), daemon=True)
                for buf in buffers]
-    cpu0 = time.process_time()
-    t0 = time.perf_counter()
     for t in threads:
         t.start()
+    try:
+        ready.wait(BARRIER_TIMEOUT_S)
+    except threading.BrokenBarrierError:
+        ready.abort()
+        for t in threads:
+            t.join(BARRIER_TIMEOUT_S)
+        for buf in buffers:
+            buf.close()
+        raise RuntimeError(
+            f"not all {qd} reader threads reached the start barrier within "
+            f"{BARRIER_TIMEOUT_S:.0f}s; refusing to report a bandwidth "
+            f"measured by an unknown number of threads")
+    # Every thread is running and past its own barrier wait, so nothing
+    # between the barrier's stamp and the last stamp in `finished` is thread
+    # bookkeeping.
+    t0 = started[0]
+    cpu0 = time.process_time()
     for t in threads:
         t.join()
-    elapsed = time.perf_counter() - t0
     cpu = time.process_time() - cpu0
+    # A case whose every worker died before reading leaves `finished` empty;
+    # falling back to the join time keeps the arithmetic total, and `errors`
+    # is what makes the run DIRTY.
+    elapsed = (max(finished) - t0) if finished else (time.perf_counter() - t0)
 
     for buf in buffers:
         buf.close()
@@ -1110,6 +1237,9 @@ def timed_reads(fd: int, offsets: list[int], block_bytes: int,
     total = len(offsets) * block_bytes
     return {
         "seconds": elapsed,
+        # Provenance for the phase-9 review fix: a summary written before it
+        # has no `timer` key and its `seconds` includes thread start and join.
+        "timer": "barrier-release-to-last-read",
         "cpu_seconds": round(cpu, 4),
         "bytes": total,
         "gb_s": round(gbps(total, elapsed), 4),
@@ -1157,11 +1287,35 @@ def inner(args) -> int:
     btrfs_before = btrfs_device_stats(plan["mount"]["target"])
     io_before = read_kv("/proc/self/io")
 
+    # Which case runs in which position. The outer harness computes it (it is
+    # the thing being varied across repeats) and hands it over in the plan; an
+    # older plan file without the key runs in built order, which is what every
+    # non-window mode uses anyway.
+    order = plan.get("case_execution_order")
+    if order is None:
+        order = list(range(len(plan["cases"])))
+    if sorted(order) != list(range(len(plan["cases"]))):
+        fail(f"case_execution_order is not a permutation of the "
+             f"{len(plan['cases'])} planned cases, so the run would measure "
+             f"some cases twice and others not at all")
+
+    # The window label is what tells sixteen window cases apart; without it
+    # they log as sixteen visually identical lines differing only in the
+    # bandwidth column. The width is taken from the cases actually planned, so
+    # a whole-file run's log keeps the column positions it always had.
+    def case_label(case: dict) -> str:
+        if case.get("window_label"):
+            return f"{case['file']}@{case['window_offset']}"
+        return case["file"]
+
+    label_width = max([9] + [len(case_label(c)) for c in plan["cases"]])
+
     cases: list[dict] = []
     t_start = time.time()
     fds: dict[str, int] = {}
     try:
-        for case in plan["cases"]:
+        for position, index in enumerate(order):
+            case = plan["cases"][index]
             path = case["path"]
             if path not in fds:
                 fds[path] = open_direct(path)
@@ -1171,8 +1325,16 @@ def inner(args) -> int:
                                    case["qd"])
             record = dict(case)
             record.update(measured)
+            # Position in *this* run, not the case's canonical index: the two
+            # differ in window mode, and a position artifact is only auditable
+            # if the position is on the record.
+            record["exec_position"] = position
             cases.append(record)
-            log(f"  {case['file']:<9} {case['pattern']:<4} K={case['k']:<2} "
+            # `[n]` is the case's canonical index (the one --dry-run prints),
+            # not its position: the log is emitted in execution order, so the
+            # position is the line number and the index is the join key.
+            log(f"  [{case['order']:>3}] {case_label(case):<{label_width}} "
+                f"{case['pattern']:<4} K={case['k']:<2} "
                 f"QD={case['qd']:<2} {case['block_bytes']:>9} B  "
                 f"{measured['gb_s']:>6.3f} GB/s  "
                 f"p50 {measured['latency_ms']['p50']:>7.3f} ms  "
@@ -1221,6 +1383,10 @@ def inner(args) -> int:
 
     result.update({
         "matrix_seconds": round(matrix_seconds, 3),
+        # The order this run actually executed in, echoed back from the plan so
+        # the record is self-contained: a reader holding one run's JSON can
+        # check for a position artifact without the plan file beside it.
+        "case_execution_order": order,
         "cases": cases,
         "residency_visible": not invisible,
         "residency_invisible_files": invisible,
@@ -1455,6 +1621,27 @@ def resolve_files(names: list[str], layers: list[dict], rvmp: str) -> list[dict]
     return unique
 
 
+def check_queue_depth(what: str, blocks: int, qd: int, hint: str) -> None:
+    """Refuse a case whose queue depth it cannot actually reach.
+
+    `timed_reads` starts `qd` threads against a queue of `blocks` reads, so
+    with fewer blocks than threads the surplus threads take nothing and the
+    real depth is `blocks` — while the plan, the log line, the table and the
+    JSON all keep saying `qd`. That is not a small inaccuracy: `--window
+    2M --window-block-bytes 1M --fixed-qd 8` runs at depth 2 and reports 8,
+    and a queue-depth number that is wrong by 4x is worse than no number.
+
+    Equality is fine (one read per thread). Whole-file cases cannot trip this
+    at any sane setting — the smallest is 128/K blocks — so this fires
+    essentially only for windows, which is where it is needed.
+    """
+    if qd > blocks:
+        fail(f"{what} issues {blocks} reads but was asked for queue depth "
+             f"{qd}: {qd - blocks} of the {qd} threads would get no work and "
+             f"the real depth would be {blocks}, while every table and JSON "
+             f"field would report {qd}. {hint}")
+
+
 def build_cases(files: list[dict], ks: list[int], qds: list[int],
                 fixed_qd: int, fixed_k: int,
                 patterns: list[str]) -> tuple[list[dict], list[tuple[int, int]]]:
@@ -1484,6 +1671,9 @@ def build_cases(files: list[dict], ks: list[int], qds: list[int],
             if blocks == 0:
                 continue
             block_bytes = k * f["stride"]
+            check_queue_depth(
+                f"{f['name']} at K={k}", blocks, qd,
+                f"Lower the queue depth to {blocks} or below, or lower K.")
             for pattern in patterns:
                 cases.append({
                     "order": order,
@@ -1529,6 +1719,9 @@ def build_all_files_cases(files: list[dict], k: int, qd: int,
         if blocks == 0:
             continue
         block_bytes = k * f["stride"]
+        check_queue_depth(
+            f"{f['name']} at K={k}", blocks, qd,
+            f"Lower --fixed-qd to {blocks} or below, or lower --fixed-k.")
         for pattern in patterns:
             cases.append({
                 "order": order,
@@ -1575,34 +1768,70 @@ def parse_window_specs(text: str) -> list[tuple[str, int, int]]:
 
 def build_window_cases(files: list[dict], specs: list[tuple[str, int, int]],
                        k: int, qd: int, patterns: list[str],
-                       block_override: int | None,
-                       extent_map: dict) -> tuple[list[dict], list[tuple[int, int]]]:
+                       block_override: int | None, extent_map: dict,
+                       units: str = LOGICAL_NOT_LBA
+                       ) -> tuple[list[dict], list[tuple[int, int]]]:
     """One case per (window, pattern): a bounded read inside a single file.
 
-    The discriminating experiment. Two windows in the same file are the same
-    age, the same NAND, the same SLC-cache and read-disturb history; if a
-    window whose bytes sit in one physical region reads faster than one whose
-    bytes are scattered across regions, placement is the mechanism. If they
-    read the same, placement is not, and the per-file spread has to come from
-    somewhere the filesystem cannot see.
+    The discriminating experiment. Two windows in the same file share the
+    file's age, its write history and the single `install` run that wrote
+    both, so every file-level confound that a cross-file comparison carries is
+    gone. They sit on different NAND blocks by construction, so per-block SLC
+    residency and read-disturb state are *not* held equal — the control is
+    over the file-level history, not over the cells. If a window whose bytes
+    sit in one physical region reads faster than one whose bytes are scattered
+    across regions, the difference is placement or something that varies from
+    block to block; if they read the same, neither is moving the number and
+    the per-file spread has to come from somewhere else again.
 
     The window's locality is computed here and stored **in the case**, so the
     result record carries the bandwidth and the geometry it is supposed to be
     explained by in one row.
+
+    ## Case order is part of the experiment
+
+    Positions in a run are not exchangeable: the first case pays extent-tree
+    and allocator warm-up the rest do not, and in the committed
+    `scratch/io-probe/p9-win2m.log` the case that happened to be built first —
+    the densest window — was the slowest of all sixteen in **every** scored
+    run, which moved the printed dense/scattered ratio from 1.19x to 1.10x. A
+    128-read whole-file case can absorb that; an 8-read window case cannot.
+
+    So the built order is not the given order. Windows are ranked by physical
+    span and the dense half is **interleaved** with the scattered half, which
+    makes it impossible for either population to own the head or the tail of
+    the run. `execution_order` then permutes that list differently every
+    repeat, so no case keeps a position across runs either. Both are recorded
+    (`window_rank`, `window_population`, `case_order_policy`,
+    `case_execution_order`, `exec_position`) so the audit does not depend on
+    reading this docstring.
     """
     by_name = {f["name"]: f for f in files}
-    # Two windows that overlap read some bytes twice in one run. O_DIRECT
-    # keeps the page cache out of it, but the drive's own read cache is not
-    # under this harness's control and a second read of the same LBAs is not
-    # the cold read the first one was.
+    # Reading the same bytes twice in one run means the second read is served
+    # from the drive's own cache, which this harness does not control and
+    # cannot evict — `posix_fadvise` reaches the page cache, not the SSD's
+    # DRAM. Both ways of doing it are refused rather than warned about,
+    # because the resulting number looks entirely plausible.
     for i, (a_name, a_off, a_len) in enumerate(specs):
         for b_name, b_off, b_len in specs[i + 1:]:
             if a_name == b_name and a_off < b_off + b_len and b_off < a_off + a_len:
-                print(f"warning: windows {a_name}:{a_off}:{a_len} and "
-                      f"{b_name}:{b_off}:{b_len} overlap, so some bytes are "
-                      f"read twice in one run and the second read is not "
-                      f"cold at the drive.", file=sys.stderr)
-    cases = []
+                fail(f"windows {a_name}:{a_off}:{a_len} and "
+                     f"{b_name}:{b_off}:{b_len} overlap, so the overlapping "
+                     f"bytes would be read twice in one run and the second "
+                     f"read would be a drive-cache hit, not a cold read. Pick "
+                     f"disjoint windows — --list-regions only ever emits "
+                     f"non-overlapping candidates.")
+    if len(patterns) > 1:
+        fail(f"--window with --patterns {','.join(patterns)} reads every "
+             f"window once per pattern, a few milliseconds apart, in the same "
+             f"run: the second pattern measures the drive's read cache, not "
+             f"the drive. (The default is '{','.join(PATTERNS)}', so this "
+             f"fires unless --patterns is given.) Run one pattern per "
+             f"invocation — 'rand' is the shape decode issues, and it is what "
+             f"the committed phase 9 window run used.")
+    # Built in the order the specs were given, then handed to
+    # `interleave_window_cases`, which decides the order they are planned in.
+    built: list[dict] = []
     order = 0
     for name, offset, length in specs:
         f = by_name.get(name)
@@ -1615,7 +1844,13 @@ def build_window_cases(files: list[dict], specs: list[tuple[str, int, int]],
         if offset < 0 or offset + length > f["size"]:
             fail(f"window {name}:{offset}:{length} runs past the end of "
                  f"{f['name']} ({f['size']} bytes)")
-        block_bytes = block_override or (k * f["stride"])
+        # `is None`, not `or`: --window-block-bytes 0 is falsy and would fall
+        # back to K x stride while the plan, the table and the JSON all
+        # reported the flag as having supplied the block size. Zero is
+        # rejected up front in main(), and this keeps the two facts in
+        # agreement even if that check ever moves.
+        block_bytes = (k * f["stride"] if block_override is None
+                       else block_override)
         if block_bytes % DIO_ALIGN:
             fail(f"--window-block-bytes {block_bytes} is not a multiple of "
                  f"{DIO_ALIGN}")
@@ -1624,6 +1859,12 @@ def build_window_cases(files: list[dict], specs: list[tuple[str, int, int]],
             fail(f"window {name}:{offset}:{length} is smaller than one "
                  f"{block_bytes}-byte block. Either widen the window or set "
                  f"--window-block-bytes below {length}.")
+        check_queue_depth(
+            f"window {name}:{offset}:{length} at {block_bytes} B blocks",
+            blocks, qd,
+            f"Lower --fixed-qd to {blocks} or below, or lower "
+            f"--window-block-bytes so the window holds at least {qd} blocks "
+            f"({length // qd} B or less would give {qd}).")
         if block_override is None and offset % f["stride"]:
             print(f"warning: window offset {offset} is not a multiple of "
                   f"{f['name']}'s {f['stride']}-byte expert stride, so its "
@@ -1632,7 +1873,7 @@ def build_window_cases(files: list[dict], specs: list[tuple[str, int, int]],
                   f"the shape decode issues.", file=sys.stderr)
         extents = extent_map.get(f["path"])
         if extents:
-            loc = window_locality(extents, offset, blocks * block_bytes)
+            loc = window_locality(extents, offset, blocks * block_bytes, units)
         else:
             loc = {"ok": False,
                    "reason": "filefrag gave no extent map for this file, so "
@@ -1640,7 +1881,7 @@ def build_window_cases(files: list[dict], specs: list[tuple[str, int, int]],
                              "the result cannot be regressed on it"}
         label = f"{offset}+{blocks * block_bytes}"
         for pattern in patterns:
-            cases.append({
+            built.append({
                 "order": order,
                 "file": f["name"],
                 "layer": f["layer"],
@@ -1666,7 +1907,115 @@ def build_window_cases(files: list[dict], specs: list[tuple[str, int, int]],
                 "window_locality": loc,
             })
             order += 1
+
+    cases = interleave_window_cases(built)
     return cases, [(k, qd)]
+
+
+def interleave_window_cases(built: list[dict]) -> list[dict]:
+    """Rank window cases by physical span and alternate the two populations.
+
+    Split out of `build_window_cases` so it can be reasoned about — and read —
+    on its own, because it is the thing standing between the experiment and a
+    position artifact.
+
+    Cases are ranked by the physical span of their window, densest first. The
+    denser half and the more scattered half are then taken alternately, so the
+    built list reads dense, scattered, dense, scattered, ... An odd case out
+    (an odd number of windows) falls in the scattered half, where it is the
+    least dense of that half and therefore the least misleading place for it.
+    Cases whose locality could not be computed cannot be ranked at all and are
+    appended last, labelled `unknown`, so they never silently pad one
+    population.
+
+    Every case comes back carrying `window_rank` (0 = densest) and
+    `window_population`, and `order` is renumbered to the position in the
+    returned list — `order` is the canonical index the plan prints and the log
+    joins on, while the position a case *runs* at is `exec_position` and
+    changes every repeat.
+    """
+    def span(case: dict) -> int | None:
+        loc = case.get("window_locality") or {}
+        return loc.get("physical_span_bytes") if loc.get("ok") else None
+
+    rankable = [c for c in built if span(c) is not None]
+    unrankable = [c for c in built if span(c) is None]
+    # Ties are certain: several dense windows can sit inside one extent and
+    # span exactly `length - 1` bytes apart. Offset then order break them, so
+    # the ranking is total and reproducible rather than input-order dependent.
+    rankable.sort(key=lambda c: (span(c), c["window_offset"], c["order"]))
+    for rank, case in enumerate(rankable):
+        case["window_rank"] = rank
+    # One window is not two populations. Calling the only case "scattered"
+    # because it landed in the upper half of a one-element list would be the
+    # table asserting a contrast that was never measured.
+    half = len(rankable) // 2
+    if len(rankable) < 2:
+        # Still woven (as the whole of one side), just not labelled as a
+        # population: there is nothing for it to contrast with.
+        dense, scattered = rankable, []
+        for case in rankable:
+            case["window_population"] = "unpaired"
+    else:
+        dense, scattered = rankable[:half], rankable[half:]
+        for case in dense:
+            case["window_population"] = "dense"
+        for case in scattered:
+            case["window_population"] = "scattered"
+    for case in unrankable:
+        case["window_rank"] = None
+        case["window_population"] = "unknown"
+
+    woven: list[dict] = []
+    for i in range(max(len(dense), len(scattered))):
+        if i < len(dense):
+            woven.append(dense[i])
+        if i < len(scattered):
+            woven.append(scattered[i])
+    woven.extend(unrankable)
+    for index, case in enumerate(woven):
+        case["order"] = index
+    return woven
+
+
+def execution_order(cases: list[dict], mode: str, repeat: int) -> list[int]:
+    """Case indices in the order run `repeat` should execute them.
+
+    Identity for every whole-file mode: those cases issue 128 reads each, the
+    warm-up a leading position costs is a fraction of a percent of that, and
+    changing the order would change what every pre-phase-9 summary is
+    comparable against for no measurable gain.
+
+    Window mode rotates the interleaved list left by the run index, so case
+    `i` runs at position `(i - repeat) mod n`. That is the property worth
+    having and it is worth having exactly: **no case occupies the same
+    position in two runs** while there are fewer runs than cases, so a
+    per-position cost cannot accumulate onto one case. Rotation also preserves
+    the interleave, so the head of every run still alternates between the two
+    populations as `repeat` advances.
+
+    Deliberately not a shuffle, and deliberately not a rotation with a
+    reflection folded in. A shuffle asks the reader to trust a PRNG where a
+    rotation can be checked by eye against `case_execution_order`. A
+    reflection looks like it adds disorder and does the opposite: it maps case
+    `i` to `n - 1 - ((i - repeat) mod n)`, which puts case 0 at position 0 in
+    both run 0 and run 1, and for two cases it collapses to no permutation at
+    all (`reverse(rotate([0, 1], 1))` is `[0, 1]`).
+
+    What rotation does not break is the neighbour relation — case `i` always
+    follows case `i - 1`. The interleave is what covers that: each dense case
+    is preceded by a scattered one and vice versa, so any read-ahead or
+    drive-cache carry-over from the previous case lands on both populations
+    equally.
+
+    The warm-up run gets index 0 and therefore the built order, so `--dry-run`
+    and the first log agree with the plan.
+    """
+    n = len(cases)
+    if mode != "window" or n < 2:
+        return list(range(n))
+    rotate = repeat % n
+    return list(range(rotate, n)) + list(range(rotate))
 
 
 # ---------------------------------------------------------------------------
@@ -1702,40 +2051,64 @@ def aggregate(runs: list[dict]) -> dict[tuple, dict]:
             "gb_s_min": round(min(rates), 4),
             "gb_s_max": round(max(rates), 4),
             "p50_ms_median": round(statistics.median(p50s), 4),
+            # One position per scored run, in run order. Identical for every
+            # case in a whole-file mode; the whole point in window mode.
+            "exec_positions": [e.get("exec_position") for e in entries],
         }
     return out
 
 
 def gb(value: float | None) -> str:
-    """A byte distance in GB (10^9), which is how far apart these things are."""
+    """An absolute byte *position* in GB (10^9). Positions on this filesystem
+    are always tens to hundreds of GB, so a fixed unit reads better than
+    `dist()`'s adaptive one — and keeps a column of them comparable by eye."""
     return "-" if value is None else f"{value / 1e9:.2f}"
 
 
+def pct_str(value: float | None) -> str:
+    """A fraction as a percentage, or a dash. Every dispersion fraction can be
+    `None` (no extents, or a file too small to have a second one), and a table
+    is not allowed to raise on the file that is missing the interesting
+    column."""
+    return "-" if value is None else f"{value * 100:.1f}%"
+
+
 def frag_row(name: str, size: int, s: dict) -> list:
-    """One file's geometry *and* dispersion, in the order both tables use."""
-    def frac(key):
-        v = s.get(key)
-        return f"{v * 100:.1f}%" if v is not None else "-"
+    """One file's geometry *and* dispersion, in the order both tables use.
+
+    Distance columns go through `dist()`, not `gb()`: a single-extent file — an
+    XFS install, or any file after `btrfs filesystem defragment` — has a span
+    of a few hundred MB and no inter-extent seek at all, and a hard GB column
+    renders both as `0.00` when the whole point of the column is to tell them
+    apart. The byte-weighted mean position stays in GB because it is a
+    position, not a distance.
+    """
     return [
         name, size, s.get("extents", "-"), s.get("mean_extent_bytes", "-"),
         s.get("median_extent_bytes", "-"), s.get("adjacent_pairs", "-"),
-        frac("adjacent_fraction"), s.get("encoded_extents", "-"),
-        gb(s.get("physical_span_bytes")), s.get("regions", "-"),
-        frac("largest_region_fraction"), gb(s.get("median_seek_bytes")),
+        pct_str(s.get("adjacent_fraction")), s.get("encoded_extents", "-"),
+        dist(s.get("physical_span_bytes")), s.get("regions", "-"),
+        pct_str(s.get("largest_region_fraction")),
+        dist(s.get("median_seek_bytes")),
         gb(s.get("byte_weighted_mean_physical_bytes")),
     ]
 
 
 FRAG_HEADER = ["file", "bytes", "extents", "mean extent B", "median extent B",
                "physically adjacent pairs", "adjacent %", "compressed extents",
-               "phys span GB", "regions", "largest region %",
-               "median seek GB", "byte-wtd mean pos GB"]
+               "phys span", "regions", "largest region %",
+               "median seek", "byte-wtd mean pos GB"]
 
 
 def dispersion_bandwidth_rows(plan: dict, agg: dict[tuple, dict],
                               frag: dict) -> list[list]:
     """The join the phase 9 question needs: one row per (file, pattern) at the
-    fixed cell, bandwidth next to dispersion, ready to regress."""
+    fixed cell, bandwidth next to dispersion, ready to regress.
+
+    Distance columns use `dist()` for the same reason `frag_row` does: a file
+    with one extent has no seek to report and must not be printed as a file
+    with a zero-length one.
+    """
     rows = []
     for f in plan["files"]:
         s = frag.get(f["path"], {})
@@ -1749,21 +2122,31 @@ def dispersion_bandwidth_rows(plan: dict, agg: dict[tuple, dict],
                 f"{entry['gb_s_median']:.3f}",
                 f"{entry['gb_s_min']:.3f}-{entry['gb_s_max']:.3f}",
                 f"{entry['p50_ms_median']:.3f}",
-                s.get("extents", "-"), gb(s.get("physical_span_bytes")),
+                s.get("extents", "-"), dist(s.get("physical_span_bytes")),
                 s.get("regions", "-"),
-                (f"{s['largest_region_fraction'] * 100:.1f}%"
-                 if s.get("largest_region_fraction") is not None else "-"),
-                gb(s.get("median_seek_bytes")),
+                pct_str(s.get("largest_region_fraction")),
+                dist(s.get("median_seek_bytes")),
             ])
     return rows
 
 
 DISPERSION_BW_HEADER = ["file", "layer", "stride", "pattern", "GB/s median",
-                        "GB/s min-max", "p50 ms", "extents", "phys span GB",
-                        "regions", "largest region %", "median seek GB"]
+                        "GB/s min-max", "p50 ms", "extents", "phys span",
+                        "regions", "largest region %", "median seek"]
 
 
 def window_rows(plan: dict, agg: dict[tuple, dict]) -> list[list]:
+    """One row per window case: bandwidth beside the locality it is meant to be
+    explained by, in the plan's canonical (interleaved) order.
+
+    The population and rank columns are what make a position artifact visible
+    from the table alone — `dense` and `scattered` alternate down the rows, so
+    a column that tracks the row number rather than the population is reading
+    as a run-order effect, not a placement effect. The per-read p50 is beside
+    the bandwidth for the same reason: a window this small issues single-digit
+    reads, and a bandwidth ratio that the latency ratio does not corroborate
+    is measuring something other than the drive.
+    """
     rows = []
     for case in plan["cases"]:
         entry = agg.get(case_key(case))
@@ -1771,6 +2154,7 @@ def window_rows(plan: dict, agg: dict[tuple, dict]) -> list[list]:
             continue
         loc = case.get("window_locality") or {}
         rows.append([
+            case["order"], case.get("window_population", "-"),
             case["file"], case["window_offset"],
             f"{case['window_length'] / 2**20:.2f}",
             case["block_bytes"], case["blocks"], case["pattern"],
@@ -1782,17 +2166,16 @@ def window_rows(plan: dict, agg: dict[tuple, dict]) -> list[list]:
             # one across regions spans hundreds of gigabytes. Forcing both
             # into a GB column prints the interesting one as 0.00.
             dist(loc.get("physical_span_bytes")),
-            (f"{loc['dominant_fraction'] * 100:.1f}%"
-             if loc.get("dominant_fraction") is not None else "-"),
+            pct_str(loc.get("dominant_fraction")),
             dist(loc.get("median_seek_bytes")),
         ])
     return rows
 
 
-WINDOW_HEADER = ["file", "window offset", "window MiB", "block B", "blocks",
-                 "pattern", "GB/s median", "GB/s min-max", "p50 ms",
-                 "regions touched", "phys span", "dominant region %",
-                 "median seek"]
+WINDOW_HEADER = ["case", "population", "file", "window offset", "window MiB",
+                 "block B", "blocks", "pattern", "GB/s median",
+                 "GB/s min-max", "p50 ms", "regions touched", "phys span",
+                 "dominant region %", "median seek"]
 
 
 def md_table(header: list[str], rows: list[list[str]]) -> str:
@@ -1821,13 +2204,21 @@ def build_markdown(plan: dict, agg: dict[tuple, dict], frag: dict,
                f"inside a `memory.max={plan['memory_max']}`, "
                f"`memory.swap.max=0` cgroup. Hygiene: **{verdict}**.")
     out.append("")
-    out.append(f"Dispersion columns are **{LOGICAL_NOT_LBA}**. To resolve "
-               f"logical to device LBA a human with sudo runs "
-               f"`{chunk_tree_command(machine['mount']['source'])}`; this "
-               f"probe never does. On a single-device `single`-profile "
-               f"filesystem the chunk map is monotone within a chunk, so a "
-               f"clustering signal survives the translation, but an absolute "
-               f"LBA does not.")
+    fstype = machine["mount"]["fstype"]
+    if fstype == "btrfs":
+        resolve = chunk_tree_command(machine["mount"]["source"], fstype)
+        out.append(f"Dispersion columns are **{LOGICAL_NOT_LBA}**. To resolve "
+                   f"logical to device LBA a human with sudo runs "
+                   f"`{resolve}`; this probe never does. On a single-device "
+                   f"`single`-profile filesystem the chunk map is monotone "
+                   f"within a chunk, so a clustering signal survives the "
+                   f"translation, but an absolute LBA does not.")
+    else:
+        out.append(f"Dispersion columns are "
+                   f"**{physical_units_note(fstype)}**. There is no "
+                   f"filesystem-internal logical space to resolve here, "
+                   f"unlike btrfs; the remaining indirection is the drive's "
+                   f"own FTL, which no host-side tool can see.")
     out.append("")
 
     def frag_table(title: str) -> None:
@@ -1840,13 +2231,29 @@ def build_markdown(plan: dict, agg: dict[tuple, dict], frag: dict,
 
     if plan.get("mode") == "window":
         out.append("**Byte-window locality test** — bounded reads inside a "
-                   "single file. Same file, same age, same NAND cells, same "
-                   "SLC and read-disturb history; the only difference is "
-                   "where the bytes sit. A dense window that reads faster "
-                   "than a scattered one makes physical placement the "
-                   "mechanism; no difference rules placement out and leaves "
-                   "the per-file spread unexplained by anything the "
-                   "filesystem can see.")
+                   "single file. What this holds constant is the file: both "
+                   "windows were written by the same `install` run, at the "
+                   "same time, into the same inode, so age, write history and "
+                   "install order — every confound a cross-file comparison "
+                   "carries — are identical. What it does **not** hold "
+                   "constant is the NAND: two ranges at different offsets are "
+                   "on different blocks by construction, so their SLC "
+                   "residency and read-disturb histories are unmeasured, not "
+                   "equal. A dense window that reads faster therefore points "
+                   "at physical placement *or* at something that varies from "
+                   "block to block; no difference says neither is moving the "
+                   "number, and the per-file spread stays unexplained by "
+                   "anything the filesystem can see.")
+        out.append("")
+        out.append(f"Case order is **{plan.get('case_order_policy', '-')}**: "
+                   f"the dense and scattered windows alternate in the built "
+                   f"order so neither population owns the head of a run, and "
+                   f"every repeat runs a different permutation "
+                   f"(`case_execution_order` per run, `exec_position` per "
+                   f"case, both in the JSON). Position matters here: these "
+                   f"cases issue single-digit numbers of reads, and in the "
+                   f"pre-fix phase 9 run the first-built case was the slowest "
+                   f"of sixteen in every scored run.")
         out.append("")
         out.append(md_table(WINDOW_HEADER, window_rows(plan, agg)))
         out.append("")
@@ -1979,10 +2386,11 @@ def print_plan(plan: dict, assume_bw: float) -> None:
               f"(--block-ks and --queue-depths are not swept in {mode} mode)")
     if mode == "window":
         print("\nwindows (byte ranges inside one file; the whole file is "
-              "still evicted and residency-proved):")
+              "still evicted and residency-proved), in built order:")
         for c in plan["cases"]:
             loc = c.get("window_locality") or {}
-            print(f"  {c['file']:<10} offset {c['window_offset']:>12} "
+            print(f"  [{c['order']:>3}] {c.get('window_population', '-'):<9} "
+                  f"{c['file']:<10} offset {c['window_offset']:>12} "
                   f"len {c['window_length']:>10} "
                   f"({c['window_length'] / 2**20:.2f} MiB) "
                   f"block {c['block_bytes']:>9} x {c['blocks']:>3} "
@@ -1994,11 +2402,22 @@ def print_plan(plan: dict, assume_bw: float) -> None:
             if loc.get("ok"):
                 print(f"       locality: {loc['regions_touched']} region(s), "
                       f"span {dist(loc['physical_span_bytes'])}, "
-                      f"dominant {loc['dominant_fraction'] * 100:.1f}%, "
+                      f"dominant {pct_str(loc['dominant_fraction'])}, "
                       f"median seek {dist(loc['median_seek_bytes'])} "
-                      f"({LOGICAL_NOT_LBA})")
+                      f"({loc.get('physical_units', LOGICAL_NOT_LBA)})")
             else:
                 print(f"       locality: UNKNOWN ({loc.get('reason')})")
+        print(f"\ncase order policy: {plan.get('case_order_policy')}")
+        print("  Built order alternates the dense and scattered populations, "
+              "so neither owns\n  the head of a run; each repeat then runs a "
+              "different permutation of it. The\n  first case of a run pays "
+              "warm-up the rest do not, and an 8-read window case\n  is small "
+              "enough for that to move the headline (it did, before this was "
+              "fixed).")
+        for repeat in range(plan["warmup"] + plan["repeats"]):
+            label = "warmup" if repeat < plan["warmup"] else "scored"
+            print(f"  run {repeat} ({label:<6}) executes cases in order "
+                  f"{execution_order(plan['cases'], mode, repeat)}")
     print(f"patterns: {plan['patterns']}  "
           f"(rand = uniform permutation of the same K-aligned blocks, so both "
           f"patterns read identical bytes)")
@@ -2052,26 +2471,47 @@ def print_regions(files: list[dict], mount: dict, cluster_gap: int,
     deliberately skips `preflight` — refusing to print an extent map because
     `systemd-run --user` is missing would be a harness bug, not a measurement
     failure.
+
+    The returned report carries `files_ok` and `files_failed` so the caller can
+    pick an exit code. "filefrag is not installed" and "this file is one
+    extent" produce very similar-looking output — an empty region table — and
+    the difference between them is the difference between a finding and a
+    missing tool.
     """
+    fstype = mount.get("fstype")
+    units = physical_units_note(fstype)
     report: dict = {"cluster_gap_bytes": cluster_gap,
-                    "physical_units": LOGICAL_NOT_LBA,
+                    "physical_units": units,
+                    "fstype": fstype,
                     "logical_to_lba_command": chunk_tree_command(
-                        mount.get("source")),
-                    "files": []}
+                        mount.get("source"), fstype),
+                    "files": [], "files_ok": 0, "files_failed": 0}
     print("=== physical dispersion of the installed expert files ===")
-    print(f"device:      {mount.get('source')} ({mount.get('fstype')}) on "
+    print(f"device:      {mount.get('source')} ({fstype}) on "
           f"{mount.get('target')}")
-    print(f"addresses:   {LOGICAL_NOT_LBA}.")
-    print(f"             filefrag reports the btrfs logical address space. On "
-          f"a single-device")
-    print(f"             `single`-profile filesystem the chunk map is monotone "
-          f"within a chunk,")
-    print(f"             so clustering survives the translation to LBA, but an "
-          f"absolute LBA")
-    print(f"             does not. To resolve it, a human with sudo runs:")
-    print(f"                 {report['logical_to_lba_command']}")
-    print(f"             This probe never runs it: there is no passwordless "
-          f"sudo here.")
+    print(f"addresses:   {units}.")
+    if fstype == "btrfs":
+        print(f"             filefrag reports the btrfs logical address "
+              f"space. On a single-device")
+        print(f"             `single`-profile filesystem the chunk map is "
+              f"monotone within a chunk,")
+        print(f"             so clustering survives the translation to LBA, "
+              f"but an absolute LBA")
+        print(f"             does not. To resolve it, a human with sudo runs:")
+        print(f"                 {report['logical_to_lba_command']}")
+        print(f"             This probe never runs it: there is no "
+              f"passwordless sudo here.")
+    else:
+        # Telling an ext4 or XFS user that their genuine device block numbers
+        # are "NOT device LBA", and then handing them a btrfs command, is the
+        # tool being wrong about the user's own filesystem.
+        print(f"             filefrag reports device physical block numbers "
+              f"directly on {fstype or 'this filesystem'};")
+        print(f"             there is no btrfs-style logical space in the "
+              f"way, so no chunk-tree")
+        print(f"             translation applies. The drive's FTL is still "
+              f"between these")
+        print(f"             addresses and the NAND, on every filesystem.")
     print(f"region gap:  {cluster_gap} B ({cluster_gap / 2**20:.0f} MiB) — two "
           f"extents are in the same region when the hole between them is no "
           f"bigger than this")
@@ -2084,22 +2524,34 @@ def print_regions(files: list[dict], mount: dict, cluster_gap: int,
         print(f"\n{f['name']}  {f['size']} B ({mib(f['size'])})  "
               f"stride {f['stride']}")
         if not parsed["ok"]:
+            # Stays on stdout: it is the report's answer for this file. The
+            # summary that follows, and the exit code, are what a wrapper
+            # reads, and those go to stderr and to the shell respectively.
             print(f"  filefrag failed: {parsed['reason']}")
             entry["ok"] = False
             entry["reason"] = parsed["reason"]
             report["files"].append(entry)
+            report["files_failed"] += 1
             continue
         extents = parsed["extents"]
-        stats = dispersion_stats(extents, cluster_gap)
+        stats = dispersion_stats(extents, cluster_gap, units)
         entry.update({"ok": True, "extents": len(extents), **stats})
+        report["files_ok"] += 1
+        # Every distance goes through `dist()`. A single-extent file — XFS, or
+        # anything after `btrfs filesystem defragment` — has no inter-extent
+        # seek at all, and `median_seek_bytes` is None there; dividing it by
+        # 1e9 raised TypeError on the one path in this script whose whole
+        # promise is that it is safe to run.
         print(f"  extents {len(extents)}   physical span "
-              f"{stats['physical_span_bytes'] / 1e9:.2f} GB   "
+              f"{dist(stats['physical_span_bytes'])}   "
               f"regions {stats['regions']}   largest region "
-              f"{stats['largest_region_fraction'] * 100:.1f}% of bytes")
+              f"{pct_str(stats['largest_region_fraction'])} of bytes")
         print(f"  median inter-extent seek in read order "
-              f"{stats['median_seek_bytes'] / 1e9:.2f} GB   "
-              f"byte-weighted mean position "
-              f"{stats['byte_weighted_mean_physical_bytes'] / 1e9:.2f} GB")
+              f"{dist(stats['median_seek_bytes'])}"
+              + ("  (one extent: there is no seek to take a median of)"
+                 if stats["median_seek_bytes"] is None else "")
+              + f"   byte-weighted mean position "
+                f"{gb(stats['byte_weighted_mean_physical_bytes'])} GB")
         regions = physical_regions(extents, cluster_gap)
         print(f"  {'#':>3} {'bytes':>12} {'%':>7} {'extents':>8} "
               f"{'phys start GB':>14} {'phys end GB':>13}  logical ranges")
@@ -2115,7 +2567,7 @@ def print_regions(files: list[dict], mount: dict, cluster_gap: int,
         entry["window_scans"] = []
         for length in scan_lengths:
             scan = scan_windows(extents, f["size"], length, f["stride"],
-                                window_count)
+                                window_count, units)
             entry["window_scans"].append(scan)
             print(f"\n  window candidates of {length} B "
                   f"({length / 2**20:.2f} MiB), ranked by physical span "
@@ -2127,7 +2579,7 @@ def print_regions(files: list[dict], mount: dict, cluster_gap: int,
                           f"{f['name']}:{w['offset']}:{w['length']}"
                           f"   span {dist(w['physical_span_bytes']):>10}"
                           f"   regions {w['regions_touched']:>2}"
-                          f"   dominant {w['dominant_fraction'] * 100:>5.1f}%"
+                          f"   dominant {pct_str(w['dominant_fraction']):>6}"
                           f"   median seek "
                           f"{dist(w['median_seek_bytes']):>10}")
             if scan["dense"] and scan["scattered"]:
@@ -2139,14 +2591,28 @@ def print_regions(files: list[dict], mount: dict, cluster_gap: int,
                 else:
                     print("    the densest window has zero span (one extent), "
                           "so the contrast is unbounded")
+                print("    Pass both populations to ONE --window run: it "
+                      "interleaves them and permutes\n"
+                      "    the order every repeat, which a dense-only run "
+                      "followed by a scattered-only\n"
+                      "    run cannot do — that shape confounds placement "
+                      "with position in the run.")
         report["files"].append(entry)
 
-    print("\nWhat this does and does not show: these are logical-address "
-          "statistics. They can establish that two files, or two windows in "
-          "one file, differ in physical clustering; they cannot by themselves "
-          "establish that the drive's controller sees the same difference. "
-          "The byte-window test (--window) is what turns the correlation into "
-          "a controlled comparison.")
+    print(f"\nWhat this does and does not show: these are host-side address "
+          f"statistics ({units}). They can establish that two files, or two "
+          f"windows in one file, differ in physical clustering; they cannot "
+          f"by themselves establish that the drive's controller sees the same "
+          f"difference. The byte-window test (--window) is what turns the "
+          f"correlation into a controlled comparison — controlled for the "
+          f"file's age and write history, not for the NAND blocks, which two "
+          f"windows at different offsets never share.")
+    if report["files_failed"]:
+        print(f"\n{report['files_failed']} of "
+              f"{report['files_failed'] + report['files_ok']} files have no "
+              f"extent map. Without filefrag (e2fsprogs) there is no "
+              f"dispersion data at all, and an empty region table must not be "
+              f"read as 'this file is contiguous'.", file=sys.stderr)
     return report
 
 
@@ -2225,6 +2691,13 @@ def one_run(args, plan: dict, index: int, label: str, fstype: str | None) -> dic
     run_plan = dict(plan)
     run_plan["repeat"] = index
     run_plan["label"] = label
+    # Computed out here, not inside the cgroup: the order is a property of the
+    # run being planned, and it goes on the record in the plan file before the
+    # drive is touched.
+    run_plan["case_execution_order"] = execution_order(
+        plan["cases"], plan.get("mode", "matrix"), index)
+    if plan.get("mode") == "window":
+        print(f"  case order: {run_plan['case_execution_order']}")
     # The plan goes through a file, never systemd-run's command line: systemd
     # expands ${NAME} and unescapes $$ inside ExecStart= arguments, silently,
     # and a model path is user-controlled text.
@@ -2317,6 +2790,14 @@ def finish(args, plan: dict, machine: dict, cases: list[dict], frag: dict,
                 "window_length": template["window_length"],
                 "window_bytes_unread": template["window_bytes_unread"],
                 "window_locality": template.get("window_locality"),
+                # The population split the headline ratio is taken over, and
+                # the positions this case actually ran at, so a reader can
+                # redo both the comparison and the position check from the
+                # aggregate alone.
+                "window_rank": template.get("window_rank"),
+                "window_population": template.get("window_population"),
+                "case_order": template.get("order"),
+                "exec_positions": value["exec_positions"],
             })
         else:
             stats = frag.get(template["path"], {})
@@ -2408,10 +2889,17 @@ def main() -> int:
                              "sizes accept K/M/G. Read at (--fixed-k, "
                              "--fixed-qd) unless --window-block-bytes "
                              "overrides the block size. Two windows in one "
-                             "file share age, NAND, SLC history and "
-                             "read-disturb history, so a dense-vs-scattered "
-                             "difference isolates physical placement. Use "
-                             "--list-regions to get specs")
+                             "file share the file's age, its write history "
+                             "and the install run that wrote it — but not "
+                             "their NAND blocks, which differ by "
+                             "construction, so SLC and read-disturb state are "
+                             "uncontrolled rather than equal. Windows must be "
+                             "disjoint and --patterns must name exactly one "
+                             "pattern, or bytes get read twice in a run and "
+                             "the second read is a drive-cache hit. Dense and "
+                             "scattered windows are interleaved and the order "
+                             "is permuted every repeat. Use --list-regions to "
+                             "get specs")
     parser.add_argument("--window-block-bytes", type=parse_size,
                         help="block size for --window cases, overriding "
                              "K x stride. Must be a multiple of 4096. Needed "
@@ -2494,6 +2982,13 @@ def main() -> int:
 
     if args.cluster_gap < 0:
         fail("--cluster-gap must be >= 0")
+    # Rejected here rather than left to fall through: 0 is falsy, and the
+    # builder used to treat "the user asked for 0-byte blocks" and "the user
+    # asked for nothing" as the same request — silently reading at K x stride
+    # while `block_from_k` and every table said the flag had supplied the size.
+    if args.window_block_bytes is not None and args.window_block_bytes < 1:
+        fail(f"--window-block-bytes {args.window_block_bytes} is not a "
+             f"positive size; a block has to have bytes in it")
     if args.window_count < 1:
         fail("--window-count must be >= 1")
     scan_lengths = []
@@ -2535,7 +3030,16 @@ def main() -> int:
             with open(args.json, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
             print(f"\nwrote {args.json}")
-        return 0
+        # An empty report is not a clean one. `filefrag` missing (rc 127, no
+        # e2fsprogs), an unreadable extent tree, or a report with no extents in
+        # it all land here, and a wrapper script that only checks the exit
+        # status would otherwise file "no dispersion" as the finding.
+        if report["files_ok"] == 0:
+            print("no extent map could be read for any requested file, so "
+                  "nothing was measured. Install e2fsprogs (filefrag), or "
+                  "check that the files are readable.", file=sys.stderr)
+            return 2
+        return 1 if report["files_failed"] else 0
 
     preflight(args)
     layers = load_layout(args.rvmp)
@@ -2569,12 +3073,13 @@ def main() -> int:
     # records the locality of the bytes it is about to read. `filefrag` reads
     # the extent tree only: no data block is touched, so this is safe under
     # --dry-run too.
+    units = physical_units_note(mount.get("fstype"))
     frag: dict = {}
     extent_map: dict = {}
     for f in files:
         parsed = filefrag_extents(f["path"])
         frag[f["path"]] = filefrag_stats(f["path"], args.cluster_gap,
-                                         parsed=parsed)
+                                         parsed=parsed, units=units)
         if parsed["ok"]:
             physical_regions(parsed["extents"], args.cluster_gap)
             extent_map[f["path"]] = parsed["extents"]
@@ -2586,7 +3091,7 @@ def main() -> int:
         cases, combos = build_window_cases(files, specs, args.fixed_k,
                                            args.fixed_qd, patterns,
                                            args.window_block_bytes,
-                                           extent_map)
+                                           extent_map, units)
     else:
         cases, combos = build_cases(files, ks, qds, args.fixed_qd,
                                     args.fixed_k, patterns)
@@ -2611,8 +3116,19 @@ def main() -> int:
         "queue": "threaded-pread",
         "mount": mount,
         "cluster_gap_bytes": args.cluster_gap,
-        "physical_units": LOGICAL_NOT_LBA,
-        "logical_to_lba_command": chunk_tree_command(mount.get("source")),
+        "physical_units": units,
+        "logical_to_lba_command": chunk_tree_command(mount.get("source"),
+                                                     mount.get("fstype")),
+        # How the case list was built, and therefore how to read a per-run
+        # `case_execution_order`. Recorded rather than described: the whole
+        # point of the interleave is that a reader can check it.
+        "case_order_policy": (
+            "window: ranked by physical span, dense and scattered halves "
+            "interleaved, then rotated left by the run index so no case "
+            "repeats a position across runs"
+            if mode == "window" else
+            "built order, identical every run (whole-file cases issue enough "
+            "reads for position not to matter)"),
     }
 
     if args.dry_run:
@@ -2649,22 +3165,25 @@ def main() -> int:
     print(f"  command    {machine['command_line']}")
 
     print(f"\nextent geometry and physical dispersion (filefrag -v; "
-          f"{LOGICAL_NOT_LBA}):")
-    print(f"  logical->LBA, for a human with sudo: "
-          f"{chunk_tree_command(mount.get('source'))}")
+          f"{units}):")
+    if mount.get("fstype") == "btrfs":
+        resolve = chunk_tree_command(mount.get("source"), mount.get("fstype"))
+        print(f"  logical->LBA, for a human with sudo: {resolve}")
     for f in files:
         stats = frag[f["path"]]
         if stats["ok"]:
+            # Distances through dist()/pct_str(): a one-extent file has no
+            # median seek at all and None does not divide.
             print(f"  {f['name']:<10} {stats['extents']:>5} extents  "
                   f"mean {stats['mean_extent_bytes']:>9} B  "
                   f"median {stats['median_extent_bytes']:>9} B  "
                   f"adjacent {stats['adjacent_pairs']}/"
                   f"{max(stats['extents'] - 1, 0)}  "
                   f"compressed {stats['encoded_extents']}  "
-                  f"span {stats['physical_span_bytes'] / 1e9:>7.2f} GB  "
+                  f"span {dist(stats['physical_span_bytes']):>10}  "
                   f"regions {stats['regions']:>3}  "
-                  f"largest {stats['largest_region_fraction'] * 100:>5.1f}%  "
-                  f"med seek {stats['median_seek_bytes'] / 1e9:>6.2f} GB")
+                  f"largest {pct_str(stats['largest_region_fraction']):>6}  "
+                  f"med seek {dist(stats['median_seek_bytes']):>10}")
         else:
             print(f"  {f['name']:<10} filefrag failed: {stats['reason']}")
 
@@ -2714,7 +3233,7 @@ def main() -> int:
         print(f"\ndecode-shaped cell K={args.fixed_k} QD={args.fixed_qd} "
               f"across all {len(files)} layer files, joined to physical "
               f"dispersion (GB/s, median of {len(scored)}; dispersion is "
-              f"{LOGICAL_NOT_LBA}):")
+              f"{units}):")
         print("  " + "  ".join(DISPERSION_BW_HEADER))
         for row in dispersion_bandwidth_rows(plan, agg, frag):
             print("  " + "  ".join(str(c) for c in row))
@@ -2733,10 +3252,12 @@ def main() -> int:
 
     if mode == "window":
         print(f"\nbyte-window locality test (GB/s, median of {len(scored)}; "
-              f"dispersion is {LOGICAL_NOT_LBA}):")
+              f"dispersion is {units}):")
         print("  " + "  ".join(WINDOW_HEADER))
         for row in window_rows(plan, agg):
             print("  " + "  ".join(str(c) for c in row))
+        print(f"  case order per run: "
+              f"{[r.get('case_execution_order') for r in scored]}")
         for f in files:
             for pattern in patterns:
                 pairs = []
@@ -2747,27 +3268,76 @@ def main() -> int:
                     loc = case.get("window_locality") or {}
                     if entry and loc.get("ok"):
                         pairs.append((loc["physical_span_bytes"],
-                                      entry["gb_s_median"], case))
+                                      entry["gb_s_median"],
+                                      entry["p50_ms_median"], case))
                 if len(pairs) < 2:
                     continue
-                pairs.sort()
+                # An explicit key. Span ties among dense windows are certain —
+                # several can sit inside one extent — and a bare sort() falls
+                # through to comparing the bandwidth, then the `case` dict,
+                # which raises. Offset then canonical index break every tie.
+                pairs.sort(key=lambda p: (p[0], p[3]["window_offset"],
+                                          p[3]["order"]))
                 # The median over every dense window and every scattered one,
                 # not the single best and single worst: with a handful of
                 # reads per window the extremes are the noise, and the
                 # question is whether the two populations differ.
                 half = len(pairs) // 2
-                dense = statistics.median(r for _, r, _ in pairs[:half])
-                scatt = statistics.median(r for _, r, _ in pairs[-half:])
+                dense = statistics.median(r for _, r, _, _ in pairs[:half])
+                scatt = statistics.median(r for _, r, _, _ in pairs[-half:])
+                # The same comparison on per-read latency. Bandwidth over a
+                # handful of reads is a ratio of two short intervals; the p50
+                # is a property of the reads themselves. If the two disagree
+                # in direction, the bandwidth ratio is measuring the harness.
+                dense_p50 = statistics.median(
+                    p for _, _, p, _ in pairs[:half])
+                scatt_p50 = statistics.median(
+                    p for _, _, p, _ in pairs[-half:])
+                bw_ratio = dense / scatt if scatt else 0
+                p50_ratio = scatt_p50 / dense_p50 if dense_p50 else 0
+                agrees = (bw_ratio - 1) * (p50_ratio - 1) >= 0
                 print(f"  {f['name']} {pattern}: {half} densest windows "
                       f"(span up to {dist(pairs[half - 1][0])}) median "
                       f"{dense:.3f} GB/s vs {half} most scattered (span from "
                       f"{dist(pairs[-half][0])}) median {scatt:.3f} GB/s = "
-                      f"{dense / scatt if scatt else 0:.2f}x. A ratio near "
-                      f"1.00 says physical placement is NOT the mechanism, "
-                      f"since these bytes share a file, an age, an SLC "
-                      f"history and a read-disturb history. Windows this "
-                      f"small issue few reads: check the per-read p50 column "
-                      f"before believing a bandwidth ratio.")
+                      f"{bw_ratio:.2f}x.")
+                print(f"    per-read p50 over the same two populations: "
+                      f"{dense_p50:.3f} ms dense vs {scatt_p50:.3f} ms "
+                      f"scattered = {p50_ratio:.2f}x "
+                      f"({'agrees with' if agrees else 'DISAGREES with'} the "
+                      f"bandwidth ratio). These windows issue "
+                      f"{pairs[0][3]['blocks']} reads each, so the two must "
+                      f"agree before either is believed.")
+                print(f"    A ratio near 1.00 says physical placement is not "
+                      f"moving the number. What that rules out is placement "
+                      f"and anything else that differs between two ranges of "
+                      f"one file; it does not rule out per-NAND-block state, "
+                      f"which two windows never share.")
+
+        # Position, printed rather than assumed clean. The interleave and the
+        # per-repeat permutation exist to stop run position from deciding the
+        # answer; this is the check that they did.
+        by_position: dict[int, list[float]] = {}
+        for run in scored:
+            for case in run.get("cases", []):
+                if case.get("exec_position") is not None:
+                    by_position.setdefault(case["exec_position"],
+                                           []).append(case["gb_s"])
+        if by_position:
+            overall = statistics.median(
+                [v for values in by_position.values() for v in values])
+            worst = min(by_position.items(),
+                        key=lambda kv: statistics.median(kv[1]))
+            first = statistics.median(by_position.get(0, [overall]))
+            ratio = first / overall if overall else 0
+            print(f"\n  position check (median GB/s by position in the run, "
+                  f"across {len(scored)} scored runs): overall "
+                  f"{overall:.3f}, position 0 {first:.3f} ({ratio:.2f}x), "
+                  f"slowest position {worst[0]} at "
+                  f"{statistics.median(worst[1]):.3f}. A position 0 well "
+                  f"below the rest is warm-up, not placement — the interleave "
+                  f"and the per-repeat rotation spread it over both "
+                  f"populations, they do not remove it.")
 
     if mode != "matrix":
         markdown = build_markdown(plan, agg, frag, machine, verdict)
