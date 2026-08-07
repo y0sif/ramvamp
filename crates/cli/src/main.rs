@@ -1290,11 +1290,16 @@ fn report_prefill_timing(state: &ForwardState, span: &PhaseStats) {
     }
 }
 
-/// The decode phase split, on stderr, under the prefill one.
+/// The decode phase split, on stderr, under the prefill one, followed by the
+/// pooled-GEMV sub-split of the same tokens.
 ///
 /// Silent when nothing has decoded on this state since the last prefill.
 fn report_decode_timing(state: &ForwardState) {
-    for line in decode_timing_lines(&state.decode_timing()) {
+    let timing = state.decode_timing();
+    for line in decode_timing_lines(&timing) {
+        eprintln!("{line}");
+    }
+    for line in decode_gemv_lines(&timing, &state.decode_gemv_split()) {
         eprintln!("{line}");
     }
 }
@@ -1390,6 +1395,72 @@ fn decode_timing_lines(timing: &PrefillTiming) -> Vec<String> {
         };
         lines.push(format!("  {label:>14}: {secs:7.2}s ({pct:5.1}%)"));
     }
+    lines
+}
+
+/// The pooled-GEMV sub-split of the same decode, one level under
+/// [`decode_timing_lines`].
+///
+/// EXP-023 put 248 ms of a 532 ms decode token in `expert compute` plus
+/// `projections` and found it flat in context — 8.04 GB/s of weight bytes
+/// across six shards against EXP-001's 9.61 GB/s on one warm core. This block
+/// splits every fan-out on the decode thread into the part that core computed
+/// itself (`own`: job set-up, the publish, and its `1/shards` of the rows) and
+/// the part it spent at the compute pool's barrier (`wait`). An `own`-heavy
+/// split points at the kernel or the memory system under it; a `wait`-heavy one
+/// points at the even row partition on a hybrid part.
+///
+/// **This is a second block, not a replacement.** The `decode split
+/// (forward_token)` heading above keeps EXP-023's exact five buckets and exact
+/// format, and this heading is `decode gemv split (` — which contains neither
+/// `decode split (` nor `decode:`, so it can be mistaken for neither the block
+/// above nor `scripts/cold_bench.py`'s `TIMING_RE`. Percentages share that
+/// block's denominator (the summed per-token wall time) so the two can be read
+/// against each other without arithmetic.
+///
+/// Silent when nothing has decoded, exactly as the block above is.
+fn decode_gemv_lines(
+    timing: &PrefillTiming,
+    split: &[(&'static str, Duration, Duration, u64); 4],
+) -> Vec<String> {
+    if timing.tokens == 0 {
+        return Vec::new();
+    }
+    let total = timing.total.as_secs_f64();
+    let share = |spent: Duration| {
+        if total > 0.0 {
+            spent.as_secs_f64() / total * 100.0
+        } else {
+            0.0
+        }
+    };
+    let mut lines = vec![format!(
+        "decode gemv split (submitting thread): {} tokens; \
+         own = set-up + this core's shard, wait = pool barrier",
+        timing.tokens
+    )];
+    for &(label, own, wait, scatters) in split {
+        // Wall time per fan-out on the decode thread, which is what makes a
+        // bucket comparable against the kernel's own throughput.
+        let each = if scatters > 0 {
+            (own + wait).as_secs_f64() / scatters as f64 * 1000.0
+        } else {
+            0.0
+        };
+        lines.push(format!(
+            "  {label:>14}: own {:7.2}s ({:5.1}%) | wait {:7.2}s ({:5.1}%); \
+             {scatters:>7} scatters at {each:.3} ms",
+            own.as_secs_f64(),
+            share(own),
+            wait.as_secs_f64(),
+            share(wait),
+        ));
+    }
+    lines.push(
+        "  router is serial on the decode thread: its wait is zero by construction, \
+         not measured"
+            .to_string(),
+    );
     lines
 }
 
@@ -3756,6 +3827,87 @@ mod tests {
             .len()
                 == 7
         );
+    }
+
+    /// The GEMV sub-split is a *second* block under the decode split, and it
+    /// has to clear both bars: `cold_bench.py`'s `TIMING_RE`, and the decode
+    /// split it prints beneath. A heading that contained `decode split (` would
+    /// make a reader — or a future parser — merge two instruments with
+    /// different denominators.
+    #[test]
+    fn the_decode_gemv_split_is_a_second_block_and_says_so() {
+        let ms = std::time::Duration::from_millis;
+        let timing = PrefillTiming {
+            mode: None,
+            tokens: 64,
+            total: ms(30_000),
+            attention: ms(21_000),
+            projections: ms(3_000),
+            expert_compute: ms(2_500),
+            expert_io: ms(2_000),
+            elementwise: ms(1_000),
+        };
+        let split = [
+            ("projections", ms(1_800), ms(700), 12_288u64),
+            ("experts", ms(1_700), ms(600), 24_576),
+            ("lm_head", ms(200), ms(50), 64),
+            ("router", ms(400), ms(0), 3_072),
+        ];
+
+        let lines = decode_gemv_lines(&timing, &split);
+        assert_eq!(
+            lines.len(),
+            6,
+            "a heading, four buckets and a note: {lines:?}"
+        );
+        assert_eq!(
+            lines[0],
+            "decode gemv split (submitting thread): 64 tokens; own = set-up + this \
+             core's shard, wait = pool barrier"
+        );
+        for line in &lines {
+            assert!(!line.contains("decode: 64 tokens"), "{line}");
+            assert!(!line.contains("; decode: "), "{line}");
+            assert!(!line.contains("tok/s"), "{line}");
+            // The block above owns this heading; two instruments, two names.
+            assert!(!line.contains("decode split ("), "{line}");
+        }
+
+        // 1.8s + 0.7s over 12,288 fan-outs is 0.203 ms each, and the shares are
+        // against the same 30s the block above uses.
+        assert_eq!(
+            lines[1],
+            "     projections: own    1.80s (  6.0%) | wait    0.70s (  2.3%);   \
+             12288 scatters at 0.203 ms"
+        );
+        assert_eq!(
+            lines[3],
+            "         lm_head: own    0.20s (  0.7%) | wait    0.05s (  0.2%);      \
+             64 scatters at 3.906 ms"
+        );
+        assert_eq!(
+            lines[4],
+            "          router: own    0.40s (  1.3%) | wait    0.00s (  0.0%);    \
+             3072 scatters at 0.130 ms"
+        );
+        assert_eq!(
+            lines[5],
+            "  router is serial on the decode thread: its wait is zero by \
+             construction, not measured"
+        );
+
+        // Nothing has decoded: nothing is printed, for the same reason the
+        // block above prints nothing.
+        assert!(decode_gemv_lines(&PrefillTiming::default(), &split).is_empty());
+
+        // A bucket nothing reached divides by no zero.
+        let idle = [
+            ("projections", Duration::ZERO, Duration::ZERO, 0u64),
+            ("experts", Duration::ZERO, Duration::ZERO, 0),
+            ("lm_head", Duration::ZERO, Duration::ZERO, 0),
+            ("router", Duration::ZERO, Duration::ZERO, 0),
+        ];
+        assert!(decode_gemv_lines(&timing, &idle)[1].ends_with("0 scatters at 0.000 ms"));
     }
 
     /// Swept prefill resolves no cache accesses at all, so the old

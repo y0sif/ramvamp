@@ -82,10 +82,11 @@
 //! `attn_k` dots Q8_0 activations. Activations are quantized once per
 //! distinct input vector, not once per consumer.
 
+use std::cell::Cell;
 use std::fmt;
 use std::ops::Range;
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::format::ArchInfo;
 use crate::io::{
@@ -564,6 +565,16 @@ pub struct ForwardState {
     /// Zeroed when a prefill is armed, so it describes the decode belonging to
     /// the most recent prompt rather than a whole chat session.
     decode_timing: PrefillTiming,
+    /// The pooled-GEMV sub-split of that decode: for each site, this core's
+    /// own share against the barrier wait.
+    ///
+    /// One level below `decode_timing`, charged by the same `forward_token`
+    /// over regions that sit *inside* [`Phase::Projections`] and
+    /// [`Phase::ExpertCompute`], and zeroed by exactly the events that zero
+    /// `decode_timing` so the two blocks always describe the same tokens.
+    /// EXP-023 measured those two coarse phases at ~248 ms of a 532 ms token
+    /// and flat in context; this says whether that is arithmetic or waiting.
+    decode_gemv: GemvSplit,
     /// Whether [`forward_token`] should charge phases into `prefill_timing`.
     ///
     /// True only while [`crate::model::prefill_prompt`] is running the
@@ -720,6 +731,7 @@ impl ForwardState {
             routed: Vec::with_capacity(n_experts),
             prefill_timing: PrefillTiming::default(),
             decode_timing: PrefillTiming::default(),
+            decode_gemv: GemvSplit::default(),
             prefill_charging: false,
         })
     }
@@ -783,6 +795,7 @@ impl ForwardState {
         self.kv.clear();
         self.prefill_timing = PrefillTiming::default();
         self.decode_timing = PrefillTiming::default();
+        self.decode_gemv = GemvSplit::default();
         self.prefill_charging = false;
     }
 
@@ -813,8 +826,10 @@ impl ForwardState {
         self.prefill_timing = PrefillTiming::started(mode, tokens);
         // The decode split is dropped with the prefill split it belongs
         // beside: in a chat session the numbers under this turn's heading must
-        // be this turn's, not the session's running total.
+        // be this turn's, not the session's running total. The GEMV sub-split
+        // goes with it, or the two blocks would be over different token sets.
         self.decode_timing = PrefillTiming::default();
+        self.decode_gemv = GemvSplit::default();
         self.prefill_charging = true;
     }
 
@@ -975,6 +990,36 @@ impl ForwardState {
         self.decode_timing
     }
 
+    /// The pooled-GEMV sub-split of that same decode, one level finer:
+    /// `(label, own, wait, scatters)` for `projections`, `experts`, `lm_head`
+    /// and `router`, in that order.
+    ///
+    /// `own` is the submitting thread's time from just before a fan-out to the
+    /// moment its **own** shard finished; `wait` is from there to the fan-out
+    /// returning, i.e. the compute pool's barrier. Reading the two apart is the
+    /// whole point: EXP-023 left ~248 ms of a 532 ms decode token in
+    /// [`PrefillTiming::projections`] plus [`PrefillTiming::expert_compute`],
+    /// flat in context and ~7x off EXP-001's single-core kernel throughput, and
+    /// a `wait`-heavy split blames the even row partition on a hybrid part
+    /// while an `own`-heavy one blames the kernel or the memory system.
+    ///
+    /// `router` is **not** pooled — it is a serial `dot_f32` loop on the decode
+    /// thread — so its `wait` is zero by construction, not measured.
+    ///
+    /// The four buckets are disjoint spans strictly inside the two coarse
+    /// phases above, so their sum can never exceed
+    /// `projections + expert_compute`; the gap is the non-GEMV work those
+    /// phases also cover (the softmax and top-k scan, SwiGLU, the intermediate
+    /// quantization, the expert view carves). Same lifetime as
+    /// [`ForwardState::decode_timing`]: accumulated across a run's tokens,
+    /// zeroed by the next prefill and by [`ForwardState::reset`].
+    ///
+    /// Returned as plain tuples rather than a struct because `ramvamp-core`
+    /// does not print, exactly as [`PrefillTiming::phases`] is.
+    pub fn decode_gemv_split(&self) -> [(&'static str, Duration, Duration, u64); 4] {
+        self.decode_gemv.rows()
+    }
+
     /// Attribute every expert request from the next [`forward_token`] on to
     /// `phase`.
     ///
@@ -1041,6 +1086,258 @@ pub(super) fn taken<E>(slot: Mutex<Option<(usize, E)>>) -> Result<(), E> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Where a decode token's GEMV time went: this core, or the barrier
+// ---------------------------------------------------------------------------
+
+/// One pooled site of the decode GEMV sub-split, as charged by [`GemvClock`].
+///
+/// Strictly finer than [`Phase`], and strictly *inside* it: every site here is
+/// already inside [`Phase::Projections`] or [`Phase::ExpertCompute`], which is
+/// what makes the two instruments checkable against each other rather than
+/// merely printable side by side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GemvSite {
+    /// `attn_q`, `attn_k`, `attn_v`, `attn_output`: four fan-outs a layer,
+    /// against resident (mmap'd) weights.
+    Projections,
+    /// gate, up and down for every routed expert: `3 * top_k` fan-outs a
+    /// layer, against streamed weights.
+    Experts,
+    /// The `[vocab]` head. One fan-out a token, and only when logits are
+    /// wanted.
+    LmHead,
+    /// The f32 router matvec. **Not pooled** — it runs serial on the decode
+    /// thread through [`dot_f32`] — so it has no barrier to wait at and its
+    /// `wait` is structurally zero rather than measured.
+    Router,
+}
+
+/// One site's decode cost, split into the part this core computed and the part
+/// it spent at the barrier.
+///
+/// # What the split means
+///
+/// The pool runs shard 0 **inline on the submitting thread**
+/// ([`PoolConfig::inline_caller`], which [`ForwardState::with_config`] always
+/// sets): the submitter publishes the job, runs shard 0 itself, and only then
+/// joins at the barrier. So the decode thread's own timeline through one
+/// fan-out is
+///
+/// ```text
+/// t0 --[ set-up + publish + this core's shard ]-- t1 --[ barrier ]-- t2
+/// ```
+///
+/// and `own = t1 - t0`, `wait = t2 - t1`. EXP-023 left ~248 ms/token of GEMV
+/// unexplained at 8.04 GB/s aggregate against EXP-001's 9.61 GB/s on one warm
+/// core, and these two numbers separate the two candidate causes: a `wait` near
+/// zero says the kernel (or the memory system under it) is genuinely slow on
+/// this core, and a large `wait` says the even
+/// [`shard_range`](crate::threads::shard_range) row split is wrong for a hybrid
+/// 6 P + 8 E + 2 LP-E part and the stragglers are the cost.
+///
+/// # What lands on which side
+///
+/// `own` carries the [`Mutex`] the failure slot needs, the job descriptor's
+/// construction, the publish (including the `futex` wake when workers are
+/// parked) and this core's `1/shards` of the rows. `wait` carries the barrier
+/// spin, the park, and the uncontended `take_panic` lock on the way out. Both
+/// are attributed to the *fan-out*, which is what the question is about; the
+/// components are named here so nobody reads `own` as pure arithmetic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GemvBucket {
+    /// Set-up, publish and this core's share of the rows.
+    own: Duration,
+    /// The barrier: stragglers, worker wake latency, and whatever the even row
+    /// split costs on cores of different speeds. Always zero for
+    /// [`GemvSite::Router`], which never fans out.
+    wait: Duration,
+    /// Fan-outs charged, so ms/scatter is derivable without another counter.
+    scatters: u64,
+}
+
+/// Every [`GemvSite`]'s bucket, for the decode since the last prefill.
+///
+/// Accumulated across tokens exactly as [`ForwardState::decode_timing`] is, and
+/// zeroed by the same two events, so the two blocks always describe the same
+/// tokens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GemvSplit {
+    projections: GemvBucket,
+    experts: GemvBucket,
+    lm_head: GemvBucket,
+    router: GemvBucket,
+}
+
+impl GemvSplit {
+    /// The bucket `site` charges.
+    fn bucket(&mut self, site: GemvSite) -> &mut GemvBucket {
+        match site {
+            GemvSite::Projections => &mut self.projections,
+            GemvSite::Experts => &mut self.experts,
+            GemvSite::LmHead => &mut self.lm_head,
+            GemvSite::Router => &mut self.router,
+        }
+    }
+
+    /// Every bucket in report order, as `(label, own, wait, scatters)`.
+    ///
+    /// An array of plain tuples rather than a struct for the same reason
+    /// [`PrefillTiming::phases`] is one: `ramvamp-core` does not print, and the
+    /// renderer wants rows.
+    fn rows(&self) -> [(&'static str, Duration, Duration, u64); 4] {
+        [
+            (
+                "projections",
+                self.projections.own,
+                self.projections.wait,
+                self.projections.scatters,
+            ),
+            (
+                "experts",
+                self.experts.own,
+                self.experts.wait,
+                self.experts.scatters,
+            ),
+            (
+                "lm_head",
+                self.lm_head.own,
+                self.lm_head.wait,
+                self.lm_head.scatters,
+            ),
+            (
+                "router",
+                self.router.own,
+                self.router.wait,
+                self.router.scatters,
+            ),
+        ]
+    }
+}
+
+thread_local! {
+    /// When the pooled GEMV in flight finished **this thread's** shard.
+    ///
+    /// This is the one piece of the instrument that cannot live on the
+    /// submitting thread's side of the call: `t1` is the instant
+    /// [`ComputePool::run`] returns from `f(Shard { index: 0, .. })`, which is
+    /// *inside* `run`, and the pool exposes no hook there. It is read from the
+    /// closure instead, under two conditions that keep the worker hot path
+    /// untouched:
+    ///
+    /// - only when the sub-split is armed, which the closure captures as a
+    ///   plain `bool`, so a prefill's fan-outs and every non-decode caller take
+    ///   a predicted-not-taken branch and nothing else;
+    /// - only from `shard.index == 0`, which under
+    ///   [`PoolConfig::inline_caller`] is the submitting thread itself. Every
+    ///   worker shard evaluates one comparison and skips.
+    ///
+    /// So no worker ever reads a clock, no worker ever writes shared state, and
+    /// the wake/park pattern the instrument is trying to measure is not itself
+    /// perturbed. Thread-local rather than atomic for the same reason: the
+    /// value never crosses a thread, and an atomic would put a store on the
+    /// only line where a straggler's timing matters.
+    ///
+    /// Without `inline_caller` shard 0 is a worker, this cell is never written
+    /// on the submitting thread, and [`GemvClock::close`] falls back to
+    /// `own = t2 - t0`, `wait = 0`. That is a degenerate report, not a wrong
+    /// one, and it is unreachable from [`ForwardState`], which hard-codes
+    /// `inline_caller: true`.
+    static SHARD0_DONE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// A stopwatch over a [`GemvSplit`], charged per fan-out rather than per
+/// region.
+///
+/// The counterpart of [`PhaseClock`] one level down, and armed the same way:
+/// `None` charges nowhere and — this is the point — reads no clock at all, so a
+/// disarmed pass costs one `Option` check per site.
+///
+/// **Three clock reads per pooled GEMV**, against [`PhaseClock`]'s one per
+/// region boundary. Per decoded token at the v0 pin (48 layers, `top_k` 8):
+/// `48 * 4 * 3` = 576 for the projections, `48 * 8 * 3 * 3` = 3,456 for the
+/// experts, 3 for `lm_head` and `48 * 2` = 96 for the serial router, so
+/// **4,131 reads a token** — derived by counting the sites, not measured. At
+/// the ~27 ns `Instant::now()` measures on this machine's vDSO (the figure
+/// [`forward_token_traced`] already quotes) that is ~112 µs against the ~532 ms
+/// token EXP-023 measured: 0.021% of it, and an order below the run-to-run
+/// noise of anything the split is read against. The budget this was designed
+/// to was 4,500 reads.
+struct GemvClock<'a> {
+    /// `None` when this pass charges nowhere.
+    split: Option<&'a mut GemvSplit>,
+}
+
+impl<'a> GemvClock<'a> {
+    /// Charge into `split` only when `armed`.
+    ///
+    /// Armed for decode and disarmed for the token-major prefill, which is the
+    /// same rule — and the same reason — as [`PhaseClock::new`]'s: the two
+    /// paths run the *same* instrumented function, and a prompt's fan-outs
+    /// belong to no decode.
+    fn new(split: &'a mut GemvSplit, armed: bool) -> Self {
+        Self {
+            split: armed.then_some(split),
+        }
+    }
+
+    /// A clock that charges nowhere, for a caller with no [`GemvSplit`] to
+    /// hand it — the prefill path, and the tests that drive the expert phase
+    /// directly.
+    fn disarmed() -> Self {
+        Self { split: None }
+    }
+
+    /// Open one fan-out: clear the previous stamp and read the clock.
+    ///
+    /// `None` on a disarmed clock, which is also the `stamp` flag the pooled
+    /// helpers take — passing `opened.is_some()` is what keeps the closure's
+    /// branch and this clock from ever disagreeing about whether a stamp is
+    /// coming.
+    #[inline]
+    fn open(&self) -> Option<Instant> {
+        self.split.as_ref()?;
+        SHARD0_DONE.set(None);
+        Some(Instant::now())
+    }
+
+    /// Close one fan-out, charging `own` and `wait` to `site`.
+    #[inline]
+    fn close(&mut self, site: GemvSite, opened: Option<Instant>) {
+        let (Some(split), Some(t0)) = (self.split.as_deref_mut(), opened) else {
+            return;
+        };
+        let t2 = Instant::now();
+        // `None` when the closure never ran on this thread: `rows == 0`, which
+        // `ComputePool::run` returns from without calling `f` at all. The whole
+        // call is then this thread's and there was no barrier, which is exactly
+        // what `t1 = t2` records.
+        let t1 = SHARD0_DONE.replace(None).unwrap_or(t2);
+        let bucket = split.bucket(site);
+        // Saturating for the same reason `PhaseClock::charge` saturates: a
+        // non-monotonic platform clock must not panic in library code.
+        bucket.own += t1.saturating_duration_since(t0);
+        bucket.wait += t2.saturating_duration_since(t1);
+        bucket.scatters += 1;
+    }
+
+    /// Close a region that never fanned out, charging all of it to `own`.
+    ///
+    /// For [`GemvSite::Router`], whose matvec is serial on the decode thread:
+    /// there is no barrier, so `wait` stays zero by construction rather than
+    /// by measuring a zero.
+    #[inline]
+    fn close_serial(&mut self, site: GemvSite, opened: Option<Instant>) {
+        let (Some(split), Some(t0)) = (self.split.as_deref_mut(), opened) else {
+            return;
+        };
+        let now = Instant::now();
+        let bucket = split.bucket(site);
+        bucket.own += now.saturating_duration_since(t0);
+        bucket.scatters += 1;
+    }
+}
+
 /// Whole-matrix k-quant GEMV, fanned out over contiguous output-row ranges.
 ///
 /// Bit-identical to `gemv_q8_k` over the same operands: the pool's shards
@@ -1055,11 +1352,37 @@ pub(super) fn pool_gemv_q8_k(
     acts: &[BlockQ8K],
     out: &mut [f32],
 ) -> Result<(), KernelError> {
+    pool_gemv_q8_k_stamped(pool, format, weight, in_dim, out_dim, acts, out, false)
+}
+
+/// [`pool_gemv_q8_k`], stamping [`SHARD0_DONE`] when `stamp` is set.
+///
+/// Split out rather than folded into the public helper so that every caller
+/// that does not want the decode sub-split — the sweep, the token-major
+/// prefill, the tests — keeps the shorter signature and passes no flag.
+/// Numerically it is the same call: the stamp is a clock read after the
+/// kernel has written its rows, and it moves no bit and no row boundary.
+#[allow(clippy::too_many_arguments)]
+fn pool_gemv_q8_k_stamped(
+    pool: &mut ComputePool,
+    format: QuantFormat,
+    weight: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+    acts: &[BlockQ8K],
+    out: &mut [f32],
+    stamp: bool,
+) -> Result<(), KernelError> {
     let failure: Mutex<Option<(usize, KernelError)>> = Mutex::new(None);
     pool.scatter(out, |shard, chunk| {
         let index = shard.index;
         if let Err(err) = gemv_q8_k_rows(format, weight, in_dim, out_dim, acts, shard.rows, chunk) {
             record(&failure, index, err);
+        }
+        // Last, so it is the end of this core's arithmetic and not the middle
+        // of it. See `SHARD0_DONE` for why a worker never reaches the read.
+        if stamp && index == 0 {
+            SHARD0_DONE.set(Some(Instant::now()));
         }
     });
     taken(failure)
@@ -1073,12 +1396,16 @@ fn pool_gemv_q8_0(
     out_dim: usize,
     acts: &[BlockQ8_0],
     out: &mut [f32],
+    stamp: bool,
 ) -> Result<(), KernelError> {
     let failure: Mutex<Option<(usize, KernelError)>> = Mutex::new(None);
     pool.scatter(out, |shard, chunk| {
         let index = shard.index;
         if let Err(err) = gemv_q8_0_rows(weight, in_dim, out_dim, acts, shard.rows, chunk) {
             record(&failure, index, err);
+        }
+        if stamp && index == 0 {
+            SHARD0_DONE.set(Some(Instant::now()));
         }
     });
     taken(failure)
@@ -1444,11 +1771,13 @@ fn expert_ffn(
     dims: MoeDims,
     scratch: &mut FfnScratch<'_>,
     out: &mut [f32],
+    gemv: &mut GemvClock<'_>,
 ) -> Result<(), ForwardError> {
     let gate_slab = view.gate();
     let up_slab = view.up();
     let down_slab = view.down();
-    pool_gemv_q8_k(
+    let opened = gemv.open();
+    pool_gemv_q8_k_stamped(
         pool,
         gate_slab.format,
         gate_slab.bytes,
@@ -1456,8 +1785,11 @@ fn expert_ffn(
         dims.moe,
         scratch.acts_hidden,
         scratch.gate,
+        opened.is_some(),
     )?;
-    pool_gemv_q8_k(
+    gemv.close(GemvSite::Experts, opened);
+    let opened = gemv.open();
+    pool_gemv_q8_k_stamped(
         pool,
         up_slab.format,
         up_slab.bytes,
@@ -1465,10 +1797,13 @@ fn expert_ffn(
         dims.moe,
         scratch.acts_hidden,
         scratch.up,
+        opened.is_some(),
     )?;
+    gemv.close(GemvSite::Experts, opened);
     swiglu_combine(scratch.gate, scratch.up)?;
     quantize_row_q8_k(scratch.gate, scratch.acts_moe)?;
-    pool_gemv_q8_k(
+    let opened = gemv.open();
+    pool_gemv_q8_k_stamped(
         pool,
         down_slab.format,
         down_slab.bytes,
@@ -1476,7 +1811,9 @@ fn expert_ffn(
         dims.hidden,
         scratch.acts_moe,
         out,
+        opened.is_some(),
     )?;
+    gemv.close(GemvSite::Experts, opened);
     Ok(())
 }
 
@@ -1499,6 +1836,7 @@ fn run_plan(
     dims: MoeDims,
     plan: &[(usize, u32)],
     scratch: &mut MoeScratch<'_>,
+    gemv: &mut GemvClock<'_>,
 ) -> Result<(), ForwardError> {
     for &(index, slot) in plan {
         if index >= dims.top_k || scratch.done[index] {
@@ -1510,7 +1848,7 @@ fn run_plan(
         }
         let view = stream.view(layer, slot)?;
         let out = &mut scratch.staged[index * dims.hidden..(index + 1) * dims.hidden];
-        expert_ffn(pool, &view, dims, &mut scratch.ffn, out)?;
+        expert_ffn(pool, &view, dims, &mut scratch.ffn, out, gemv)?;
         scratch.done[index] = true;
     }
     Ok(())
@@ -1536,8 +1874,9 @@ fn stream_experts(
     dims: MoeDims,
     scratch: &mut MoeScratch<'_>,
     clock: &mut PhaseClock<'_>,
+    gemv: &mut GemvClock<'_>,
 ) -> Result<(), ForwardError> {
-    let outcome = stage_expert_phases(stream, pool, layer, dims, scratch, clock);
+    let outcome = stage_expert_phases(stream, pool, layer, dims, scratch, clock, gemv);
     if outcome.is_err()
         && let Err(drain) = stream.await_misses()
     {
@@ -1566,6 +1905,7 @@ fn stream_experts(
 /// arithmetic, and the block between them is expert I/O. `await_misses`'s
 /// blocked time is separately (and independently) counted by the streamer as
 /// [`StreamStats::io_wait`], so nothing here re-times the drive.
+#[allow(clippy::too_many_arguments)]
 fn stage_expert_phases(
     stream: &mut ExpertStream,
     pool: &mut ComputePool,
@@ -1573,13 +1913,14 @@ fn stage_expert_phases(
     dims: MoeDims,
     scratch: &mut MoeScratch<'_>,
     clock: &mut PhaseClock<'_>,
+    gemv: &mut GemvClock<'_>,
 ) -> Result<(), ForwardError> {
     scratch.done.fill(false);
-    run_plan(stream, pool, layer, dims, stream.hits(), scratch)?;
+    run_plan(stream, pool, layer, dims, stream.hits(), scratch, gemv)?;
     clock.charge(Phase::ExpertCompute);
     stream.await_misses()?;
     clock.charge(Phase::ExpertIo);
-    run_plan(stream, pool, layer, dims, stream.misses(), scratch)?;
+    run_plan(stream, pool, layer, dims, stream.misses(), scratch, gemv)?;
     clock.charge(Phase::ExpertCompute);
     let covered = scratch.done.iter().filter(|filled| **filled).count();
     if covered != dims.top_k {
@@ -1692,6 +2033,7 @@ pub fn forward_token_traced<'s>(
         routed: _,
         prefill_timing,
         decode_timing,
+        decode_gemv,
         prefill_charging,
     } = state;
 
@@ -1723,10 +2065,19 @@ pub fn forward_token_traced<'s>(
     // happens. The honest statement is that decode instrumentation is no longer
     // free, that its cost is ~20 µs/token, and that this comment — not the old
     // promise — is the current contract.
-    let mut clock = if *prefill_charging {
-        PhaseClock::new(prefill_timing, true)
+    //
+    // The GEMV sub-split rides the same choice one level down: armed for
+    // decode, disarmed for the token-major prefill, so a prompt's fan-outs
+    // never land in a decode's `own`/`wait`. Its own cost is a further ~4,131
+    // clock reads (~112 µs) a decoded token and zero on the prefill path; see
+    // [`GemvClock`] for the count and the arithmetic behind it.
+    let (mut clock, mut gemv) = if *prefill_charging {
+        (PhaseClock::new(prefill_timing, true), GemvClock::disarmed())
     } else {
-        PhaseClock::decoding(decode_timing)
+        (
+            PhaseClock::decoding(decode_timing),
+            GemvClock::new(decode_gemv, true),
+        )
     };
 
     let expected = kv.seq_len()?;
@@ -1751,7 +2102,8 @@ pub fn forward_token_traced<'s>(
         quantize_row_q8_0(normed, acts_q8_0_hidden)?;
         clock.charge(Phase::Elementwise);
 
-        pool_gemv_q8_k(
+        let opened = gemv.open();
+        pool_gemv_q8_k_stamped(
             pool,
             lw.attn_q.format,
             lw.attn_q.bytes,
@@ -1759,9 +2111,22 @@ pub fn forward_token_traced<'s>(
             q_dim,
             acts_q8k_hidden,
             q,
+            opened.is_some(),
         )?;
-        pool_gemv_q8_0(pool, lw.attn_k.bytes, hidden, kv_dim, acts_q8_0_hidden, k)?;
-        pool_gemv_q8_k(
+        gemv.close(GemvSite::Projections, opened);
+        let opened = gemv.open();
+        pool_gemv_q8_0(
+            pool,
+            lw.attn_k.bytes,
+            hidden,
+            kv_dim,
+            acts_q8_0_hidden,
+            k,
+            opened.is_some(),
+        )?;
+        gemv.close(GemvSite::Projections, opened);
+        let opened = gemv.open();
+        pool_gemv_q8_k_stamped(
             pool,
             lw.attn_v.format,
             lw.attn_v.bytes,
@@ -1769,7 +2134,9 @@ pub fn forward_token_traced<'s>(
             kv_dim,
             acts_q8k_hidden,
             v,
+            opened.is_some(),
         )?;
+        gemv.close(GemvSite::Projections, opened);
         clock.charge(Phase::Projections);
 
         // Per-head QK-RMSNorm, then RoPE — HF order: q_norm/k_norm apply
@@ -1793,7 +2160,8 @@ pub fn forward_token_traced<'s>(
         // Output projection (q5_k, Q8_K activations) and residual add.
         quantize_row_q8_k(attn_out, acts_q8k_attn)?;
         clock.charge(Phase::Elementwise);
-        pool_gemv_q8_k(
+        let opened = gemv.open();
+        pool_gemv_q8_k_stamped(
             pool,
             lw.attn_output.format,
             lw.attn_output.bytes,
@@ -1801,7 +2169,9 @@ pub fn forward_token_traced<'s>(
             hidden,
             acts_q8k_attn,
             o_proj,
+            opened.is_some(),
         )?;
+        gemv.close(GemvSite::Projections, opened);
         clock.charge(Phase::Projections);
         vec_add(residual, o_proj)?;
 
@@ -1813,6 +2183,14 @@ pub fn forward_token_traced<'s>(
         // load), softmax over all experts in f32, top-k by probability
         // (equivalent to top-k by logit; first index wins ties like
         // torch.topk), then renormalize when norm_topk_prob.
+        //
+        // The matvec is the one GEMV on this path that never reaches the
+        // compute pool, so the sub-split charges it serially: all `own`, no
+        // barrier to wait at. Its two clock reads bracket the loop alone, not
+        // the softmax and top-k scan the coarse `Projections` region also
+        // covers, which is why the two instruments do not sum to each other
+        // here.
+        let opened = gemv.open();
         for (row, logit) in lw
             .router
             .data()
@@ -1821,6 +2199,7 @@ pub fn forward_token_traced<'s>(
         {
             *logit = dot_f32(row, normed);
         }
+        gemv.close_serial(GemvSite::Router, opened);
         router_probs.copy_from_slice(router_logits);
         softmax(router_probs)?;
         topk.clear();
@@ -1869,7 +2248,15 @@ pub fn forward_token_traced<'s>(
             staged: expert_staged,
             done: expert_done,
         };
-        let phases = stream_experts(stream, pool, layer, dims, &mut scratch, &mut clock);
+        let phases = stream_experts(
+            stream,
+            pool,
+            layer,
+            dims,
+            &mut scratch,
+            &mut clock,
+            &mut gemv,
+        );
         stream.end_layer(layer);
         clock.charge(Phase::ExpertIo);
         phases?;
@@ -1895,7 +2282,8 @@ pub fn forward_token_traced<'s>(
     quantize_row_q8_k(normed, acts_q8k_hidden)?;
     clock.charge(Phase::Elementwise);
     let head = model.lm_head();
-    pool_gemv_q8_k(
+    let opened = gemv.open();
+    pool_gemv_q8_k_stamped(
         pool,
         head.format,
         head.bytes,
@@ -1903,7 +2291,9 @@ pub fn forward_token_traced<'s>(
         head.out_dim,
         acts_q8k_hidden,
         logits,
+        opened.is_some(),
     )?;
+    gemv.close(GemvSite::LmHead, opened);
     clock.charge(Phase::Projections);
     clock.close();
     Ok(Some(logits))
@@ -2538,6 +2928,7 @@ mod tests {
                 dims,
                 scratch,
                 &mut PhaseClock::new(&mut timing, false),
+                &mut GemvClock::disarmed(),
             )
             .unwrap_err();
             assert!(
@@ -2586,7 +2977,16 @@ mod tests {
 
             // Past the end of the routed set: nothing is computed at all.
             scratch.done.fill(false);
-            let err = run_plan(stream, pool, 0, dims, &[(2, slot)], scratch).unwrap_err();
+            let err = run_plan(
+                stream,
+                pool,
+                0,
+                dims,
+                &[(2, slot)],
+                scratch,
+                &mut GemvClock::disarmed(),
+            )
+            .unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -2604,8 +3004,16 @@ mod tests {
             // because slot 0 is already filled. Reducing it twice would
             // weight one expert twice and leave the other's slot stale.
             scratch.done.fill(false);
-            let err =
-                run_plan(stream, pool, 0, dims, &[(0, slot), (0, slot)], scratch).unwrap_err();
+            let err = run_plan(
+                stream,
+                pool,
+                0,
+                dims,
+                &[(0, slot), (0, slot)],
+                scratch,
+                &mut GemvClock::disarmed(),
+            )
+            .unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -2653,6 +3061,7 @@ mod tests {
                 dims,
                 scratch,
                 &mut PhaseClock::new(&mut timing, false),
+                &mut GemvClock::disarmed(),
             )
             .unwrap_err();
             assert!(
@@ -2733,5 +3142,203 @@ mod tests {
 
         assert_eq!(DEFAULT_CACHE_BYTES / PER_SLOT_ALL_LAYERS, 11);
         assert_eq!(1438 * 1024 * 1024 / PER_SLOT_ALL_LAYERS, 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // The decode GEMV sub-split
+    // -----------------------------------------------------------------------
+
+    /// `(own + wait)` over every bucket, plus the serial router.
+    fn gemv_accounted(split: &[(&'static str, Duration, Duration, u64); 4]) -> Duration {
+        split
+            .iter()
+            .map(|&(_, own, wait, _)| own + wait)
+            .sum::<Duration>()
+    }
+
+    /// The scatter count of one labelled bucket.
+    fn gemv_scatters(split: &[(&'static str, Duration, Duration, u64); 4], want: &str) -> u64 {
+        split
+            .iter()
+            .find(|&&(label, ..)| label == want)
+            .unwrap_or_else(|| panic!("no {want} bucket in {split:?}"))
+            .3
+    }
+
+    /// The sub-split and the coarse split are two instruments over the same
+    /// decode, and they must not be able to disagree.
+    ///
+    /// Four directions, all checked over a real multi-token decode:
+    ///
+    /// - **Counts.** Every fan-out is charged exactly once, to the bucket the
+    ///   geometry says: `4` projections and `3 * top_k` expert GEMVs a layer, a
+    ///   serial router matvec a layer, one `lm_head` a token. A GEMV that
+    ///   slipped out of the sub-split, or one charged twice, moves one of these
+    ///   exact numbers.
+    /// - **Containment.** Every sub-split region sits strictly inside
+    ///   `Phase::Projections` or `Phase::ExpertCompute`, so the sub-split can
+    ///   never exceed those two coarse phases together. A region charged to the
+    ///   wrong coarse phase — attention, say — breaks this immediately.
+    /// - **Coverage.** And it has to be most of them, or a bucket has silently
+    ///   stopped charging. The gap is the non-GEMV work those phases also cover
+    ///   (the softmax and top-k scan, SwiGLU, the intermediate quantization, the
+    ///   expert view carves); it measures ~6% here, and the assertion is set at
+    ///   50% so that it pins the instrument rather than the fixture's SwiGLU.
+    /// - **Liveness.** At least one pooled barrier measured non-zero, which is
+    ///   the only thing that distinguishes "the barrier is free" from "the
+    ///   shard-0 stamp never arrived and `own` swallowed the whole call".
+    ///
+    /// No absolute duration is asserted anywhere, for the reason the prefill
+    /// timing tests give: this machine runs the model under a cgroup while the
+    /// tests run.
+    #[test]
+    fn the_gemv_sub_split_cannot_disagree_with_the_coarse_decode_split() {
+        let (_fx, model) = load_fixture("fwd-gemv-subsplit");
+        let mut st = state(&model, 16);
+        let layers = model.n_layers() as u64;
+        let top_k = model.arch().top_k as u64;
+        let tokens = 4u64;
+
+        for pos in 0..tokens as usize {
+            forward_token(&model, &mut st, (pos % VOCAB) as u32, pos, true).unwrap();
+        }
+
+        let split = st.decode_gemv_split();
+        let coarse = st.decode_timing();
+        assert_eq!(
+            coarse.tokens, tokens,
+            "the two blocks cover the same tokens"
+        );
+
+        assert_eq!(
+            gemv_scatters(&split, "projections"),
+            4 * layers * tokens,
+            "attn_q, attn_k, attn_v and attn_output, once a layer: {split:?}"
+        );
+        assert_eq!(
+            gemv_scatters(&split, "experts"),
+            3 * top_k * layers * tokens,
+            "gate, up and down for every routed expert: {split:?}"
+        );
+        assert_eq!(
+            gemv_scatters(&split, "lm_head"),
+            tokens,
+            "one head fan-out a token: {split:?}"
+        );
+        assert_eq!(
+            gemv_scatters(&split, "router"),
+            layers * tokens,
+            "one serial matvec a layer: {split:?}"
+        );
+
+        let accounted = gemv_accounted(&split);
+        let inside = coarse.projections + coarse.expert_compute;
+        assert!(
+            accounted <= inside,
+            "the sub-split {accounted:?} exceeds the coarse phases {inside:?} it \
+             lives inside — a fan-out is charged to the wrong phase, or twice: \
+             {split:?}"
+        );
+        assert!(
+            accounted > Duration::ZERO,
+            "a decode that ran charged nothing: {split:?}"
+        );
+        // And the other side of the sum: the gap between the two instruments is
+        // only the non-GEMV work those phases also cover, so the sub-split has
+        // to be *most* of them. Measured on this fixture it is ~94%; the floor
+        // is set at half, which is eight times the observed gap and still
+        // catches a whole bucket that stopped charging (the smallest, `lm_head`,
+        // is worth more than that share at the v0 pin). A tighter bound would
+        // be measuring the fixture's SwiGLU and top-k scan, not the instrument.
+        assert!(
+            accounted * 2 >= inside,
+            "the sub-split {accounted:?} is under half the coarse phases \
+             {inside:?} it tiles: a site has stopped charging: {split:?}"
+        );
+        for &(label, own, _, _) in &split {
+            assert!(
+                own > Duration::ZERO,
+                "{label} charged no own time: {split:?}"
+            );
+        }
+
+        // The instrument's own failure mode: if the shard-0 stamp never reaches
+        // the submitting thread, `close` falls back to `t1 = t2` and every
+        // pooled bucket reports its whole fan-out as `own` with a `wait` of
+        // exactly zero — which reads like a finding ("the barrier costs
+        // nothing") rather than like a dead instrument. Over the ~150 real
+        // fan-outs above, a barrier that measures zero every single time is
+        // that failure and nothing else.
+        let pooled_wait: Duration = split[..3].iter().map(|&(_, _, wait, _)| wait).sum();
+        assert!(
+            pooled_wait > Duration::ZERO,
+            "every pooled fan-out reported a zero barrier: the shard-0 stamp is \
+             not reaching the submitting thread, so `own` is the whole call and \
+             the split says nothing: {split:?}"
+        );
+
+        // The router never fans out, so it has no barrier to wait at.
+        let (_, _, router_wait, _) = split[3];
+        assert_eq!(split[3].0, "router");
+        assert_eq!(
+            router_wait,
+            Duration::ZERO,
+            "the serial router cannot wait at a barrier it never reaches"
+        );
+
+        // Same lifetime as the coarse split: a reset drops both.
+        st.reset();
+        assert_eq!(
+            st.decode_gemv_split(),
+            GemvSplit::default().rows(),
+            "a reset state reports no decode GEMVs at all"
+        );
+    }
+
+    /// A disarmed [`GemvClock`] reads no clock and touches no state.
+    ///
+    /// "No clock reads" is not directly observable, so this asserts the
+    /// structural cause of it: [`GemvClock::open`] returns before it does
+    /// anything at all, which is why it can neither clear [`SHARD0_DONE`] nor
+    /// call `Instant::now`. A sentinel left in the cell across the whole
+    /// open/close/close_serial cycle is what pins that.
+    #[test]
+    fn a_disarmed_gemv_clock_does_nothing() {
+        let sentinel = Instant::now();
+        SHARD0_DONE.set(Some(sentinel));
+
+        let mut clock = GemvClock::disarmed();
+        assert!(
+            clock.open().is_none(),
+            "a disarmed clock has no instant to hand back, so it read none"
+        );
+        assert_eq!(
+            SHARD0_DONE.get(),
+            Some(sentinel),
+            "`open` cleared the stamp, so it did more than return"
+        );
+
+        // And charging is a no-op even when handed an instant by a caller that
+        // armed and then disarmed.
+        clock.close(GemvSite::Experts, Some(sentinel));
+        clock.close_serial(GemvSite::Router, Some(sentinel));
+        assert_eq!(
+            SHARD0_DONE.get(),
+            Some(sentinel),
+            "a disarmed close consumed the stamp"
+        );
+
+        // An armed clock over its own split does charge, and clears the stamp
+        // on the way in.
+        let mut split = GemvSplit::default();
+        let mut clock = GemvClock::new(&mut split, true);
+        let opened = clock.open();
+        assert!(opened.is_some());
+        assert_eq!(SHARD0_DONE.get(), None, "`open` arms a fresh stamp");
+        clock.close_serial(GemvSite::Router, opened);
+        assert_eq!(split.router.scatters, 1);
+        assert_eq!(split.router.wait, Duration::ZERO);
+
+        SHARD0_DONE.set(None);
     }
 }

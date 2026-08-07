@@ -3762,4 +3762,42 @@ mod tests {
             "three decode tokens moved a prefill counter"
         );
     }
+
+    /// The GEMV sub-split rides the same arming rule one level down: the
+    /// token-major prefill runs the *same* pooled fan-outs `forward_token`
+    /// does, and charges none of them.
+    ///
+    /// This is the disarmed half of the instrument, asserted where it actually
+    /// matters: not that a `None` clock returns early — a unit test in
+    /// `forward` pins that — but that the path which shares the instrumented
+    /// function with decode leaves every bucket, and every scatter count, at
+    /// zero. A prompt's fan-outs folded into a decode's `own`/`wait` would put
+    /// hundreds of prefill GEMVs under a heading that says decode.
+    #[test]
+    fn a_token_major_prefill_charges_no_decode_gemvs() {
+        let (_fx, model) = load_fixture("prefill-gemv-subsplit");
+        let ids = [1u32, 2, 3, 4, 5];
+        let mut st = state_with(&model, 32, token_major_config());
+
+        prefill_prompt(&model, &mut st, &ids, None).unwrap();
+        let after_prefill = st.decode_gemv_split();
+        for &(label, own, wait, scatters) in &after_prefill {
+            assert_eq!(
+                (own, wait, scatters),
+                (Duration::ZERO, Duration::ZERO, 0),
+                "the prefill charged {label}: {after_prefill:?}"
+            );
+        }
+
+        // The same state, now decoding: the instrument is armed and every
+        // bucket fills.
+        for step in 0..2usize {
+            let position = ids.len() + step;
+            crate::model::forward_token(&model, &mut st, 7, position, true).unwrap();
+        }
+        for &(label, own, _, scatters) in &st.decode_gemv_split() {
+            assert!(scatters > 0, "{label} charged no fan-out after decoding");
+            assert!(own > Duration::ZERO, "{label} charged no own time");
+        }
+    }
 }
