@@ -43,10 +43,52 @@
 //! drive the io_uring reactor inline on the coordinator, so they are *not* a
 //! reactor-to-worker measurement — this pool performs no such handoff.
 //!
-//! The pool therefore uses a bounded spin ([`SPIN_ROUNDS`]) followed by a
-//! futex wait, which behaves like the spinner while the decode loop is hot
-//! and like the futex when it goes idle. Re-measure with
+//! The pool therefore uses a bounded spin followed by a futex wait, which
+//! behaves like the spinner while the decode loop is hot and like the futex
+//! when it goes idle. Re-measure with
 //! `cargo test -p ramvamp-core -- --ignored wake_latency --nocapture`.
+//!
+//! # Why the spin bound is adaptive
+//!
+//! The bound used to be a fixed 64 `pause` iterations, sized against that
+//! microbenchmark. The microbenchmark is `pool.run(6, |_| {})` in a tight
+//! loop, in which a worker retires one job and the next is already published
+//! — so it never actually reaches the end of its spin, and it measures a
+//! barrier that is never cold. Decode does not look like that.
+//!
+//! Phase 9 measured the decode fan-out on the submitting thread, split into
+//! `own` (set-up, publish, and this core's shard) and `wait` (the barrier).
+//! Warm diagnostic, ctx 512, 63 tokens, v0 pin — a diagnostic, not a
+//! published number under the cold-cgroup rule in
+//! `docs/experiments/README.md`. Across 84,735 fan-outs the pool spent 5.04 s
+//! in `own` and 9.07 s in `wait`, and forcing `shard_count() == 1` — which
+//! drives `wait` to zero by construction — moved the same work from 14.11 s
+//! to 16.35 s. Six cores bought 1.16x.
+//!
+//! Two costs explain that, and they are the same cost seen from both ends:
+//!
+//! * A worker's gap between consecutive fan-outs is tens of microseconds,
+//!   which a 64-`pause` spin (single-digit microseconds at most) does not
+//!   cover. So the worker parks on essentially every fan-out and has to be
+//!   woken by a syscall — and a wake that has to pull a P-core back out of
+//!   an idle state is nothing like the 3.1 µs of the hot microbenchmark.
+//! * The submitter pays for the other half of that same wake: `publish`
+//!   issues `FUTEX_WAKE` only when `workers_parked > 0`, so a pool whose
+//!   workers never park never makes the syscall at all. Every fan-out that
+//!   parked its workers charges the wake to `own` and the wake *latency* to
+//!   `wait`.
+//!
+//! So the spin bound is now a budget in nanoseconds ([`SPIN_MIN`] to
+//! [`SPIN_MAX`]) that the submitter re-derives per job from the gap the
+//! workers just sat through — see [`spin_budget_ns`]. A train of fan-outs
+//! converges within a couple of jobs onto a budget that covers its own
+//! cadence and the pool stops entering the kernel in either direction; a gap
+//! too long to be worth chasing collapses the budget to [`SPIN_MIN`], so an
+//! idle pool, an I/O stall, and the space between tokens all park exactly as
+//! before. Nothing about the publish/park/wake protocol changes: the budget
+//! is a hint that only decides *how long* a waiter spins before it enters
+//! the park/wake protocol, and any value of it — including a garbage one —
+//! is safe.
 //!
 //! # Borrowed work on persistent threads
 //!
@@ -98,7 +140,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -131,13 +173,50 @@ pub const MAX_CPUS: usize = 1024;
 /// because the constructors are documented as infallible.
 pub const MAX_SHARDS: usize = MAX_CPUS;
 
-/// Bounded spin, in `pause` iterations, before a thread parks on a futex.
+/// `pause` iterations between deadline checks inside a bounded spin.
 ///
-/// 64 `pause` instructions is roughly 2-3 µs on the reference machine —
-/// the same order as the futex round trip it replaces, so a hot decode
-/// loop essentially never enters the kernel while an idle pool still
-/// parks promptly.
-pub const SPIN_ROUNDS: u32 = 64;
+/// This is a *clock* granularity, not a latency one: a bounded spin re-reads
+/// its word on every single iteration, so a waiter still notices a change
+/// as fast as the cache line reaches it. The batch only decides how often
+/// the spin asks whether it should give up. `Instant::now()` is a vDSO
+/// `clock_gettime` on Linux — tens of nanoseconds — and 64 `pause`
+/// instructions are on the order of a microsecond, so the check is a small
+/// fraction of the spin it bounds and none of its responsiveness.
+pub const SPIN_BATCH: u32 = 64;
+
+/// Floor on a waiter's spin budget, and the budget of a cold pool.
+///
+/// Roughly what the old fixed 64-`pause` spin bought. It exists because a
+/// job published while a worker was still on its way into `await_seq` is
+/// visible within a cache-coherence round trip, and paying a futex pair for
+/// that would be absurd; it is deliberately too small to cover a real
+/// inter-job gap, so a pool with no evidence that spinning pays parks.
+pub const SPIN_MIN: Duration = Duration::from_micros(1);
+
+/// Ceiling on a waiter's spin budget.
+///
+/// Everything in this module is bounded, and this is the bound that matters
+/// for power: five workers spinning is five P-cores not in an idle state,
+/// competing with the io_uring reactor for the package's thermal headroom.
+/// A gap longer than this is not chased at all ([`spin_budget_ns`]), so the
+/// worst case is one budget's worth of wasted spin per worker on the fan-out
+/// where the cadence changes, not a sustained burn.
+pub const SPIN_MAX: Duration = Duration::from_micros(64);
+
+/// The submitter's bounded spin at the barrier, in nanoseconds.
+///
+/// Fixed rather than adaptive, because the quantity it is covering is not
+/// the inter-job gap the workers see but the skew between shards of the
+/// *same* job, and with [`PoolConfig::inline_caller`] that skew is
+/// structurally small: the submitter pays the job set-up before it starts
+/// shard 0 while the workers start theirs immediately, and `rows % shards`
+/// hands shard 0 the extra row, so the submitter normally arrives at the
+/// barrier last and the spin retires on its first look. What is left for
+/// this to cover is jitter. A job still outstanding after this long is
+/// either prefill-shaped — milliseconds, where a futex pair is free — or a
+/// straggler that was parked, where the pair is small against the wake it
+/// is waiting on.
+const BARRIER_SPIN_NS: u32 = 8_000;
 
 /// "Wake everyone" for `FUTEX_WAKE`.
 ///
@@ -914,7 +993,7 @@ pub fn shard_range(rows: usize, shards: usize, index: usize) -> Range<usize> {
 ///
 /// It is free in the hot path. A parked submitter is by definition waiting
 /// on a job that is already running; the decode loop usually never reaches
-/// the park at all ([`SPIN_ROUNDS`] covers the common barrier); and one
+/// the park at all ([`BARRIER_SPIN_NS`] covers the common barrier); and one
 /// extra wakeup per millisecond of a job that already costs milliseconds is
 /// noise.
 const BARRIER_POLL: Duration = Duration::from_millis(1);
@@ -935,6 +1014,78 @@ const JOB_POLL_MIN: Duration = Duration::from_millis(1);
 /// lost on an already-idle pool is that the next job starts a quarter second
 /// late rather than never.
 const JOB_POLL_MAX: Duration = Duration::from_millis(256);
+
+/// The spin budget, in nanoseconds, to arm the workers with after they have
+/// just waited `gap` for a job.
+///
+/// A pure function, so the policy is testable without a clock, a pool, or a
+/// timing run. Three regimes, and the middle one is the whole point:
+///
+/// * **Longer than [`SPIN_MAX`]** — unreachable. Doubling it would still not
+///   cover it and clamping to the ceiling would spin the ceiling away on
+///   every fan-out for nothing, so the budget collapses to [`SPIN_MIN`] and
+///   the workers go back to parking. This is what makes an I/O stall, a
+///   token boundary, and an idle pool cheap.
+/// * **Up to half of [`SPIN_MAX`]** — covered with a full 2x margin, which
+///   is what absorbs the jitter in the next gap without needing to smooth
+///   the estimate over a history.
+/// * **In between** — covered by the ceiling, with less than 2x margin but
+///   still more than the gap. This band is what lets a cold pool climb out:
+///   the first fan-out after a park pays a `FUTEX_WAKE` in its set-up, which
+///   inflates the *next* gap to tens of microseconds, and a rule that gave
+///   up there would leave the pool parked forever.
+///
+/// Recovery is one job in every direction, which is why no history is kept.
+#[must_use]
+pub fn spin_budget_ns(gap: Duration) -> u32 {
+    if gap > SPIN_MAX {
+        return SPIN_MIN.subsec_nanos();
+    }
+    // `gap <= SPIN_MAX` is well under a second, so `subsec_nanos` is the
+    // whole of it; the saturating double is belt and braces.
+    gap.subsec_nanos()
+        .saturating_mul(2)
+        .clamp(SPIN_MIN.subsec_nanos(), SPIN_MAX.subsec_nanos())
+}
+
+/// Spin until `ready` yields a value or `budget_ns` nanoseconds have passed.
+///
+/// `ready` is polled on every iteration and the clock only once per
+/// [`SPIN_BATCH`], so the deadline costs responsiveness nothing. Returns
+/// `None` if the budget ran out, which is the caller's cue to park.
+///
+/// The budget is always bounded: a zero budget polls exactly once, and an
+/// `Instant` that cannot represent the deadline (which no budget this module
+/// arms can produce) degrades the same way rather than spinning forever.
+#[inline]
+fn spin_for<T>(budget_ns: u32, mut ready: impl FnMut() -> Option<T>) -> Option<T> {
+    // Poll before touching the clock. The hottest case in the pool is a
+    // waiter whose word already changed while it was on its way in — a
+    // worker retiring a shard of a job whose successor is already published,
+    // or a submitter arriving at a barrier its workers have already left —
+    // and that case should not pay for a deadline it will never reach.
+    if let Some(value) = ready() {
+        return Some(value);
+    }
+    if budget_ns == 0 {
+        return None;
+    }
+    // `?` is "park now": an `Instant` that cannot represent the deadline —
+    // which no budget this module arms can produce — must not become an
+    // unbounded spin.
+    let deadline = Instant::now().checked_add(Duration::from_nanos(u64::from(budget_ns)))?;
+    loop {
+        for _ in 0..SPIN_BATCH {
+            if let Some(value) = ready() {
+                return Some(value);
+            }
+            std::hint::spin_loop();
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod park {
@@ -1042,6 +1193,14 @@ unsafe fn call_job<F: Fn(Shard) + Sync>(data: *const (), shard: Shard) {
 ///   paired against a `SeqCst` access of the corresponding futex word, which
 ///   is the standard Dekker interleaving: whichever side commits second
 ///   necessarily observes the other, so a wakeup can never be lost.
+/// * `spin_ns` is **outside** the protocol. It is a `Relaxed` hint, written
+///   by the submitter and read by workers, that decides only how long a
+///   worker spins before it enters the protocol above. Every value of it —
+///   zero, stale, `u32::MAX`, one torn from a concurrent write — produces a
+///   waiter that still parks correctly and is still woken correctly, because
+///   the spin sits entirely *before* the `workers_parked` increment that
+///   arms the Dekker pairing. It can cost latency or power. It cannot cost a
+///   wakeup, and nothing below it may be allowed to depend on it.
 ///
 /// # Why a worker may read the park flag but never take it
 ///
@@ -1087,6 +1246,11 @@ struct Shared {
     /// written, by workers. See the type docs for why the asymmetry is
     /// load-bearing.
     lead_parked: AtomicU32,
+    /// How long a worker spins in `await_seq` before parking, in
+    /// nanoseconds. Armed per job by the submitter from the gap the workers
+    /// just sat through; see [`spin_budget_ns`] and the type docs for why
+    /// this is a hint and never a correctness input.
+    spin_ns: AtomicU32,
     quit: AtomicU32,
     job: UnsafeCell<Option<JobRef>>,
     panic: Mutex<Option<PanicPayload>>,
@@ -1110,6 +1274,7 @@ impl Shared {
             pending: AtomicU32::new(0),
             workers_parked: AtomicU32::new(0),
             lead_parked: AtomicU32::new(0),
+            spin_ns: AtomicU32::new(SPIN_MIN.subsec_nanos()),
             quit: AtomicU32::new(0),
             job: UnsafeCell::new(None),
             panic: Mutex::new(None),
@@ -1130,6 +1295,21 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
+    }
+
+    /// Arm the workers' spin budget from the gap they just waited through.
+    ///
+    /// Called once per published job, before the job itself, so the two
+    /// stores land in the same trip of the cache line the workers are
+    /// watching. The budget armed for job N is the one the workers will
+    /// apply while waiting for job N+1: they read it on entering
+    /// `await_seq`, which happens after they retire job N. That one-job lag
+    /// is the whole predictor, and it is the right one — a decode step's
+    /// cadence is stationary across the ~1,300 fan-outs inside it, and the
+    /// two ends of it (the first fan-out after a token boundary, the first
+    /// after an I/O stall) are exactly where the pool *should* park.
+    fn arm_spin(&self, gap: Duration) {
+        self.spin_ns.store(spin_budget_ns(gap), Ordering::Relaxed);
     }
 
     /// Publish a job and release the workers.
@@ -1191,11 +1371,11 @@ impl Shared {
     /// whichever job happens to be in flight when some worker gets around to
     /// looking at it.
     fn await_barrier(&self) {
-        for _ in 0..SPIN_ROUNDS {
-            if self.pending.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            std::hint::spin_loop();
+        let retired = spin_for(BARRIER_SPIN_NS, || {
+            (self.pending.load(Ordering::Acquire) == 0).then_some(())
+        });
+        if retired.is_some() {
+            return;
         }
         // Dekker: this store is ordered before the `SeqCst` load below, and
         // a worker's `fetch_sub` is ordered before its load of the flag.
@@ -1214,13 +1394,18 @@ impl Shared {
     }
 
     /// Block until `seq` differs from `last`, returning the new value.
+    ///
+    /// The spin ahead of the park is bounded by `spin_ns`, read once here.
+    /// Reading it once rather than per iteration is deliberate: the budget
+    /// belongs to *this* wait, and re-reading it would let a submitter that
+    /// is mid-train extend a wait that has already decided to give up.
     fn await_seq(&self, last: u32) -> u32 {
-        for _ in 0..SPIN_ROUNDS {
+        let budget = self.spin_ns.load(Ordering::Relaxed);
+        if let Some(seq) = spin_for(budget, || {
             let seq = self.seq.load(Ordering::Acquire);
-            if seq != last {
-                return seq;
-            }
-            std::hint::spin_loop();
+            (seq != last).then_some(seq)
+        }) {
+            return seq;
         }
         let mut poll = JOB_POLL_MIN;
         loop {
@@ -1319,9 +1504,12 @@ impl Default for PoolConfig {
 
 /// A pool of persistent, optionally pinned worker threads.
 ///
-/// Workers park between jobs and wake to run a closure over a contiguous row
-/// range. See the module docs for the cost model and for why handing
-/// non-`'static` borrows to threads that outlive the borrow is sound.
+/// Workers wait between jobs and run a closure over a contiguous row range.
+/// Whether a wait spins or parks is decided per job by [`spin_budget_ns`]
+/// from the cadence the pool is actually being driven at; a pool that stops
+/// being driven parks. See the module docs for the cost model and for why
+/// handing non-`'static` borrows to threads that outlive the borrow is
+/// sound.
 ///
 /// `run` takes `&mut self` on purpose: it is what statically rules out two
 /// jobs in flight at once and re-entrant submission from inside a job, both
@@ -1333,6 +1521,12 @@ pub struct ComputePool {
     shards: usize,
     inline_caller: bool,
     lead_cpu: Option<usize>,
+    /// When the previous *pooled* job's barrier retired, i.e. when the
+    /// workers were released back into `await_seq`. `None` until the first
+    /// pooled job, and deliberately not touched by the inline fast path —
+    /// a run that never published anything is part of the gap the workers
+    /// are sitting through, not a break in it.
+    last_retired: Option<Instant>,
 }
 
 impl ComputePool {
@@ -1416,6 +1610,7 @@ impl ComputePool {
             shards: shards.max(1),
             inline_caller,
             lead_cpu,
+            last_retired: None,
         };
 
         if config.pin_caller
@@ -1471,6 +1666,13 @@ impl ComputePool {
     /// thread as a single shard, which is both cheaper and still a
     /// deterministic function of `(rows, shards())`.
     ///
+    /// How long each side waits before it parks is re-derived here from the
+    /// gap since the previous *pooled* `run` (see [`spin_budget_ns`]), so a
+    /// pool driven in a train stays hot and one driven occasionally parks.
+    /// That is a scheduling decision and only a scheduling decision: it
+    /// changes when a thread enters the kernel, never which rows anybody
+    /// computes.
+    ///
     /// # Panics
     ///
     /// If `f` panics on any shard the panic is re-raised on this thread
@@ -1503,27 +1705,49 @@ impl ComputePool {
             shards,
         };
 
-        let shared: &Shared = &self.shared;
-        // The guard is armed *before* the job is published, not after.
-        // Nothing in `publish` can panic today, so the erased `&f` could not
-        // actually escape through that gap — but the entire soundness
-        // argument for the erased pointer is "the guard exists from the
-        // moment the workers can see it", and an argument that depends on
-        // auditing the callee for panics is one edit away from being wrong.
-        // Draining a barrier that was never published is a no-op
-        // (`pending == 0`), so arming early is free.
-        let guard = BarrierGuard { shared };
-        shared.publish(job, workers);
-        if inline_caller {
-            f(Shard {
-                index: 0,
-                count: shards,
-                rows: shard_range(rows, shards, 0),
-            });
-        }
-        drop(guard);
+        // How long the workers have been waiting for this job, measured
+        // entirely on this thread: `last_retired` is when the previous
+        // barrier released them. It is the only evidence available about
+        // whether spinning through the next gap will pay, and it is read
+        // here — before the publish — so that both the budget store and the
+        // `seq` store land in one trip of the workers' cache line. Two
+        // `Instant::now()` calls per pooled job, tens of nanoseconds each,
+        // against the `FUTEX_WAKE` they exist to avoid.
+        let gap = self.last_retired.map_or(Duration::MAX, |t| {
+            Instant::now().saturating_duration_since(t)
+        });
 
-        if let Some(payload) = shared.take_panic() {
+        // The `shared` borrow is scoped so that `last_retired` can be
+        // written the instant the barrier has retired.
+        let payload = {
+            let shared: &Shared = &self.shared;
+            shared.arm_spin(gap);
+            // The guard is armed *before* the job is published, not after.
+            // Nothing in `publish` can panic today, so the erased `&f` could
+            // not actually escape through that gap — but the entire
+            // soundness argument for the erased pointer is "the guard exists
+            // from the moment the workers can see it", and an argument that
+            // depends on auditing the callee for panics is one edit away
+            // from being wrong. Draining a barrier that was never published
+            // is a no-op (`pending == 0`), so arming early is free.
+            let guard = BarrierGuard { shared };
+            shared.publish(job, workers);
+            if inline_caller {
+                f(Shard {
+                    index: 0,
+                    count: shards,
+                    rows: shard_range(rows, shards, 0),
+                });
+            }
+            drop(guard);
+            shared.take_panic()
+        };
+        // Not updated when this thread's own shard unwound: the stale, older
+        // timestamp only ever overstates the gap, which collapses the budget
+        // to `SPIN_MIN` — the conservative direction.
+        self.last_retired = Some(Instant::now());
+
+        if let Some(payload) = payload {
             resume_unwind(payload);
         }
     }
@@ -2611,6 +2835,305 @@ mod tests {
         let text = format!("{pool:?}");
         assert!(text.contains("shards: 3"), "{text}");
         assert!(text.contains("workers: 2"), "{text}");
+    }
+
+    // --- spin policy --------------------------------------------------------
+
+    /// Spin budgets spanning everything a waiter could ever read out of
+    /// `spin_ns`, including three values [`spin_budget_ns`] cannot produce:
+    /// zero (park immediately), a millisecond, and a garbage `u32::MAX`
+    /// (4.3 seconds, i.e. "never park"). All three must be survivable,
+    /// because the budget is a hint outside the park/wake protocol.
+    const HOSTILE_BUDGETS: [u32; 6] = [0, 1, 3_000, 64_000, 1_000_000, u32::MAX];
+
+    #[test]
+    fn the_spin_budget_tracks_the_gap_it_is_given() {
+        let min = SPIN_MIN.subsec_nanos();
+        let max = SPIN_MAX.subsec_nanos();
+
+        // No history, and any gap past the ceiling: not worth chasing.
+        assert_eq!(spin_budget_ns(Duration::MAX), min);
+        assert_eq!(spin_budget_ns(Duration::from_secs(1)), min);
+        assert_eq!(spin_budget_ns(Duration::from_millis(1)), min);
+        assert_eq!(spin_budget_ns(SPIN_MAX + Duration::from_nanos(1)), min);
+
+        // A reachable gap gets twice itself, so the next one has room to
+        // drift without falling out of the spin.
+        assert_eq!(spin_budget_ns(Duration::from_micros(2)), 4_000);
+        assert_eq!(spin_budget_ns(Duration::from_micros(27)), 54_000);
+
+        // Clamped at both ends, including the band between half the ceiling
+        // and the ceiling, which is what lets a parked pool climb back out.
+        assert_eq!(spin_budget_ns(Duration::ZERO), min);
+        assert_eq!(spin_budget_ns(Duration::from_nanos(1)), min);
+        assert_eq!(spin_budget_ns(Duration::from_micros(40)), max);
+        assert_eq!(spin_budget_ns(SPIN_MAX), max);
+
+        // Over the whole reachable range: bounded, never zero, monotone, and
+        // always at least the gap it is covering.
+        let mut last = 0;
+        for us in 0..=u64::from(max / 1_000) {
+            let gap = Duration::from_micros(us);
+            let ns = spin_budget_ns(gap);
+            assert!((min..=max).contains(&ns), "{us} us -> {ns} ns");
+            assert!(ns >= last, "budget is not monotone at {us} us");
+            assert!(
+                u64::from(ns) >= gap.as_nanos() as u64,
+                "budget {ns} ns cannot cover the {us} us gap it was derived from"
+            );
+            last = ns;
+        }
+    }
+
+    #[test]
+    fn a_bounded_spin_gives_up_at_its_budget() {
+        // Never later than the budget is what stops a worker burning a
+        // P-core; never earlier is what makes the budget mean anything.
+        let mut polls = 0u64;
+        let start = Instant::now();
+        let gave_up = spin_for(SPIN_MAX.subsec_nanos(), || {
+            polls += 1;
+            None::<()>
+        });
+        let elapsed = start.elapsed();
+        assert!(gave_up.is_none(), "an exhausted spin must report failure");
+        assert!(
+            elapsed >= SPIN_MAX,
+            "gave up after {elapsed:?}, short of its {SPIN_MAX:?} budget"
+        );
+        assert!(
+            polls >= u64::from(SPIN_BATCH),
+            "the word was polled {polls} times, fewer than one batch"
+        );
+
+        // A zero budget polls exactly once and never reads the clock.
+        let mut polls = 0u64;
+        let gave_up = spin_for(0, || {
+            polls += 1;
+            None::<()>
+        });
+        assert!(gave_up.is_none());
+        assert_eq!(polls, 1);
+
+        // And a spin that wins returns the value it was waiting for.
+        assert_eq!(spin_for(SPIN_MAX.subsec_nanos(), || Some(7u32)), Some(7));
+    }
+
+    #[test]
+    fn a_long_gap_between_jobs_collapses_the_pools_spin_budget() {
+        let mut pool = test_pool(4);
+        let floor = SPIN_MIN.subsec_nanos();
+
+        // The first pooled job has no history behind it, so there is no
+        // evidence that spinning pays and the workers are armed to park.
+        pool.run(400, |_| {});
+        assert_eq!(pool.shared.spin_ns.load(Ordering::Relaxed), floor);
+
+        // Neither is a gap far past the ceiling — an I/O stall, a token
+        // boundary, or a pool nobody is driving.
+        std::thread::sleep(Duration::from_millis(5));
+        pool.run(400, |_| {});
+        assert_eq!(pool.shared.spin_ns.load(Ordering::Relaxed), floor);
+
+        // The inline fast path publishes nothing, so it is part of the gap
+        // the workers are sitting through rather than a break in it, and it
+        // must not re-arm or restart anything.
+        let before = pool.last_retired;
+        pool.run(2, |_| {});
+        assert_eq!(pool.last_retired, before);
+        assert_eq!(pool.shared.spin_ns.load(Ordering::Relaxed), floor);
+    }
+
+    #[test]
+    fn a_measurable_gap_between_jobs_arms_a_real_spin() {
+        // The closed loop, end to end, through a real pool rather than
+        // through `spin_budget_ns` on its own.
+        //
+        // The gap is deliberate. Back-to-back `run` calls leave a few
+        // hundred nanoseconds between the barrier and the next publish,
+        // which `SPIN_MIN` already covers — a budget of exactly the floor is
+        // the *correct* answer there, and asserting a climb off the floor
+        // for a train that tight only passes when the machine is loaded
+        // enough to preempt the submitter. So this arms a gap inside the
+        // reachable band and requires the pool to have seen it.
+        //
+        // "At least once in 200" rather than "every time" because a
+        // preempted submitter turns a 10 us gap into an unreachable one,
+        // which correctly collapses to the floor.
+        let mut pool = test_pool(4);
+        let gap = Duration::from_micros(10);
+        let mut best = 0;
+        for _ in 0..200 {
+            let until = Instant::now() + gap;
+            while Instant::now() < until {
+                std::hint::spin_loop();
+            }
+            pool.run(400, |_| {});
+            best = best.max(pool.shared.spin_ns.load(Ordering::Relaxed));
+        }
+        assert!(
+            (20_000..=SPIN_MAX.subsec_nanos()).contains(&best),
+            "a train of {gap:?} gaps armed {best} ns, not the ~20,000 ns \
+             (twice the gap) the policy calls for"
+        );
+    }
+
+    #[test]
+    fn an_idle_pool_parks() {
+        let mut pool = test_pool(4);
+        let workers = pool.workers.len() as u32;
+        assert_eq!(workers, 3);
+        pool.run(400, |_| {});
+        let shared = Arc::clone(&pool.shared);
+
+        // Every worker reaches the futex. The armed budget is bounded by
+        // `SPIN_MAX`, so this is a matter of microseconds; the deadline is
+        // slack for a loaded machine, not the thing under test.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut all_parked = false;
+        while Instant::now() < deadline {
+            if shared.workers_parked.load(Ordering::SeqCst) == workers {
+                all_parked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        assert!(
+            all_parked,
+            "an undriven pool never got all {workers} workers onto the futex; \
+             it is spinning instead of parking"
+        );
+
+        // And it *stays* parked. `await_seq` spins once on entry and then
+        // backs off inside the futex, so the only moments a worker is not
+        // counted are the few nanoseconds around each timeout return; a pool
+        // that had gone back to spinning would miss most of these samples.
+        let samples = 200;
+        let mut parked = 0;
+        for _ in 0..samples {
+            if shared.workers_parked.load(Ordering::SeqCst) == workers {
+                parked += 1;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            parked * 100 >= samples * 95,
+            "an idle pool was fully parked in only {parked} of {samples} samples"
+        );
+    }
+
+    #[test]
+    fn the_spin_budget_cannot_change_which_rows_a_shard_computes() {
+        // The budget decides how long a waiter spins and nothing else, so
+        // the partition must be exactly the `shard_range` split for every
+        // value of it. A second thread rewrites the budget continuously, so
+        // the workers observe a different — and often absurd — one on
+        // essentially every job.
+        let mut pool = test_pool(4);
+        let stop = Arc::new(AtomicU32::new(0));
+        let hammer = {
+            let (shared, stop) = (Arc::clone(&pool.shared), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut i = 0usize;
+                while stop.load(Ordering::Relaxed) == 0 {
+                    shared.spin_ns.store(
+                        HOSTILE_BUDGETS[i % HOSTILE_BUDGETS.len()],
+                        Ordering::Relaxed,
+                    );
+                    i = i.wrapping_add(1);
+                    std::hint::spin_loop();
+                }
+            })
+        };
+
+        let rows = 97;
+        let expected: Vec<Range<usize>> = (0..4).map(|i| shard_range(rows, 4, i)).collect();
+        for _ in 0..500 {
+            let seen: Mutex<Vec<(usize, Range<usize>)>> = Mutex::new(Vec::new());
+            pool.run(rows, |shard| {
+                seen.lock()
+                    .expect("lock")
+                    .push((shard.index, shard.rows.clone()));
+            });
+            let mut got = seen.into_inner().expect("into_inner");
+            got.sort_by_key(|(index, _)| *index);
+            assert_eq!(got.len(), 4, "a shard went missing");
+            let mut next = 0;
+            for (index, rows_of) in &got {
+                assert_eq!(*rows_of, expected[*index], "shard {index} moved");
+                assert_eq!(rows_of.start, next, "shards are not contiguous");
+                next = rows_of.end;
+            }
+            assert_eq!(next, rows, "the shards do not cover the job");
+        }
+
+        stop.store(1, Ordering::Relaxed);
+        hammer.join().expect("hammer thread");
+    }
+
+    #[test]
+    fn a_hammered_spin_budget_never_loses_a_wakeup() {
+        // `spin_ns` is read before the `workers_parked` increment that arms
+        // the Dekker pairing, so it cannot participate in a lost wakeup no
+        // matter what it holds or when it changes. The adversarial values
+        // matter in both directions: `0` forces a park on every job, so the
+        // full futex round trip runs thousands of times, and `u32::MAX`
+        // forces a spin, so `publish` takes the "nobody is parked, skip the
+        // syscall" branch thousands of times. A deadlock here is a hang, so
+        // the work runs on its own thread behind a watchdog.
+        let finished = Arc::new(AtomicU32::new(0));
+        let counted = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicU32::new(0));
+
+        let jobs = 4_000;
+        let rows = 128;
+        let scenario = {
+            let (finished, counted, stop) = (
+                Arc::clone(&finished),
+                Arc::clone(&counted),
+                Arc::clone(&stop),
+            );
+            std::thread::spawn(move || {
+                let mut pool = test_pool(4);
+                let hammer = {
+                    let (shared, stop) = (Arc::clone(&pool.shared), Arc::clone(&stop));
+                    std::thread::spawn(move || {
+                        let mut i = 0usize;
+                        while stop.load(Ordering::Relaxed) == 0 {
+                            shared.spin_ns.store(
+                                HOSTILE_BUDGETS[i % HOSTILE_BUDGETS.len()],
+                                Ordering::Relaxed,
+                            );
+                            i = i.wrapping_add(1);
+                            std::thread::yield_now();
+                        }
+                    })
+                };
+                for _ in 0..jobs {
+                    pool.run(rows, |shard| {
+                        counted.fetch_add(shard.rows.len(), Ordering::Relaxed);
+                    });
+                }
+                stop.store(1, Ordering::Relaxed);
+                hammer.join().expect("hammer thread");
+                finished.store(1, Ordering::SeqCst);
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while finished.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Release the hammer even if the pool did strand a waiter, so the
+        // failure is a clean assertion rather than a hung test binary.
+        stop.store(1, Ordering::Relaxed);
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "the compute pool stalled while its spin budget was being rewritten"
+        );
+        scenario.join().expect("scenario thread");
+        assert_eq!(counted.load(Ordering::Relaxed), jobs * rows);
     }
 
     /// Handoff-latency probe. Not part of the gate; run with
