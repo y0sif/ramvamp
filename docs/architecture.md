@@ -16,17 +16,24 @@ published before being re-measured there.
 ## Goal
 
 Run Qwen3-30B-A3B coherently in about 3 GB of RAM on an ordinary Linux
-machine with an NVMe SSD, CPU only. The tok/s target is under review; see
+machine with an NVMe SSD, CPU only. The tok/s floor is **OPEN** and is the
+user's decision, not a silent edit; what is measured against it is in
 "Performance model".
 
 v0 success criterion: coherent chat, decode throughput at or above the
 agreed floor (**OPEN**, currently written as >= 3 tok/s and pending the
-user's decision; the derived I/O-only ceiling on the reference drive is
-~2.8-3.4 tok/s at EXP-019's measured bandwidths, up from the ~2.2-2.7 that
-EXP-008's provisional ones gave, see "Performance model"), inside a cgroup
-with `memory.max=3G`
+user's decision), inside a cgroup with `memory.max=3G`
 and `memory.swap.max=0` (zram counts as swap), cold page cache,
 KL-divergence vs llama.cpp within accepted tolerance on identical weights.
+
+What decode actually does on the reference drive is **MEASURED cold** as of
+EXP-023 and is below that floor: **1.46 to 2.19 tok/s** across five context
+rungs at the shipped 11 slots/layer (2.19 / 1.91 / 1.82 / 1.75 / 1.46 at 64 /
+512 / 1,024 / 2,048 / 3,961 prompt tokens, medians of three scored runs,
+`--max-new 64`). The earlier "~2.8-3.4 tok/s derived I/O-only ceiling" that
+stood here is **withdrawn**; "Performance model" records why, and no
+replacement headline band is offered, because an I/O-only ceiling both
+overstates what is reachable and is not what the floor is written against.
 
 Reference hardware: Intel Core Ultra 9 185H (6P + 8E + 2 LP-E, AVX2, no
 AVX-512), 16 GB LPDDR5X-7467, **Micron 2400 DRAM-less QLC** NVMe
@@ -200,11 +207,17 @@ validates before atomic promotion. The runtime hashes `manifest.json`,
 
 ## Memory contract (option B, agreed; dial revised 2026-08-03, twice)
 
-The expert-cache dial is a total memory budget, divided by layer count to get
-slots per layer. This keeps one config meaningful across models. **That is
-design intent, not current fact:** `SlotPool::new(slots_per_layer,
-layer_strides)` and `LayerCache::new(n_slots, n_experts)` both take slot
-counts today; converting the configured quantity into bytes is still owed.
+The expert-cache dial is a total memory budget, divided by the summed
+per-layer blob strides to get slots per layer. This keeps one config
+meaningful across models, and **it ships**: `DEFAULT_CACHE_BYTES`
+(`crates/core/src/model/forward.rs`) is a 1,440 MiB total byte budget, and
+`--cache-bytes` sets it. Earlier revisions of this section said the byte
+conversion "is still owed", which was true when `SlotPool::new` and
+`LayerCache::new` were the only entry points; those still take slot counts,
+but they are no longer what the user configures. EXP-023 exercised the byte
+dial directly at `1570M` and `1701M` and asserted the slot count each budget
+bought (12 and 13, checked against every run's stderr), so the conversion is
+measured as well as shipped.
 
 For Qwen3 (48 layers) the budget is **1,438.6 MiB of expert pool, which is
 11 slots/layer**. The dial was 10 in the original design, revised up to 12 by
@@ -218,7 +231,7 @@ exact count depends on its blob stride and has not been computed.
 | Common core (mmap, read-only) | 1,023.34 MiB (audited) | touched every token, page cache keeps it resident; charged to the cgroup as `file` |
 | KV cache FP16 | 384 MiB @ 4K | 96 KiB/token; linear append, 48 layers; allocated zeroed at full capacity and faulted lazily |
 | Expert slot pool | 1,438.59 MiB | 11 slots x 48 layers at the real per-layer strides, page-aligned, allocated once, every page faulted at construction |
-| Runtime anonymous memory | 115.1 MiB (**provisional**, EXP-012) + 387 KiB (phase 7) | activations and scratch, tokenizer, thread stacks, allocator arenas; peak `anon` sampled from inside the cgroup on a live decode run whose context length, token count and page-cache state were not recorded — it fails rule 2, so it is a floor for this tenant, not a ceiling. See Open risk below. The 387 KiB is decode's per-shard attention scratch, `min(n_kv_heads, shards)` carves of 132,096 B for 528,384 B total against the one 132,096 B carve that preceded it (EXP-020); it is exact arithmetic on top of a provisional figure, so it does not make the row less provisional |
+| Runtime anonymous memory | 115.1 MiB (**provisional**, EXP-012) + 387 KiB (phase 7) + 48 KiB (phase 9) | activations and scratch, tokenizer, thread stacks, allocator arenas; peak `anon` sampled from inside the cgroup on a live decode run whose context length, token count and page-cache state were not recorded — it fails rule 2, so it is a floor for this tenant, not a ceiling. See Open risk below. The 387 KiB is decode's per-shard attention scratch, `min(n_kv_heads, shards)` carves of 132,096 B for 528,384 B total against the one 132,096 B carve that preceded it (EXP-020). The 48 KiB is phase 9's fused expert fan-out, which sizes the FFN scratch for a whole routed window instead of for one expert at a time: `gate_up` goes `2 x 8 x 768 x 4 B` = **49,152 B** against 6,144 B (**+43,008**) and `acts_q8k_moe` goes `8 x (768 / 256)` = 24 `BlockQ8K` of 292 B = **7,008 B** against 876 B (**+6,132**), so **+49,140 B = 47.99 KiB**. Both are `Vec`s in `ForwardState::with_config`, allocated once at construction and shared by all 48 layers; nothing is per token and nothing is per layer. Total added since EXP-012 sampled the row: 396,288 + 49,140 = **445,428 B (435 KiB)**. All of it is exact arithmetic on top of a provisional figure, so it does not make the row less provisional |
 | Subtotal | **2,961.0 MiB** (**provisional**) | 111.0 MiB headroom under `memory.max=3G` (3,072 MiB), also provisional: both cells inherit the provenance of the anon row above, and neither may be published until that row is re-measured. **Correction (EXP-023):** measured cold at 3,961 prompt tokens plus 64 generated, the cgroup peaks at **2,929.3 MiB**, so this row overpredicts by 31.7 MiB. The prediction is not edited, because the overshoot is not yet attributed; see the Correction under the slot table below |
 
 **The prefill sweep is not a fifth row.** Its streaming ring is a
@@ -251,19 +264,26 @@ The pool figures are exact arithmetic on the audited strides in
 `experts/layout.json` (3,059,712 B on the 24 Q6_K-down layers, 2,654,208 B on
 the other 24), not estimates. Against 1,522.44 MiB of fixed tenants
 (1,023.34 + 384 + 115.1). Only the `pool MiB` column is exact: 115.1 of
-those 1,522.44 MiB is provisional, so the `subtotal MiB` and
-`vs 3,072 MiB` columns below are **provisional** too, including the 19.8
-MiB overshoot that moved the dial.
+those 1,522.44 MiB is provisional, so the two predicted columns below are
+**provisional** too — and the 19.8 MiB overshoot that moved the dial is worse
+than provisional, it is measured to be wrong in sign (EXP-023, and the
+Correction below).
 
-| slots/layer | pool MiB | subtotal MiB | vs 3,072 MiB | measured `memory.peak` at 3,961 + 64 tokens (EXP-023) |
+| slots/layer | pool MiB | predicted subtotal MiB | predicted vs 3,072 MiB (**REFUTED at 12**) | measured `memory.peak` at 3,961 + 64 tokens (EXP-023) |
 | ---: | ---: | ---: | ---: | ---: |
 | 10 | 1,307.81 | 2,830.25 | 241.75 spare | not measured |
 | 11 | 1,438.59 | 2,961.03 | 111.0 spare | **2,929.3 MiB**, 142.7 spare |
-| 12 | 1,569.38 | 3,091.82 | **19.8 over** | **3,058.4 MiB**, 13.6 spare |
+| 12 | 1,569.38 | 3,091.82 | ~~19.8 over~~ **wrong in sign; measured 13.6 spare** | **3,058.4 MiB**, 13.6 spare |
 
-That 19.8 MiB is why the dial moved back: **12 slots/layer does not fit**
-once anonymous runtime memory is counted, and EXP-005's fit arithmetic
-counted only the mmap'd core and the KV cache.
+The prediction column is kept only as the record of what was believed; the
+measurement column is what is true. **The 19.8 MiB overshoot at 12 slots was
+the reason the dial moved back to 11, and it does not exist**: EXP-023
+measured 12 slots/layer fitting, cold, at full context, with 13.6 MiB spare.
+The prediction that moved the dial was arithmetic on a fixed-tenant sum that
+is about 33 MiB high. EXP-005's fit arithmetic counted only the mmap'd core
+and the KV cache, which is the separate error that first moved the dial the
+other way. **The dial still does not move** — see the Correction below for why
+13.6 MiB of margin in one session is not a licence to spend it.
 
 **Correction (2026-08-06, EXP-023): the 12-slot row is wrong in sign. 12
 slots/layer fits.** Measured cold inside `memory.max=3G` with
@@ -348,9 +368,11 @@ this tenant, not a ceiling, and the 111.0 MiB of spare is not yet proven at
 4K context with the slot pool wired in. If the real figure exceeds 226 MiB
 the dial drops to 10 slots/layer, or the KV cache goes Q8. Needs the
 re-measurement EXP-012 asks for before the 11-slot dial is treated as
-settled. Two things have since been charged against that unproven spare and
-neither is large: EXP-018's unexplained 99-105 MiB residual, and phase 7's
-387 KiB of decode attention scratch. The first is the one to worry about.
+settled. Three things have since been charged against that unproven spare and
+only one is large: EXP-018's unexplained 99-105 MiB residual, phase 7's
+387 KiB of decode attention scratch, and phase 9's 48 KiB of fused expert
+scratch. The first is the one to worry about; the other two together are
+435 KiB.
 
 16 slots/layer is the next real step (simulated 58.1% hit; the batch-pinned
 figure at 16 has never been computed) but its 2,092.5 MiB pool puts the
@@ -589,6 +611,86 @@ buys back the scheduling.
 
 Sampler defaults come from the checkpoint's generation_config (temp 0.7,
 top_p 0.8, top_k 20); greedy override for validation.
+
+### How decode's GEMVs fan out, and what phase 9 refuted about them
+
+**Every number in this subsection is MEASURED WARM** — ctx 512, 63 decode
+tokens, three runs per arm, medians with ranges, pooled GEMV bucket =
+`projections + experts + lm_head` (the router is serial and excluded). Warm
+numbers are diagnostics under rule 2 and **none of them may be published as a
+result**. Artifacts: `scratch/phase9/wave0-baseline/*.err` and
+`scratch/phase9/wave1-measure/rep/*.err`. **The cold rule-2 pairing has not
+been run** — the harness is committed at `scripts/phase9_decode_sweep.sh` and
+has only been executed under `--dry-run` — and **EXP-025 is reserved for it**.
+
+Step 4-5's expert work fans out **once per expert phase, not once per matrix**
+(`70cf304`). A phase's routed experts issue one job for every gate and up
+together and one for every down; `attn_q` joins `attn_v` the same way. A layer
+went from 28 fan-outs to five when its plan is all hits or all misses and seven
+when it splits, and a token from 1,345 to between 241 and 337. Fusion stays
+strictly inside one `run_plan` call: crossing the hit/miss boundary would make
+a resident expert's arithmetic wait on a missing expert's read.
+
+| arm (warm, ctx 512) | pooled GEMV bucket, median | scored range |
+| --- | ---: | --- |
+| pre-fusion baseline | 14.44 s | 14.35-15.06 |
+| adaptive-spin policy, pre-fusion | 14.27 s | 13.99-14.48 |
+| **fused fan-out** | **11.42 s** | 11.36-11.48 |
+| fused + adaptive spin | 11.38 s | 11.34-11.51 |
+
+Fusion is worth **1.264x on the pooled GEMV bucket** (14.44 / 11.42, DERIVED
+from the medians above; the two ranges do not overlap). What that is worth on
+a token is **not** in this table and is not derivable from it — the bucket is a
+span inside decode's `projections` and `expert compute` phases, not the token —
+and the paired cold answer is EXP-025's to give.
+
+Four things this refutes, and they matter more than the 1.264x:
+
+- **EXP-001's 9.61 GB/s (the `q4_k x q8_k` 2048x2048 row of its table) is not
+  a valid reference for decode, and three code comments that used it have been
+  fixed.** That fixture dots a matrix small enough to sit in **L2**; decode
+  streams every expert byte **once from DRAM**. They are not the same
+  quantity, and the "shortfall" between decode's throughput and 9.61 GB/s was
+  an artefact of pairing them rather than a gap to be closed. Nothing in this
+  document or in `crates/core` may quote 9.61 GB/s as a decode reference again.
+- **The pool's ~1.3 µs barrier figure does not describe decode.** It comes from
+  `pool.run(6, |_| {})` — see the `ATTENTION_FANOUT_MIN_POSITIONS` docs in
+  `crates/core/src/model/forward.rs`, which is where it is recorded — a hot
+  loop in which **no worker ever parks**. Decode parks on essentially every
+  fan-out.
+  Any arithmetic that multiplies 1.3 µs by a fan-out count to price decode's
+  dispatch is arithmetic on the wrong constant.
+- **Six cores do not buy 6x; decode GEMV is memory-bound, not
+  dispatch-bound.** Forcing a single shard puts the pooled GEMV bucket at
+  **16.36 s**, of which **16.35 s is `own`** — with one shard there is nobody
+  to wait for, so `own` is the serial arithmetic and 16.35 is the figure the
+  ratios below and the derivations in `kernels::gemv` use. Against the
+  six-shard arm run in the same session and on the same binary that is **1.16x
+  pre-fusion** (16.35 against **14.11 s**, both from
+  `scratch/phase9/wave0-baseline/`, single runs rather than medians). Against
+  the fused arm it is **1.43x** (16.35 against 11.42 s), which is legitimate to
+  pair only because fusion moves no arithmetic, so 16.35 s is the same serial
+  arithmetic either side of it — **there is no single-shard control on the
+  fused binary**. Against the separate three-run pre-fusion baseline of 14.44 s
+  the same control gives 1.13x, which is a cross-session pairing and is the
+  weaker of the two. Fused aggregate throughput is **11.00 GB/s** (DERIVED:
+  1.99 GB of weights a token over 11.42 s / 63 tokens). A dispatch-bound site
+  would scale with cores. This one does not.
+- **The barrier wait scales with WORK, not with fan-out count.** Fusion cut
+  expert scatters **6.14x** (72,576 to 11,812) and cut expert barrier wait only
+  **1.47x** (6.77 s median, range 6.67-7.21, to 4.62 s median, range
+  4.55-4.63). Per-scatter wait therefore went **up** about 4.2x, from 93 µs to
+  391 µs (DERIVED from those medians and counts). It was never
+  wake latency, and no spin policy could reach it: workers are simply slower
+  per row than the submitting thread. That is why the adaptive-spin change was
+  written, measured at 1.012x against a baseline whose own spread is 1.049x,
+  and **reverted** (`88e3e9d`); the code is preserved unchanged and
+  cherry-pickable on `feat/pool-adaptive-spin`, to be revisited only if a later
+  change makes the pool latency-bound again.
+
+Reported and not fixed: `attn_q` plus `attn_v` is 4,096 q4_k rows then 512 q6_k
+rows, so an even row split leaves the last shard about 30% long. A
+cost-weighted split belongs in `shard_range`.
 
 ## Prefill (sequential sweep, our improvement over TF)
 
@@ -1097,6 +1199,51 @@ the sites**, at ~27 ns each on this machine's vDSO, so ~20 µs against a token
 EXP-018 puts in the hundreds of milliseconds. Order 1e-4 of the token, well
 under the run-to-run noise of anything it would be read against.
 
+**Phase 9 added a second stderr block, `decode gemv split (submitting
+thread):`,** beside the first. The first block is **untouched** so that
+EXP-023 stays comparable against it; the second is a finer decomposition of
+two of the first block's phases and never replaces it.
+
+It splits every pooled GEMV, as seen from the submitting thread (the pool runs
+shard 0 there, so both halves are observable from one thread without any worker
+touching a clock), into:
+
+- `own` — set-up, the job descriptor, the failure-slot `Mutex`, the publish
+  including its `futex` wake when workers are parked, and **this core's
+  `1/shards` of the rows**;
+- `wait` — the barrier: straggler shards, worker wake latency, and whatever
+  the even row split costs on cores of different speeds.
+
+Four buckets: **projections, experts, lm_head, router**. The **router is
+serial on the decode thread, so its `wait` is zero by construction rather than
+measured**, and the block says so on its own last line. The four buckets are
+disjoint spans strictly inside the first block's `projections` and
+`expert compute` phases, so their sum can never exceed those two; the gap is
+the non-GEMV work those phases also cover (the softmax and top-k scan, SwiGLU,
+the intermediate quantization, the expert view carves).
+
+Two things about the counts column changed with the fused fan-out and will
+mislead a reader who assumes otherwise:
+
+- **The count is per fan-out, not per matrix.** Before fusion a job was one
+  matrix and the two readings coincided. They no longer do, and the `ms` figure
+  beside the count is milliseconds per *fan-out*.
+- **The experts bucket's fan-out count is data-dependent.** A phase fans out
+  twice — once for every gate and up together, once for every down — and a
+  layer runs one phase when its plan is all hits or all misses and two when it
+  splits. So the experts count is a range set by routing rather than a
+  constant, and it is pinned in the tests as a range for that reason.
+
+The accessor is `ForwardState::decode_gemv_split`, which returns four
+`(name, own, wait, scatters)` tuples as plain data because `ramvamp-core` does
+not print, exactly as `PrefillTiming::phases` does. It accumulates across a
+run's tokens and is zeroed by the next prefill and by `ForwardState::reset`.
+Cost is **4,131 clock reads per token, derived by counting the sites**, ~112 µs
+against a token EXP-023 measures at 532 ms at ctx 512; zero when disarmed. No
+worker reads a clock, writes shared state or touches an atomic — a worker shard
+evaluates one predicted-not-taken compare — because instrumenting a barrier
+must not perturb the barrier.
+
 ## Validation protocol vs llama.cpp
 
 Same GGUF bytes on both sides. Gates, in order:
@@ -1194,10 +1341,10 @@ withdrawn.
   simulation only); replaying the shipped `io/cache.rs` over the identical
   traces the way the runtime actually calls it gives **50.02% at 10 and 54.48%
   at 12** (EXP-005 Correction), which is where the roughly 5-point
-  simulator underestimate is recorded. **The table below is not re-derived at
-  the measured rate**, because its rows are dial points from the replay and
-  mixing a measured rate into them would put two entries on one curve; see the
-  correction under it.
+  simulator underestimate is recorded. **The table below is retired rather than
+  re-derived**, for the reason under it: its rows are dial points from the
+  replay, and mixing a measured rate into them would put two entries on one
+  curve.
 - Decode I/O time, derived rather than measured. Miss bytes are estimated as
   `(1 - hit) x 1,097 MB`, which assumes misses are spread across the two
   stride classes in proportion to accesses; on the one point where EXP-005
@@ -1215,41 +1362,64 @@ withdrawn.
   | 12 slots, batch-pinned | 54.48 | 499 | 295-322 | 3.11-3.39 |
   | no cache | 0 | 1,097 | 649-708 | 1.41-1.54 |
 
-  So the current I/O-only band at the shipped dial is roughly **2.8-3.4
-  tok/s**, bracketed by the 10- and 12-slot rows, up from the 2.2-2.7 the
-  EXP-008 bandwidths gave. **What is and is not now measured**: the bandwidth
-  is measured and rule-2 clean, but through a threaded-`preadv` queue rather
-  than io_uring (EXP-019), so it characterises the drive and not the runtime's
-  submission path. The hit rates in **this table** are still a trace replay
-  rather than a decode run, which is why the table is not re-derived: as of
-  EXP-023 the shipped 11-slot dial does have a measured point of its own
-  (53.0-59.3%), and so do 12 and 13, but those are a different entry and a
-  different session and putting them in these rows would make one curve out of
-  two. The 1,097 MB/token is still exact arithmetic. So the table is one grade
-  less provisional than it was, not measured end to end, and it is now a
-  derivation that a measurement has overtaken rather than the best available
-  answer.
+  **The "~2.8-3.4 tok/s I/O-only band" this table used to yield is RETIRED and
+  must not be quoted.** The table is kept as the record of a derivation that
+  measurement has overtaken; the band drawn from it is withdrawn on four counts,
+  and every one of them pushes the same way:
 
-  The width of the band is per-file bandwidth variance, not measurement noise:
-  EXP-019 finds a 1.44x spread between two layer files with identical extent
-  geometry, and a real decode touches all 48, so the true aggregate sits
-  somewhere inside rather than at either end. That 1.44x is `layer_00` at
-  1.578 against `layer_20` at 2.271 GB/s at **K=1, sequential, QD 8**, which
-  is easy to misread as a K=8 figure and is not one.
+  1. **It bracketed the 10- and 12-slot rows, and the shipped dial is 11.**
+     The band never contained a row for what ships.
+  2. **Its hit rates were a trace replay, not a decode.** The doc used to call
+     them "simulated", which is imprecise: `scripts/lfu_sim.py` is the
+     simulator and gives 44.8% / 49.9%, while 50.02% and 54.48% come from
+     replaying the shipped `io/cache.rs` over EXP-005's four routing traces.
+     Both are replays of 556 recorded decode tokens rather than a decode run.
+     **MEASURED cold, EXP-023: 53.0-59.3% at the shipped 11 slots** over five
+     live rungs.
+  3. **Its bandwidth input was EXP-019's 1.55-1.69 GB/s**, a per-file
+     whole-file probe. **Decode's own effective rate, DERIVED from its own
+     measured counters, is 2.16 GB/s** (EXP-023: 28.3 GiB against 14.05 s of
+     `io wait` at 3,961 prompt tokens).
+  4. **An I/O-only ceiling computed as `1 / expert_io` OVERSTATES what decode
+     can reach.** EXP-023 Note 4 establishes that the `expert io` bucket is a
+     **residual**: the miss reads are already in flight during hit compute, so
+     the bucket measures only the part of the read that hit compute did not
+     cover. Inverting it therefore prices the drive as if it were idle during
+     compute, which it is not. It is an upper bound on an upper bound.
 
-  **Correction (2026-08-06, EXP-023): decode's own effective rate is now
-  measured, and it is above this band.** The band above stays where it is,
-  because it is a derivation from EXP-019 at EXP-019's bandwidths and rewriting
-  it with a number from another entry is exactly the curve rule 3 forbids. What
-  EXP-023 adds is decode's own figure, **derived** from its own measured
-  counters on one run: at 3,961 prompt tokens the streamer reads **28.3 GiB of
-  experts against 14.05 s of `io wait`**, which is **2.16 GB/s** (2.01 GiB/s).
-  Read it as an **upper bound** rather than a point: miss reads are in flight
-  during hit compute, so the drive's average delivery rate over the window it
-  was actually busy is at most that (see EXP-023 Note 4 on why `expert io` is a
-  residual). 2.16 GB/s sits between the slow files' 1.57-1.65 and the fast
-  files' 3.46-3.47 in EXP-023's own probe at the same K=1, random, QD 8 cell,
-  which is where an aggregate over 48 files of both kinds belongs.
+  **What replaces it: nothing derived, and these measurements.** MEASURED cold,
+  in-cgroup, hygiene PASS, medians of three scored runs at `--max-new 64`
+  (EXP-023):
+
+  | quantity | measured | what it bounds |
+  | --- | --- | --- |
+  | decode tok/s at 11 slots | **2.19 / 1.91 / 1.82 / 1.75 / 1.46** at ctx 64 / 512 / 1,024 / 2,048 / 3,961 | nothing — this **is** decode, end to end, and it is the number to beat |
+  | decode hit rate at 11 slots | **53.0-59.3%** over the same rungs | the miss volume; no trend in context |
+  | decode effective read rate (DERIVED) | **2.16 GB/s** at ctx 3,961 | an **upper** bound on the drive's average delivery rate over the window it was busy (Note 4 above) |
+  | expert io share of a token | **54.1% at ctx 64 falling to 33.2% at 3,961** | a **lower** bound on drive-busy time, for the same residual reason |
+
+  So the honest statement is: **decode measures 1.46-2.19 tok/s cold on this
+  drive at the shipped dial**, expert I/O is the largest single term below
+  2,048 tokens of context and is level with attention at 3,961, and **no I/O-only
+  ceiling is offered**, because the only one this document knows how to compute
+  overstates. The bandwidth inputs remain rule-2 clean but come through a
+  threaded-`preadv` queue rather than io_uring (EXP-019, EXP-023 Note 10,
+  EXP-024), so they characterise the drive and not the runtime's submission
+  path. The 1,097 MB/token is still exact arithmetic.
+
+  The retired band's width was per-file bandwidth variance rather than
+  measurement noise, which is one more reason not to resurrect it: the width
+  was a property of the session that measured the spread, and EXP-024 measures
+  that spread not reproducing (below).
+
+  **Decode's own effective rate is measured (2026-08-06, EXP-023).** **DERIVED**
+  from its own measured counters on one run: at 3,961 prompt tokens the streamer
+  reads **28.3 GiB of experts against 14.05 s of `io wait`**, which is **2.16
+  GB/s** (2.01 GiB/s). Read it as an **upper bound** rather than a point: miss
+  reads are in flight during hit compute, so the drive's average delivery rate
+  over the window it was actually busy is at most that (see EXP-023 Note 4 on
+  why `expert io` is a residual). This figure is not merged into the retired
+  table's rows and never was — that would be the curve rule 3 forbids.
 
   **Decode is not queue-starved.** EXP-023 derives its concurrency from the
   same counters: 10,530 misses over `63 tokens x 48 layers` is **3.48 misses
@@ -1261,59 +1431,88 @@ withdrawn.
   left to buy: more would take more concurrent misses, which needs the
   cross-layer prefetch that is closed as a no.
 
-  **The per-file spread is the larger lever and it is bigger at K=1 than
-  EXP-019 saw.** EXP-023 measures 1.568 / 3.455 / 1.654 / 3.469 GB/s on the
-  same four files at K=1, random, QD 8, a **2.21x spread**, with `layer_00`
-  flat at 1.59-1.60 across the whole sweep. EXP-019's decode-shaped cell read
-  1.55-1.69 GB/s across all four, so the two fast files roughly doubled between
-  the two sessions. **Those are different entries and different sessions and
-  must not be drawn as one curve**; each spread is a fact about its own
-  session, and what both sessions agree on is that the spread exists, is large,
-  and is not predicted by extent geometry. Both probes are `threaded-pread`
-  rather than io_uring, so neither characterises the runtime's submission
-  path.
-- **This band is drive-dependent and must never be published without the
-  device.** The same design and the same ~500 MB/token on a 3.5 GB/s drive
-  computes to roughly 7 tok/s. The reference machine has a DRAM-less QLC
-  part; a mainstream TLC Gen4 drive would roughly double these numbers. Any
-  headline tok/s figure ships next to the drive it was measured on. EXP-019
-  adds a second reason the device matters and it is finer-grained than
-  "which drive": bandwidth varies 1.44x **between files on the same drive**
-  with identical extent geometry, so even the same drive does not give one
-  number.
-- **I/O is probably not the binding constraint yet, but no single
-  measurement says so.** The two figures that suggest it come from different
-  machine states and must not be subtracted from each other (experiment log,
-  rule 3): phase-4 decode is ~2 s/token on the 185H (EXP-004 diagnostic:
-  warm cache, single thread, uncgrouped, and the expert reads in it are
-  buffered `pread` served largely from that warm cache), while the 690 ms of
-  uncached expert I/O is a *simulated* figure at an unsourced bandwidth
-  constant (EXP-005, no cache; the same volume re-derived at EXP-019's
-  measured bandwidth is 649-708 ms, so the figure survives its constant).
-  What can be said without combining them is
-  that a single-threaded decode step measured in seconds sits an order of
-  magnitude above an I/O budget estimated in hundreds of milliseconds, so
-  compute-parallelism work matters at least as much as the cache does.
-  Neither the cache dial nor the bandwidth probe can be evaluated against
-  tok/s until the compute side is threaded and one run produces both halves
-  under rule 2.
-- **Floor for success: OPEN, and the arithmetic against it has changed.** The
-  criterion is written as 3 tok/s. At EXP-008's bandwidths that sat *above*
-  the derived I/O-only ceiling of 2.2-2.7 tok/s, so it was unreachable on this
-  drive by construction. At EXP-019's measured bandwidths the derived ceiling
-  is 2.8-3.4 tok/s, so **3 tok/s now sits inside the band rather than above
-  it**, at the shipped 11-slot dial and without appealing to the unsourced
-  1.59 GB/s constant. That does not make the floor met: an I/O-only ceiling is
-  a ceiling, compute is a real term on top of it, and no cold decode run at a
-  useful token count exists yet to say where the sum lands. It only means the
-  floor is no longer arithmetically impossible. The decision is still the
-  user's rather than a silent edit, and the three options are unchanged: keep
-  3, restate the floor per-drive, or lower it. Recorded here as unresolved.
+  **The per-file spread is NOT a lever, and EXP-023 Note 12's suggestion that
+  it is has been withdrawn.** EXP-023 measured 1.568 / 3.455 / 1.654 / 3.469
+  GB/s on four files at K=1, random, QD 8 — a **2.21x spread** — and pointed at
+  it as the thing to attack. **EXP-024 re-ran that exact cell the next day and
+  measured 1.672 / 1.607 / 1.658 / 1.601, a 1.04x spread**, with the two fast
+  files roughly halving and the two slow ones unmoved; a control arm running
+  the byte-identical phase-8 probe script agrees. Over all 48 expert files, the
+  first time the population has been measured, the spread is **1.082x** (1.565
+  to 1.694, median 1.633) and most of even that is blob size rather than any
+  property of a file. Physical dispersion does not predict it (Pearson r =
+  **-0.043**), and 2 MiB windows inside one file are only **1.161x** apart
+  across a 7,493x median physical-span contrast. **EXP-019, EXP-023 and EXP-024
+  are three sessions and must not be drawn as one curve**; the correct reading
+  is that a per-file spread is a fact about the session that measured it, that
+  the mechanism is drive-internal and invisible to the runtime, and that
+  **there is nothing here for the runtime to pull**. All three probes are
+  `threaded-pread` rather than io_uring, so none characterises the runtime's
+  submission path.
+- **Every tok/s figure here is drive-dependent and must never be published
+  without the device.** The reference machine has a **DRAM-less QLC** part; a
+  mainstream TLC Gen4 drive would materially change these numbers, and the
+  arithmetic that used to be offered for how much ("~7 tok/s on a 3.5 GB/s
+  drive") is **ESTIMATED** on a bandwidth constant nobody has measured on such
+  a drive, so it is a direction and not a figure. Any headline tok/s figure
+  ships next to the drive it was measured on. EXP-024 adds a second reason the
+  device matters that is finer-grained than "which drive", and it cuts the
+  opposite way from what EXP-019 and EXP-023 suggested: the same drive does not
+  even give one number **across sessions**, so a published figure must name its
+  session as well as its device.
+- **Both halves are now measured in one run, and neither dominates.** This
+  bullet used to say that no run produced both halves under rule 2 and that
+  the two available figures came from different machine states. **EXP-023
+  supplies the run**: five cold rungs, in-cgroup, hygiene PASS, with the phase
+  split of the same tokens. MEASURED cold at ctx 512: expert io **44.4%**,
+  expert compute **29.0%**, projections **17.6%**, attention **6.4%**,
+  elementwise 2.6%. At ctx 3,961: expert io **33.2%**, attention **31.6%**,
+  expert compute 21.1%, projections 12.1%. So expert I/O is the largest single
+  term below 2,048 tokens of context, and at 3,961 it is level with attention
+  and the ordering inverts run to run (EXP-023 Note 2). Everything that is
+  **not** `expert io` is **45.9% of a token at ctx 64 rising to 66.8% at
+  3,961** (DERIVED as `100 - expert io%` on the same rows), and what grows
+  across that ladder is attention, not the GEMVs. The old phase-4 figures
+  (EXP-004's ~2 s/token warm single-threaded, EXP-005's simulated 690 ms) are
+  superseded and must not be quoted against these.
+- **The compute half is memory-bound, not dispatch-bound, and three of the
+  figures previously used to reason about it are refuted.** MEASURED **warm**
+  at ctx 512, so diagnostics rather than results, and the cold rule-2 pairing
+  (EXP-025) has not been run:
+  - **EXP-001's 9.61 GB/s is an L2-resident fixture and is not a valid
+    reference for decode**, which streams every expert byte once from DRAM.
+    Three code comments cited it and have been fixed.
+  - **The pool's ~1.3 µs barrier figure comes from `pool.run(6, |_| {})`, a
+    hot loop in which no worker parks**, and does not describe decode.
+  - **Six cores buy 1.16x pre-fusion and 1.43x post-fusion, not 6x**: a forced
+    single shard puts the pooled GEMV bucket at 16.35 s against 14.11 s at six
+    shards in the same session, and against 11.42 s fused. Fused aggregate
+    throughput is 11.00 GB/s (DERIVED).
+  - **The barrier wait scales with work, not with fan-out count**: fusion cut
+    expert scatters 6.14x and expert barrier wait 1.47x.
+
+  See "How decode's GEMVs fan out, and what phase 9 refuted about them" under
+  "Decode loop" for the arms, ranges and artifacts.
+- **Floor for success: OPEN, and it is now measured against rather than
+  derived against.** The criterion is written as 3 tok/s. Every derived
+  I/O-only ceiling this document has carried against it — EXP-008's 2.2-2.7,
+  EXP-019's 2.8-3.4 — is **withdrawn**, for the four reasons under the retired
+  table above, of which the load-bearing one is that inverting the `expert io`
+  residual overstates. What exists instead is the measurement: **1.46 to 2.19
+  tok/s, MEASURED cold at the shipped 11-slot dial across five context rungs
+  at `--max-new 64`** (EXP-023). **3 tok/s is not met at any measured rung**,
+  and the gap at ctx 512 is 1.57x. Nothing here says it is unreachable — the
+  ceiling that once said so is withdrawn too, and phase 9's fused fan-out has
+  not been measured cold — but nothing derived may be offered in place of the
+  number. The decision remains the user's rather than a silent edit, and the
+  three options are unchanged: keep 3, restate the floor per-drive, or lower
+  it. Recorded here as unresolved.
 
 Prior-art anchors, with the qualifiers that were previously missing:
 
 - llama.cpp RFC #23324 (same design, pread sidecar) reports 13 tok/s on a
-  16 GB M1 Pro. This does **not** bound our band in either direction: it is
+  16 GB M1 Pro. This does **not** bound our measurements in either direction:
+  it is
   **Q6_K, not Q4_K_M**; **48 slots/layer, not 11**; GPU-accelerated; and the
   author explicitly qualifies it as "after warmup", with the macOS page cache
   in the read path. It is a single unreplicated self-report with no cold
@@ -1456,12 +1655,18 @@ are neither now, and they should not come back without new evidence.
   at 161 s, 143 s and 131 s on a 512-token prompt, all three byte-identical
   to token-major (EXP-017). That is a direction, not the sweep: it fails
   rule 2, it does not cover 1024, and it says nothing about the memory peak
-- **The cold rule-2 measurement of phase 7's attention work.** EXP-020 is warm
-  and in process; the runbook for the cold pass is committed at
-  `scratch/phase7/wave3-runbook.md` and **EXP-021 is reserved for it**: paired
-  cold prefill at `--repeats 5`, paired cold decode at `--max-new 256`, the 4K
-  `memory.peak` run, and the numerics gate. Until it exists, phase 7 has
-  published nothing (EXP-020)
+- ~~**The cold rule-2 measurement of phase 7's attention work**~~: **done,
+  EXP-021.** The reservation is discharged — paired cold prefill, paired cold
+  decode, the 4K `memory.peak` run and the numerics gate all exist. Kept here
+  only so the trail from EXP-020's warm numbers to EXP-021's cold ones is
+  legible (EXP-020, EXP-021)
+- **The cold rule-2 measurement of phase 9's fused decode fan-out.** Phase 9's
+  numbers are warm and are diagnostics; the harness for the cold pass is
+  committed at `scripts/phase9_decode_sweep.sh`, pairs the branch against the
+  phase-8 reference binary at ctx 512 and 3,961, and **EXP-025 is reserved for
+  it**. It has been run under `--dry-run` only
+  (`scratch/phase9/sweep-20260807-173501/exitcodes.tsv` is `DRY` on every
+  row). Until it exists, phase 9's compute work has published nothing
 - **Softmax, and unfreezing `primitives`.** `primitives::softmax` is 23.5% of
   the attention kernel at 4096 positions (1,059 µs of 4,499 µs, measured,
   EXP-020) and `primitives` is frozen. Leaving it frozen caps every other
@@ -1491,13 +1696,17 @@ are neither now, and they should not come back without new evidence.
   on both arms of the same pair would separate the transient from steady
   state. This is the one place the sweep is currently known to cost a user
   something, so it is worth measuring rather than reasoning about (EXP-018)
-- The **cold phase split**. EXP-017's attribution of prefill time to attention
-  is warm and uncgrouped; EXP-018 is cold but has no per-phase counters in it.
-  Neither says what attention's share is cold, which is the number phase 7
-  should be judged against. Phase 7 added the counter half: `forward_token`
-  now emits a `decode split (forward_token):` block on stderr beside the
-  prefill one, always on, at ~1e-4 of a token in overhead. So the cold run
-  itself is all that is missing, and it is EXP-021's
+- ~~The **cold phase split**~~: **done, EXP-021 and EXP-023.** Phase 7 added
+  the counter half — `forward_token` emits a `decode split (forward_token):`
+  block on stderr beside the prefill one, always on, at ~1e-4 of a token in
+  overhead — and EXP-023 supplied the cold runs, five context rungs of both
+  splits. Phase 9 added a **second** block, `decode gemv split (submitting
+  thread):`, which decomposes the pooled GEMVs of the first block's
+  `projections` and `expert compute` phases into `own` and barrier `wait`
+  across projections / experts / lm_head / router; see "Instrumentation" for
+  what changed about the counts column and why the router's `wait` is zero by
+  construction. **That second block has been read warm only**, and its cold
+  pairing is EXP-025
 
 Dropped from the backlog:
 

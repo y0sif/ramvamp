@@ -142,23 +142,38 @@ number appears in anything published.
   ~half its per-token time on expert reads. That is a claim about decode, and
   it does not carry to prefill on the swept path: EXP-017 measured expert I/O
   at 1.7% of a 512-token swept prefill and 0.5% at 1891 tokens, with attention
-  taking 61.3% and 85.2%. The slowdown versus a
-  fits-in-RAM engine is **drive-dependent and larger than the "2-3x" this
-  document previously claimed**. On ramvamp's reference machine (Micron 2400,
-  DRAM-less QLC, Qwen3-30B-A3B Q4_K_M at the shipped 11 slots/layer) the
-  derived I/O-only ceiling is **2.8-3.4 tok/s** against a 15-25 tok/s in-RAM
-  compute estimate, so roughly 4-9x on that device; a mainstream TLC Gen4
-  drive would roughly halve the gap. That band is up from the 2.2-2.7 this
-  document carried before, because the bandwidth under it was re-measured:
-  EXP-019 puts the decode geometry (one expert blob, random order, up to 8
-  outstanding) at **1.55-1.69 GB/s**, cold, in-cgroup, hygiene PASS, against
-  the 1.211-1.349 EXP-008 gave. Both ends of the ratio are still soft, but the
-  old caveat that the denominator "fails the experiment log's rule 2" no
-  longer applies. What remains: the numerator is an estimate with no direct
-  public benchmark, the hit rates behind the band are a trace replay rather
-  than a decode run, and EXP-019's queue was threaded `preadv` rather than
-  io_uring, so it characterises the drive and not the runtime's submission
-  path. The memory saving, **~6x**
-  (17.35 GiB of model bytes against a ~2.9 GiB resident budget), is the part
-  that does not depend on the drive. See the performance model in
-  `docs/architecture.md` for the derivation and its provisional status.
+  taking 61.3% and 85.2%. That is confirmed cold on our own path: **MEASURED**
+  at ctx 512, expert I/O is 44.4% of a decode token and 2.8% of a prefill token
+  (EXP-023, five context rungs, cold, in-cgroup, hygiene PASS). The slowdown
+  versus a fits-in-RAM engine is **drive-dependent and larger than the "2-3x"
+  this document previously claimed**.
+
+  On ramvamp's reference machine (Micron 2400, DRAM-less QLC, Qwen3-30B-A3B
+  Q4_K_M at the shipped 11 slots/layer) decode **MEASURES 1.46 to 2.19 tok/s
+  cold** across five context rungs (EXP-023: 2.19 / 1.91 / 1.82 / 1.75 / 1.46
+  at 64 / 512 / 1,024 / 2,048 / 3,961 prompt tokens, medians of three scored
+  runs at `--max-new 64`). Against a **15-25 tok/s ESTIMATED** in-RAM compute
+  ceiling — an estimate with no direct public benchmark behind it — that is
+  roughly **7-17x on that device**, and the width of that range is mostly the
+  softness of the estimate rather than anything measured. A mainstream TLC Gen4
+  drive would narrow the gap; by how much is **UNKNOWN**, since no such drive
+  has been measured here.
+
+  **The "derived I/O-only ceiling of 2.8-3.4 tok/s" this document used to build
+  that ratio on is withdrawn.** It bracketed the 10- and 12-slot rows while 11
+  is what ships; its hit rates were a replay of the shipped cache over recorded
+  routing traces rather than a decode run (this document called them
+  "simulated", which was imprecise — the simulator is a different, lower
+  figure); its bandwidth input was EXP-019's 1.55-1.69 GB/s where decode's own
+  effective rate is **2.16 GB/s DERIVED** (EXP-023); and, decisively, **an
+  I/O-only ceiling computed as `1 / expert_io` overstates**, because EXP-023
+  Note 4 establishes that the `expert io` bucket is a residual left after hit
+  compute has already covered part of the read. No replacement band is offered.
+
+  All bandwidth figures here come from a threaded-`preadv` probe rather than
+  io_uring, so they characterise the drive and not the runtime's submission
+  path, and EXP-024 records that a per-file bandwidth spread on this drive is a
+  fact about the session that measured it rather than a stable property. The
+  memory saving, **~6x** (17.35 GiB of model bytes against a ~2.9 GiB resident
+  budget), is the part that does not depend on the drive. See the performance
+  model in `docs/architecture.md` for what is measured and what it bounds.

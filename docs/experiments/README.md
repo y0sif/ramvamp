@@ -60,6 +60,16 @@ which is the reason their claims are credible.
 - [EXP-021: Phase 7 measured cold: prefill, decode and 4K context under rule 2](#exp-021-phase-7-measured-cold-prefill-decode-and-4k-context-under-rule-2) — KEEP
 - [EXP-022: T_BLOCK 4 to 8 with a stepped position tail, measured warm](#exp-022-t_block-4-to-8-with-a-stepped-position-tail-measured-warm) — KEEP
 - [EXP-023: The cold decode sweep: the phase split against context, the 11-slot hit rate, the slot dial and T_BLOCK](#exp-023-the-cold-decode-sweep-the-phase-split-against-context-the-11-slot-hit-rate-the-slot-dial-and-t_block) — KEEP
+- [EXP-024: The per-file read spread does not reproduce, and it is not filesystem placement](#exp-024-the-per-file-read-spread-does-not-reproduce-and-it-is-not-filesystem-placement) — NEUTRAL
+
+**EXP-025 is reserved for the cold rule-2 measurement of phase 9's fused
+decode fan-out**, paired against the phase-8 reference binary at ctx 512 and
+3,961. The harness is committed (`scripts/phase9_decode_sweep.sh`, stamped
+`scratch/phase9/sweep-20260807-173501/`) and **has only been run under
+`--dry-run`**: every row of that directory's `exitcodes.tsv` reads `DRY`. The
+fusion's warm numbers are diagnostics and appear in `docs/architecture.md`
+labelled as such; they are not published here and the number must not be
+reused for anything else.
 
 Entries EXP-007 through EXP-013 were measured on a machine that was not
 quiet, and most are microbenchmarks rather than end-to-end runs. Under rule 2
@@ -3218,3 +3228,297 @@ they are, as the record of what was believed when phase 5 was designed.
       3's tests and on EXP-021's gates, and this entry adds nothing to it.
       And the io_uring queue-depth measurement inside the runtime, which
       EXP-019 Note 5 called for, is still not taken (Note 10).
+
+## EXP-024: The per-file read spread does not reproduce, and it is not filesystem placement
+
+- Date / commit: 2026-08-07 / `9e1c134` and `16b30a2` (`feat/decode-compute`),
+  which arm ran under which is stated per arm in Method. **No runtime binary is
+  involved and no `ramvamp` process ran**: this entry measures the drive
+  through `scripts/io_probe.py`, so the artefact whose identity matters is the
+  script rather than an executable, and it changed twice inside the session.
+  Its sha256 at each state, each verified by hashing `git show <rev>:scripts/io_probe.py`:
+
+  | rev | sha256 of `scripts/io_probe.py` | what it is |
+  | --- | --- | --- |
+  | `8e1eee8` | `887c330d0e182f546c7fc7171b678b789a9733eb84f0190984206e391b82b4f0` | the phase-8 script EXP-023 used; the control arm ran these exact bytes |
+  | `9e1c134` | `149d507aba5fd587d3c6dcd31333ff693e0f7a8a87fafbf49562cf639c711161` | adds dispersion statistics, `--all-files`, `--window` |
+  | `16b30a2` | `ceb5698acd2d945a989a9030a3959d45b67339d261491d5d76c65f8bb7fe778a` | fixes the window path's own measurement defects; unchanged at `cd1547f`, the branch head |
+
+- Hypothesis: EXP-023 Note 11 measured a **2.21x** bandwidth spread between
+  four expert files at decode's own read geometry and named the per-file spread
+  as the lever worth pulling (Note 12: "the lever this points at is the
+  per-file spread, not the queue"). `docs/benchmark-machine.md` said flatly
+  **"It is not fragmentation"** on the strength of identical extent geometry.
+  Neither statement had been tested against the two obvious alternatives, and
+  the probe could not test them: `filefrag_stats` only ever computed extent
+  count, extent sizes and successor adjacency, so it could see *fragmentation*
+  and could not see *placement*. So: (1) is the spread a property of the files,
+  reproducible across sessions; (2) does it hold over all 48 expert files or
+  only over the four that have ever been sampled; (3) is it predicted by
+  physical dispersion; and (4) does locality move bandwidth *inside* one file,
+  where age, write history and install order are held constant by construction.
+- Method: four probe arms, all on 2026-08-07, all against the installed
+  `models/qwen3.rvmp/experts/*.bin`, all `measurement hygiene: PASS`.
+
+  | arm | script rev | invocation | artifact |
+  | --- | --- | --- | --- |
+  | spread re-run | `9e1c134` | `--block-ks 1 --fixed-k 1 --fixed-qd 8 --queue-depths 1,2,4,8,16 --patterns rand,seq --repeats 3` | `scratch/io-probe/p9-20260807-130656-spread.json` / `.md` / `.log` |
+  | control | `8e1eee8` | `--block-ks 1 --fixed-k 1 --fixed-qd 8 --queue-depths 8 --patterns rand --repeats 3`, run from an unmodified copy of the phase-8 script | `scratch/io-probe/p9-control-orig.json` / `.log` |
+  | population | `9e1c134` | `--all-files --fixed-k 1 --fixed-qd 8 --patterns rand --repeats 3` | `scratch/io-probe/p9-all48.json` / `.md` / `.log` |
+  | window | `16b30a2` | `--window <16 x layer_00:OFFSET:2M> --window-block-bytes 262144 --fixed-qd 8 --patterns rand --repeats 5` | `scratch/io-probe/p9-win2m-fixed.json` / `.log` |
+
+  Every arm evicts every probed file with
+  `posix_fadvise(POSIX_FADV_DONTNEED)` and then **proves** the eviction with
+  `mmap` + `mincore` before measuring, re-execs itself into a transient
+  `systemd-run --user --wait` **service** at `MemoryMax=3G`,
+  `MemorySwapMax=0`, `MemoryAccounting=yes`, and **refuses to measure at all
+  if `O_DIRECT` was silently downgraded to buffered I/O**, which is a
+  documented btrfs behaviour and would produce exactly the wrong number. Each
+  arm discards a warmup and scores the repeats that follow; every GB/s below is
+  a median of the scored runs and carries its scored min-max beside it.
+
+  **Rule-2 status, stated head on.** All four arms are `measurement hygiene:
+  PASS`, no arm grew the page cache under `O_DIRECT`, and `btrfs device stats`
+  is unchanged across every session at its 138,407 `corruption_errs` baseline
+  with all four other counters 0. What rule 2 governs is a published *runtime*
+  number and there is none here: this is a drive-side probe, its queue depth
+  is emulated with N OS threads issuing blocking `preadv` (`threaded-pread`)
+  and **not** io_uring, so it characterises the drive and the filesystem and
+  not the runtime's submission path. That is the same bound EXP-019 Note 5 and
+  EXP-023 Note 10 state, restated rather than inherited.
+
+  **Dial status.** No runtime dial is read, set or measured anywhere in this
+  entry. The shipped defaults are untouched: **11 slots/layer**,
+  `--cache-bytes` unchanged, `RING_ENTRIES` unchanged. Nothing here is a
+  licence to move any of them.
+
+  No prompt is involved, so there is no prompt sha256 to record.
+- Baseline: EXP-023 Note 11's four-file cell — `layer_00` 1.568, `layer_20`
+  3.455, `layer_06` 1.654, `layer_21` 3.469 GB/s at K=1, random, QD 8 — and
+  `docs/benchmark-machine.md`'s "It is not fragmentation". Both are being
+  tested rather than extended. **EXP-019, EXP-023 and this entry are three
+  sessions on the same drive and rule 3 forbids drawing one curve through
+  them**; where a figure from either earlier entry appears below it is named as
+  the prior being tested, and no number from this entry may be combined with
+  one from those.
+- Result:
+
+  **1. EXP-023's cell does not reproduce. The spread is 1.04x where EXP-023
+  measured 2.21x.** Same four files, same K=1, QD 8, random cell, medians of 3
+  scored runs with the scored min-max beside them. MEASURED, cold, in-cgroup.
+
+  | file | EXP-023, 2026-08-06 (prior) | this entry, 2026-08-07 | scored min-max | control arm (`8e1eee8` script) | control min-max |
+  | --- | ---: | ---: | --- | ---: | --- |
+  | layer_00 | 1.568 | **1.672** | 1.661-1.672 | 1.617 | 1.614-1.619 |
+  | layer_06 | 1.654 | **1.607** | 1.601-1.612 | 1.612 | 1.580-1.613 |
+  | layer_20 | 3.455 | **1.658** | 1.657-1.671 | 1.657 | 1.652-1.660 |
+  | layer_21 | 3.469 | **1.601** | 1.597-1.635 | 1.575 | 1.569-1.618 |
+  | spread | **2.21x** | **1.044x** | | **1.052x** | |
+
+  **The fast files became slow; the slow files stayed where they were.**
+  `layer_20` and `layer_21` fell from 3.455 and 3.469 to 1.658 and 1.601,
+  roughly halving. `layer_00` and `layer_06` moved by +6.6% and -2.8%, which
+  leaves both inside the 1.57-1.69 GB/s band every session has found for them
+  — they did not move in the sense that matters here, which is that neither
+  crossed into the other population. The control arm is why the probe's own
+  edits are not the explanation: it is the byte-identical phase-8 script that
+  produced EXP-023's numbers, started 103 s after the edited arm on the same
+  four files (`10:06:56Z` and `10:08:39Z`, both recorded in the artifacts'
+  `machine.started_utc`), and it agrees with the edited script to within 3.5%
+  on every file (Note 2).
+
+  **2. The population, measured for the first time.** All 48 expert files at
+  the same decode-shaped cell; EXP-019 and EXP-023 each sampled four. Medians
+  of 3 scored runs, MEASURED cold. Per-file rows are in
+  `scratch/io-probe/p9-all48.md`; the summary:
+
+  | statistic | value |
+  | --- | ---: |
+  | slowest file | `layer_25`, **1.565** GB/s (scored 1.515-1.609) |
+  | fastest file | `layer_32`, **1.694** GB/s (scored 1.662-1.704) |
+  | median over 48 files | **1.633** GB/s |
+  | population spread | **1.082x** |
+  | Pearson r, bandwidth vs largest-region byte fraction | **-0.043** |
+
+  **1.082x over 48 files against 2.21x over four the day before.** And most of
+  even that 1.082x is blob size rather than any property of a file: the 24
+  layers whose expert stride is 3,059,712 B read at a median of 1.671 GB/s
+  (1.617-1.694) and the 24 at 2,654,208 B read at 1.610 (1.565-1.636), so the
+  two stride classes are 1.038x apart and the residual spread **inside** a
+  class is 1.047x and 1.045x. Bandwidth correlates with block size at r =
+  **0.835** and with dispersion at essentially zero.
+
+  **3. Dispersion is a covariate, not a mechanism.** `layer_00` is the only
+  physically dispersed file of the 48 — **26 regions, 23.0% of its bytes in its
+  largest, 72.46 GB median inter-extent seek** — against **43 of 48 at >= 99%
+  of bytes in one region**. If placement drove the spread, `layer_00` would be
+  the slow file. It is **rank 17 of 48**, at 1.6169 GB/s. `layer_06`, which is
+  **99.6% clustered with a 0.11 GB median seek**, is rank 16 at 1.6165 — the
+  two are indistinguishable in that run (0.02% apart), and in the four-file arm
+  above `layer_00` is the *faster* of the pair by 4.0% (1.672 against 1.607).
+  Within its own stride class `layer_00` is the slowest of 24, by 1.048x; that
+  1.048x is the entire effect dispersion could be worth here, and it is smaller
+  than the 1.082x whole-population spread it would have to explain.
+
+  **4. Locality inside one file moves bandwidth 1.161x against a physical-span
+  contrast of three to four orders of magnitude.** Sixteen 2 MiB windows inside
+  `layer_00`, eight in one physical region and eight straddling three or four,
+  8 reads of 262,144 B each, 5 repeats, MEASURED cold. Same file, so age, write
+  history, install run and inode are identical by construction.
+
+  | population | GB/s median | scored range across the 8 windows | p50 ms median | median physical span |
+  | --- | ---: | --- | ---: | ---: |
+  | dense (1 region) | **1.093** | 1.024-1.284 | 1.321 | 24.7 MB |
+  | scattered (3-4 regions) | **0.941** | 0.823-1.067 | 1.531 | 185.0 GB |
+  | ratio | **1.161x** | | **1.159x** | **7,493x** (median), up to **54,512x** at the extremes |
+
+  Bandwidth and p50 agree to 0.2 points, so the ratio is not an artefact of
+  which statistic is quoted. **A 7,493x median difference in physical span buys
+  1.161x of bandwidth, and the two populations' ranges overlap** (dense down to
+  1.024, scattered up to 1.067). Note 3 records that an earlier run of this same
+  test reported 1.104x, that it is superseded, and that **both** of its defects
+  biased it toward the conclusion rather than away from it.
+- Verdict: **NEUTRAL (no change shipped; no dial moved, no code changed on the
+  strength of this entry, and the lever EXP-023 Note 12 pointed at is
+  withdrawn).** Three things are settled and one is not.
+
+  Settled: the per-file spread is **not a stable property of a file**, so no
+  entry may quote a spread as a fact about the drive — only as a fact about its
+  own session. It is **not extent geometry** and it is **not physical
+  placement**: dispersion does not predict it across 48 files (r = -0.043) and
+  four orders of magnitude of span inside one file are worth 1.161x. And there
+  is **no runtime lever here**. What is left as the mechanism is drive-internal
+  and invisible to the filesystem — pSLC residency or FTL state on a DRAM-less
+  QLC part — and Note 5 says why a fix built on it must never be published as a
+  runtime improvement even if one were found.
+
+  Not settled: nothing explains why `layer_06` is slow (Note 6).
+- Notes:
+  1. **The framing that matters, and it is not "the drive got slower".** The
+     finding is that **the per-file spread is not reproducible across
+     sessions**, which is a larger caveat than the mechanism question it was
+     opened to answer. Three sessions have now measured the same decode-shaped
+     cell on the same files: EXP-019 read 1.55-1.69 GB/s across all four,
+     EXP-023 read 1.57-3.47, and this entry reads 1.60-1.67. **Per rule 3 those
+     are three sessions and must not be drawn on one curve**, and the reason to
+     say so here is not bookkeeping: the three disagree by 2.2x on a quantity
+     each reported as a property of a file, so a curve through them would be a
+     curve through three different machine states. Any entry, doc line or code
+     comment that quotes a per-file spread is describing its own session and
+     must say so. A statement that *is* licensed, because all three sessions
+     agree on it: the slow end of the band sits at 1.55-1.69 GB/s in every
+     session anyone has measured.
+  2. **The probe's own edits are ruled out, deliberately and by construction.**
+     Phase 9 edited `scripts/io_probe.py` between EXP-023 and this entry, which
+     makes "the instrument changed" a live alternative to "the drive changed".
+     The control arm removes it: an unmodified copy of the script at `8e1eee8`
+     — sha256 `887c330d0e18...`, verified against `git show
+     8e1eee8:scripts/io_probe.py` — was run on the same four files at the same
+     cell 103 s after the edited script started, and read 1.617 / 1.612 / 1.657 /
+     1.575 GB/s against the edited script's 1.672 / 1.607 / 1.658 / 1.601. The
+     largest per-file disagreement is 3.4% (`layer_00`), the others are 0.3%,
+     0.1% and 1.6%, and **neither arm sees anything near EXP-023's 3.46 GB/s on
+     the two files that had it**. The instrument is not the story.
+  3. **The window result was re-run after two defects were found in it, and
+     both of them had biased it toward the conclusion.** This is recorded
+     plainly because the correction moved the number **away** from the
+     conclusion, not toward it, which is the direction that is easy to leave
+     unsaid. The superseded run
+     (`scratch/io-probe/p9-win2m.json`, script at `9e1c134`, 3 repeats)
+     reported **1.104x**. Two defects, both fixed in `16b30a2`:
+     - **The measurement timer enclosed thread start and join.** Measured
+       directly on this machine, start plus join around eight no-op workers is
+       **0.549 ms**. A window case is 8 reads, and the median per-case elapsed
+       that run reported was **2.192 ms** (range 1.671-5.314), so the overhead
+       was of order a quarter of what was being timed. Being additive and equal
+       across both populations it pushes the ratio toward 1.00. Reads are now
+       timed from a barrier release to the last worker's own completion stamp.
+     - **Case order was dense-then-scattered, with no interleaving and no
+       variation across repeats.** In the superseded run the first-built case
+       was the slowest of all sixteen in every scored run — and it is a *dense*
+       case, so position was costing the dense population. Windows are now
+       ranked by physical span, the two populations interleaved, and the order
+       rotated per run, with `case_execution_order` and `exec_position` written
+       into the JSON so a reader can audit rather than trust it.
+
+     Corrected, the ratio is **1.161x** on 5 repeats. The whole-file arms are
+     unaffected: at 128 reads a case the removed overhead is under a quarter of
+     a percent, and the 48-file spread moves 1.0824x to 1.0826x.
+  4. **What the window test does and does not hold constant, since it is the
+     sharpest test in the entry.** It holds the *file* constant: both
+     populations were written by the same `install` run, at the same time, into
+     the same inode, so age, write history and install order — every confound a
+     cross-file comparison carries — are identical. It does **not** hold the
+     NAND constant: two ranges at different offsets are on different blocks by
+     construction, so their pSLC residency and read-disturb histories are
+     **unmeasured, not equal**. So a dense window reading faster points at
+     physical placement *or* at something that varies block to block, and the
+     1.161x measured is an upper bound on the placement term rather than a
+     measurement of it. Two sizing facts, so the design of the test is
+     auditable. The window is 2 MiB rather than the 8 MiB that would hold a
+     whole expert-plus-neighbours span because **no 8 MiB window lies inside a
+     single region of `layer_00`** — the probe's `--list-regions` output at
+     `9e1c134` reported its longest contiguous run as 2,174,976 B, which is why
+     `--window-block-bytes` exists at all; that figure comes from the probe's
+     own region listing and is not recomputable from the JSONs quoted here,
+     which record per-region byte totals rather than per-run extents. And
+     "dense" means **one region**, not one contiguous extent: the dense
+     windows' own physical spans run from 3.83 MB to 49.80 MB (recorded per
+     case in the artifact), so they are clustered rather than contiguous.
+  5. **The mechanism is drive-internal, it is not addressable from the runtime,
+     and a fix built on it must never be published as a runtime improvement.**
+     What survives every test above is pSLC residency or FTL state on a
+     DRAM-less QLC part (`MTFDKBA1T0QFM-1BD1AABGB`). Two consequences, and the
+     second is the one that matters. First, the runtime cannot see it, cannot
+     query it and cannot pin data into it; nothing in `crates/core` has a lever
+     on it. Second, **anything that appears to fix it by arranging for hot
+     bytes to sit in pSLC decays on a user's machine within days** — the
+     residency window is a property of that drive's recent write history, not
+     of the install — so a benchmark taken just after an install would be
+     measuring a transient and publishing it as a runtime property. If a future
+     entry finds such an effect, it is a fact about a freshly written install
+     and must be labelled that way.
+  6. **The unexplained residual: nothing explains why `layer_06` is slow.** It
+     is 99.6% clustered with a 0.11 GB median inter-extent seek — one of the
+     most compact files of the 48 — and it reads 1.607 and 1.6165 GB/s in the
+     two arms that measured it, below the 1.633 population median in both and
+     below the far more dispersed `layer_00` in both (by 4.0% and by 0.02%).
+     Its expert stride is 2,654,208 B, which puts it in
+     the slower of the two block-size classes, and inside that class it is rank
+     16 of 24 rather than the floor, so blob size explains where its class sits
+     and explains nothing about its position within it. Recorded as
+     unexplained, not as diagnosed.
+  7. **Vendor SMART data was unavailable and would be the next evidence.** The
+     drive-internal hypothesis is testable from outside the filesystem, and
+     this session could not test it: `nvme-cli` and `smartmontools` are both
+     **not installed** on the reference machine (`command -v nvme` and
+     `command -v smartctl` both return nothing). The exact commands that would
+     supply it, for whoever runs them next, all needing root:
+
+     ```
+     sudo pacman -S nvme-cli smartmontools
+     sudo smartctl -a /dev/nvme0n1
+     sudo nvme smart-log /dev/nvme0n1
+     sudo nvme id-ctrl -H /dev/nvme0n1
+     sudo nvme micron smart-add-log /dev/nvme0n1   # vendor log; only if the
+                                                   # nvme-cli micron plugin
+                                                   # supports this part
+     ```
+
+     What they would settle: media and data-integrity errors, percentage used
+     and available spare, and — if the vendor log is readable on this part —
+     SLC-cache state. None of that is in this entry and none of it should be
+     guessed at from the numbers that are.
+  8. **What this entry does not settle.** It measures one drive, on one
+     filesystem (btrfs with `compress=zstd:3`, though the expert files carry
+     **zero compressed extents**), over two days. Dispersion is reported as
+     **btrfs LOGICAL bytenr from `filefrag`, not device LBA**; on a
+     single-device `single`-profile filesystem the chunk map is monotone within
+     a chunk so a clustering signal survives the translation, but an absolute
+     LBA does not, and resolving it needs `sudo btrfs inspect-internal
+     dump-tree -t 3 /dev/nvme0n1p2`, which this probe never runs. Every arm is
+     `threaded-pread` rather than io_uring, so the io_uring measurement inside
+     the runtime that EXP-019 Note 5 asked for is **still not taken**. And
+     nothing here re-measures decode: EXP-023's derived 2.16 GB/s effective
+     decode rate is untouched by this entry and is still an upper bound for the
+     reason EXP-023 Note 4 gives.
