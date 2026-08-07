@@ -233,12 +233,38 @@ set -o pipefail
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$(pwd -P)
 
-STAMP=$(date +%Y%m%d-%H%M%S)
+# Inherited across the re-exec below, so parent and child agree on which
+# sweep directory this is. Unset on a first invocation, which is the normal
+# case.
+STAMP=${SWEEP_STAMP:-$(date +%Y%m%d-%H%M%S)}
 # Every artifact below is gated on being at least this old. Taken before any
 # step so a step can never be older than the sweep that ran it.
 SWEEP_T0=$(date +%s)
 OUT="$ROOT/scratch/phase9/sweep-$STAMP"
 mkdir -p "$OUT" "$ROOT/scratch/cold-bench" || exit 1
+
+# Everything this sweep prints goes to run.log AND to the terminal, so it can
+# be watched while it runs without choosing between the two and without the
+# operator having to remember a `tee`. `say` already mirrors its own narrative
+# into SUMMARY.txt, but plenty is not `say`: cargo's build output, a python
+# traceback, whatever a step writes on its way out. Those are exactly the
+# lines worth seeing at the moment something goes wrong, and until now they
+# reached only whatever the caller happened to redirect stdout to.
+#
+# Done by re-exec through a pipe rather than `exec > >(tee ...)`. Process
+# substitution detaches the writer, so a script that exits promptly can lose
+# its last lines to an unflushed tee, and the last lines here are the tail
+# table the whole run exists to produce. A pipe with `${PIPESTATUS[0]}` keeps
+# the sweep's own exit status intact, which the `set -o pipefail` above would
+# otherwise let `tee` overwrite.
+RUNLOG="$OUT/run.log"
+if [ -z "${SWEEP_LOGGED:-}" ]; then
+    export SWEEP_LOGGED=1 SWEEP_STAMP="$STAMP"
+    printf 'transcript: %s\n' "$RUNLOG"
+    printf 'watch it from another pane with:  tail -f %s\n\n' "$RUNLOG"
+    bash "$0" "$@" 2>&1 | tee "$RUNLOG"
+    exit "${PIPESTATUS[0]}"
+fi
 SUMMARY="$OUT/SUMMARY.txt"
 MANIFEST="$OUT/summaries.tsv"
 : > "$SUMMARY"
