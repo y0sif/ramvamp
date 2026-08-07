@@ -1,7 +1,9 @@
 # Handoff: phase 9 to phase 10
 
-Branch `feat/decode-compute`, 9 commits on `8e1eee8`. Not merged. The one
-thing standing between it and `main` is a cold run that has not happened.
+Branch `feat/decode-compute`, 11 commits on `8e1eee8`. **Not merged, and not
+blocked either** — the cold rule-2 sweep ran and is recorded as EXP-025. The
+branch is parked by the author's decision, to be landed or revisited later.
+Everything below is measured; nothing is pending.
 
 ## WHAT PHASE 9 MEASURED
 
@@ -50,6 +52,29 @@ Measured warm, ctx 512, 3 runs each, pooled GEMV bucket, medians with ranges:
 **1.264x**, and by bucket: experts 9.94 to 7.20 (1.381x), projections 3.52 to
 3.21 (1.097x), lm_head 1.05 to 0.94 on **unchanged code** (1.117x, which is
 the noise floor for a bucket that size).
+
+**It held cold (EXP-025).** The decode GEMV bucket, medians of 3 with ranges,
+paired in one session against the banked `8e1eee8` binary:
+
+    ctx  512   ref 16.25 (15.68-16.39)  ->  fused 12.93 (12.49-13.96)   1.257x
+    ctx 3961   ref 15.39 (14.71-15.72)  ->  fused 13.29 (13.18-13.31)   1.158x
+
+Ranges disjoint at both rungs. Note the warm 1.264x and the cold 1.257x are
+close but are **not the same bucket** — warm was the `own + wait` pooled GEMV
+from the sub-split, cold is `expert compute + projections` from the coarse
+split. Do not treat either as confirming the other's denominator.
+
+**End to end it separates at 4K and not at 512.** Decode tok/s, medians (runs):
+
+    ctx  512   ref 1.85 (1.78, 1.85, 1.87)  ->  fused 1.87 (1.76, 1.87, 1.97)   1.011x, overlapping
+    ctx 3961   ref 1.33 (1.31, 1.33, 1.35)  ->  fused 1.43 (1.37, 1.43, 1.44)   1.075x, disjoint
+
+512 gained nothing because **`expert io` rose ~1.85 s in the fused arm**,
+systematically. Inferred, not measured: `expert io` is a residual after hit
+compute, so faster hit-compute leaves less work to overlap the outstanding
+reads with and more read latency becomes visible. **A compute win at mid
+context partly converts into exposed io wait.** That is the single most
+important thing phase 9 learned about where to go next.
 
 ### 2. The compute pool is not dispatch-bound. It is memory-bound.
 
@@ -108,20 +133,52 @@ stable property, so any entry quoting it describes its own session.
 *geometry* was ruled out, but the probe that ruled it out never computed
 physical dispersion at all, and non-reproduction is the larger caveat.
 
+## WHERE THE TOKEN GOES NOW
+
+Fused, cold, medians. This is the map any next phase should plan against:
+
+    ctx  512 (524 ms/token)        ctx 3961 (712 ms/token)
+      expert io   275 ms  52.5%      expert io   256 ms  36.0%
+      GEMV        205 ms  39.2%      attention   232 ms  32.6%
+      attention    31 ms   5.8%      GEMV        211 ms  29.6%
+      elementwise  13 ms   2.5%      elementwise  13 ms   1.8%
+
+The fusion handed the crown back to I/O. At 512 expert io is over half a
+token, and it **grew** when compute got faster.
+
 ## WORK TO DO, IN PRIORITY ORDER
 
-1. **Run the cold sweep. Nothing merges until this exists.**
+1. **Raise the expert cache hit rate. This is the next phase.** It is the
+   biggest lever, it is bit-safe by construction (which experts are resident
+   changes nothing about what is computed), it costs no memory, and it attacks
+   the exposed-io problem from the other side: fewer misses means less read
+   latency to expose.
 
-       nohup bash scripts/phase9_decode_sweep.sh > /dev/null 2>&1 &
+   The headroom is already measured and unused. EXP-005 replays the shipped
+   ghost-LFU at **49.9%** against Belady's **72.0%** at 12 slots; live hit rate
+   is 53-59%. Nobody has tried a policy in between.
 
-   ~1 h 55 m ESTIMATED. Five rungs on the branch binary, paired against the
-   banked phase-8 reference at 512 and 3,961. The reference is
-   `scratch/phase8-ref/ramvamp`, sha256 `d36036b6485b00e7…`, which is
-   byte-identical to the branch binary EXP-023 published. **EXP-025 is
-   reserved for the result** and the experiments index says so.
-   Everything the phase claims about the fusion is warm until this runs.
+   **And it is answerable offline**, which phase 9's questions were not.
+   `scripts/lfu_sim.py` already replays real `--trace-experts` traces against
+   the real per-layer strides, sweeps slots, and scores `lfu`, `lfu-aged`,
+   `lfu-ghost`, `lfu-window`, `lru` and `opt`. So: capture traces, add
+   candidate policies (LRU-K, ARC, S3-FIFO, a layer-aware variant exploiting
+   the per-layer slot arrays), pick the winner on hit rate in seconds, and
+   spend exactly one paired cold sweep confirming it. Phase 9 needed ~2 h to
+   answer each question; this loop does not.
 
-2. **Decide the `attn_q` + `attn_v` fusion.** It is 1.097x against a 1.117x
+   DERIVED sketch of the prize: taking the hit rate from ~54% to ~65% is ~24%
+   fewer bytes, roughly 275 ms to 209 ms at 512, about 66 ms a token. Larger
+   than everything phase 9 shipped.
+
+2. **Instrument the overlap, alongside item 1.** `expert io` is a residual and
+   that is now load-bearing: it moved +/-1.85 s between paired arms and
+   swallowed the fusion's win at 512. Split it into submitting, waiting on a
+   read genuinely in flight, and waiting with the queue empty. Same class of
+   change as phase 9's `own`/`wait` instrument, which changed the plan twice.
+   Until it exists, nobody can say how much of that 275 ms is reducible.
+
+3. **Decide the `attn_q` + `attn_v` fusion.** It is 1.097x against a 1.117x
    noise floor, it leaves the last shard ~24% long (4096 q4_k rows then 512
    q6_k rows on an even split), and it contributes 48 of the ~1,100 fan-outs a
    token that `70cf304` removes. Both reviewers flagged it independently. Drop
@@ -129,21 +186,28 @@ physical dispersion at all, and non-reproduction is the larger caveat.
    fenced off from every fix lane, so it is clean either way. `forward.rs`
    around the `qv` buffer.
 
-3. **Why are workers slower per row than the submitter?** This is the real
-   phase-10 question. Six cores buy 1.43x on a site reading 1.99 GB a token.
-   11.00 GB/s aggregate is far below what the memory system should give, so it
-   is not obviously bandwidth saturation either. Candidates nobody has tested:
-   memory-level parallelism per core, software prefetch, the access pattern
-   into q4_k super-blocks, NUMA-ish effects of the hybrid part, or the
-   submitter simply starting earlier. A cost-weighted `shard_range` is a
-   separate, smaller lever and would also fix item 2's imbalance.
+4. **Why are workers slower per row than the submitter?** The most interesting
+   open problem, and the one most likely to eat a phase for nothing, so
+   timebox it and do it after item 1. Six cores buy 1.43x on a site reading
+   1.99 GB a token. 11.00 GB/s aggregate is far below what the memory system
+   should give, so it is not obviously bandwidth saturation either. Candidates
+   nobody has tested: memory-level parallelism per core, software prefetch,
+   the access pattern into q4_k super-blocks, effects of the hybrid part, or
+   the submitter simply starting earlier. A cost-weighted `shard_range` is a
+   separate, smaller lever and would also fix item 3's imbalance.
 
-4. **Carried, unblocked, unchanged from phase 8**: prefill chunk-size sweep
+5. **Attention at 4K** is 232 ms of a 712 ms token, 33%, and untouched. It is
+   6% at 512, so this only buys the 4K story. Online/flash rescaled softmax is
+   forbidden; blocking and tiling are not.
+
+6. **Carried, unblocked, unchanged from phase 8**: prefill chunk-size sweep
    (128/256/512/1024, one warm point exists); EXP-018's memory.peak residual
    (note it is TWO residuals of opposite sign, see below); the pgsteal 2817
    repeat; Kaggle/SSH portability smoke; 13 slots/layer has no 4K measurement.
+   The slot dial is a rider on item 1, not a phase: a better policy changes
+   the hit-rate-per-slot curve and therefore the right dial.
 
-5. **The drive reports `corruption_errs=138407`** on `/dev/nvme0n1p2`. It did
+7. **The drive reports `corruption_errs=138407`** on `/dev/nvme0n1p2`. It did
    not grow during any phase-9 run (`btrfs_session_grew: []`), so it is not
    touching these measurements, but it is unexplained on a benchmark machine
    and it sits next to a finding about that drive's read behaviour changing
@@ -211,6 +275,30 @@ Phase 8's eleven still apply. These are new or sharpened.
     (`long_00.txt`). Phase 9's warm A/B used it consistently across arms, which
     is fine, but its numbers must not be laid beside EXP-023's 512 rung as the
     same workload. The cold sweep uses phase 8's fixtures deliberately.
+12. **A run's stderr carries two splits that share bucket names.** `prefill
+    split` and `decode split (forward_token)` both have `attention`, `expert
+    compute`, `expert io`, `projections`, `elementwise`. A regex over the whole
+    stderr silently sums them: during EXP-025's analysis that produced a
+    133 s GEMV inside a 44 s decode. Slice the block first. It was only caught
+    because the number was absurd; a subtler mix would have shipped.
+13. **A paired reference is not optional on this machine.** The byte-identical
+    `8e1eee8` binary read 0.969x at 512 and 0.911x at 3,961 between EXP-023
+    and EXP-025. Comparing a change against a published prior instead of an
+    in-session baseline would have inverted the sign of the 4K result.
+14. **Two preflight messages read as failures and are not.** The dirty-tree
+    banner fired because `nohup` created `nohup.out` and the check asked
+    `git status --porcelain`, which counts untracked files; the tell was a
+    printed diff sha256 of `e3b0c442...`, sha256 of the empty string. And the
+    slot self-test's five negative cases make the checker print `FAIL:` on
+    purpose. Both cost a run before a single arm started. Both are fixed, but
+    the general lesson stands: a preflight that cries wolf gets its whole
+    output ignored, including the one line that matters.
+15. **Read the per-source reclaim counters, never the bare `pgsteal`.** Every
+    reclaim event in EXP-025 is `pgsteal_khugepaged` with `kswapd` and
+    `direct` at zero, which is the huge-page daemon and not memory pressure.
+    `pgsteal 147` recurs across two arms, the same shape as GOTCHA 11's 2,817
+    — which was `kswapd`, so this does not explain it, but it does suggest a
+    deterministic daemon is a likelier story than coincidence.
 
 ## STATE
 
@@ -223,8 +311,21 @@ Phase 8's eleven still apply. These are new or sharpened.
     1b51978  test: pin staging to the routed index, and retire a refuted reference
     cd1547f  feat: adapt the cold sweep to pair against phase 8
     c50e514  docs: record EXP-024, and retire what phase 9 refuted
+    9b11b6d  docs: hand phase 9 over
+    c59f09e  fix: stop the sweep alarming its operator before step 0
+    0d0cfc9  feat: tee the sweep to a transcript so it can be watched
+    9744aa5  docs: record EXP-025, the fused fan-out paired cold
 
 Branch `feat/pool-adaptive-spin` holds `ce9b0d3` for revisiting.
+
+The cold sweep that produced EXP-025 is
+`scratch/phase9/sweep-20260807-203558/`, run from `0d0cfc9`. Branch binary
+sha256 `74822112a1d5...`, reference `d36036b6485b...` (`8e1eee8`, byte-identical
+to EXP-023's). All 17 steps exit 0, hygiene PASS on all seven cold arms,
+`slots=11 OK` asserted on all seven. Re-running it costs ~1 h 55 m:
+
+    nohup bash scripts/phase9_decode_sweep.sh > /dev/null 2>&1 &
+    tail -f scratch/phase9/sweep-*/run.log
 
 Gate, all green on the final tree: `cargo fmt --check`, `cargo clippy
 --all-targets -- -D warnings`, `cargo test` (606 passed), `cargo test -p
