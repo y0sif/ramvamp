@@ -3667,7 +3667,7 @@ they are, as the record of what was believed when phase 5 was designed.
   | 3,961 | projections | 5.72 (5.39 / 5.95 / 5.72) | 5.58 (5.58 / 5.61 / 5.58) | 1.025x | overlap |
   | 3,961 | expert io | 14.43 (18.45 / 14.43 / 14.34) | 16.12 (16.14 / 16.12 / 16.12) | 0.895x | overlap |
   | 3,961 | attention | 16.99 (13.99 / 17.74 / 16.99) | 14.60 (14.30 / 14.60 / 16.34) | 1.164x | overlap |
-  | 3,961 | elementwise | 0.83 (0.84 / 0.83 / 0.83) | 0.82 (0.82 / 0.82 / 0.82) | 1.012x | overlap |
+  | 3,961 | elementwise | 0.83 (0.84 / 0.83 / 0.83) | 0.82 (0.82 / 0.82 / 0.82) | 1.012x | **disjoint by 0.01 s** (one instrument step) |
 
   **The GEMV bucket gains 1.257x at 512 and 1.158x at 3,961 with
   non-overlapping scored ranges at both rungs**, and the gain is carried
@@ -3694,12 +3694,20 @@ they are, as the record of what was believed when phase 5 was designed.
   **4. End to end it separates at 3,961 and it does not at 512.** MEASURED
   cold, paired, same session.
 
-  | rung | metric | phase-8 reference, median (runs) | fused, median (runs) | ref / fused | separates? |
+  | rung | metric | phase-8 reference, median (runs) | fused, median (runs) | fused speedup | separates? |
   | ---: | --- | --- | --- | ---: | --- |
   | 512 | decode tok/s | 1.85 (1.85 / 1.78 / 1.87) | 1.87 (1.87 / 1.97 / 1.76) | 1.011x | **no** |
   | 512 | `decode_s` | 34.66 (34.66 / 35.92 / 34.19) | 34.24 (34.24 / 32.51 / 36.35) | 1.012x | **no** |
   | 3,961 | decode tok/s | 1.33 (1.33 / 1.31 / 1.35) | 1.43 (1.44 / 1.43 / 1.37) | 1.075x | **yes** |
   | 3,961 | `decode_s` | 48.00 (48.00 / 48.76 / 47.57) | 44.87 (44.47 / 44.87 / 46.59) | 1.070x | **yes** |
+
+  The ratio column is **"how much faster the fused arm is"**, which is
+  `fused / ref` on the rate rows and `ref / fused` on the time rows. An
+  earlier revision headed it `ref / fused` for all four, which is wrong for
+  the two tok/s rows — read literally those would be 0.989x and 0.930x. Every
+  printed value was and is the correct speedup; only the header was wrong.
+  Result 3's tables are all time buckets, so `ref / fused` there is correct
+  throughout.
 
   At **3,961** both range tests pass and they pass with room: the reference arm
   reads 1.31-1.35 tok/s against the fused arm's 1.37-1.44, and 47.57-48.76 s of
@@ -3805,8 +3813,13 @@ they are, as the record of what was believed when phase 5 was designed.
      control on both binaries in one session, which is cheap and is not taken
      here. The `elementwise` bucket is the counter-evidence for a plain
      global-timer explanation — it reads 0.81-0.84 s on all twelve paired runs
-     and does not move at all (1.012x) — so whatever moved attention is
-     specific to attention.
+     and moves **1.012x**, which is 1.2% against attention's 14-15% — so
+     whatever moved attention is specific to attention. An earlier revision
+     said elementwise "does not move at all", and that is a hair stronger than
+     the data: at 3,961 its scored ranges are **disjoint** (ref 0.83-0.84
+     against fused 0.82), so it moves systematically, in the same direction as
+     attention, by one 0.01 s step of the instrument. The argument survives on
+     the order of magnitude, not on the bucket being motionless.
   2. **Why 512 does not pay: `expert io` rose about 1.85 s, systematically, and
      the mechanism is an INFERENCE rather than a measurement.** MEASURED first,
      so the inference is separable from it. At 512 the bucket goes from a
@@ -3911,9 +3924,15 @@ they are, as the record of what was believed when phase 5 was designed.
      `pgsteal_kswapd`, `pgsteal_direct` and `pgsteal_proactive` are **0
      everywhere**, and every non-zero page of `pgsteal` is khugepaged's, 0 to
      866 pages per run. That is the huge-page daemon compacting, not memory
-     pressure, which is why hygiene stayed CLEAN on 17 runs with a non-zero
-     `pgsteal` total. An entry that read only `pgsteal` would have called those
-     17 runs dirty and thrown away the sweep.
+     pressure, which is why hygiene stayed CLEAN on **19** runs with a
+     non-zero `pgsteal` total. An entry that read only `pgsteal` would have
+     called those 19 runs dirty and thrown away the sweep. (An earlier
+     revision of this note said 17 twice, contradicting the Method paragraph
+     above it, which had 19 right. 17 is the row count of `exitcodes.tsv` and
+     leaked in; 16 is the count restricted to scored runs. The correct figure
+     against all 28 runs is **19**: decode-64 x1, decode-512 x3,
+     phase8ref-512 x3, decode-1024 x1, decode-2048 x4, decode-3961 x3,
+     phase8ref-3961 x4.)
 
      **A lead, recorded as a lead and nothing more: `pgsteal 147` appears
      twice, in the second scored run of `decode-512` and the second scored run
