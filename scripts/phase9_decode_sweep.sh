@@ -666,10 +666,20 @@ PYEOF
         exp=${rest%%|*};  rest=${rest#*|}
         json=${rest%%|*}; minm=${rest##*|}
         total=$((total + 1))
-        run_slot_check "$json" "$want" "$minm" "$dir/$total.out"
+        # Silenced at the call site, deliberately, and not by a quieter
+        # variant of run_slot_check: five of these six cases are negative, so
+        # making the checker print its rejection is the whole point of them.
+        # On a console those lines read as the sweep collapsing rather than as
+        # the checker working, and phase 9 lost a run to exactly that
+        # misreading before a single arm had started. The text still lands in
+        # the case's own .out file, and the mismatch branch below prints it.
+        # Redirecting here keeps the one invocation the comment above
+        # run_slot_check insists on: the self-test still exercises the shipped
+        # path, `tee`'s file write and the `${PIPESTATUS[0]}` verdict included.
+        run_slot_check "$json" "$want" "$minm" "$dir/$total.out" >/dev/null
         rc=$?
         if [ "$rc" -eq "$exp" ]; then
-            say "  self-test OK   exit=$rc  $name"
+            say "  self-test OK   exit=$rc  $name  (rejection text in $total.out)"
         else
             say "  self-test FAIL exit=$rc want=$exp  $name"
             say "    see $dir/$total.out"
@@ -860,11 +870,28 @@ say "commit  $(git describe --always --dirty 2>/dev/null) on $(git rev-parse --a
 # exactly the state this sweep was written in. `--dirty` above distinguishes
 # them; the diff hash below says *which* uncommitted tree, so the experiments
 # entry can name a binary rather than gesture at a branch.
-if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+# `git status --porcelain` is the wrong question and phase 9 lost a run to it:
+# it counts untracked files, so `nohup bash scripts/phase9_decode_sweep.sh &`
+# creates nohup.out and the sweep then declares its own tree dirty. The banner
+# fired with a diff sha256 of e3b0c442..., which is sha256 of nothing at all.
+# What actually threatens the branch arm's provenance is a source change that
+# is in the binary but in no commit, so ask that instead: tracked
+# modifications, plus untracked files somewhere cargo would compile them from.
+# An untracked file outside those paths cannot reach the binary and is noise.
+tracked_dirty="$(git diff HEAD 2>/dev/null)"
+untracked_build="$(git ls-files --others --exclude-standard \
+    -- crates Cargo.toml Cargo.lock 2>/dev/null)"
+if [ -n "$tracked_dirty" ] || [ -n "$untracked_build" ]; then
     say "        WORKING TREE IS DIRTY. The commit above is not sufficient"
     say "        provenance for the branch arm: its binary contains changes"
     say "        that are in no commit. Diff sha256 over \`git diff HEAD\`:"
-    say "          $(git diff HEAD 2>/dev/null | sha256sum | cut -d' ' -f1)"
+    say "          $(printf '%s' "$tracked_dirty" | sha256sum | cut -d' ' -f1)"
+    if [ -n "$untracked_build" ]; then
+        say "        Untracked files under crates/ that cargo would compile:"
+        printf '%s\n' "$untracked_build" | while IFS= read -r f; do
+            [ -n "$f" ] && say "          $f"
+        done
+    fi
     say "        Record that beside the binary sha256 in the EXP entry, or"
     say "        commit before measuring and re-run. The reference arm is"
     say "        unaffected: it is pinned by hash, not by this tree."

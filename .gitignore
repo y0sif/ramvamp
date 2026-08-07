@@ -15,5 +15,9 @@
 *.swp
 .DS_Store
 
+# `nohup bash scripts/<sweep>.sh &` drops this here, and a sweep that greps
+# its own tree for provenance would otherwise report itself as dirty.
+/nohup.out
+
 # Python bytecode from scripts/
 __pycache__/
