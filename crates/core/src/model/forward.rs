@@ -58,6 +58,15 @@
 //! kernels fix their float accumulation order per super-block, and float
 //! addition is not associative. See `kernels/gemv.rs`.
 //!
+//! That argument never said a fan-out may cover only one matrix, and phase 9
+//! stopped assuming it did. A phase's routed experts run their gate and up
+//! projections as **one** job over the concatenated row space, and their down
+//! projections as one more; `attn_q` and `attn_v` share a job the same way.
+//! A partition of a concatenated row space restricts to a partition of every
+//! constituent matrix's own rows, so each row is still the same whole-row dot
+//! on the same bytes, and the fused form is bit-identical to the sequence it
+//! replaces (see [`run_expert_window`] and `kernels/gemv.rs`).
+//!
 //! # Reference fidelity
 //!
 //! Layer structure follows HF `transformers`
@@ -90,7 +99,7 @@ use std::time::{Duration, Instant};
 
 use crate::format::ArchInfo;
 use crate::io::{
-    ExpertStream, ExpertView, IoError, StreamMode, StreamPhase, StreamStats, SweepError, SweepPlan,
+    ExpertStream, IoError, StreamMode, StreamPhase, StreamStats, SweepError, SweepPlan,
 };
 use crate::kernels::KernelError;
 use crate::kernels::attention::{
@@ -103,6 +112,10 @@ use crate::kernels::primitives::{
 use crate::kernels::quants::{
     BlockQ8_0, BlockQ8K, QuantFormat, quantize_row_q8_0, quantize_row_q8_k,
 };
+// The fused row-space entry points come from `kernels::gemv` by path rather
+// than through `kernels`'s re-export list: `pub mod gemv` already makes the
+// path public, and this seam does not own `kernels/mod.rs`.
+use crate::kernels::gemv::{FusedPart, fused_out_dim, fused_row_parts, gemv_q8_k_fused_rows};
 use crate::kernels::{gemv_q8_0_rows, gemv_q8_k_rows};
 use crate::kv::{KvCache, KvError};
 use crate::threads::{ComputePool, PoolConfig};
@@ -489,19 +502,28 @@ pub struct ForwardState {
     normed: Vec<f32>,
     /// Q8_K quantization of a `[hidden]` vector (`hidden / 256` blocks).
     acts_q8k_hidden: Vec<BlockQ8K>,
-    /// Q8_K quantization of a `[moe_intermediate]` vector.
+    /// Q8_K quantization of one `[moe_intermediate]` vector per routed expert
+    /// in a fused window (see [`FfnScratch`]).
     acts_q8k_moe: Vec<BlockQ8K>,
     /// Q8_K quantization of a `[n_heads * head_dim]` vector.
     acts_q8k_attn: Vec<BlockQ8K>,
     /// Q8_0 quantization of a `[hidden]` vector (`hidden / 32` blocks),
     /// consumed by the q8_0 `attn_k` gemv.
     acts_q8_0_hidden: Vec<BlockQ8_0>,
-    /// Query projection output (`[n_heads * head_dim]`).
-    q: Vec<f32>,
+    /// Query and value projection outputs, concatenated: `[n_heads *
+    /// head_dim]` then `[n_kv_heads * head_dim]`.
+    ///
+    /// One buffer because the two are a **single** fused fan-out. They read
+    /// the same Q8_K activation row and differ only in weight matrix, so
+    /// their output rows concatenate into one row space and the pool writes
+    /// both without a copy; the layer loop then splits the buffer for the
+    /// per-head norms, RoPE and the KV append. `attn_k` cannot join them —
+    /// it is the one projection against Q8_0 activations — so it keeps its
+    /// own buffer and its own fan-out. Costs no bytes: the two spans are the
+    /// two old buffers, adjacent.
+    qv: Vec<f32>,
     /// Key projection output (`[n_kv_heads * head_dim]`).
     k: Vec<f32>,
-    /// Value projection output (`[n_kv_heads * head_dim]`).
-    v: Vec<f32>,
     /// Attention context output (`[n_heads * head_dim]`).
     attn_out: Vec<f32>,
     /// Output projection result (`[hidden]`).
@@ -514,12 +536,12 @@ pub struct ForwardState {
     topk: Vec<(u32, f32)>,
     /// The routed expert ids alone (`top_k` entries), the streamer's input.
     expert_ids: Vec<u32>,
-    /// Expert gate projection output (`[moe_intermediate]`), then the
-    /// SwiGLU-combined value in place. Shared: experts are computed one at
-    /// a time, each one fanned out across the pool.
-    gate: Vec<f32>,
-    /// Expert up projection output (`[moe_intermediate]`).
-    up: Vec<f32>,
+    /// Gate and up projection outputs for one fused window of routed
+    /// experts, `[slot][gate | up][moe_intermediate]`; the gate half then
+    /// holds the SwiGLU combination in place. Sized for the window rather
+    /// than for one expert because the window is one fan-out — see
+    /// [`FfnScratch`] for the byte count.
+    gate_up: Vec<f32>,
     /// Per-expert staged down-projection outputs, `top_k * hidden` f32
     /// (64 KiB at the v0 dims). Reduced in fixed top-k order after both
     /// compute phases, which is what keeps the pass bit-identical.
@@ -650,6 +672,10 @@ impl ForwardState {
         if top_k == 0 || top_k > n_experts {
             return Err(ForwardError::InvalidTopK { top_k, n_experts });
         }
+        // Experts in one fused window, and so the width the window scratch is
+        // sized for. A wider `top_k` is walked in several windows rather than
+        // refused, so this caps an allocation and nothing else.
+        let window = top_k.min(MAX_FUSED_EXPERTS);
 
         let kv = KvCache::new(
             arch.n_layers as usize,
@@ -706,20 +732,18 @@ impl ForwardState {
             hidden: vec![0.0; hidden],
             normed: vec![0.0; hidden],
             acts_q8k_hidden: vec![BlockQ8K::default(); hidden / QK_K],
-            acts_q8k_moe: vec![BlockQ8K::default(); moe / QK_K],
+            acts_q8k_moe: vec![BlockQ8K::default(); window * (moe / QK_K)],
             acts_q8k_attn: vec![BlockQ8K::default(); q_dim / QK_K],
             acts_q8_0_hidden: vec![BlockQ8_0::default(); hidden / QK8_0],
-            q: vec![0.0; q_dim],
+            qv: vec![0.0; q_dim + kv_dim],
             k: vec![0.0; kv_dim],
-            v: vec![0.0; kv_dim],
             attn_out: vec![0.0; q_dim],
             o_proj: vec![0.0; hidden],
             router_logits: vec![0.0; n_experts],
             router_probs: vec![0.0; n_experts],
             topk: Vec::with_capacity(top_k),
             expert_ids: Vec::with_capacity(top_k),
-            gate: vec![0.0; moe],
-            up: vec![0.0; moe],
+            gate_up: vec![0.0; 2 * window * moe],
             expert_staged: vec![0.0; top_k * hidden],
             expert_done: vec![false; top_k],
             expert_acc: vec![0.0; hidden],
@@ -1098,11 +1122,15 @@ pub(super) fn taken<E>(slot: Mutex<Option<(usize, E)>>) -> Result<(), E> {
 /// merely printable side by side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GemvSite {
-    /// `attn_q`, `attn_k`, `attn_v`, `attn_output`: four fan-outs a layer,
-    /// against resident (mmap'd) weights.
+    /// `attn_q` and `attn_v` fused, `attn_k`, `attn_output`: **three**
+    /// fan-outs a layer, against resident (mmap'd) weights.
     Projections,
-    /// gate, up and down for every routed expert: `3 * top_k` fan-outs a
-    /// layer, against streamed weights.
+    /// gate, up and down for every routed expert, fused per phase: **two**
+    /// fan-outs — a gate/up job and a down job — per window of each of the
+    /// hit and miss phases that has any experts in it. At the v0 pin
+    /// (`top_k` 8, so one window) that is two to four a layer, against
+    /// streamed weights. Not `3 * top_k` any more; see
+    /// [`run_expert_window`].
     Experts,
     /// The `[vocab]` head. One fan-out a token, and only when logits are
     /// wanted.
@@ -1255,14 +1283,20 @@ thread_local! {
 ///
 /// **Three clock reads per pooled GEMV**, against [`PhaseClock`]'s one per
 /// region boundary. Per decoded token at the v0 pin (48 layers, `top_k` 8):
-/// `48 * 4 * 3` = 576 for the projections, `48 * 8 * 3 * 3` = 3,456 for the
-/// experts, 3 for `lm_head` and `48 * 2` = 96 for the serial router, so
-/// **4,131 reads a token** — derived by counting the sites, not measured. At
-/// the ~27 ns `Instant::now()` measures on this machine's vDSO (the figure
-/// [`forward_token_traced`] already quotes) that is ~112 µs against the ~532 ms
-/// token EXP-023 measured: 0.021% of it, and an order below the run-to-run
-/// noise of anything the split is read against. The budget this was designed
-/// to was 4,500 reads.
+/// `48 * 3 * 3` = 432 for the projections (`attn_q` and `attn_v` share a
+/// fan-out), at most `48 * 4 * 3` = 576 for the experts (two fused fan-outs
+/// for each non-empty phase, and a layer has one or two), 3 for `lm_head` and
+/// `48 * 2` = 96 for the serial router, so **1,107 reads a token at worst and
+/// 819 when every layer's experts are all hits or all misses** — derived by
+/// counting the sites, not measured. At the ~27 ns `Instant::now()` measures
+/// on this machine's vDSO (the figure [`forward_token_traced`] already quotes)
+/// that is ~30 µs against the ~532 ms token EXP-023 measured: 0.006% of it,
+/// and an order below the run-to-run noise of anything the split is read
+/// against.
+///
+/// It was 4,131 reads before phase 9 fused the fan-outs (`48 * 4 * 3` plus
+/// `48 * 8 * 3 * 3`), against a design budget of 4,500. The instrument did not
+/// get cheaper; there are simply a quarter as many jobs to charge.
 struct GemvClock<'a> {
     /// `None` when this pass charges nowhere.
     split: Option<&'a mut GemvSplit>,
@@ -1381,6 +1415,159 @@ fn pool_gemv_q8_k_stamped(
         }
         // Last, so it is the end of this core's arithmetic and not the middle
         // of it. See `SHARD0_DONE` for why a worker never reaches the read.
+        if stamp && index == 0 {
+            SHARD0_DONE.set(Some(Instant::now()));
+        }
+    });
+    taken(failure)
+}
+
+/// A **fused** k-quant GEMV: several independent matrices' output rows as one
+/// row space, fanned out as a single job over contiguous ranges of it.
+///
+/// Bit-identical to running each part through [`pool_gemv_q8_k`] in turn. The
+/// pool's shards tile the fused space contiguously and ascending; that tiling
+/// restricts to a contiguous ascending tiling of every part's own
+/// `0..out_dim`; and each output row is one whole-row dot against its part's
+/// own activation row. See [`crate::kernels::gemv`]'s module docs — this
+/// helper adds the fan-out and nothing else.
+///
+/// The `out.len()` check is load-bearing rather than defensive:
+/// [`ComputePool::scatter`] shards over `out`, so an `out` shorter than the
+/// fused row space would quietly compute a prefix of it and report success.
+fn pool_gemv_q8_k_fused(
+    pool: &mut ComputePool,
+    parts: &[FusedPart<'_>],
+    out: &mut [f32],
+    stamp: bool,
+) -> Result<(), KernelError> {
+    let total = fused_out_dim(parts);
+    if out.len() != total {
+        return Err(KernelError::LengthMismatch {
+            what: FUSED_OUT_VS_SPACE,
+            left: out.len(),
+            right: total,
+        });
+    }
+    let failure: Mutex<Option<(usize, KernelError)>> = Mutex::new(None);
+    pool.scatter(out, |shard, chunk| {
+        let index = shard.index;
+        if let Err(err) = gemv_q8_k_fused_rows(parts, shard.rows, chunk) {
+            record(&failure, index, err);
+        }
+        if stamp && index == 0 {
+            SHARD0_DONE.set(Some(Instant::now()));
+        }
+    });
+    taken(failure)
+}
+
+/// `what` when a fused destination does not match the fused row space.
+const FUSED_OUT_VS_SPACE: &str = "pool fused gemv: out vs fused out_dim";
+
+/// `what` when a fused part's destination span is not inside `dst`.
+const FUSED_SPAN_BOUND: &str = "pool fused gemv: destination span end vs dst";
+
+/// `what` when two fused parts' destination spans overlap or descend.
+const FUSED_SPAN_ORDER: &str = "pool fused gemv: destination span start vs previous end";
+
+/// `what` when `at` does not name one destination per part.
+const FUSED_SPAN_COUNT: &str = "pool fused gemv: destination spans vs parts";
+
+/// [`pool_gemv_q8_k_fused`] with one destination span per part instead of one
+/// contiguous buffer: part `p`'s output row `r` lands at `dst[at[p] + r]`.
+///
+/// The expert-down job needs this. A phase's routed experts share one fused
+/// row space, but each stages its `[hidden]` output into the slot of
+/// `expert_staged` that its **routed** index names, and a phase's plan is a
+/// subset of the routed set — so the destination is contiguous per part and
+/// gapped across parts, which [`ComputePool::scatter`] cannot express.
+///
+/// `at` must name one span per part, strictly non-overlapping and ascending
+/// (`at[p] + out_dim(p) <= at[p + 1]`), with every span inside `dst`. That is
+/// exactly the disjointness the per-shard `&mut [f32]` reconstructions rest
+/// on, so it is checked here rather than assumed by the caller.
+///
+/// # Errors
+///
+/// [`KernelError::LengthMismatch`] when `at` disagrees with `parts`, a span
+/// runs past `dst`, or two spans overlap or descend; otherwise whatever the
+/// kernel reports for the lowest-indexed shard that fails.
+fn pool_gemv_q8_k_fused_at(
+    pool: &mut ComputePool,
+    parts: &[FusedPart<'_>],
+    at: &[usize],
+    dst: &mut [f32],
+    stamp: bool,
+) -> Result<(), KernelError> {
+    if parts.len() != at.len() {
+        return Err(KernelError::LengthMismatch {
+            what: FUSED_SPAN_COUNT,
+            left: at.len(),
+            right: parts.len(),
+        });
+    }
+    // Establishes both halves of the safety argument below in one walk:
+    // every span ends inside `dst`, and no span starts before the previous
+    // one ended. Saturating so an absurd `out_dim` reports a bound failure
+    // rather than wrapping into a span that looks in range.
+    let mut watermark = 0usize;
+    for (part, &start) in parts.iter().zip(at) {
+        let end = start.saturating_add(part.out_dim);
+        if start < watermark {
+            return Err(KernelError::LengthMismatch {
+                what: FUSED_SPAN_ORDER,
+                left: start,
+                right: watermark,
+            });
+        }
+        if end > dst.len() {
+            return Err(KernelError::LengthMismatch {
+                what: FUSED_SPAN_BOUND,
+                left: end,
+                right: dst.len(),
+            });
+        }
+        watermark = end;
+    }
+    let total = fused_out_dim(parts);
+    let failure: Mutex<Option<(usize, KernelError)>> = Mutex::new(None);
+    let base = SendPtr(dst.as_mut_ptr());
+    pool.run(total, |shard| {
+        let index = shard.index;
+        for (p, local) in fused_row_parts(parts, shard.rows.clone()) {
+            let part = parts[p];
+            let start = at[p] + local.start;
+            let len = local.len();
+            // SAFETY: the same invariant as `pool_decode_attention`'s —
+            // **shard windows are the image of a tiling under an injective
+            // map**. `fused_row_parts` carries the pool's tiling of
+            // `0..total` to, per part, a tiling of that part's own
+            // `0..out_dim` (`the_fused_row_map_covers_every_part_row_exactly_once`),
+            // so distinct shards never name the same `(part, local row)`;
+            // and the spans `at` names are pairwise disjoint by the
+            // watermark walk above, so distinct parts never name the same
+            // element of `dst` either. In bounds because
+            // `at[p] + local.end <= at[p] + out_dim <= dst.len()`, also from
+            // that walk. `dst` is mutably borrowed by this frame for the
+            // whole call and `run` joins before returning, so no view
+            // outlives the borrow.
+            let chunk = unsafe { std::slice::from_raw_parts_mut(base.get().add(start), len) };
+            if let Err(err) = gemv_q8_k_rows(
+                part.format,
+                part.weight,
+                part.in_dim,
+                part.out_dim,
+                part.acts,
+                local,
+                chunk,
+            ) {
+                record(&failure, index, err);
+                // Deterministic: the reported error is the lowest shard's,
+                // and within a shard the first part in fused order.
+                break;
+            }
+        }
         if stamp && index == 0 {
             SHARD0_DONE.set(Some(Instant::now()));
         }
@@ -1737,17 +1924,49 @@ struct MoeDims {
     top_k: usize,
 }
 
-/// The scratch one expert's FFN writes, reused by every expert in a layer:
-/// experts are computed one at a time, each fanned out across the pool.
+/// `what` when a window holds more experts than the parts buffers can carry.
+const FUSED_WINDOW_PARTS: &str = "expert window: experts vs MAX_FUSED_EXPERTS";
+
+/// `what` when the gate/up scratch is short for the window's fused row space.
+const FUSED_WINDOW_GATE_UP: &str = "expert window: gate_up vs 2 * experts * moe_intermediate";
+
+/// `what` when the intermediate blocks are short for the window's experts.
+const FUSED_WINDOW_ACTS: &str = "expert window: intermediate blocks vs experts";
+
+/// Routed experts one fused expert job may cover, and so the widest window
+/// [`run_plan`] walks at a time.
+///
+/// The gate/up job carries two matrices per expert, so its parts buffer is
+/// `2 * MAX_FUSED_EXPERTS` and lives on the stack: this runs twice a layer,
+/// 48 layers a token, and the whole point of fusing is to stop paying
+/// per-job set-up. A `top_k` wider than this is not refused — the plan is
+/// walked in windows of this many *routed indices* — so the constant is a
+/// buffer size and not an architecture limit. The v0 pin routes 8, so every
+/// plan is one window.
+const MAX_FUSED_EXPERTS: usize = 16;
+
+/// The scratch one window of routed experts writes, reused by every window of
+/// every phase of every layer.
+///
+/// Sized for a whole window rather than for one expert, because a window's
+/// gate and up projections are a *single* fan-out and all of their outputs
+/// are live at once. At the v0 pin (`top_k` 8, `moe_intermediate` 768) that is
+/// 49,152 B of `gate_up` and 7,008 B of `acts_moe`, against 6,144 B and 876 B
+/// for the per-expert form it replaces: **49,140 B more**, charged against the
+/// same provisional decode headroom as [`ForwardState::attn_scratch`].
 struct FfnScratch<'a> {
-    /// Q8_K quantization of the layer's normed residual (`[hidden]`).
+    /// Q8_K quantization of the layer's normed residual (`[hidden]`), shared
+    /// by every routed expert's gate and up — which is what lets all of them
+    /// share one fused row space.
     acts_hidden: &'a [BlockQ8K],
-    /// Q8_K quantization of the SwiGLU output (`[moe_intermediate]`).
+    /// Q8_K quantization of each window slot's SwiGLU output: one row of
+    /// `moe_intermediate / 256` blocks per slot, because the down job reads
+    /// all of them at once.
     acts_moe: &'a mut [BlockQ8K],
-    /// Gate projection, then the SwiGLU combination in place.
-    gate: &'a mut [f32],
-    /// Up projection.
-    up: &'a mut [f32],
+    /// Gate and up outputs for the window, `[slot][gate | up][moe]`. That is
+    /// the fused row space's own layout, so the fan-out writes it directly
+    /// and the SwiGLU reads one slot as a single `2 * moe` run.
+    gate_up: &'a mut [f32],
 }
 
 /// Everything the expert phase writes, borrowed for one layer.
@@ -1760,59 +1979,125 @@ struct MoeScratch<'a> {
     done: &'a mut [bool],
 }
 
-/// gate/up -> SwiGLU -> down for one expert, staging `[hidden]` into `out`.
+/// gate/up -> SwiGLU -> down for one **window** of routed experts, staging
+/// each one's `[hidden]` output into its own top-k slot of `scratch.staged`.
 ///
-/// Each of the three GEMVs is row-parallel across the pool; the two cheap
-/// `[moe_intermediate]` element-wise steps between them stay on the decode
-/// thread.
-fn expert_ffn(
+/// Two fan-outs, not `3 * window.len()`. Every expert's gate and up read the
+/// same Q8_K activation row — the layer's normed residual, quantized once by
+/// the caller — so their output rows concatenate into one fused row space
+/// ([`FusedPart`]) and go out as a single job; the down projections then
+/// concatenate the same way, each reading its *own* SwiGLU intermediate. The
+/// two cheap `[moe_intermediate]` element-wise steps between them stay on the
+/// decode thread, one expert at a time, exactly as before.
+///
+/// Phase 9 measured the decode fan-out at ~27 µs of submitter-side set-up
+/// against ~5 µs of per-worker arithmetic, with 64% of pooled GEMV time spent
+/// at the barrier and six cores buying 1.16x; the jobs were too small to pay
+/// for themselves. This is that arithmetic re-packed into fewer, larger jobs,
+/// and it moves no bit: see [`crate::kernels::gemv`]'s fused-row-space docs.
+///
+/// `window` is `(routed index, slot)` in **ascending routed index**, which is
+/// what makes the down job's staging spans ascending and provably disjoint.
+fn run_expert_window(
+    stream: &ExpertStream,
     pool: &mut ComputePool,
-    view: &ExpertView<'_>,
+    layer: u32,
     dims: MoeDims,
-    scratch: &mut FfnScratch<'_>,
-    out: &mut [f32],
+    window: &[(usize, u32)],
+    scratch: &mut MoeScratch<'_>,
     gemv: &mut GemvClock<'_>,
 ) -> Result<(), ForwardError> {
-    let gate_slab = view.gate();
-    let up_slab = view.up();
-    let down_slab = view.down();
+    let MoeScratch { ffn, staged, .. } = scratch;
+    let n = window.len();
+    let blocks = dims.moe / QuantFormat::Q8_K.block_weights();
+    let acts_hidden: &[BlockQ8K] = ffn.acts_hidden;
+
+    // Everything below indexes fixed-capacity buffers with widths derived from
+    // `dims`, which is read off the *argument* model, while the scratch was
+    // sized from the construction-time one and the parts arrays from
+    // `MAX_FUSED_EXPERTS`. `ArchFingerprint::check` and `run_plan`'s windowing
+    // make all three agree on the decode path, so none of these can fail
+    // there — but a slice that panics when they disagree is not something
+    // library code should rest on a check two frames up, and `run_plan` is
+    // reachable from a caller with a hand-built plan. Reported, not asserted.
+    let gate_up_len = 2usize.saturating_mul(n).saturating_mul(dims.moe);
+    for (what, have, need) in [
+        (FUSED_WINDOW_PARTS, MAX_FUSED_EXPERTS, n),
+        (FUSED_WINDOW_GATE_UP, ffn.gate_up.len(), gate_up_len),
+        (
+            FUSED_WINDOW_ACTS,
+            ffn.acts_moe.len(),
+            n.saturating_mul(blocks),
+        ),
+    ] {
+        if have < need {
+            return Err(KernelError::LengthMismatch {
+                what,
+                left: have,
+                right: need,
+            }
+            .into());
+        }
+    }
+
+    // One pass over the window carves every slab it needs, so a slot's view
+    // is resolved once rather than once per projection. `ExpertSlab` borrows
+    // the streamer's slot bytes, not the `ExpertView`, so the view can go.
+    let mut gate_up = [FusedPart::empty(); 2 * MAX_FUSED_EXPERTS];
+    let mut down = [FusedPart::empty(); MAX_FUSED_EXPERTS];
+    for (j, &(_, slot)) in window.iter().enumerate() {
+        let view = stream.view(layer, slot)?;
+        let (gate_slab, up_slab, down_slab) = (view.gate(), view.up(), view.down());
+        gate_up[2 * j] = FusedPart {
+            format: gate_slab.format,
+            weight: gate_slab.bytes,
+            in_dim: dims.hidden,
+            out_dim: dims.moe,
+            acts: acts_hidden,
+        };
+        gate_up[2 * j + 1] = FusedPart {
+            format: up_slab.format,
+            weight: up_slab.bytes,
+            in_dim: dims.hidden,
+            out_dim: dims.moe,
+            acts: acts_hidden,
+        };
+        // `acts` is filled in below, once the SwiGLU has produced it.
+        down[j] = FusedPart {
+            format: down_slab.format,
+            weight: down_slab.bytes,
+            in_dim: dims.moe,
+            out_dim: dims.hidden,
+            acts: &[],
+        };
+    }
+
+    let combined = &mut ffn.gate_up[..gate_up_len];
     let opened = gemv.open();
-    pool_gemv_q8_k_stamped(
-        pool,
-        gate_slab.format,
-        gate_slab.bytes,
-        dims.hidden,
-        dims.moe,
-        scratch.acts_hidden,
-        scratch.gate,
-        opened.is_some(),
-    )?;
+    pool_gemv_q8_k_fused(pool, &gate_up[..2 * n], combined, opened.is_some())?;
     gemv.close(GemvSite::Experts, opened);
+
+    // Indexed rather than `chunks_exact_mut(2 * moe)`, which panics on a zero
+    // chunk width; a degenerate `moe_intermediate` has to fall out as `n`
+    // empty slots, not as a panic.
+    for j in 0..n {
+        let slot = &mut combined[j * 2 * dims.moe..(j + 1) * 2 * dims.moe];
+        let (gate, up) = slot.split_at_mut(dims.moe);
+        swiglu_combine(gate, up)?;
+        quantize_row_q8_k(gate, &mut ffn.acts_moe[j * blocks..(j + 1) * blocks])?;
+    }
+
+    // The down job's destinations are the routed slots of `staged`, which the
+    // phase's plan covers only in part, so they are contiguous per expert and
+    // gapped across experts — ascending because `window` is.
+    let intermediates: &[BlockQ8K] = ffn.acts_moe;
+    let mut at = [0usize; MAX_FUSED_EXPERTS];
+    for (j, &(index, _)) in window.iter().enumerate() {
+        down[j].acts = &intermediates[j * blocks..(j + 1) * blocks];
+        at[j] = index * dims.hidden;
+    }
     let opened = gemv.open();
-    pool_gemv_q8_k_stamped(
-        pool,
-        up_slab.format,
-        up_slab.bytes,
-        dims.hidden,
-        dims.moe,
-        scratch.acts_hidden,
-        scratch.up,
-        opened.is_some(),
-    )?;
-    gemv.close(GemvSite::Experts, opened);
-    swiglu_combine(scratch.gate, scratch.up)?;
-    quantize_row_q8_k(scratch.gate, scratch.acts_moe)?;
-    let opened = gemv.open();
-    pool_gemv_q8_k_stamped(
-        pool,
-        down_slab.format,
-        down_slab.bytes,
-        dims.moe,
-        dims.hidden,
-        scratch.acts_moe,
-        out,
-        opened.is_some(),
-    )?;
+    pool_gemv_q8_k_fused_at(pool, &down[..n], &at[..n], staged, opened.is_some())?;
     gemv.close(GemvSite::Experts, opened);
     Ok(())
 }
@@ -1827,7 +2112,20 @@ fn expert_ffn(
 /// stops a stale `expert_staged` slot from being reduced into the residual,
 /// and it has to be pinned by something other than a healthy streamer.
 ///
-/// `stream` is taken shared: every [`ExpertView`] borrows it for the length
+/// The whole plan is validated **before** any arithmetic. A window below is
+/// one fan-out, so there is no longer a "between two experts" for a bad index
+/// to be caught at, and a plan that is not a partial permutation of the
+/// routed set must not reach the pool at all. The flags this sets on the way
+/// through are what a repeat within the plan, or across the two phases, trips
+/// on — unchanged, only earlier.
+///
+/// The two phases are still separate calls, so **no fusion crosses the
+/// hit/miss boundary**: a resident expert's arithmetic never waits on a
+/// missing expert's read, which is the overlap the two-phase decode exists
+/// for and is worth more than the two fan-outs merging them would save.
+///
+/// `stream` is taken shared: every [`ExpertView`](crate::io::ExpertView)
+/// borrows it for the length
 /// of the phase, and nothing here needs to mutate it.
 fn run_plan(
     stream: &ExpertStream,
@@ -1838,7 +2136,7 @@ fn run_plan(
     scratch: &mut MoeScratch<'_>,
     gemv: &mut GemvClock<'_>,
 ) -> Result<(), ForwardError> {
-    for &(index, slot) in plan {
+    for &(index, _) in plan {
         if index >= dims.top_k || scratch.done[index] {
             return Err(ForwardError::StreamPlanIndex {
                 layer,
@@ -1846,10 +2144,30 @@ fn run_plan(
                 top_k: dims.top_k,
             });
         }
-        let view = stream.view(layer, slot)?;
-        let out = &mut scratch.staged[index * dims.hidden..(index + 1) * dims.hidden];
-        expert_ffn(pool, &view, dims, &mut scratch.ffn, out, gemv)?;
         scratch.done[index] = true;
+    }
+
+    // Windows are ranges of the *routed* index rather than of the plan's own
+    // order, so a window's staging spans come out ascending and disjoint,
+    // which is what `pool_gemv_q8_k_fused_at` needs before it hands shards
+    // raw sub-slices of `staged`. The scan is `top_k` finds over a plan of at
+    // most `top_k` entries — 64 integer compares at the v0 pin, against the
+    // ~27 µs a fan-out costs to set up.
+    let mut window = [(0usize, 0u32); MAX_FUSED_EXPERTS];
+    let mut base = 0usize;
+    while base < dims.top_k {
+        let end = base.saturating_add(MAX_FUSED_EXPERTS).min(dims.top_k);
+        let mut n = 0usize;
+        for index in base..end {
+            if let Some(&(_, slot)) = plan.iter().find(|&&(i, _)| i == index) {
+                window[n] = (index, slot);
+                n += 1;
+            }
+        }
+        if n > 0 {
+            run_expert_window(stream, pool, layer, dims, &window[..n], scratch, gemv)?;
+        }
+        base = end;
     }
     Ok(())
 }
@@ -2010,17 +2328,15 @@ pub fn forward_token_traced<'s>(
         acts_q8k_moe,
         acts_q8k_attn,
         acts_q8_0_hidden,
-        q,
+        qv,
         k,
-        v,
         attn_out,
         o_proj,
         router_logits,
         router_probs,
         topk,
         expert_ids,
-        gate,
-        up,
+        gate_up,
         expert_staged,
         expert_done,
         expert_acc,
@@ -2068,8 +2384,8 @@ pub fn forward_token_traced<'s>(
     //
     // The GEMV sub-split rides the same choice one level down: armed for
     // decode, disarmed for the token-major prefill, so a prompt's fan-outs
-    // never land in a decode's `own`/`wait`. Its own cost is a further ~4,131
-    // clock reads (~112 µs) a decoded token and zero on the prefill path; see
+    // never land in a decode's `own`/`wait`. Its own cost is a further ~1,107
+    // clock reads (~30 µs) a decoded token and zero on the prefill path; see
     // [`GemvClock`] for the count and the arithmetic behind it.
     let (mut clock, mut gemv) = if *prefill_charging {
         (PhaseClock::new(prefill_timing, true), GemvClock::disarmed())
@@ -2102,18 +2418,43 @@ pub fn forward_token_traced<'s>(
         quantize_row_q8_0(normed, acts_q8_0_hidden)?;
         clock.charge(Phase::Elementwise);
 
+        // `attn_q` and `attn_v` are one fan-out: both are k-quant matrices
+        // over the *same* Q8_K activation row, so their output rows are one
+        // fused row space and `qv` is that space's buffer. `attn_k` is the
+        // one projection against Q8_0 activations and keeps its own job.
+        //
+        // The two formats need not match — `attn_v` is Q6_K in some layers
+        // while `attn_q` is Q4_K — and an even row split is then uneven in
+        // *time*, since a Q6_K row is 1680 B against Q4_K's 1152 B at
+        // `in_dim` 2048. Only the last shard's tail crosses the boundary
+        // (4096 Q4_K rows then 512 Q6_K ones at the v0 pin), and one fan-out
+        // whose slowest shard is ~30% long still beats two whose set-up costs
+        // ~27 µs each. Noted rather than fixed: a cost-weighted split is a
+        // change to `shard_range`, which is not this seam.
         let opened = gemv.open();
-        pool_gemv_q8_k_stamped(
+        pool_gemv_q8_k_fused(
             pool,
-            lw.attn_q.format,
-            lw.attn_q.bytes,
-            hidden,
-            q_dim,
-            acts_q8k_hidden,
-            q,
+            &[
+                FusedPart {
+                    format: lw.attn_q.format,
+                    weight: lw.attn_q.bytes,
+                    in_dim: hidden,
+                    out_dim: q_dim,
+                    acts: acts_q8k_hidden,
+                },
+                FusedPart {
+                    format: lw.attn_v.format,
+                    weight: lw.attn_v.bytes,
+                    in_dim: hidden,
+                    out_dim: kv_dim,
+                    acts: acts_q8k_hidden,
+                },
+            ],
+            qv,
             opened.is_some(),
         )?;
         gemv.close(GemvSite::Projections, opened);
+        let (q, v) = qv.split_at_mut(q_dim);
         let opened = gemv.open();
         pool_gemv_q8_0(
             pool,
@@ -2122,18 +2463,6 @@ pub fn forward_token_traced<'s>(
             kv_dim,
             acts_q8_0_hidden,
             k,
-            opened.is_some(),
-        )?;
-        gemv.close(GemvSite::Projections, opened);
-        let opened = gemv.open();
-        pool_gemv_q8_k_stamped(
-            pool,
-            lw.attn_v.format,
-            lw.attn_v.bytes,
-            hidden,
-            kv_dim,
-            acts_q8k_hidden,
-            v,
             opened.is_some(),
         )?;
         gemv.close(GemvSite::Projections, opened);
@@ -2242,8 +2571,7 @@ pub fn forward_token_traced<'s>(
             ffn: FfnScratch {
                 acts_hidden: acts_q8k_hidden,
                 acts_moe: acts_q8k_moe,
-                gate,
-                up,
+                gate_up,
             },
             staged: expert_staged,
             done: expert_done,
@@ -2854,8 +3182,7 @@ mod tests {
         let ForwardState {
             acts_q8k_hidden,
             acts_q8k_moe,
-            gate,
-            up,
+            gate_up,
             pool,
             stream,
             ..
@@ -2864,8 +3191,7 @@ mod tests {
             ffn: FfnScratch {
                 acts_hidden: &acts_q8k_hidden[..],
                 acts_moe: &mut acts_q8k_moe[..],
-                gate: &mut gate[..],
-                up: &mut up[..],
+                gate_up: &mut gate_up[..],
             },
             staged,
             done,
@@ -3000,9 +3326,12 @@ mod tests {
             );
             assert_eq!(scratch.done, &[false, false]);
 
-            // Repeated: the first occurrence stages, the second is refused
-            // because slot 0 is already filled. Reducing it twice would
-            // weight one expert twice and leave the other's slot stale.
+            // Repeated: the first occurrence claims slot 0, the second is
+            // refused because that slot is already claimed. Reducing it twice
+            // would weight one expert twice and leave the other's slot stale.
+            // Since phase 9 the whole plan is validated before the first
+            // fan-out, so nothing is computed here at all — strictly earlier
+            // than before, and the flag the guard leaves behind is the same.
             scratch.done.fill(false);
             let err = run_plan(
                 stream,
@@ -3025,7 +3354,7 @@ mod tests {
                 ),
                 "{err}"
             );
-            assert_eq!(scratch.done, &[true, false], "only the first ran");
+            assert_eq!(scratch.done, &[true, false], "only the first was taken");
         });
     }
 
@@ -3083,6 +3412,395 @@ mod tests {
             stream.await_misses().unwrap();
             stream.end_layer(0);
         });
+    }
+
+    /// A packed Q4_K matrix with planted f16 scales and a deterministic body.
+    /// Structurally valid, finite, and different for every `seed`, which is
+    /// all the fused fan-out tests need of it — they compare against the
+    /// unfused call on the *same* bytes.
+    fn synth_q4_k(in_dim: usize, out_dim: usize, seed: u8) -> Vec<u8> {
+        let block_bytes = QuantFormat::Q4_K.block_bytes();
+        let blocks = out_dim * (in_dim / QuantFormat::Q4_K.block_weights());
+        let mut w = vec![0u8; blocks * block_bytes];
+        let d = crate::kernels::quants::f32_to_f16(f32::powi(2.0, -8)).to_le_bytes();
+        for (b, block) in w.chunks_exact_mut(block_bytes).enumerate() {
+            // d and dmin lead a Q4_K super-block; the rest is scales and qs,
+            // both of which are valid for any bit pattern.
+            block[0..2].copy_from_slice(&d);
+            block[2..4].copy_from_slice(&d);
+            for (i, byte) in block[4..].iter_mut().enumerate() {
+                *byte = (i as u8)
+                    .wrapping_mul(31)
+                    .wrapping_add(b as u8)
+                    .wrapping_add(seed);
+            }
+        }
+        w
+    }
+
+    /// The gapped fused fan-out — the one that reconstructs `&mut [f32]` from
+    /// a raw pointer per shard — writes each part into exactly its own span of
+    /// `dst`, bit-identically to the unfused whole-matrix call, and touches
+    /// nothing between the spans.
+    ///
+    /// Driven directly rather than through the expert phase so that the
+    /// disjointness the `unsafe` rests on is pinned by something other than
+    /// "`run_plan` happens to build ascending spans today", and so that the
+    /// spans can be made deliberately gapped, which a real routed plan only
+    /// sometimes is.
+    #[test]
+    fn a_gapped_fused_fan_out_writes_only_its_own_spans() {
+        let (in_dim, out_dim) = (256usize, 40usize);
+        let weights: Vec<Vec<u8>> = (0..3).map(|s| synth_q4_k(in_dim, out_dim, s * 7)).collect();
+        let x: Vec<f32> = (0..in_dim).map(spread).collect();
+        let mut acts = vec![BlockQ8K::default(); in_dim / QuantFormat::Q8_K.block_weights()];
+        quantize_row_q8_k(&x, &mut acts).unwrap();
+        let parts: Vec<FusedPart<'_>> = weights
+            .iter()
+            .map(|w| FusedPart {
+                format: QuantFormat::Q4_K,
+                weight: w,
+                in_dim,
+                out_dim,
+                acts: &acts,
+            })
+            .collect();
+
+        // Deliberately gapped and not starting at zero: the spans a routed
+        // plan of experts 1, 2 and 4 out of a top-8 would name.
+        let at = [out_dim, 2 * out_dim, 4 * out_dim];
+        const FILL: f32 = 1.25;
+
+        for shards in [1usize, 2, 3, 5] {
+            let mut pool = ComputePool::with_config(PoolConfig {
+                shards: Some(shards),
+                pin: false,
+                pin_caller: false,
+                inline_caller: true,
+            });
+            let mut dst = vec![FILL; 8 * out_dim];
+            pool_gemv_q8_k_fused_at(&mut pool, &parts, &at, &mut dst, false).unwrap();
+
+            for (p, &start) in at.iter().enumerate() {
+                let mut want = vec![f32::NAN; out_dim];
+                crate::kernels::gemv_q8_k(
+                    QuantFormat::Q4_K,
+                    &weights[p],
+                    in_dim,
+                    out_dim,
+                    &acts,
+                    &mut want,
+                )
+                .unwrap();
+                assert!(
+                    want.iter().all(|v| v.is_finite() && *v != FILL),
+                    "shards={shards}: part {p} reference is degenerate: {want:?}"
+                );
+                for (r, (&g, &w)) in dst[start..start + out_dim].iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "shards={shards}: part {p} row {r} ({g} vs {w})"
+                    );
+                }
+            }
+            // Every element outside a span is still the fill, so no shard
+            // wrote past the range it owns.
+            for (i, &v) in dst.iter().enumerate() {
+                let inside = at.iter().any(|&s| (s..s + out_dim).contains(&i));
+                assert!(
+                    inside || v == FILL,
+                    "shards={shards}: element {i} outside every span was written ({v})"
+                );
+            }
+        }
+
+        // The disjointness the `unsafe` rests on is checked, not assumed.
+        let mut pool = ComputePool::with_config(PoolConfig {
+            shards: Some(2),
+            pin: false,
+            pin_caller: false,
+            inline_caller: true,
+        });
+        let mut dst = vec![0.0f32; 8 * out_dim];
+        let overlap = [0usize, out_dim - 1, 4 * out_dim];
+        assert!(matches!(
+            pool_gemv_q8_k_fused_at(&mut pool, &parts, &overlap, &mut dst, false).unwrap_err(),
+            KernelError::LengthMismatch {
+                what: FUSED_SPAN_ORDER,
+                ..
+            }
+        ));
+        let descending = [2 * out_dim, 0, 4 * out_dim];
+        assert!(matches!(
+            pool_gemv_q8_k_fused_at(&mut pool, &parts, &descending, &mut dst, false).unwrap_err(),
+            KernelError::LengthMismatch {
+                what: FUSED_SPAN_ORDER,
+                ..
+            }
+        ));
+        let past_end = [0usize, out_dim, 8 * out_dim];
+        assert!(matches!(
+            pool_gemv_q8_k_fused_at(&mut pool, &parts, &past_end, &mut dst, false).unwrap_err(),
+            KernelError::LengthMismatch {
+                what: FUSED_SPAN_BOUND,
+                ..
+            }
+        ));
+        assert!(matches!(
+            pool_gemv_q8_k_fused_at(&mut pool, &parts, &at[..2], &mut dst, false).unwrap_err(),
+            KernelError::LengthMismatch {
+                what: FUSED_SPAN_COUNT,
+                ..
+            }
+        ));
+        // And a contiguous fused destination has to be the whole row space,
+        // or `scatter` would shard over a prefix of it and report success.
+        assert!(matches!(
+            pool_gemv_q8_k_fused(&mut pool, &parts, &mut dst[..3 * out_dim - 1], false)
+                .unwrap_err(),
+            KernelError::LengthMismatch {
+                what: FUSED_OUT_VS_SPACE,
+                ..
+            }
+        ));
+    }
+
+    /// One expert's FFN the way phase 8 ran it: three separate whole-matrix
+    /// fan-outs with the SwiGLU and the intermediate quantization between
+    /// them. This is the sequence [`run_expert_window`] claims to reproduce
+    /// bit for bit, so it is written out here rather than derived from it.
+    fn expert_ffn_unfused(
+        stream: &ExpertStream,
+        pool: &mut ComputePool,
+        layer: u32,
+        dims: MoeDims,
+        slot: u32,
+        acts_hidden: &[BlockQ8K],
+        out: &mut [f32],
+    ) {
+        let view = stream.view(layer, slot).unwrap();
+        let (g, u, d) = (view.gate(), view.up(), view.down());
+        let mut gate = vec![0.0f32; dims.moe];
+        let mut up = vec![0.0f32; dims.moe];
+        let hidden = dims.hidden;
+        pool_gemv_q8_k(
+            pool,
+            g.format,
+            g.bytes,
+            hidden,
+            dims.moe,
+            acts_hidden,
+            &mut gate,
+        )
+        .unwrap();
+        pool_gemv_q8_k(
+            pool,
+            u.format,
+            u.bytes,
+            hidden,
+            dims.moe,
+            acts_hidden,
+            &mut up,
+        )
+        .unwrap();
+        swiglu_combine(&mut gate, &up).unwrap();
+        let mut mid = vec![BlockQ8K::default(); dims.moe / QuantFormat::Q8_K.block_weights()];
+        quantize_row_q8_k(&gate, &mut mid).unwrap();
+        pool_gemv_q8_k(pool, d.format, d.bytes, dims.moe, hidden, &mid, out).unwrap();
+    }
+
+    /// Fill a state's `[hidden]` activation blocks with a real quantized row.
+    ///
+    /// Without this every block is `BlockQ8K::default()` — `d = 0`, `qs` all
+    /// zero — so every dot in the layer is exactly `0.0`, every expert stages
+    /// the same all-zero vector, and a comparison between two experts (or
+    /// between fused and unfused) is vacuously true.
+    fn plant_activations(st: &mut ForwardState, hidden: usize) {
+        let x: Vec<f32> = (0..hidden).map(spread).collect();
+        quantize_row_q8_k(&x, &mut st.acts_q8k_hidden).unwrap();
+    }
+
+    /// The claim phase 9 wave 1 rests on, at the layer above the kernel: a
+    /// fused expert phase stages exactly what the per-expert sequence of
+    /// whole-matrix fan-outs stages, bit for bit — and it stages each
+    /// expert's own output in that expert's own routed slot.
+    ///
+    /// The routing half is not decoration. Fusing gives one job `2 * n`
+    /// matrices sharing one activation row and then `n` matrices each reading
+    /// a *different* intermediate into a *different* staging slot, so the two
+    /// ways to get it wrong are pairing an expert with another's intermediate
+    /// and pairing it with another's slot. Running the same two experts under
+    /// swapped routed indices catches both: the staged halves must swap with
+    /// them, which they cannot do if either pairing is positional.
+    #[test]
+    fn a_fused_expert_phase_matches_the_per_expert_sequence_bitwise() {
+        let (_fx, model) = load_fixture("fwd-fused-experts");
+        let hidden = model.arch().hidden as usize;
+        let mut st = state(&model, 4);
+        let dims = dims_with_top_k(&model, 2);
+        plant_activations(&mut st, hidden);
+
+        let mut staged = vec![f32::NAN; 2 * hidden];
+        let mut done = vec![false; 2];
+        let mut want = vec![f32::NAN; 2 * hidden];
+        let mut got = vec![f32::NAN; 2 * hidden];
+        let mut swapped_got = vec![f32::NAN; 2 * hidden];
+
+        with_expert_scratch(&mut st, &mut staged, &mut done, |stream, pool, scratch| {
+            // Two distinct experts, both resident: the shape `run_plan` sees
+            // for a miss phase that has just been awaited.
+            stream.begin_layer(0, &[0, 1]).unwrap();
+            stream.await_misses().unwrap();
+            let mut plan: Vec<(usize, u32)> = stream.hits().to_vec();
+            plan.extend_from_slice(stream.misses());
+            plan.sort_unstable();
+            assert_eq!(plan.len(), 2, "the fixture routes two distinct experts");
+            assert_ne!(plan[0].1, plan[1].1, "two experts, two slots");
+
+            let acts: Vec<BlockQ8K> = scratch.ffn.acts_hidden.to_vec();
+            for &(index, slot) in &plan {
+                expert_ffn_unfused(
+                    stream,
+                    pool,
+                    0,
+                    dims,
+                    slot,
+                    &acts,
+                    &mut want[index * hidden..(index + 1) * hidden],
+                );
+            }
+            assert!(
+                want.iter().all(|v| v.is_finite()),
+                "the reference is not finite: {want:?}"
+            );
+
+            scratch.done.fill(false);
+            run_plan(
+                stream,
+                pool,
+                0,
+                dims,
+                &plan,
+                scratch,
+                &mut GemvClock::disarmed(),
+            )
+            .unwrap();
+            assert_eq!(scratch.done, &[true, true]);
+            got.copy_from_slice(scratch.staged);
+
+            // Same experts, swapped routed indices.
+            let swapped: Vec<(usize, u32)> = plan
+                .iter()
+                .map(|&(index, slot)| (1 - index, slot))
+                .collect();
+            scratch.done.fill(false);
+            scratch.staged.fill(f32::NAN);
+            run_plan(
+                stream,
+                pool,
+                0,
+                dims,
+                &swapped,
+                scratch,
+                &mut GemvClock::disarmed(),
+            )
+            .unwrap();
+            swapped_got.copy_from_slice(scratch.staged);
+            stream.end_layer(0);
+        });
+
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "fused expert phase differs at slot {} element {} ({g} vs {w})",
+                i / hidden,
+                i % hidden,
+            );
+        }
+        // The two experts really do produce different vectors, so the swap
+        // below is a test and not a tautology.
+        assert!(
+            want[..hidden]
+                .iter()
+                .zip(&want[hidden..])
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "the fixture's two experts stage the same vector"
+        );
+        for (i, (&g, &w)) in swapped_got[..hidden]
+            .iter()
+            .zip(&want[hidden..])
+            .enumerate()
+        {
+            assert_eq!(g.to_bits(), w.to_bits(), "swapped slot 0 element {i}");
+        }
+        for (i, (&g, &w)) in swapped_got[hidden..]
+            .iter()
+            .zip(&want[..hidden])
+            .enumerate()
+        {
+            assert_eq!(g.to_bits(), w.to_bits(), "swapped slot 1 element {i}");
+        }
+    }
+
+    /// The count the coarse-versus-fine test can no longer pin exactly: an
+    /// expert phase is **two** fan-outs — one gate/up job and one down job —
+    /// however many experts its plan holds, and an empty plan is none.
+    ///
+    /// This is the whole of phase 9 wave 1 in one assertion. Before it, a
+    /// two-expert phase was six fan-outs and a one-expert phase three.
+    #[test]
+    fn an_expert_phase_is_two_fan_outs_however_many_experts_it_has() {
+        let (_fx, model) = load_fixture("fwd-fused-count");
+        let hidden = model.arch().hidden as usize;
+        let mut st = state(&model, 4);
+        let dims = dims_with_top_k(&model, 2);
+        plant_activations(&mut st, hidden);
+
+        let mut staged = vec![0.0f32; 2 * hidden];
+        let mut done = vec![false; 2];
+        let mut split = GemvSplit::default();
+
+        with_expert_scratch(&mut st, &mut staged, &mut done, |stream, pool, scratch| {
+            stream.begin_layer(0, &[0, 1]).unwrap();
+            stream.await_misses().unwrap();
+            let mut plan: Vec<(usize, u32)> = stream.hits().to_vec();
+            plan.extend_from_slice(stream.misses());
+            plan.sort_unstable();
+            assert_eq!(plan.len(), 2);
+
+            let mut gemv = GemvClock::new(&mut split, true);
+
+            // An empty plan fans nothing out at all.
+            scratch.done.fill(false);
+            run_plan(stream, pool, 0, dims, &[], scratch, &mut gemv).unwrap();
+
+            // One expert: still exactly two.
+            scratch.done.fill(false);
+            run_plan(stream, pool, 0, dims, &plan[..1], scratch, &mut gemv).unwrap();
+
+            // Both experts: two more, not four more.
+            scratch.done.fill(false);
+            run_plan(stream, pool, 0, dims, &plan, scratch, &mut gemv).unwrap();
+
+            stream.end_layer(0);
+        });
+
+        assert_eq!(
+            split.experts.scatters, 4,
+            "an empty plan, a one-expert plan and a two-expert plan must charge \
+             0 + 2 + 2 fan-outs: {split:?}"
+        );
+        assert_eq!(
+            (
+                split.projections.scatters,
+                split.lm_head.scatters,
+                split.router.scatters
+            ),
+            (0, 0, 0),
+            "the expert phase charged another site: {split:?}"
+        );
     }
 
     /// F8. `forward_token` takes the model and the state independently, and
@@ -3171,10 +3889,21 @@ mod tests {
     /// Four directions, all checked over a real multi-token decode:
     ///
     /// - **Counts.** Every fan-out is charged exactly once, to the bucket the
-    ///   geometry says: `4` projections and `3 * top_k` expert GEMVs a layer, a
-    ///   serial router matvec a layer, one `lm_head` a token. A GEMV that
-    ///   slipped out of the sub-split, or one charged twice, moves one of these
-    ///   exact numbers.
+    ///   geometry says: `3` projections a layer (`attn_q` and `attn_v` fused,
+    ///   `attn_k`, `attn_output`), a serial router matvec a layer, one
+    ///   `lm_head` a token. A GEMV that slipped out of the sub-split, or one
+    ///   charged twice, moves one of these exact numbers.
+    ///
+    ///   The expert count is the one that is not a constant any more: phase 9
+    ///   fuses a phase's experts into a gate/up job and a down job, so a layer
+    ///   charges `2` when every routed expert is a cache hit (or every one a
+    ///   miss) and `4` when the plan splits across both phases — which is a
+    ///   property of the cache on the day, not of the geometry. So the bucket
+    ///   is pinned by the invariant that *is* structural (two fan-outs per
+    ///   non-empty phase, one or two non-empty phases a layer, hence even and
+    ///   inside `[2, 4]` per layer) and the exact per-phase count is pinned
+    ///   separately, and exactly, by
+    ///   `an_expert_phase_is_two_fan_outs_however_many_experts_it_has`.
     /// - **Containment.** Every sub-split region sits strictly inside
     ///   `Phase::Projections` or `Phase::ExpertCompute`, so the sub-split can
     ///   never exceed those two coarse phases together. A region charged to the
@@ -3212,13 +3941,30 @@ mod tests {
 
         assert_eq!(
             gemv_scatters(&split, "projections"),
-            4 * layers * tokens,
-            "attn_q, attn_k, attn_v and attn_output, once a layer: {split:?}"
+            3 * layers * tokens,
+            "attn_q+attn_v fused, attn_k, attn_output, once a layer: {split:?}"
         );
+        let experts = gemv_scatters(&split, "experts");
         assert_eq!(
-            gemv_scatters(&split, "experts"),
-            3 * top_k * layers * tokens,
-            "gate, up and down for every routed expert: {split:?}"
+            experts % 2,
+            0,
+            "an expert phase charges a gate/up job and a down job or neither, \
+             so the count is even: {split:?}"
+        );
+        assert!(
+            experts >= 2 * layers * tokens && experts <= 4 * layers * tokens,
+            "every layer runs one or two non-empty expert phases at two fused \
+             fan-outs each, so {experts} must sit in \
+             [{}, {}]: {split:?}",
+            2 * layers * tokens,
+            4 * layers * tokens,
+        );
+        // The fusion is the point: whatever the cache did, the old
+        // per-expert form would have charged this many.
+        assert!(
+            experts < 3 * top_k * layers * tokens,
+            "the expert phase is still fanning out per projection per expert: \
+             {split:?}"
         );
         assert_eq!(
             gemv_scatters(&split, "lm_head"),
@@ -3266,9 +4012,9 @@ mod tests {
         // the submitting thread, `close` falls back to `t1 = t2` and every
         // pooled bucket reports its whole fan-out as `own` with a `wait` of
         // exactly zero — which reads like a finding ("the barrier costs
-        // nothing") rather than like a dead instrument. Over the ~150 real
-        // fan-outs above, a barrier that measures zero every single time is
-        // that failure and nothing else.
+        // nothing") rather than like a dead instrument. Over the several dozen
+        // real fan-outs above, a barrier that measures zero every single time
+        // is that failure and nothing else.
         let pooled_wait: Duration = split[..3].iter().map(|&(_, _, wait, _)| wait).sum();
         assert!(
             pooled_wait > Duration::ZERO,

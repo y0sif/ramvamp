@@ -79,6 +79,39 @@
 //! quantized activation rows, each `in_dim / block_weights` blocks, in the
 //! same order as the activation axis of `out`.
 //!
+//! # Fused row spaces
+//!
+//! [`gemv_q8_k_fused_rows`] runs the output rows of **several independent
+//! matrices** as one row space. Part `p` owns the global rows
+//! `[start(p), start(p) + out_dim(p))`, where `start(p)` is the sum of the
+//! earlier parts' `out_dim`s, and every part carries its own activation row.
+//!
+//! Decode wants this because its jobs are too small to pay for themselves: a
+//! layer runs gate, up and down as a separate fan-out per routed expert, and
+//! phase 9 measured ~27 µs of submitter-side set-up against ~5 µs of
+//! per-worker arithmetic per fan-out (`docs/experiments/README.md`). Nothing
+//! in the row-range argument above says a fan-out may cover only *one*
+//! matrix, so the fix is to give one job more rows rather than to make the
+//! job cheaper.
+//!
+//! **No arithmetic change, again.** [`fused_row_parts`] maps a global row
+//! range onto per-matrix *local* row ranges and hands each one to
+//! [`gemv_q8_k_rows`] unchanged, so row `r` of part `p` is the same `vec_dot`
+//! of the same weight row against the same activation row it would be in a
+//! single-matrix call. And a partition of the fused space restricts to a
+//! partition of every part's own `0..out_dim`: intersecting an ascending
+//! contiguous range with an interval is an ascending contiguous range, and
+//! the intersections of a tiling tile. So the row-range guarantee carries
+//! over part by part, and a fused fan-out is **bit-identical** to the
+//! sequence of single-matrix fan-outs it replaces.
+//!
+//! What fusing does change is load balance. [`crate::threads::shard_range`]
+//! splits rows evenly, and a Q6_K row costs more than a Q4_K row of the same
+//! `in_dim` (1680 B against 1152 B at `in_dim` 2048), so a fused space of
+//! mixed formats splits unevenly *in time*. Callers that mix formats own that
+//! trade; the eight routed experts' gate and up projections, which is what
+//! this exists for, are one format.
+//!
 //! Sizes are validated once up front; the per-row kernels re-check their
 //! own row length, which after this validation cannot fail (the checks are
 //! a few integer compares per row, noise next to the dot itself).
@@ -102,6 +135,12 @@ const ROW_RANGE_ORDER: &str = "gemv rows: row range start vs end";
 
 /// `what` for a row range that runs past the last row of the matrix.
 const ROW_RANGE_BOUND: &str = "gemv rows: row range end vs out_dim";
+
+/// `what` for a fused destination that is not exactly the requested range.
+const FUSED_OUT: &str = "gemv_q8_k_fused_rows: out vs range";
+
+/// `what` for one fused part's own geometry.
+const FUSED_PART: &str = "gemv_q8_k_fused_rows: part weight bytes vs rows / out vs range";
 
 /// The dispatching k-quant row-dot kernels all share this signature
 /// (`weight_row`, `acts`, `force_scalar`).
@@ -524,6 +563,187 @@ pub fn gemv_q8_0_batched(
         out,
         force_scalar(),
     )
+}
+
+/// One matrix of a fused row space: a whole packed k-quant weight matrix and
+/// the one pre-quantized Q8_K activation row all of its output rows are
+/// dotted against.
+///
+/// Parts are independent by construction — a part reads only its own weight
+/// bytes and its own activation row, and writes only its own output rows — so
+/// concatenating their row spaces is a relabelling and nothing more. Several
+/// parts may share one activation row (a layer's routed experts all read the
+/// same normed residual) or carry different ones (each expert's `down` reads
+/// its own SwiGLU intermediate); the fused walk does not care which.
+#[derive(Debug, Clone, Copy)]
+pub struct FusedPart<'a> {
+    /// Weight quantization format.
+    pub format: QuantFormat,
+    /// Row-major packed bytes for all `out_dim` rows.
+    pub weight: &'a [u8],
+    /// Weights per row.
+    pub in_dim: usize,
+    /// Rows this part contributes to the fused row space.
+    pub out_dim: usize,
+    /// The activation row every one of those rows is dotted against,
+    /// `in_dim / 256` blocks.
+    pub acts: &'a [BlockQ8K],
+}
+
+impl FusedPart<'_> {
+    /// A part with no rows, for pre-filling a fixed-capacity parts buffer.
+    ///
+    /// Contributes nothing to the fused row space: [`fused_row_parts`] never
+    /// yields an empty part, and callers slice the buffer down to the parts
+    /// they filled before handing it over. The format is arbitrary and is
+    /// never resolved to a kernel.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            format: QuantFormat::Q4_K,
+            weight: &[],
+            in_dim: 0,
+            out_dim: 0,
+            acts: &[],
+        }
+    }
+}
+
+/// Rows in the fused row space of `parts`.
+///
+/// Saturating rather than wrapping, for the reason [`validate`]'s products
+/// saturate: `out_dim` is caller data, and a wrapped total would look like a
+/// plausible row count instead of falling out as the nonsense it is.
+#[must_use]
+pub fn fused_out_dim(parts: &[FusedPart<'_>]) -> usize {
+    parts
+        .iter()
+        .fold(0usize, |total, part| total.saturating_add(part.out_dim))
+}
+
+/// The parts a fused row range touches, as `(part index, local rows)` in
+/// ascending part order.
+///
+/// Part `p` owns global rows `[start(p), start(p) + parts[p].out_dim)`.
+/// Intersecting `rows` with those spans yields contiguous ascending local
+/// ranges whose lengths sum to `rows.len()` (clamped to the fused
+/// `out_dim`), so walking them in order and advancing a cursor over one
+/// destination buffer reconstructs the range exactly. Parts the range misses
+/// — including every empty part — are not yielded, and an inverted `rows`
+/// yields nothing rather than panicking.
+///
+/// This is the whole of the fused mapping: everything else in this module's
+/// fused path is [`gemv_q8_k_rows`] over what this returns.
+pub fn fused_row_parts<'p>(
+    parts: &'p [FusedPart<'_>],
+    rows: Range<usize>,
+) -> impl Iterator<Item = (usize, Range<usize>)> + 'p {
+    let mut start = 0usize;
+    parts.iter().enumerate().filter_map(move |(p, part)| {
+        let base = start;
+        // Saturating so a nonsense `out_dim` cannot wrap the cursor back
+        // under an earlier part and make two parts claim the same rows.
+        let end = base.saturating_add(part.out_dim);
+        start = end;
+        let lo = rows.start.clamp(base, end);
+        let hi = rows.end.clamp(base, end);
+        (lo < hi).then(|| (p, lo - base..hi - base))
+    })
+}
+
+/// GEMV over the fused row space of `parts`, restricted to `rows`:
+/// `out[i]` is fused row `rows.start + i`, which is some part's own output
+/// row dotted against that part's activation row.
+///
+/// `out` holds exactly `rows.len()` floats and receives only those rows, in
+/// fused row order — so a compute pool shards over the fused space and hands
+/// each shard one contiguous sub-slice, exactly as it does for
+/// [`gemv_q8_k_rows`]. Concatenating any partition of `0..fused_out_dim`
+/// reproduces the per-part whole-matrix calls bit for bit (see the module
+/// docs).
+///
+/// # Errors
+///
+/// [`KernelError::LengthMismatch`] when `rows` is inverted, runs past the
+/// fused `out_dim`, or disagrees with `out.len()`; otherwise whatever
+/// [`gemv_q8_k_rows`] reports for the first part that fails, which includes
+/// [`KernelError::UnsupportedFormat`] for a non-k-quant part. Never panics.
+pub fn gemv_q8_k_fused_rows(
+    parts: &[FusedPart<'_>],
+    rows: Range<usize>,
+    out: &mut [f32],
+) -> Result<(), KernelError> {
+    gemv_q8_k_fused_rows_impl(parts, rows, out, force_scalar())
+}
+
+/// [`gemv_q8_k_fused_rows`] with the kernel path passed rather than read from
+/// the environment, so tests and benches can drive both in one process — the
+/// same split, and for the same reason, as [`gemv_impl`]'s `scalar`.
+fn gemv_q8_k_fused_rows_impl(
+    parts: &[FusedPart<'_>],
+    rows: Range<usize>,
+    out: &mut [f32],
+    scalar: bool,
+) -> Result<(), KernelError> {
+    let total = fused_out_dim(parts);
+    if rows.start > rows.end {
+        return Err(KernelError::LengthMismatch {
+            what: ROW_RANGE_ORDER,
+            left: rows.start,
+            right: rows.end,
+        });
+    }
+    if rows.end > total {
+        return Err(KernelError::LengthMismatch {
+            what: ROW_RANGE_BOUND,
+            left: rows.end,
+            right: total,
+        });
+    }
+    // Safe: `start <= end` was just established.
+    let wanted = rows.end - rows.start;
+    if out.len() != wanted {
+        return Err(KernelError::LengthMismatch {
+            what: FUSED_OUT,
+            left: out.len(),
+            right: wanted,
+        });
+    }
+    let mut rest = out;
+    for (p, local) in fused_row_parts(parts, rows) {
+        let part = parts[p];
+        // Cannot fail after the checks above — the yielded lengths sum to
+        // `wanted == out.len()` — but this is library code on an untrusted
+        // input path, so the split is guarded rather than allowed to panic.
+        if local.len() > rest.len() {
+            return Err(KernelError::LengthMismatch {
+                what: FUSED_OUT,
+                left: rest.len(),
+                right: local.len(),
+            });
+        }
+        let (head, tail) = rest.split_at_mut(local.len());
+        // The same `gemv_impl` call `gemv_q8_k_rows` would make for this
+        // part's local range, on the same bytes: the fusion is a relabelling
+        // of the row index and touches nothing below this line.
+        let dot = k_quant_dot("gemv_q8_k_fused_rows", part.format)?;
+        gemv_impl(
+            dot,
+            FUSED_PART,
+            Matrix {
+                format: part.format,
+                bytes: part.weight,
+                in_dim: part.in_dim,
+                out_dim: part.out_dim,
+            },
+            Batch::single(part.acts),
+            local,
+            head,
+            scalar,
+        )?;
+        rest = tail;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2003,6 +2223,265 @@ mod tests {
         let mut out: [f32; 0] = [];
         gemv_q8_k(QuantFormat::Q4_K, &[], 256, 0, &acts, &mut out).unwrap();
         gemv_q8_k_rows(QuantFormat::Q4_K, &[], 256, 0, &acts, 0..0, &mut out).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Fused row spaces
+    // -----------------------------------------------------------------------
+
+    /// One fused part over a fixture's weights and a chosen activation row.
+    fn part<'a>(f: &'a Fixture, acts: &'a [BlockQ8K]) -> FusedPart<'a> {
+        FusedPart {
+            format: f.format,
+            weight: &f.weight,
+            in_dim: f.in_dim,
+            out_dim: f.out_dim,
+            acts,
+        }
+    }
+
+    /// The decode fusions this exists for, in one row space: two routed
+    /// experts' gate and up against the *shared* normed-residual row, the
+    /// `attn_v` projection against that same row, and the two experts' down
+    /// projections each against their *own* SwiGLU intermediate.
+    ///
+    /// Real formats and in-dims (they fix `row_bytes`, hence the packed
+    /// alignment each kernel sees) with the row counts trimmed, for the same
+    /// reason [`k_quant_batch_fixtures`] trims them: the row walk is
+    /// independent of `out_dim`. Mixed formats and mixed in-dims are the
+    /// point — a fused walk that mixed up which part a global row belongs to
+    /// would read the wrong bytes at the wrong stride and could not agree.
+    fn fused_fixtures() -> (Vec<Fixture>, Vec<Vec<BlockQ8K>>) {
+        let fx = vec![
+            Fixture::new("e0 gate (Q4_K)", QuantFormat::Q4_K, 2048, 96),
+            Fixture::new("e0 up (Q4_K)", QuantFormat::Q4_K, 2048, 96),
+            Fixture::new("e1 gate (Q4_K)", QuantFormat::Q4_K, 2048, 96),
+            Fixture::new("e1 up (Q4_K)", QuantFormat::Q4_K, 2048, 96),
+            Fixture::new("attn_v (Q6_K)", QuantFormat::Q6_K, 2048, 64),
+            Fixture::new("e0 down (Q4_K)", QuantFormat::Q4_K, 768, 128),
+            Fixture::new("e1 down (Q6_K)", QuantFormat::Q6_K, 768, 128),
+        ];
+        // Index-matched to `fx`: the first five share one row, the last two
+        // have their own. Distinct rows per part, so a walk that dotted
+        // everything against part 0's activations cannot pass by coincidence.
+        let shared = q8_k_acts(2048, 0xF05E_D000);
+        let acts = vec![
+            shared.clone(),
+            shared.clone(),
+            shared.clone(),
+            shared.clone(),
+            shared,
+            q8_k_acts(768, 0xF05E_D001),
+            q8_k_acts(768, 0xF05E_D002),
+        ];
+        (fx, acts)
+    }
+
+    /// Total rows of the fused fixture, spelled out so the coverage test is
+    /// pinned to a number and not to its own arithmetic.
+    const FUSED_TOTAL: usize = 4 * 96 + 64 + 2 * 128;
+
+    /// **The core claim.** A fused fan-out is bit-identical to the sequence
+    /// of single-matrix fan-outs over the same operands — whole space against
+    /// per-part whole matrices, and under every partition scheme the compute
+    /// pool can produce, on both kernel paths.
+    #[test]
+    fn a_fused_row_space_is_bit_identical_to_the_single_matrix_sequence() {
+        let paths = kernel_paths(
+            "a fused multi-matrix fan-out is bit-identical to the sequence of \
+             single-matrix fan-outs on both the AVX2 and the scalar kernel path",
+        );
+        let (fx, acts) = fused_fixtures();
+        let parts: Vec<FusedPart<'_>> =
+            fx.iter().zip(&acts).map(|(f, a)| part(f, &a[..])).collect();
+        let total = fused_out_dim(&parts);
+        assert_eq!(total, FUSED_TOTAL);
+
+        for &scalar in paths.flags() {
+            let path = if scalar { "scalar" } else { "avx2" };
+
+            // The reference: each part on its own, through the *unfused*
+            // row-range path, concatenated in part order.
+            let mut want = vec![f32::NAN; total];
+            let mut rest: &mut [f32] = &mut want;
+            for (f, a) in fx.iter().zip(&acts) {
+                let (head, tail) = rest.split_at_mut(f.out_dim);
+                run_k(f, &a[..], 1, 0..f.out_dim, head, scalar);
+                rest = tail;
+            }
+            assert!(
+                want.iter().all(|v| v.is_finite()),
+                "[{path}]: the fused fixture produced a non-finite reference",
+            );
+
+            for (scheme, ranges) in partitions(total) {
+                let mut got = vec![f32::NAN; total];
+                let mut rest: &mut [f32] = &mut got;
+                let mut cursor = 0usize;
+                for r in &ranges {
+                    assert_eq!(r.start, cursor, "[{path}] {scheme}: bad tiling");
+                    let (head, tail) = rest.split_at_mut(r.len());
+                    gemv_q8_k_fused_rows_impl(&parts, r.clone(), head, scalar).unwrap();
+                    rest = tail;
+                    cursor = r.end;
+                }
+                assert_eq!(cursor, total, "[{path}] {scheme}: short tiling");
+                for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "[{path}] {scheme}: fused row {i} differs ({g} vs {w})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The mapping itself: a tiling of the fused space restricts to a tiling
+    /// of every part's own `0..out_dim`, so every matrix's every row is
+    /// computed exactly once and nothing outside it ever is.
+    ///
+    /// Checked by replaying the same partition schemes and marking each
+    /// `(part, local row)` the walk yields. A part visited twice, a row
+    /// skipped, or a local index that ran past its own matrix all fail here
+    /// rather than showing up as a wrong number three layers up.
+    #[test]
+    fn the_fused_row_map_covers_every_part_row_exactly_once() {
+        let (fx, acts) = fused_fixtures();
+        let parts: Vec<FusedPart<'_>> =
+            fx.iter().zip(&acts).map(|(f, a)| part(f, &a[..])).collect();
+        let total = fused_out_dim(&parts);
+
+        for (scheme, ranges) in partitions(total) {
+            let mut seen: Vec<Vec<u32>> = parts.iter().map(|p| vec![0u32; p.out_dim]).collect();
+            let mut rows_yielded = 0usize;
+            for r in &ranges {
+                let mut taken = 0usize;
+                for (p, local) in fused_row_parts(&parts, r.clone()) {
+                    assert!(
+                        local.end <= parts[p].out_dim,
+                        "{scheme}: part {p} local range {local:?} runs past its \
+                         own out_dim {}",
+                        parts[p].out_dim,
+                    );
+                    assert!(!local.is_empty(), "{scheme}: an empty part was yielded");
+                    for row in local.clone() {
+                        seen[p][row] += 1;
+                    }
+                    taken += local.len();
+                }
+                assert_eq!(
+                    taken,
+                    r.len(),
+                    "{scheme}: range {r:?} mapped to {taken} part rows",
+                );
+                rows_yielded += taken;
+            }
+            assert_eq!(rows_yielded, total, "{scheme}: the tiling lost rows");
+            for (p, counts) in seen.iter().enumerate() {
+                for (row, &n) in counts.iter().enumerate() {
+                    assert_eq!(n, 1, "{scheme}: part {p} row {row} computed {n} times");
+                }
+            }
+        }
+
+        // Empty parts are skipped rather than yielded as zero-row work, and a
+        // part after one contributes rows at the right offset.
+        let padded = vec![
+            FusedPart::empty(),
+            part(&fx[0], &acts[0]),
+            FusedPart::empty(),
+            part(&fx[4], &acts[4]),
+            FusedPart::empty(),
+        ];
+        assert_eq!(fused_out_dim(&padded), fx[0].out_dim + fx[4].out_dim);
+        let walked: Vec<(usize, Range<usize>)> =
+            fused_row_parts(&padded, 0..fused_out_dim(&padded)).collect();
+        assert_eq!(walked, vec![(1, 0..fx[0].out_dim), (3, 0..fx[4].out_dim)]);
+        // And a range that starts inside the second real part still lands on
+        // it, with the empty parts before it contributing no offset of their
+        // own beyond zero rows.
+        let tail: Vec<(usize, Range<usize>)> =
+            fused_row_parts(&padded, fx[0].out_dim + 5..fx[0].out_dim + 9).collect();
+        assert_eq!(tail, vec![(3, 5..9)]);
+    }
+
+    /// Fused geometry is refused with the same typed errors as the row-range
+    /// path, and never panics — including on an inverted range, a range past
+    /// the fused end, a mis-sized `out`, a non-k-quant part, and an `out_dim`
+    /// sum that would overflow.
+    #[test]
+    fn fused_rejects_bad_geometry() {
+        let (fx, acts) = fused_fixtures();
+        let parts: Vec<FusedPart<'_>> =
+            fx.iter().zip(&acts).map(|(f, a)| part(f, &a[..])).collect();
+        let total = fused_out_dim(&parts);
+        let mut out = vec![0f32; total];
+
+        assert_eq!(
+            gemv_q8_k_fused_rows(&parts, raw_range(9, 2), &mut []).unwrap_err(),
+            KernelError::LengthMismatch {
+                what: ROW_RANGE_ORDER,
+                left: 9,
+                right: 2,
+            },
+        );
+        assert_eq!(
+            gemv_q8_k_fused_rows(&parts, 0..total + 1, &mut out).unwrap_err(),
+            KernelError::LengthMismatch {
+                what: ROW_RANGE_BOUND,
+                left: total + 1,
+                right: total,
+            },
+        );
+        assert_eq!(
+            gemv_q8_k_fused_rows(&parts, 0..total, &mut out[..total - 1]).unwrap_err(),
+            KernelError::LengthMismatch {
+                what: FUSED_OUT,
+                left: total - 1,
+                right: total,
+            },
+        );
+
+        // A part whose activation row is the wrong width is caught by the
+        // per-part validation, not silently dotted.
+        let mut bad = parts.clone();
+        bad[1].acts = &acts[5];
+        assert_eq!(
+            gemv_q8_k_fused_rows(&bad, 0..total, &mut out).unwrap_err(),
+            KernelError::BlockCountMismatch {
+                weight_blocks: 2048 / 256,
+                activation_blocks: 768 / 256,
+            },
+        );
+
+        // A non-k-quant part is refused where it sits, by format.
+        let mut wrong = parts.clone();
+        wrong[0].format = QuantFormat::Q8_0;
+        assert_eq!(
+            gemv_q8_k_fused_rows(&wrong, 0..total, &mut out).unwrap_err(),
+            KernelError::UnsupportedFormat {
+                what: "gemv_q8_k_fused_rows",
+                format: QuantFormat::Q8_0,
+            },
+        );
+
+        // No parts at all is a well-defined empty space, not a panic.
+        assert_eq!(fused_out_dim(&[]), 0);
+        gemv_q8_k_fused_rows(&[], 0..0, &mut []).unwrap();
+
+        // An absurd `out_dim` saturates the total instead of wrapping it back
+        // under an earlier part.
+        let huge = [
+            FusedPart {
+                out_dim: usize::MAX,
+                ..parts[0]
+            },
+            parts[1],
+        ];
+        assert_eq!(fused_out_dim(&huge), usize::MAX);
+        let walked: Vec<(usize, Range<usize>)> = fused_row_parts(&huge, 0..4).collect();
+        assert_eq!(walked, vec![(0, 0..4)], "part 1 cannot alias part 0's rows");
     }
 
     /// An empty range in the middle of a real matrix writes nothing and
