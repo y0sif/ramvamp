@@ -16,15 +16,25 @@ published before being re-measured there.
 ## Goal
 
 Run Qwen3-30B-A3B coherently in about 3 GB of RAM on an ordinary Linux
-machine with an NVMe SSD, CPU only. The tok/s floor is **OPEN** and is the
-user's decision, not a silent edit; what is measured against it is in
-"Performance model".
+machine with an NVMe SSD, CPU only. **The tok/s floor is SETTLED as of
+2026-08-08: it is stated per drive, not as one number.** What it resolves to
+on the reference machine is in "Performance model".
 
-v0 success criterion: coherent chat, decode throughput at or above the
-agreed floor (**OPEN**, currently written as >= 3 tok/s and pending the
-user's decision), inside a cgroup with `memory.max=3G`
-and `memory.swap.max=0` (zram counts as swap), cold page cache,
-KL-divergence vs llama.cpp within accepted tolerance on identical weights.
+v0 success criterion: coherent chat, decode throughput **published against the
+drive it was measured on** rather than against a single global floor, inside a
+cgroup with `memory.max=3G` and `memory.swap.max=0` (zram counts as swap),
+cold page cache, KL-divergence vs llama.cpp within accepted tolerance on
+identical weights.
+
+The floor was written as `>= 3 tok/s` from phase 1 to phase 9 and was never
+met at any measured rung. Three phases derived independently that it is not
+reachable on this drive by code alone (phase 5 on bandwidth, phase 7 as a
+stated risk, phase 9 on the post-fusion compute headroom), and the decision
+was escalated three times without being taken. It is taken now, and the
+reason it is stated per drive rather than lowered is that **the device is the
+dominant term and this document already requires every tok/s figure to name
+it** ("Performance model", the drive-dependence rule). A single number
+would contradict that rule at the headline while enforcing it in the body.
 
 What decode actually does on the reference drive is **MEASURED cold** and is
 below that floor: **1.46 to 2.19 tok/s** across five context rungs at the
@@ -1589,8 +1599,8 @@ withdrawn.
   See "How decode's GEMVs fan out, and what phase 9 refuted about them" under
   "Decode loop" for the arms, ranges and artifacts, cold and warm, and for why
   the warm 1.264x and the cold 1.257x are not the same bucket.
-- **Floor for success: OPEN, and it is now measured against rather than
-  derived against.** The criterion is written as 3 tok/s. Every derived
+- **Floor for success: SETTLED 2026-08-08 as a per-drive statement.** The
+  criterion was written as 3 tok/s. Every derived
   I/O-only ceiling this document has carried against it — EXP-008's 2.2-2.7,
   EXP-019's 2.8-3.4 — is **withdrawn**, for the four reasons under the retired
   table above, of which the load-bearing one is that inverting the `expert io`
@@ -1600,15 +1610,36 @@ withdrawn.
   rungs on the fused branch in a different session** (EXP-025). Those are two
   sessions and rule 3 forbids one curve through them; the same binary moved
   0.969x and 0.911x between them (above), so **the floor must be judged against
-  a range of sessions rather than one ladder**. **3 tok/s is not met at any
-  measured rung of either**, and the gap at ctx 512 is 1.57x on EXP-023's
-  ladder and 1.60x on EXP-025's. Nothing here says it is unreachable — the
-  ceiling that once said so is withdrawn too, and phase 9's fused fan-out is
-  now measured cold and is worth 1.011x at 512 and 1.070x at 3,961, which does
-  not close a 1.6x gap — but nothing derived may be offered in place of the
-  number. The decision remains the user's rather than a silent edit, and the
-  three options are unchanged: keep 3, restate the floor per-drive, or lower
-  it. Recorded here as unresolved.
+  a range of sessions rather than one ladder**. 3 tok/s was not met at any
+  measured rung of either, and the gap at ctx 512 was 1.57x on EXP-023's
+  ladder and 1.60x on EXP-025's.
+
+  **What ships instead.** v0 publishes decode throughput as a band attached to
+  the device and the dial that produced it, never as one number:
+
+  | | value |
+  | --- | --- |
+  | Drive | Micron 2400 `MTFDKBA1T0QFM-1BD1AABGB`, **DRAM-less QLC**, Gen4 x4 |
+  | Decode, 11 slots/layer, ctx 64 to 3,961 | **1.46 to 2.19 tok/s** (EXP-023) and **1.43 to 2.16** (EXP-025). MEASURED cold. **Two sessions; rule 3 forbids one curve through them and they are quoted separately for that reason.** |
+  | Decode, 13 slots/layer, ctx 512 | **2.06 tok/s** MEASURED cold (EXP-023) |
+  | Prefill, ctx 512 | **11.25** (EXP-023), **11.07** (EXP-025) MEASURED cold |
+  | `memory.peak` | **2,497 to 2,929 MiB** against the 3,072 MiB ceiling |
+
+  The one-line summary the README carries is **"about 2 tok/s decode on a
+  DRAM-less QLC drive"**. That is the honest reading of two ladders that read
+  **1.91 to 2.19** and **1.87 to 2.16** over ctx 64 to 512, the lengths a chat
+  turn actually uses, and it matches what the author observes running it
+  himself. "About 2" is the only form in which the two sessions may be
+  collapsed; **any specific figure still names its rung, its dial and its
+  session.**
+
+  **A faster drive is expected to move this and the size is UNKNOWN.** No
+  mainstream TLC Gen4 part has been measured here. The arithmetic once offered
+  for it ("~7 tok/s on a 3.5 GB/s drive") is **ESTIMATED on a bandwidth
+  constant nobody has measured on such a drive** and stays withdrawn as a
+  figure; it survives only as a direction. Measuring a second drive is the
+  cheapest remaining experiment in the project and is the one thing that would
+  turn this band into a curve. See `docs/roadmap.md`.
 
 Prior-art anchors, with the qualifiers that were previously missing:
 
