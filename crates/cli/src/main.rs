@@ -454,6 +454,14 @@ struct ChatArgs {
     #[arg(long)]
     seed: Option<u64>,
 
+    /// Draw the terminal harness: the transcript scrolls natively and a
+    /// pinned panel shows the prefill bar, the live rate, context use and the
+    /// expert-cache hit rate. Needs a terminal on stdout and refuses without
+    /// one. Off by default, so a redirected or scripted `chat` behaves exactly
+    /// as it always has.
+    #[arg(long)]
+    tui: bool,
+
     #[command(flatten)]
     prefill: PrefillArgs,
 
@@ -1689,7 +1697,19 @@ fn chat_turn(
 }
 
 /// The chat REPL.
+///
+/// `--tui` is a second front end over the same [`repl`] logic, not a rewrite
+/// of this one: it moves the model onto a worker thread so a pinned panel can
+/// be drawn while a generate call holds `&mut ForwardState` (see
+/// [`tui::run_chat_tui`]). Everything below this branch is the line-oriented
+/// REPL exactly as it was, down to the stdout/stderr split and the SIGINT
+/// machinery, because `scripts/cold_bench.py` and the phase 8/9 sweeps parse
+/// what it writes.
 fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
+    if args.tui {
+        return tui::run_chat_tui(args);
+    }
+
     let model_dir = args.model.as_path();
     let tokenizer = load_tokenizer(model_dir)?;
     let sanitizer = tokenizer.content_sanitizer();

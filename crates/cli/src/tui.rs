@@ -32,13 +32,19 @@
 //!
 //! # Wiring
 //!
-//! This module is presentation only. Nothing in it loads a model, and
-//! [`selftest`] drives the whole surface with fabricated numbers so the panel
-//! can be reviewed in seconds rather than in six minutes. A later change
-//! points the real generate loop at [`Harness`].
+//! [`Harness`], [`panel`] and [`input`] are presentation only: nothing in them
+//! loads a model, and [`selftest`] drives the whole surface with fabricated
+//! numbers so the panel can be reviewed in seconds rather than in six minutes.
+//!
+//! [`session`] is the other half — it owns the model on a worker thread and
+//! feeds this one by message. That split is forced rather than stylistic; see
+//! its module docs.
 
 mod input;
 mod panel;
+mod session;
+
+pub use session::run_chat_tui;
 
 use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
