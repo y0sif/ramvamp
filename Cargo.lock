@@ -1171,6 +1171,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ramvamp-server"
+version = "0.1.0"
+dependencies = [
+ "ramvamp-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "rand"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
