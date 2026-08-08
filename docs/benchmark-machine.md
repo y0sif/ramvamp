@@ -91,19 +91,69 @@ btrfs device stats /home
   instead.
 - `cgroup v2` memory accounting works rootless via
   `systemd-run --user --scope`; `memory.swap.peak` needs kernel 6.5 or newer.
-- Concurrent readers cost roughly 3.5x read amplification, and **per-file
-  bandwidth variance exceeds run-to-run variance** (`layer_00` 1,237 MB/s vs
-  `layer_20` 1,812 MB/s, a 1.46x spread), so benchmarks must pin the same file
-  set and run on a quiet machine. That advice stands and the spread is
-  reproducible: EXP-019 measures the same two files at 1.58 and 2.27 GB/s, a
-  1.44x spread, far above its 1.4% run-to-run median.
+- Concurrent readers cost roughly 3.5x read amplification, and **benchmarks
+  must pin the same file set and run on a quiet machine**. That advice stands
+  and is the durable part of this bullet. What it used to rest on does not.
 
-  **It is not fragmentation.** This file used to attribute the spread to
-  fragmentation; EXP-019 eliminates that hypothesis. The two files have
-  byte-identical extent geometry, 398 extents each, mean 984,027 B, median
-  884,736 B, and zero extents physically adjacent to their successor. What is
-  left is physical placement on the drive or QLC-internal behaviour such as
-  SLC-cache residency or block wear, none of which a filesystem-level probe
-  can see. Consequence for benchmarking: an aggregate bandwidth figure that
-  hides this spread is worse than no aggregate, and any run that changes which
-  files it touches has changed its own baseline.
+  **The per-file spread is real in any one session and is not stable across
+  sessions, which is the bigger caveat.** Three sessions have measured the same
+  four expert files at decode's own read geometry (K=1, one expert blob,
+  random order, QD 8), all cold, all in-cgroup, all hygiene PASS, and they
+  disagree by more than 2x on a quantity each reported as a property of a file:
+
+  | session | `layer_00` | `layer_06` | `layer_20` | `layer_21` | spread |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | EXP-019, 2026-08-04 | 1.594 | 1.627 | 1.688 | 1.550 | 1.09x |
+  | EXP-023, 2026-08-06 | 1.568 | 1.654 | 3.455 | 3.469 | **2.21x** |
+  | EXP-024, 2026-08-07 | 1.672 | 1.607 | 1.658 | 1.601 | **1.04x** |
+
+  All figures MEASURED, cold, GB/s = 10^9 B/s, medians of three scored runs.
+  **These are three sessions and rule 3 forbids drawing one curve through
+  them**; the table exists to show that they disagree, not to trend them.
+  Consequences for benchmarking, in order of importance: **pin the same file
+  set**, because a run that changes which files it touches has changed its own
+  baseline; **an aggregate that hides a spread is worse than no aggregate**;
+  and **never quote a per-file spread as a fact about this drive** — it is a
+  fact about the session that measured it, and it must be re-measured inside
+  any entry that leans on it.
+
+  **Extent geometry is ruled out. Physical placement is now measured, and it is
+  a covariate rather than a mechanism.** This file used to attribute the spread
+  to fragmentation, then to say flatly "it is not fragmentation" on the
+  strength of geometry alone. The geometry half stands: `layer_00` and
+  `layer_20` have byte-identical extent geometry, 398 extents each, mean
+  984,027 B, median 884,736 B, zero extents physically adjacent to their
+  successor, zero compressed extents (EXP-019, EXP-023). But the probe that
+  supported that statement only ever computed extent count, extent sizes and
+  successor adjacency — it never computed physical span or clustering — so it
+  could see *fragmentation* and could not see *placement*. EXP-024 added the
+  missing statistics and measured them over the whole population:
+
+  - All 48 expert files at the same cell read **1.565 to 1.694 GB/s, median
+    1.633, a 1.082x spread** (MEASURED cold). Most of even that is blob size:
+    the 24 layers at a 3,059,712 B expert stride median 1.671 GB/s and the 24
+    at 2,654,208 B median 1.610, so the residual spread inside a stride class
+    is 1.045x and 1.047x.
+  - **Pearson r between bandwidth and largest-region byte fraction is
+    -0.043** over those 48 files. Bandwidth correlates with block size (r =
+    0.835) and with dispersion not at all.
+  - `layer_00` is the **only** physically dispersed file of the 48 — 26
+    regions, 23.0% of its bytes in its largest, 72.46 GB median inter-extent
+    seek — against **43 of 48 at >= 99% of bytes in one region**. It is
+    **not** the slowest file: rank 17 of 48. The 99.6%-clustered `layer_06`,
+    with a 0.11 GB median seek, ranks 16 — indistinguishable from `layer_00`
+    in that run (1.6165 against 1.6169) and clearly slower in the four-file
+    arm (1.607 against 1.672).
+  - Sixteen 2 MiB windows **inside `layer_00`**, dense against scattered, are
+    **1.161x** apart (1.093 vs 0.941 GB/s medians, ranges 1.024-1.284 and
+    0.823-1.067) against a **7,493x** median physical-span contrast.
+
+  Dispersion is reported as **btrfs LOGICAL bytenr from `filefrag`, not device
+  LBA**; resolving it needs `sudo btrfs inspect-internal dump-tree -t 3
+  /dev/nvme0n1p2`, which the probe never runs. What is left as the mechanism is
+  drive-internal and invisible to any filesystem-level probe — pSLC residency
+  or FTL state on this DRAM-less QLC part — and it is not addressable from the
+  runtime. Vendor SMART would be the next evidence and is unavailable here:
+  `nvme-cli` and `smartmontools` are not installed on this machine. See EXP-024
+  for the commands, and for why a "fix" that only holds while data sits in
+  pSLC must never be published as a runtime improvement.
