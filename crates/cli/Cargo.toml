@@ -23,3 +23,10 @@ clap = { workspace = true }
 # dependency (see the root Cargo.toml), and the alternatives (ctrlc,
 # signal-hook) would be.
 libc = { workspace = true }
+# `tui` draws the pinned status panel. Default features are off on purpose:
+# the only backend we want is crossterm, and `scrolling-regions` is
+# deliberately *not* enabled because it only changes `Terminal::insert_before`,
+# which this crate never calls. crossterm itself is not listed here — it comes
+# in through ratatui and is used via the `ratatui::crossterm` re-export, so the
+# tree cannot end up with two versions of it.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }

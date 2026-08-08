@@ -50,6 +50,7 @@ use ramvamp_core::model::{
 use ramvamp_core::tokenizer::{ChatMessage, Role, RvmpTokenizer};
 
 mod repl;
+mod tui;
 
 use repl::{
     CONTEXT_CAP, PhaseStats, ReplInput, Transcript, TurnCodec, TurnPlan, parse_repl_input,
@@ -491,6 +492,14 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
+
+    // Hidden entry point for the terminal harness, ahead of argument parsing
+    // so it needs no model and no subcommand: `RAMVAMP_TUI_SELFTEST=1
+    // ramvamp` draws the pinned panel over fabricated prefill and decode.
+    // See `tui::selftest`.
+    if std::env::var_os("RAMVAMP_TUI_SELFTEST").is_some_and(|value| value == "1") {
+        return tui::selftest();
+    }
 
     match Cli::parse().command {
         Command::Tokenize(args) => tokenize(&args.model, args.prompt, args.messages_file),
