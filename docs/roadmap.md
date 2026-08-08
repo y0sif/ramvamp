@@ -73,9 +73,39 @@ on runtime work.
 
 ## Next: the shipping surface (v0 exit)
 
-The runtime works and nothing consumes it but a REPL. TurboFieldfare ships a
-CLI, an installer, a Mac app and a loopback OpenAI-compatible server; ramvamp
-ships a CLI and an installer. The gap is the server.
+**SETTLED 2026-08-08: the harness first, the server second.** Both get built;
+this is an ordering, not a choice between them.
+
+The reason is that a Chat Completions request is **stateless**, so a server
+re-prefills the whole conversation every turn. At the measured 11.25 tok/s
+prefill that is ~44 s for a 500-token history, ~3 min at 2,000 and ~6 min at
+4,000, before a single token comes back. **KV prefix caching is therefore a
+prerequisite for the server, not a follow-up to it**, and it is the larger
+piece of work. The harness has no such dependency: the REPL already retains KV
+across turns through `generate_from(.., start_position, ..)`.
+
+**This reverses a recorded stance and does so deliberately.**
+`docs/handoff-phase8.md` records the REPL as "a development affordance, and
+the project's direction is to drive ramvamp from another harness rather than
+to build one here." That was right when the runtime was unfinished and the
+REPL was a means to an end. It is wrong now, for one measured reason: **a 4K
+prompt is about six minutes of total silence before the first character**,
+because prefill emits nothing and the timing line only lands at the end. The
+genesis session identified exactly this failure mode when it cut thinking mode
+("at our 4-8 tok/s, a 1,000-token think block is 2-4 minutes of silence before
+the first useful word"). The harness is not a nicer REPL. It is the thing that
+makes the runtime's slowness legible, and that is a v0 concern.
+
+Scope discipline: the harness is the **local operator console**, not the
+integration surface. `ramvamp-server` remains the answer for OpenCode and
+anything OpenAI-speaking, and `generate` and `logits` keep their exact stdio
+because every rule-2 measurement in the project parses them.
+
+### The server, when its turn comes
+
+TurboFieldfare ships a CLI, an installer, a Mac app and a loopback
+OpenAI-compatible server; ramvamp ships a CLI and an installer. The gap is the
+server.
 
 `ramvamp-server` was recorded as post-v0 direction in the genesis session and
 is the single component that unlocks every integration at once:
@@ -151,8 +181,10 @@ for four consecutive phases.
 | Decision | Raised | Status |
 | --- | --- | --- |
 | The tok/s floor | Phase 5, 7, 9 | **SETTLED 2026-08-08**, per drive |
-| Shipping surface: server, richer CLI, or both | Genesis, reopened 2026-08-08 | **open** |
-| Merge `feat/decode-compute`? | Phase 9 | **held**, EXP-025 KEEP, gates green. Its stated blocker, the row below, is cleared |
+| Shipping surface: server, richer CLI, or both | Genesis, reopened 2026-08-08 | **SETTLED 2026-08-08: harness first, server second.** See below |
+| Merge `feat/decode-compute`? | Phase 9 | **SETTLED 2026-08-08, merged** at `2f52545`, gate re-verified on `main` |
+| Core API additions for TUI progress | Phase 10 | **SETTLED 2026-08-08, approved.** Per-chunk prefill callback plus a stats snapshot passed into `on_token` |
+| `ratatui` as a CLI dependency | Phase 10 | **SETTLED 2026-08-08, approved.** +31 crates against 137 |
 | Keep or drop the `attn_q` + `attn_v` fusion | Phase 9, recommended dropped 3x | **SETTLED 2026-08-08, dropped.** The expert-phase fusion stays |
 | Reopen progressive miss execution | Phase 8 | **open** |
 | Move the slot dial to 12 or 13 | Phase 8 ("lets hold it for now") | **held**, needs a 13-slot 4K arm |
