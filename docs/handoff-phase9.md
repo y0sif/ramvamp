@@ -1,7 +1,7 @@
 # Handoff: phase 9 to phase 10
 
-Branch `feat/decode-compute`, 11 commits on `8e1eee8`. **Not merged, and not
-blocked either** — the cold rule-2 sweep ran and is recorded as EXP-025. The
+Branch `feat/decode-compute`, on `8e1eee8`. **Not merged, and not
+blocked either**: the cold rule-2 sweep ran and is recorded as EXP-025. The
 branch is parked by the author's decision, to be landed or revisited later.
 Everything below is measured; nothing is pending.
 
@@ -37,10 +37,13 @@ zero, so `own` becomes the whole arithmetic:
 `70cf304` fuses matrices into one fan-out per expert phase: all of a phase's
 gate and up together, all of its down together, and attn_q with attn_v. A
 layer goes from 28 fan-outs to 5 when its plan is all hits or all misses and 7
-when it splits; a token from 1,345 to between 241 and 337. It is bit-safe
-because a row of a fused space still computes one whole-row dot on the same
-bytes, so the pool's tiling of the fused space restricts to a tiling of each
-matrix's own rows.
+when it splits; a token from 1,345 to between 241 and 337. (**The attn_q with
+attn_v half was dropped on 2026-08-08**, item 3 below. As it now stands a layer
+goes from 28 to 6 and 8, and a token to between 289 and 385, DERIVED. Every
+measured figure in this handoff describes the binary that was measured, which
+still had it.) It is bit-safe because a row of a fused space still computes one
+whole-row dot on the same bytes, so the pool's tiling of the fused space
+restricts to a tiling of each matrix's own rows.
 
 Measured warm, ctx 512, 3 runs each, pooled GEMV bucket, medians with ranges:
 
@@ -51,7 +54,9 @@ Measured warm, ctx 512, 3 runs each, pooled GEMV bucket, medians with ranges:
 
 **1.264x**, and by bucket: experts 9.94 to 7.20 (1.381x), projections 3.52 to
 3.21 (1.097x), lm_head 1.05 to 0.94 on **unchanged code** (1.117x, which is
-the noise floor for a bucket that size).
+the noise floor for a bucket that size). That projections row, 1.097x under a
+1.117x floor, is the reading that eventually got the attn_q with attn_v half
+dropped (item 3).
 
 **It held cold (EXP-025).** The decode GEMV bucket, medians of 3 with ranges,
 paired in one session against the banked `8e1eee8` binary:
@@ -60,7 +65,7 @@ paired in one session against the banked `8e1eee8` binary:
     ctx 3961   ref 15.39 (14.71-15.72)  ->  fused 13.29 (13.18-13.31)   1.158x
 
 Ranges disjoint at both rungs. Note the warm 1.264x and the cold 1.257x are
-close but are **not the same bucket** — warm was the `own + wait` pooled GEMV
+close but are **not the same bucket**: warm was the `own + wait` pooled GEMV
 from the sub-split, cold is `expert compute + projections` from the coarse
 split. Do not treat either as confirming the other's denominator.
 
@@ -178,13 +183,38 @@ token, and it **grew** when compute got faster.
    change as phase 9's `own`/`wait` instrument, which changed the plan twice.
    Until it exists, nobody can say how much of that 275 ms is reducible.
 
-3. **Decide the `attn_q` + `attn_v` fusion.** It is 1.097x against a 1.117x
-   noise floor, it leaves the last shard ~24% long (4096 q4_k rows then 512
-   q6_k rows on an even split), and it contributes 48 of the ~1,100 fan-outs a
-   token that `70cf304` removes. Both reviewers flagged it independently. Drop
-   it, or keep it and label it unattributable in EXP-025. It was deliberately
-   fenced off from every fix lane, so it is clean either way. `forward.rs`
-   around the `qv` buffer.
+3. ~~**Decide the `attn_q` + `attn_v` fusion.**~~ **DECIDED 2026-08-08:
+   dropped.** The half is removed from `forward.rs`; the expert-phase fusion,
+   which is what carries the cold 1.257x on decode's GEMV bucket, is untouched
+   and stays. Read that 1.257x as a figure for **the binary EXP-025 measured**,
+   which still had both halves: the shipped binary's GEMV bucket has not been
+   measured. EXP-025 attributes the gain entirely to `expert compute` (1.347x
+   at 512, disjoint) and records `projections` as not separating at either
+   rung, so no part of it is expected to have gone with the half, but that is
+   an inference and not a measurement. It was 1.097x against a 1.117x noise floor warm, its bucket did
+   not separate cold at either rung (1.134x at ctx 512 and 1.025x at 3,961,
+   ranges overlapping at both, both smaller than the 1.164-1.176x the
+   *unchanged* attention bucket moved by in the same runs, EXP-025 Note 3), and
+   it contributed 48 of the ~1,012 fan-outs a token that `70cf304` removes,
+   about 4.7%. Both reviewers flagged it independently. It had been deliberately
+   fenced off from every fix lane, so the removal was clean: gates and numerics
+   green, `bitident.py` PASS 8/8 byte-identical to the phase-4 baseline and
+   gate 3 PASS at mean KL 1.039e-02. **No performance claim attaches to the
+   removal**: its bucket never separated cold, so no change is expected and
+   none has been measured. Recorded in EXP-025 Note 3 (amendment),
+   `docs/architecture.md` and `docs/roadmap.md`.
+
+   **The shard-split figure this item used to quote was ~24% and the number to
+   quote is ~30%** (DERIVED, and it is the figure the now-deleted code comment
+   in `forward.rs` carried). Both come from the same imbalance and differ only
+   in denominator. On the 24 layers where `attn_v` is Q6_K, the fused space is
+   4,096 Q4_K rows then 512 Q6_K rows, and at `in_dim` 2048 a Q6_K row is
+   1,680 B against a Q4_K row's 1,152 B. An even six-way split by row is 768
+   rows a shard, so the last shard holds 256 Q4_K rows plus all 512 Q6_K ones:
+   1,155,072 B against 884,736 B in each of the other five, **1.306x**, about
+   30% long. Against the mean shard (929,792 B) the same imbalance reads
+   1.242x, which is where ~24% came from. A barrier waits on the slowest shard
+   against the others, so ~30% is the figure that describes the cost.
 
 4. **Why are workers slower per row than the submitter?** The most interesting
    open problem, and the one most likely to eat a phase for nothing, so
@@ -194,7 +224,9 @@ token, and it **grew** when compute got faster.
    nobody has tested: memory-level parallelism per core, software prefetch,
    the access pattern into q4_k super-blocks, effects of the hybrid part, or
    the submitter simply starting earlier. A cost-weighted `shard_range` is a
-   separate, smaller lever and would also fix item 3's imbalance.
+   separate, smaller lever; it used to have item 3's mixed-format imbalance as
+   a second motivation and no longer does, since dropping that half leaves no
+   fused space that mixes quant formats.
 
 5. **Attention at 4K** is 232 ms of a 712 ms token, 33%, and untouched. It is
    6% at 512, so this only buys the 4K story. Online/flash rescaled softmax is
@@ -296,8 +328,8 @@ Phase 8's eleven still apply. These are new or sharpened.
 15. **Read the per-source reclaim counters, never the bare `pgsteal`.** Every
     reclaim event in EXP-025 is `pgsteal_khugepaged` with `kswapd` and
     `direct` at zero, which is the huge-page daemon and not memory pressure.
-    `pgsteal 147` recurs across two arms, the same shape as GOTCHA 11's 2,817
-    — which was `kswapd`, so this does not explain it, but it does suggest a
+    `pgsteal 147` recurs across two arms, the same shape as GOTCHA 11's 2,817,
+    which was `kswapd`, so this does not explain it, but it does suggest a
     deterministic daemon is a likelier story than coincidence.
 
 ## STATE

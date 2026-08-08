@@ -61,8 +61,8 @@
 //! That argument never said a fan-out may cover only one matrix, and phase 9
 //! stopped assuming it did. A phase's routed experts run their gate and up
 //! projections as **one** job over the concatenated row space, and their down
-//! projections as one more; `attn_q` and `attn_v` share a job the same way.
-//! A partition of a concatenated row space restricts to a partition of every
+//! projections as one more. A partition of a concatenated row space restricts
+//! to a partition of every
 //! constituent matrix's own rows, so each row is still the same whole-row dot
 //! on the same bytes, and the fused form is bit-identical to the sequence it
 //! replaces (see [`run_expert_window`] and `kernels/gemv.rs`).
@@ -510,20 +510,12 @@ pub struct ForwardState {
     /// Q8_0 quantization of a `[hidden]` vector (`hidden / 32` blocks),
     /// consumed by the q8_0 `attn_k` gemv.
     acts_q8_0_hidden: Vec<BlockQ8_0>,
-    /// Query and value projection outputs, concatenated: `[n_heads *
-    /// head_dim]` then `[n_kv_heads * head_dim]`.
-    ///
-    /// One buffer because the two are a **single** fused fan-out. They read
-    /// the same Q8_K activation row and differ only in weight matrix, so
-    /// their output rows concatenate into one row space and the pool writes
-    /// both without a copy; the layer loop then splits the buffer for the
-    /// per-head norms, RoPE and the KV append. `attn_k` cannot join them —
-    /// it is the one projection against Q8_0 activations — so it keeps its
-    /// own buffer and its own fan-out. Costs no bytes: the two spans are the
-    /// two old buffers, adjacent.
-    qv: Vec<f32>,
+    /// Query projection output (`[n_heads * head_dim]`).
+    q: Vec<f32>,
     /// Key projection output (`[n_kv_heads * head_dim]`).
     k: Vec<f32>,
+    /// Value projection output (`[n_kv_heads * head_dim]`).
+    v: Vec<f32>,
     /// Attention context output (`[n_heads * head_dim]`).
     attn_out: Vec<f32>,
     /// Output projection result (`[hidden]`).
@@ -735,8 +727,9 @@ impl ForwardState {
             acts_q8k_moe: vec![BlockQ8K::default(); window * (moe / QK_K)],
             acts_q8k_attn: vec![BlockQ8K::default(); q_dim / QK_K],
             acts_q8_0_hidden: vec![BlockQ8_0::default(); hidden / QK8_0],
-            qv: vec![0.0; q_dim + kv_dim],
+            q: vec![0.0; q_dim],
             k: vec![0.0; kv_dim],
+            v: vec![0.0; kv_dim],
             attn_out: vec![0.0; q_dim],
             o_proj: vec![0.0; hidden],
             router_logits: vec![0.0; n_experts],
@@ -1125,8 +1118,8 @@ pub(super) fn taken<E>(slot: Mutex<Option<(usize, E)>>) -> Result<(), E> {
 /// merely printable side by side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GemvSite {
-    /// `attn_q` and `attn_v` fused, `attn_k`, `attn_output`: **three**
-    /// fan-outs a layer, against resident (mmap'd) weights.
+    /// `attn_q`, `attn_k`, `attn_v`, `attn_output`: **four** fan-outs a
+    /// layer, against resident (mmap'd) weights.
     Projections,
     /// gate, up and down for every routed expert, fused per phase: **two**
     /// fan-outs — a gate/up job and a down job — per window of each of the
@@ -1299,20 +1292,19 @@ thread_local! {
 ///
 /// **Three clock reads per pooled GEMV**, against [`PhaseClock`]'s one per
 /// region boundary. Per decoded token at the v0 pin (48 layers, `top_k` 8):
-/// `48 * 3 * 3` = 432 for the projections (`attn_q` and `attn_v` share a
-/// fan-out), at most `48 * 4 * 3` = 576 for the experts (two fused fan-outs
-/// for each non-empty phase, and a layer has one or two), 3 for `lm_head` and
-/// `48 * 2` = 96 for the serial router, so **1,107 reads a token at worst and
-/// 819 when every layer's experts are all hits or all misses** — derived by
-/// counting the sites, not measured. At the ~27 ns `Instant::now()` measures
-/// on this machine's vDSO (the figure [`forward_token_traced`] already quotes)
-/// that is ~30 µs against the ~532 ms token EXP-023 measured: 0.006% of it,
-/// and an order below the run-to-run noise of anything the split is read
-/// against.
+/// `48 * 4 * 3` = 576 for the projections, at most `48 * 4 * 3` = 576 for the
+/// experts (two fused fan-outs for each non-empty phase, and a layer has one
+/// or two), 3 for `lm_head` and `48 * 2` = 96 for the serial router, so
+/// **1,251 reads a token at worst and 963 when every layer's experts are all
+/// hits or all misses** — derived by counting the sites, not measured. At the
+/// ~27 ns `Instant::now()` measures on this machine's vDSO (the figure
+/// [`forward_token_traced`] already quotes) that is ~34 µs against the ~532 ms
+/// token EXP-023 measured: 0.006% of it, and an order below the run-to-run
+/// noise of anything the split is read against.
 ///
-/// It was 4,131 reads before phase 9 fused the fan-outs (`48 * 4 * 3` plus
-/// `48 * 8 * 3 * 3`), against a design budget of 4,500. The instrument did not
-/// get cheaper; there are simply a quarter as many jobs to charge.
+/// It was 4,131 reads before phase 9 fused the expert fan-outs (`48 * 4 * 3`
+/// plus `48 * 8 * 3 * 3`), against a design budget of 4,500. The instrument
+/// did not get cheaper; there are simply far fewer jobs to charge.
 struct GemvClock<'a> {
     /// `None` when this pass charges nowhere.
     split: Option<&'a mut GemvSplit>,
@@ -2356,8 +2348,9 @@ pub fn forward_token_traced<'s>(
         acts_q8k_moe,
         acts_q8k_attn,
         acts_q8_0_hidden,
-        qv,
+        q,
         k,
+        v,
         attn_out,
         o_proj,
         router_logits,
@@ -2412,8 +2405,8 @@ pub fn forward_token_traced<'s>(
     //
     // The GEMV sub-split rides the same choice one level down: armed for
     // decode, disarmed for the token-major prefill, so a prompt's fan-outs
-    // never land in a decode's `own`/`wait`. Its own cost is a further ~1,107
-    // clock reads (~30 µs) a decoded token and zero on the prefill path; see
+    // never land in a decode's `own`/`wait`. Its own cost is a further ~1,251
+    // clock reads (~34 µs) a decoded token and zero on the prefill path; see
     // [`GemvClock`] for the count and the arithmetic behind it.
     let (mut clock, mut gemv) = if *prefill_charging {
         (PhaseClock::new(prefill_timing, true), GemvClock::disarmed())
@@ -2446,44 +2439,18 @@ pub fn forward_token_traced<'s>(
         quantize_row_q8_0(normed, acts_q8_0_hidden)?;
         clock.charge(Phase::Elementwise);
 
-        // `attn_q` and `attn_v` are one fan-out: both are k-quant matrices
-        // over the *same* Q8_K activation row, so their output rows are one
-        // fused row space and `qv` is that space's buffer. `attn_k` is the
-        // one projection against Q8_0 activations and keeps its own job.
-        //
-        // The two formats need not match — `attn_v` is Q6_K in some layers
-        // while `attn_q` is Q4_K — and an even row split is then uneven in
-        // *time*, since a Q6_K row is 1680 B against Q4_K's 1152 B at
-        // `in_dim` 2048. Only the last shard's tail crosses the boundary
-        // (4096 Q4_K rows then 512 Q6_K ones at the v0 pin), and one fan-out
-        // whose slowest shard is ~30% long still beats two whose set-up costs
-        // ~27 µs each (phase 9's measurement; `run_expert_window` carries its
-        // derivation). Noted rather than fixed: a cost-weighted split is a
-        // change to `shard_range`, which is not this seam.
         let opened = gemv.open();
-        pool_gemv_q8_k_fused(
+        pool_gemv_q8_k_stamped(
             pool,
-            &[
-                FusedPart {
-                    format: lw.attn_q.format,
-                    weight: lw.attn_q.bytes,
-                    in_dim: hidden,
-                    out_dim: q_dim,
-                    acts: acts_q8k_hidden,
-                },
-                FusedPart {
-                    format: lw.attn_v.format,
-                    weight: lw.attn_v.bytes,
-                    in_dim: hidden,
-                    out_dim: kv_dim,
-                    acts: acts_q8k_hidden,
-                },
-            ],
-            qv,
+            lw.attn_q.format,
+            lw.attn_q.bytes,
+            hidden,
+            q_dim,
+            acts_q8k_hidden,
+            q,
             opened.is_some(),
         )?;
         gemv.close(GemvSite::Projections, opened);
-        let (q, v) = qv.split_at_mut(q_dim);
         let opened = gemv.open();
         pool_gemv_q8_0(
             pool,
@@ -2492,6 +2459,18 @@ pub fn forward_token_traced<'s>(
             kv_dim,
             acts_q8_0_hidden,
             k,
+            opened.is_some(),
+        )?;
+        gemv.close(GemvSite::Projections, opened);
+        let opened = gemv.open();
+        pool_gemv_q8_k_stamped(
+            pool,
+            lw.attn_v.format,
+            lw.attn_v.bytes,
+            hidden,
+            kv_dim,
+            acts_q8k_hidden,
+            v,
             opened.is_some(),
         )?;
         gemv.close(GemvSite::Projections, opened);
@@ -4083,10 +4062,10 @@ mod tests {
     /// Four directions, all checked over a real multi-token decode:
     ///
     /// - **Counts.** Every fan-out is charged exactly once, to the bucket the
-    ///   geometry says: `3` projections a layer (`attn_q` and `attn_v` fused,
-    ///   `attn_k`, `attn_output`), a serial router matvec a layer, one
-    ///   `lm_head` a token. A GEMV that slipped out of the sub-split, or one
-    ///   charged twice, moves one of these exact numbers.
+    ///   geometry says: `4` projections a layer (`attn_q`, `attn_k`, `attn_v`,
+    ///   `attn_output`), a serial router matvec a layer, one `lm_head` a
+    ///   token. A GEMV that slipped out of the sub-split, or one charged
+    ///   twice, moves one of these exact numbers.
     ///
     ///   The expert count is the one that is not a constant any more: phase 9
     ///   fuses a phase's experts into a gate/up job and a down job, so a layer
@@ -4135,8 +4114,8 @@ mod tests {
 
         assert_eq!(
             gemv_scatters(&split, "projections"),
-            3 * layers * tokens,
-            "attn_q+attn_v fused, attn_k, attn_output, once a layer: {split:?}"
+            4 * layers * tokens,
+            "attn_q, attn_k, attn_v, attn_output, each once a layer: {split:?}"
         );
         let experts = gemv_scatters(&split, "experts");
         assert_eq!(

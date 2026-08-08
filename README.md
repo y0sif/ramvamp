@@ -10,16 +10,16 @@
 > llama.cpp on identical weights. What is left before this goes public is a
 > shipping surface, not a working runtime.
 
-Measured on the reference machine — Intel Core Ultra 9 185H, CPU only, 16 GB
-RAM, **Micron 2400 DRAM-less QLC** NVMe — running Qwen3-30B-A3B Q4_K_M with a
+Measured on the reference machine (Intel Core Ultra 9 185H, CPU only, 16 GB
+RAM, **Micron 2400 DRAM-less QLC** NVMe) running Qwen3-30B-A3B Q4_K_M with a
 cold page cache inside `memory.max=3G` and `memory.swap.max=0`:
 
 | | measured |
 | --- | --- |
-| Decode | **about 2 tok/s** — 1.46 to 2.19 over ctx 64–3,961 in one session, 1.43 to 2.16 over the same rungs in another |
+| Decode | **about 2 tok/s**: 1.46 to 2.19 over ctx 64-3,961 in one session, 1.43 to 2.16 over the same rungs in another |
 | Prefill | **11.25 tok/s** at ctx 512 |
-| Peak RAM | **2.5–2.9 GiB** of a 3.0 GiB ceiling |
-| Model on disk | 17.35 GiB — a **~6x** memory saving |
+| Peak RAM | **2.5-2.9 GiB** of a 3.0 GiB ceiling |
+| Model on disk | 17.35 GiB, a **~6x** memory saving |
 | Fidelity | mean full-vocab KL **1.04e-2** vs llama.cpp, top-1 agreement 8/8 |
 
 Those are two separate sessions and deliberately not merged into one curve:
@@ -27,9 +27,9 @@ re-running the *byte-identical* binary a day later read 3.1% slower at ctx 512
 and 8.9% slower at 3,961. On a DRAM-less QLC part, a decode figure describes
 its session as well as its device.
 
-**Throughput is stated per drive on purpose.** Decode is I/O-bound — expert
-reads are about half of every token — and this reference part is DRAM-less
-QLC measuring 1.54–2.37 GB/s. A mainstream TLC Gen4 drive should do
+**Throughput is stated per drive on purpose.** Decode is I/O-bound (expert
+reads are about half of every token) and this reference part is DRAM-less
+QLC measuring 1.54-2.37 GB/s. A mainstream TLC Gen4 drive should do
 materially better; by how much is unmeasured, and this project does not
 publish numbers it has not measured. Every figure above comes from a cold run
 inside the benchmark cgroup; the method and the full experiment record are in

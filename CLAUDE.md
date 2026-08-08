@@ -4,15 +4,15 @@ Rust runtime for streaming fine-grained MoE experts from NVMe: 26-30B models
 in ~3 GB RAM, CPU-first (AVX2), Linux-first (io_uring). v0 model:
 Qwen3-30B-A3B.
 
-**Read `docs/roadmap.md` first** — it is the plan of record: what v0 needs,
-what is done, and which decisions are open. Handoff docs describe one phase to
-the next and go stale; when they disagree with the roadmap, the roadmap wins.
+**Read `docs/roadmap.md` first**: it is the plan of record, covering what v0
+needs, what is done, and which decisions are open. Handoff docs describe one
+phase to the next and go stale; when they disagree with the roadmap, it wins.
 Then `docs/architecture.md` before touching the runtime, and
 `docs/landscape.md` for why design decisions were made.
 
 Every phase updates `docs/roadmap.md`. A phase that has not updated it has not
-finished. If work hits a question only the author can answer, **stop and ask** —
-do not default to gathering more measurements. Four consecutive phases did
+finished. If work hits a question only the author can answer, **stop and ask**.
+Do not default to gathering more measurements: four consecutive phases did
 that, and the open decisions are listed in the roadmap because of it.
 
 ## Commands
