@@ -2118,18 +2118,36 @@ fn run_logits(args: LogitsArgs) -> anyhow::Result<()> {
         .iter()
         .map(|&id| {
             let logit = logits[id as usize];
+            // Keys are written in alphabetical order deliberately; see the note
+            // on `out` below.
             serde_json::json!({
-                "token_id": id,
                 "logit": logit,
                 "logprob": f64::from(logit) - lse,
                 "text": tokenizer.decode(&[id], false).unwrap_or_default(),
+                "token_id": id,
             })
         })
         .collect();
+    // **Key order here is load-bearing and alphabetical on purpose.**
+    //
+    // `scripts/bitident.py` SHA-256s this command's whole stdout and compares
+    // it against a baseline captured at phase 4. That baseline encodes
+    // alphabetical order, which back then was not a choice: `serde_json::Map`
+    // was a `BTreeMap` and sorted every key on the way out.
+    //
+    // Enabling `serde_json`'s `preserve_order` feature (needed so tool
+    // definitions render in the client's key order, which is what the Qwen
+    // template's `tojson` does) switched `Map` to an `IndexMap`, so these
+    // literals are now emitted in the order they are written. Writing them
+    // alphabetically keeps the bytes identical and keeps the phase-4 baseline
+    // a real gate: re-capturing it against today's binary would replace an
+    // independent reference with an assertion that today equals today.
+    //
+    // `the_logits_dump_keeps_the_key_order_bitident_baselined` pins this.
     let out = serde_json::json!({
         "prompt": prompt,
-        "prompt_tokens": ids.len(),
         "prompt_ids": ids,
+        "prompt_tokens": ids.len(),
         "top": top_entries,
     });
     println!("{}", serde_json::to_string_pretty(&out)?);
@@ -3336,6 +3354,58 @@ mod tests {
     // -----------------------------------------------------------------
     // the stats footer
     // -----------------------------------------------------------------
+
+    /// `scripts/bitident.py` SHA-256s the whole stdout of `logits` and
+    /// compares it to a baseline captured at phase 4, so the *key order* of
+    /// that JSON is part of the contract, not a style choice.
+    ///
+    /// It used to be enforced by accident: `serde_json::Map` was a `BTreeMap`
+    /// and sorted every key. Turning on `preserve_order`, which the Qwen
+    /// template's `tojson` needs so tool definitions keep the client's key
+    /// order, made emission order literal instead, and every stored baseline
+    /// went `FAIL 8/8 (formatting)` at once. The fix was to write the literals
+    /// alphabetically; this test is what stops that drifting back.
+    #[test]
+    fn the_logits_dump_keeps_the_key_order_bitident_baselined() {
+        let entry = serde_json::json!({
+            "logit": 1.5_f32,
+            "logprob": -0.5_f64,
+            "text": "x",
+            "token_id": 7_u32,
+        });
+        let out = serde_json::json!({
+            "prompt": "p",
+            "prompt_ids": [1, 2],
+            "prompt_tokens": 2,
+            "top": [entry],
+        });
+        let rendered = serde_json::to_string_pretty(&out).expect("serializes");
+
+        // Order, not just presence: find each key and check it comes after the
+        // one before it.
+        for keys in [
+            [
+                "\"prompt\"",
+                "\"prompt_ids\"",
+                "\"prompt_tokens\"",
+                "\"top\"",
+            ],
+            ["\"logit\"", "\"logprob\"", "\"text\"", "\"token_id\""],
+        ] {
+            let mut last = 0;
+            for key in keys {
+                let at = rendered
+                    .find(key)
+                    .unwrap_or_else(|| panic!("{key} missing from {rendered}"));
+                assert!(
+                    at > last,
+                    "{key} is out of order in {rendered}; bitident's phase-4 \
+                     baseline hashes these bytes"
+                );
+                last = at;
+            }
+        }
+    }
 
     /// The timing line is a contract with `scripts/cold_bench.py`, whose
     /// `TIMING_RE` pulls six numbers out of a cold run's stderr. Reword it

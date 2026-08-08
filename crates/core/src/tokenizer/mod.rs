@@ -27,6 +27,7 @@
 mod chat;
 mod config;
 mod error;
+pub mod pyjson;
 
 use std::fmt;
 use std::fs;
