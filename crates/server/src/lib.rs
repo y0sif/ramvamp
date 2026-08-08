@@ -16,6 +16,9 @@
 //!   `[DONE]` sentinel.
 //! * [`prompt`] — mapping messages onto the vendored ChatML renderer, through
 //!   the *sanitizing* encoder because the input is untrusted.
+//! * [`toolcall`] — the return leg: recovering `tool_calls` from the
+//!   `<tool_call>` text the model writes, preserving the argument bytes so the
+//!   client's echo of them re-renders into the block the model emitted.
 //! * [`error`] — one typed error per refusal, each knowing its status, body and
 //!   headers.
 //!
@@ -57,6 +60,7 @@ pub mod prompt;
 pub mod request;
 pub mod response;
 pub mod sse;
+pub mod toolcall;
 pub mod wire;
 
 pub use engine::{
@@ -72,9 +76,10 @@ pub use request::{
 };
 pub use response::{
     ChatCompletion, ChatCompletionChunk, ChunkBuilder, Delta, FinishReason, Health, ModelList,
-    Usage,
+    ResponseMessage, Usage,
 };
 pub use sse::{DONE_SENTINEL, sse_data, sse_done, sse_event};
+pub use toolcall::{Extracted, ParsedCall, call_id, extract, wire_calls};
 
 #[cfg(test)]
 mod tests {

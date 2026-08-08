@@ -19,6 +19,13 @@ use serde::{Deserialize, Serialize};
 /// The `object` discriminant of a non-streaming completion.
 pub const OBJECT_CHAT_COMPLETION: &str = "chat.completion";
 
+/// The prefix every completion id carries.
+///
+/// Lives here rather than at the mint site because it is also *read*: a call
+/// id is derived from the completion id with this stripped off (see
+/// [`crate::toolcall::call_id`]), and the two must not drift apart.
+pub const COMPLETION_ID_PREFIX: &str = "chatcmpl-";
+
 /// The `object` discriminant of a streaming chunk.
 pub const OBJECT_CHAT_COMPLETION_CHUNK: &str = "chat.completion.chunk";
 
@@ -83,10 +90,25 @@ pub struct ResponseMessage {
 impl ResponseMessage {
     /// An assistant message carrying `content`.
     pub fn assistant(content: impl Into<String>) -> Self {
+        ResponseMessage::calling(content, Vec::new())
+    }
+
+    /// An assistant message carrying `content` and the calls it asked for.
+    ///
+    /// No calls means the key is omitted rather than serialized as `[]`:
+    /// clients branch on the field being *present*, and an empty array reads
+    /// to some of them as "this turn wants tools" — which then waits forever
+    /// for a `tool` message that is never coming.
+    ///
+    /// `content` stays a `Some`, empty string included, rather than becoming
+    /// `null` on a pure tool-call turn. Both are legal and clients accept
+    /// either; the empty string is the one that cannot be rendered as the
+    /// literal text `None` by a client that formats it naively.
+    pub fn calling(content: impl Into<String>, tool_calls: Vec<crate::request::ToolCall>) -> Self {
         ResponseMessage {
             role: crate::request::MessageRole::Assistant.as_str().to_owned(),
             content: Some(content.into()),
-            tool_calls: None,
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
         }
     }
 }
@@ -129,6 +151,26 @@ impl ChatCompletion {
         finish_reason: FinishReason,
         usage: Usage,
     ) -> Self {
+        ChatCompletion::from_message(
+            id,
+            created,
+            model,
+            ResponseMessage::assistant(content),
+            finish_reason,
+            usage,
+        )
+    }
+
+    /// The same, around a message that was assembled elsewhere — a reply that
+    /// carries tool calls, whose content and calls come out of one parse.
+    pub fn from_message(
+        id: impl Into<String>,
+        created: u64,
+        model: impl Into<String>,
+        message: ResponseMessage,
+        finish_reason: FinishReason,
+        usage: Usage,
+    ) -> Self {
         ChatCompletion {
             id: id.into(),
             object: OBJECT_CHAT_COMPLETION.to_owned(),
@@ -136,7 +178,7 @@ impl ChatCompletion {
             model: model.into(),
             choices: vec![Choice {
                 index: 0,
-                message: ResponseMessage::assistant(content),
+                message,
                 finish_reason: Some(finish_reason),
             }],
             usage,

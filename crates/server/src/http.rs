@@ -40,7 +40,10 @@ use tiny_http::{Header, Method, Request, Response, Server};
 use crate::engine::{Engine, NullSink, Plan, StreamError, TokenSink, hush_stream_aborts, unix_now};
 use crate::error::ServerError;
 use crate::request::ChatCompletionRequest;
-use crate::response::{ChatCompletion, ChunkBuilder, Health, ModelList};
+use crate::response::{
+    COMPLETION_ID_PREFIX, ChatCompletion, ChunkBuilder, FinishReason, Health, ModelList,
+    ResponseMessage,
+};
 use crate::sse::{sse_data, sse_done, sse_event};
 use crate::wire::{KEEPALIVE, StreamState};
 
@@ -221,12 +224,40 @@ fn chat_completions(engine: &mut dyn Engine, mut request: Request, config: &Serv
         let mut sink = NullSink;
         match engine.run(plan, &mut sink) {
             Ok(completion) => {
-                let body = ChatCompletion::single(
+                // The whole reply is in hand, so the `<tool_call>` blocks in it
+                // can be turned into calls before anything is sent. The
+                // streaming path cannot do this, having already sent the text,
+                // which is why only this half is wired up.
+                //
+                // Gated on the request having declared tools. Without that, a
+                // conversation *about* tool calls ("show me what a tool call
+                // looks like") gets its example swallowed: the prose vanishes
+                // into a structured call the client never enabled, and the
+                // reply comes back `finish_reason: "tool_calls"` for a request
+                // that offered none. The model only emits these blocks because
+                // the tools branch of the template told it to, so when no tools
+                // were sent the markers are ordinary text and stay that way.
+                let extracted = if parsed.tools().is_empty() {
+                    crate::toolcall::Extracted::none(&completion.text)
+                } else {
+                    crate::toolcall::extract(&completion.text)
+                };
+                let calls = crate::toolcall::wire_calls(&id, &extracted.calls);
+                // A recovered call overrides the stop reason: the model
+                // stopped because it wanted a tool, whatever token ended it.
+                // Nothing recovered leaves the reason alone, so a block cut off
+                // by the token budget still reports `length`.
+                let finish_reason = if calls.is_empty() {
+                    completion.finish_reason
+                } else {
+                    FinishReason::ToolCalls
+                };
+                let body = ChatCompletion::from_message(
                     id,
                     created,
                     &parsed.model,
-                    completion.text,
-                    completion.finish_reason,
+                    ResponseMessage::calling(extracted.content, calls),
+                    finish_reason,
                     completion.usage,
                 );
                 respond_json(request, 200, &body);
@@ -483,7 +514,7 @@ fn read_body(request: &mut Request, limit: usize) -> Result<String, ServerError>
 fn completion_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("chatcmpl-{:x}{:04x}", unix_now(), n & 0xffff)
+    format!("{COMPLETION_ID_PREFIX}{:x}{:04x}", unix_now(), n & 0xffff)
 }
 
 /// Build a header from ASCII.
@@ -559,6 +590,9 @@ mod tests {
         prefill_delay: Duration,
         tokens: Vec<String>,
         token_delay: Duration,
+        /// Why the stub says it stopped. The tool-call lane overrides this, so
+        /// what it overrides has to be settable.
+        finish_reason: FinishReason,
         /// How many tokens the engine got as far as producing. The evidence
         /// that a hung-up client actually stops generation.
         produced: Arc<AtomicUsize>,
@@ -571,6 +605,7 @@ mod tests {
                 prefill_delay: Duration::ZERO,
                 tokens: tokens.iter().map(|t| (*t).to_owned()).collect(),
                 token_delay: Duration::ZERO,
+                finish_reason: FinishReason::Stop,
                 produced: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -623,7 +658,7 @@ mod tests {
             Ok(Completion {
                 text,
                 usage: Usage::new(plan.prompt_tokens as u32, generated as u32),
-                finish_reason: FinishReason::Stop,
+                finish_reason: self.finish_reason,
                 aborted: false,
             })
         }
@@ -952,9 +987,16 @@ mod tests {
     // ---- the buffered endpoints, over a real socket ----
 
     fn spawn_server() -> SocketAddr {
+        spawn_server_with(&["ok"], FinishReason::Stop)
+    }
+
+    fn spawn_server_with(tokens: &[&str], finish_reason: FinishReason) -> SocketAddr {
+        let tokens: Vec<String> = tokens.iter().map(|t| (*t).to_owned()).collect();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut engine = StubEngine::new(&["ok"]);
+            let borrowed: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            let mut engine = StubEngine::new(&borrowed);
+            engine.finish_reason = finish_reason;
             let _ = serve_with(
                 &mut engine,
                 ServeConfig {
@@ -1055,6 +1097,160 @@ mod tests {
         );
         assert!(response.contains(r#""content":"ok""#), "{response}");
         assert!(response.contains(r#""finish_reason":"stop""#), "{response}");
+    }
+
+    /// What the model actually writes when it wants a tool: prose, then the
+    /// block the template asked for.
+    const TOOL_CALL_REPLY: &str = "Let me look.\n<tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"a.txt\"}}\n</tool_call>";
+
+    /// The JSON body of an HTTP response, headers stripped.
+    fn body_json(response: &str) -> serde_json::Value {
+        let body = response
+            .split_once("\r\n\r\n")
+            .map_or(response, |(_, body)| body);
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("a JSON body: {e}\n{response}"))
+    }
+
+    /// The end of this wave: a client can act on the reply. The text the model
+    /// wrote is gone from `content` and present as structure, with an id the
+    /// client can put on its `tool` message.
+    #[test]
+    fn a_tool_call_reply_comes_back_as_structured_calls() {
+        let address = spawn_server_with(&[TOOL_CALL_REPLY], FinishReason::Stop);
+        let response = post(
+            address,
+            PATH_CHAT_COMPLETIONS,
+            r#"{"model":"stub-model","messages":[{"role":"user","content":"read a.txt"}],
+                "tools":[{"type":"function","function":{"name":"read","parameters":{}}}]}"#,
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let json = body_json(&response);
+        let choice = &json["choices"][0];
+
+        // The stop reason the engine reported is overridden: the model stopped
+        // because it wants a tool run.
+        assert_eq!(choice["finish_reason"], "tool_calls");
+
+        let calls = choice["message"]["tool_calls"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a tool_calls array: {json}"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "read");
+        // `arguments` is a JSON *string*, byte for byte what the model wrote.
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"path": "a.txt"}"#);
+        let call_id = calls[0]["id"].as_str().expect("an id");
+        assert!(call_id.starts_with("call_"), "{call_id}");
+        assert!(call_id.ends_with("_0"), "{call_id}");
+        assert!(
+            call_id.contains(
+                json["id"]
+                    .as_str()
+                    .and_then(|id| id.strip_prefix("chatcmpl-"))
+                    .expect("a completion id")
+            ),
+            "the call id is derived from the completion id: {call_id}"
+        );
+
+        // And the prose survives without the markup.
+        assert_eq!(choice["message"]["content"], "Let me look.");
+        assert!(
+            !response.contains("<tool_call>"),
+            "the raw block is still in the body: {response}"
+        );
+    }
+
+    /// The same reply, from a request that declared no tools, stays text.
+    ///
+    /// A conversation *about* tool calling is the case this protects: asked
+    /// what a call looks like, the model writes one, and extracting it would
+    /// delete the answer from `content` and hand back a call the caller never
+    /// enabled, on a request that offered no tools to call.
+    #[test]
+    fn a_block_in_a_reply_to_a_request_without_tools_stays_text() {
+        let address = spawn_server_with(&[TOOL_CALL_REPLY], FinishReason::Stop);
+        let response = post(
+            address,
+            PATH_CHAT_COMPLETIONS,
+            r#"{"model":"stub-model","messages":[{"role":"user","content":"show me a tool call"}]}"#,
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let json = body_json(&response);
+        let choice = &json["choices"][0];
+
+        assert_eq!(choice["finish_reason"], "stop");
+        assert!(
+            choice["message"]["tool_calls"].is_null(),
+            "a request without tools got tool_calls back: {json}"
+        );
+        // Byte for byte, markers and all.
+        assert_eq!(
+            choice["message"]["content"].as_str().expect("content"),
+            TOOL_CALL_REPLY
+        );
+    }
+
+    /// A reply with no block is untouched, and the key stays absent rather
+    /// than becoming an empty array a client would read as "tools wanted".
+    #[test]
+    fn a_plain_reply_carries_no_tool_calls_key() {
+        let address = spawn_server();
+        let response = post(
+            address,
+            PATH_CHAT_COMPLETIONS,
+            r#"{"model":"stub-model","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let json = body_json(&response);
+        assert_eq!(json["choices"][0]["message"]["content"], "ok");
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert!(
+            json["choices"][0]["message"].get("tool_calls").is_none(),
+            "{json}"
+        );
+    }
+
+    /// A block cut off by the token budget yields no call, so the reason stays
+    /// `length` — the client's cue to raise `max_tokens`, not to run something
+    /// that was never fully asked for.
+    #[test]
+    fn a_block_truncated_by_the_token_budget_keeps_the_length_reason() {
+        let address = spawn_server_with(
+            &["<tool_call>\n{\"name\": \"read\", \"argum"],
+            FinishReason::Length,
+        );
+        let response = post(
+            address,
+            PATH_CHAT_COMPLETIONS,
+            r#"{"model":"stub-model","messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#,
+        );
+        let json = body_json(&response);
+        assert_eq!(json["choices"][0]["finish_reason"], "length");
+        assert!(
+            json["choices"][0]["message"].get("tool_calls").is_none(),
+            "{json}"
+        );
+        assert_eq!(
+            json["choices"][0]["message"]["content"], "<tool_call>\n{\"name\": \"read\", \"argum",
+            "half a block is text, and text is not dropped"
+        );
+    }
+
+    /// Wave 4's boundary, asserted rather than assumed: the streaming path
+    /// still sends the model's text exactly as it comes, blocks included.
+    #[test]
+    fn the_streaming_path_still_emits_the_raw_block() {
+        let mut engine = StubEngine::new(&["<tool_call>", "{\"name\": \"read\"}", "</tool_call>"]);
+        let recorder = Recorder::new();
+        run_stream(&mut engine, recorder.clone(), Duration::from_secs(60));
+
+        let body = recorder.body();
+        assert!(body.contains(r#""content":"<tool_call>""#), "{body}");
+        assert!(body.contains(r#""content":"</tool_call>""#), "{body}");
+        assert!(body.contains(r#""finish_reason":"stop""#), "{body}");
+        assert!(
+            !body.contains(r#""tool_calls""#),
+            "streaming tool calls are wave 4: {body}"
+        );
     }
 
     /// The array-form `content` every SDK sends, end to end. A server that
