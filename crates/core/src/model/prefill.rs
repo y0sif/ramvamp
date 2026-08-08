@@ -494,6 +494,29 @@ impl<'a> PhaseClock<'a> {
 /// the order the work happens in.
 pub type PrefillRouteSink<'a> = &'a mut dyn FnMut(usize, u32, &[(u32, f32)]);
 
+/// Observer for prefill *progress*, called with
+/// `(positions_done, positions_total)` after each unit of work completes.
+///
+/// Both numbers are relative to the call, not to the KV cache: a prefill that
+/// continues a conversation from position 4,000 still counts its own new
+/// tokens from zero, because "how far through this prompt am I" is the only
+/// question a progress bar asks. `positions_done` is strictly increasing and
+/// the last call of a successful prefill always has
+/// `positions_done == positions_total == tokens.len()`.
+///
+/// **Granularity differs by path, deliberately.**
+/// [`PrefillMode::Sweep`] fires once per chunk, because a chunk is the unit it
+/// commits; [`PrefillMode::TokenMajor`] fires once per token, because that is
+/// the unit *it* commits. Neither promises a fixed number of calls — the
+/// sweep's chunk width is narrowed to whatever the expert slot slab can host
+/// (see `plan_arena`), so it is a function of the pool, not only of
+/// [`PrefillConfig::chunk`].
+///
+/// This is pure instrumentation: nothing downstream of it reads the callback,
+/// and no arithmetic, ordering or scheduling depends on whether one is
+/// installed.
+pub type PrefillProgressSink<'a> = &'a mut dyn FnMut(usize, usize);
+
 // ---------------------------------------------------------------------------
 // Typed scratch sub-allocation
 // ---------------------------------------------------------------------------
@@ -1498,6 +1521,33 @@ pub fn prefill_prompt<'s>(
     tokens: &[u32],
     on_route: Option<PrefillRouteSink<'_>>,
 ) -> Result<&'s [f32], ForwardError> {
+    prefill_prompt_with_progress(model, state, tokens, on_route, None)
+}
+
+/// [`prefill_prompt`] reporting how far through the prompt it is.
+///
+/// `on_progress` is called after each unit of work commits — a chunk under
+/// [`PrefillMode::Sweep`], a token under [`PrefillMode::TokenMajor`] — with
+/// `(positions_done, positions_total)`; see [`PrefillProgressSink`] for what
+/// those mean and what they do not promise. A long prompt is otherwise a
+/// silent multi-second stall for anything driving the runtime, which is the
+/// only reason this exists.
+///
+/// Passing `None` is exactly [`prefill_prompt`], down to the branch: the
+/// callback is only reached through an `if let` at the fire site, so an
+/// uninstrumented prefill pays one null check per chunk.
+///
+/// # Errors
+///
+/// Exactly [`prefill_prompt`]'s. A failed prefill simply stops reporting;
+/// `positions_done` never reaches `positions_total`.
+pub fn prefill_prompt_with_progress<'s>(
+    model: &Model,
+    state: &'s mut ForwardState,
+    tokens: &[u32],
+    on_route: Option<PrefillRouteSink<'_>>,
+    on_progress: Option<PrefillProgressSink<'_>>,
+) -> Result<&'s [f32], ForwardError> {
     if tokens.is_empty() {
         return Err(ForwardError::EmptyPrefill);
     }
@@ -1508,8 +1558,8 @@ pub fn prefill_prompt<'s>(
     state.arm_prefill_timing(mode, tokens.len());
     let started = Instant::now();
     let outcome = match mode {
-        PrefillMode::TokenMajor => prefill_token_major(model, state, tokens, on_route),
-        PrefillMode::Sweep => prefill_sweep(model, state, tokens, on_route),
+        PrefillMode::TokenMajor => prefill_token_major(model, state, tokens, on_route, on_progress),
+        PrefillMode::Sweep => prefill_sweep(model, state, tokens, on_route, on_progress),
     };
     state.close_prefill_timing(started.elapsed());
     outcome?;
@@ -1522,6 +1572,7 @@ fn prefill_token_major(
     state: &mut ForwardState,
     tokens: &[u32],
     mut on_route: Option<PrefillRouteSink<'_>>,
+    mut on_progress: Option<PrefillProgressSink<'_>>,
 ) -> Result<(), ForwardError> {
     let start = state.seq_len()?;
     let last = tokens.len() - 1;
@@ -1543,6 +1594,13 @@ fn prefill_token_major(
                 super::forward_token(model, state, id, position, i == last)?;
             }
         }
+        // Once the token is committed, never before: a progress report is a
+        // claim about work that has already happened. This path has no
+        // chunks, so its unit is the token — finer than the sweep's, which
+        // is the honest granularity rather than a synthetic one.
+        if let Some(progress) = on_progress.as_deref_mut() {
+            progress(i + 1, tokens.len());
+        }
     }
     Ok(())
 }
@@ -1553,6 +1611,7 @@ fn prefill_sweep(
     state: &mut ForwardState,
     tokens: &[u32],
     mut on_route: Option<PrefillRouteSink<'_>>,
+    mut on_progress: Option<PrefillProgressSink<'_>>,
 ) -> Result<(), ForwardError> {
     let arch = model.arch();
     state.check_arch(arch)?;
@@ -1632,6 +1691,14 @@ fn prefill_sweep(
         )?;
         position += n;
         rest = tail;
+        // After `run_chunk`, so the report describes committed work, and
+        // outside the clock's regions, so an expensive observer is charged to
+        // `other` rather than to whichever phase happened to be open. Counted
+        // from the start of *this* prompt (`position - start`), not from the
+        // start of the cache.
+        if let Some(progress) = on_progress.as_deref_mut() {
+            progress(position - start, tokens.len());
+        }
     }
     session.finish()?;
     Ok(())

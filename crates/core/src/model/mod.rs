@@ -74,7 +74,7 @@ pub use forward::{
     forward_token_traced,
 };
 pub use prefill::{
-    DEFAULT_PREFILL_CHUNK, PrefillConfig, PrefillMode, PrefillRouteSink, PrefillTiming,
-    prefill_prompt,
+    DEFAULT_PREFILL_CHUNK, PrefillConfig, PrefillMode, PrefillProgressSink, PrefillRouteSink,
+    PrefillTiming, prefill_prompt, prefill_prompt_with_progress,
 };
 pub use weights::{F32Tensor, LayerWeights, Model, QuantTensor};

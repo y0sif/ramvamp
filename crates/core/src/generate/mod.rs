@@ -1,6 +1,7 @@
 //! Generation orchestration: prefill, token-by-token decode, sampling.
 //!
-//! **Prefill is the chunked layer-major sweep** ([`prefill_prompt`]): up to
+//! **Prefill is the chunked layer-major sweep**
+//! ([`prefill_prompt`](crate::model::prefill_prompt)): up to
 //! [`DEFAULT_PREFILL_CHUNK`](crate::model::DEFAULT_PREFILL_CHUNK) prompt
 //! positions are carried through the model together and each layer's expert
 //! file is streamed once per chunk, bypassing the decode cache entirely.
@@ -29,6 +30,17 @@
 //! generated are reported in [`GenerateStats::generated_ids`] for exactly
 //! that reason.
 //!
+//! # Watching a call from outside it
+//!
+//! A generate call holds `&mut ForwardState` from the first prefill chunk to
+//! the last token, and every telemetry accessor on that state takes `&self`,
+//! so a driver cannot read one while a call is in flight. That leaves a long
+//! prompt looking like a hang. [`generate_from_with_progress`] is the way
+//! through: an optional [`GenerateProgress`] callback fired from inside the
+//! loops, once per prefill chunk and once per sampled token. It is additive
+//! and off by default — [`generate_from`] is that function with `None` — and
+//! it is observation only, never a hook that can change what is computed.
+//!
 //! # Sampling
 //!
 //! Greedy is a pure argmax over the raw logits (first index wins ties) and
@@ -53,9 +65,10 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+use crate::io::StreamStats;
 use crate::model::{
-    ForwardError, ForwardState, Model, PrefillRouteSink, StreamPhase, forward_token,
-    forward_token_traced, prefill_prompt,
+    ForwardError, ForwardState, Model, PrefillProgressSink, PrefillRouteSink, StreamPhase,
+    forward_token, forward_token_traced, prefill_prompt_with_progress,
 };
 use crate::tokenizer::{RvmpTokenizer, SamplingDefaults, TokenizerError};
 
@@ -101,6 +114,59 @@ impl From<TracePhase> for StreamPhase {
 /// `(expert, weight)` selection in routed order (descending router
 /// probability).
 pub type RouteSink<'a> = &'a mut dyn FnMut(TracePhase, usize, u32, &[(u32, f32)]);
+
+/// A progress event reported from inside a generate call.
+///
+/// [`generate_from_with_progress`] exists because a generate call is opaque
+/// from the outside for as long as it runs: it holds `&mut ForwardState` for
+/// the whole call, so the telemetry accessors on that state — every one of
+/// which takes `&self` — are unreachable from another thread until it
+/// returns. A long prompt is therefore a multi-second stall with nothing to
+/// show, and `on_token` says nothing at all until the first token is sampled.
+/// This enum is the inside of the call talking to whatever is driving it.
+///
+/// It is instrumentation and nothing else. Numerics, ordering and scheduling
+/// are identical whether a callback is installed or not, which
+/// `progress_does_not_perturb_generation` pins.
+#[derive(Clone, Copy, Debug)]
+pub enum GenerateProgress {
+    /// Fired once after each prefill chunk completes.
+    ///
+    /// Both counts are relative to this call's prompt, so a turn continuing a
+    /// cache from position 4,000 still reports `0..=prompt_ids.len()`.
+    /// `positions_done` increases strictly to `positions_total`; the number
+    /// of events is not fixed, because the sweep's chunk width is narrowed to
+    /// whatever the expert slot slab can host and
+    /// [`PrefillMode::TokenMajor`](crate::model::PrefillMode) reports per
+    /// token rather than per chunk (see
+    /// [`PrefillProgressSink`](crate::model::PrefillProgressSink)).
+    PrefillChunk {
+        /// Prompt positions committed so far, counted from this call's start.
+        positions_done: usize,
+        /// Prompt positions this call will consume in total.
+        positions_total: usize,
+    },
+    /// Fired once per decoded token, before `on_token` for that token.
+    ///
+    /// `index` is 0-based over the tokens actually generated, so it always
+    /// ends one short of [`GenerateStats::generated`]. Two things do **not**
+    /// produce an event: a sampled stop token (which is never streamed and
+    /// never counted), and the trailing `on_token` call that flushes a
+    /// partial UTF-8 character at end of generation — that flush re-reports
+    /// an id already seen and samples nothing, so counting it would make
+    /// `index` disagree with the stats. One `DecodeToken` per sampled token,
+    /// exactly.
+    DecodeToken {
+        /// 0-based index of this token within the generated sequence.
+        index: usize,
+        /// The streamer's counters for the decode phase as of this token,
+        /// i.e. [`ForwardState::stream_stats_in`] at
+        /// [`StreamPhase::Decode`]. Decode-only on purpose: the cumulative
+        /// figure folds the prompt in and is not a decode number (see
+        /// [`ForwardState::stream_stats`]).
+        stats: StreamStats,
+    },
+}
 
 /// Knobs for one [`generate`] call.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -561,12 +627,15 @@ impl StreamDecoder {
 /// Prefill `prompt_ids` and decode up to `max_new` tokens, streaming each
 /// token id and its newly-decoded text through `on_token`.
 ///
-/// Prefill runs [`prefill_prompt`] over the whole prompt (logits only for
-/// the last position). Decode samples per [`GenerateParams`], stops on any of
-/// the tokenizer's stop tokens (the stop token is neither counted nor
-/// streamed) or after `max_new` tokens, and streams text via incremental
-/// detokenization (see the module docs). `state` must be fresh (empty KV
-/// cache); use [`generate_from`] to continue one.
+/// Prefill runs [`prefill_prompt`](crate::model::prefill_prompt) over the
+/// whole prompt (logits only for the last position). Decode samples per
+/// [`GenerateParams`], stops on any of the tokenizer's stop tokens (the stop
+/// token is neither counted nor streamed) or after `max_new` tokens, and
+/// streams text via incremental detokenization (see the module docs). `state`
+/// must be fresh (empty KV cache); use [`generate_from`] to continue one.
+///
+/// Nothing here reports progress; [`generate_from_with_progress`] is the
+/// entry point that does.
 ///
 /// # Errors
 ///
@@ -591,6 +660,7 @@ pub fn generate(
         params,
         tokenizer.stop_tokens(),
         &mut on_token,
+        None,
         None,
     )
 }
@@ -643,6 +713,47 @@ pub fn generate_from(
     prompt_ids: &[u32],
     start_position: usize,
     params: &GenerateParams,
+    on_token: impl FnMut(u32, &str),
+) -> Result<GenerateStats, GenerateError> {
+    generate_from_with_progress(
+        model,
+        state,
+        tokenizer,
+        prompt_ids,
+        start_position,
+        params,
+        None,
+        on_token,
+    )
+}
+
+/// [`generate_from`] reporting prefill and decode progress as it goes.
+///
+/// `on_progress` sees a [`GenerateProgress::PrefillChunk`] after each prefill
+/// chunk commits and a [`GenerateProgress::DecodeToken`] before each
+/// `on_token`, which is what lets a UI show a prompt filling and live
+/// streaming counters during a call that holds `&mut ForwardState` from start
+/// to finish. `on_token` is unchanged and still carries the text.
+///
+/// Passing `None` is [`generate_from`] exactly — the same code path, the same
+/// arithmetic in the same order, the same bytes out. Nothing between the two
+/// entry points reads the callback except an `if let` at each of the two fire
+/// sites.
+///
+/// # Errors
+///
+/// Exactly [`generate_from`]'s. A callback cannot fail: it returns `()`, so
+/// there is no way for an observer to abort a run, and equally no way for one
+/// to invent an error the uninstrumented path would not have produced.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_from_with_progress(
+    model: &Model,
+    state: &mut ForwardState,
+    tokenizer: &RvmpTokenizer,
+    prompt_ids: &[u32],
+    start_position: usize,
+    params: &GenerateParams,
+    on_progress: Option<&mut dyn FnMut(GenerateProgress)>,
     mut on_token: impl FnMut(u32, &str),
 ) -> Result<GenerateStats, GenerateError> {
     generate_with_stops(
@@ -655,6 +766,7 @@ pub fn generate_from(
         tokenizer.stop_tokens(),
         &mut on_token,
         None,
+        on_progress,
     )
 }
 
@@ -662,6 +774,11 @@ pub fn generate_from(
 /// decision for both the prefill and the decode passes.
 ///
 /// Numerically identical to [`generate`] (see [`forward_token_traced`]).
+///
+/// Starts at position 0 and so needs a fresh `state`: unlike
+/// [`generate_from`] there is no way to trace a turn that continues a cache.
+/// That is a gap, not a design decision — the trace format's positions are
+/// absolute, so the plumbing is a `start_position` parameter and nothing else.
 ///
 /// # Errors
 ///
@@ -685,6 +802,7 @@ pub fn generate_traced(
         tokenizer.stop_tokens(),
         &mut on_token,
         Some(trace),
+        None,
     )
 }
 
@@ -724,7 +842,7 @@ fn traced_step<'s>(
 
 /// [`generate`] with an explicit stop set (unit tests drive this with
 /// synthetic stop tokens a tiny fixture model can actually emit), a starting
-/// position, and an optional routing trace.
+/// position, an optional routing trace, and an optional progress observer.
 #[allow(clippy::too_many_arguments)]
 fn generate_with_stops(
     model: &Model,
@@ -736,6 +854,7 @@ fn generate_with_stops(
     stop_tokens: &[u32],
     on_token: &mut dyn FnMut(u32, &str),
     mut trace: Option<RouteSink<'_>>,
+    mut on_progress: Option<&mut dyn FnMut(GenerateProgress)>,
 ) -> Result<GenerateStats, GenerateError> {
     if prompt_ids.is_empty() {
         return Err(GenerateError::EmptyPrompt);
@@ -760,8 +879,8 @@ fn generate_with_stops(
     let prefill_start = Instant::now();
     state.set_stream_phase(StreamPhase::Prefill);
     let mut logits = {
-        // The sink borrows `trace` for the length of the prefill only; the
-        // decode loop below needs it back.
+        // Both sinks borrow their observer for the length of the prefill
+        // only; the decode loop below needs `on_progress` back.
         let mut tagged;
         let sink: Option<PrefillRouteSink<'_>> = match trace.as_deref_mut() {
             Some(inner) => {
@@ -772,7 +891,22 @@ fn generate_with_stops(
             }
             None => None,
         };
-        prefill_prompt(model, state, prompt_ids, sink)?
+        // The prefill layer counts positions; naming them is this layer's
+        // job, so the pair is widened into the event here rather than there.
+        let mut counted;
+        let progress: Option<PrefillProgressSink<'_>> = match on_progress.as_deref_mut() {
+            Some(inner) => {
+                counted = |positions_done: usize, positions_total: usize| {
+                    inner(GenerateProgress::PrefillChunk {
+                        positions_done,
+                        positions_total,
+                    });
+                };
+                Some(&mut counted)
+            }
+            None => None,
+        };
+        prefill_prompt_with_progress(model, state, prompt_ids, sink, progress)?
     };
     let prefill = prefill_start.elapsed();
 
@@ -789,6 +923,19 @@ fn generate_with_stops(
             break;
         }
         let text = stream.push(tokenizer, next)?;
+        // Before `on_token`, and only for a token that was actually sampled:
+        // the trailing flush below calls `on_token` a second time for an id
+        // already reported, and giving that an index would put the event
+        // stream one ahead of `GenerateStats::generated`. The counters are
+        // read here rather than after the pass because a caller watching a
+        // 128-token generation wants them per token, and `stream_stats_in`
+        // is a cheap copy of already-summed fields.
+        if let Some(progress) = on_progress.as_deref_mut() {
+            progress(GenerateProgress::DecodeToken {
+                index: generated_ids.len(),
+                stats: state.stream_stats_in(StreamPhase::Decode),
+            });
+        }
         on_token(next, &text);
         generated_ids.push(next);
         if generated_ids.len() == params.max_new {
@@ -1386,6 +1533,7 @@ mod tests {
             stops,
             &mut on_token,
             None,
+            None,
         )
         .unwrap();
         // One event per generated token, plus at most one flush event that
@@ -1579,6 +1727,7 @@ mod tests {
                 &[],
                 &mut |_, _| {},
                 None,
+                None,
             )
             .unwrap();
             assert_eq!(stats.generated, max_new);
@@ -1653,6 +1802,7 @@ mod tests {
             &[],
             &mut |_, _| {},
             None,
+            None,
         )
         .unwrap();
         assert_eq!(turn1.generated_ids.len(), 3);
@@ -1677,6 +1827,7 @@ mod tests {
             &[],
             &mut |_, _| {},
             None,
+            None,
         )
         .unwrap();
         assert_eq!(turn2.prompt_tokens, segment.len());
@@ -1693,6 +1844,7 @@ mod tests {
             &params,
             &[],
             &mut |_, _| {},
+            None,
             None,
         )
         .unwrap();
@@ -1792,6 +1944,7 @@ mod tests {
             &[],
             &mut |_, _| {},
             None,
+            None,
         )
         .unwrap();
         assert!(reused.seq_len().unwrap() > 0);
@@ -1811,9 +1964,316 @@ mod tests {
             &[],
             &mut |_, _| {},
             None,
+            None,
         )
         .unwrap();
         assert_eq!(second.generated_ids, first.generated_ids);
+    }
+
+    // --- Progress reporting ---
+
+    /// One instrumented run: every progress event, every `on_token` call, and
+    /// the stats, so a test can hold the three against each other.
+    fn run_with_progress(
+        h: &Harness,
+        config: PrefillConfig,
+        prompt: &[u32],
+        max_new: usize,
+    ) -> (Vec<GenerateProgress>, Vec<(u32, String)>, GenerateStats) {
+        let mut state = small(&h.model, 24);
+        state.set_prefill_config(config).unwrap();
+        let mut progress: Vec<GenerateProgress> = Vec::new();
+        let mut tokens: Vec<(u32, String)> = Vec::new();
+        let stats = {
+            let mut on_progress = |event: GenerateProgress| progress.push(event);
+            generate_from_with_progress(
+                &h.model,
+                &mut state,
+                &h.tokenizer,
+                prompt,
+                0,
+                &greedy_params(max_new),
+                Some(&mut on_progress),
+                |id, piece| tokens.push((id, piece.to_owned())),
+            )
+            .unwrap()
+        };
+        (progress, tokens, stats)
+    }
+
+    fn prefill_events(events: &[GenerateProgress]) -> Vec<(usize, usize)> {
+        events
+            .iter()
+            .filter_map(|event| match *event {
+                GenerateProgress::PrefillChunk {
+                    positions_done,
+                    positions_total,
+                } => Some((positions_done, positions_total)),
+                GenerateProgress::DecodeToken { .. } => None,
+            })
+            .collect()
+    }
+
+    fn decode_events(events: &[GenerateProgress]) -> Vec<usize> {
+        events
+            .iter()
+            .filter_map(|event| match *event {
+                GenerateProgress::DecodeToken { index, .. } => Some(index),
+                GenerateProgress::PrefillChunk { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The same run without any instrumentation, through the public
+    /// `generate_from`. The reference every "the callback changes nothing"
+    /// assertion is made against.
+    fn run_plain(
+        h: &Harness,
+        config: PrefillConfig,
+        prompt: &[u32],
+        max_new: usize,
+    ) -> (Vec<(u32, String)>, GenerateStats) {
+        let mut state = small(&h.model, 24);
+        state.set_prefill_config(config).unwrap();
+        let mut tokens: Vec<(u32, String)> = Vec::new();
+        let stats = generate_from(
+            &h.model,
+            &mut state,
+            &h.tokenizer,
+            prompt,
+            0,
+            &greedy_params(max_new),
+            |id, piece| tokens.push((id, piece.to_owned())),
+        )
+        .unwrap();
+        (tokens, stats)
+    }
+
+    /// A progress bar's whole contract: one event per chunk, counted from
+    /// this call's start, strictly increasing, landing exactly on the prompt
+    /// length. The chunk *width* is the sweep's business — it is narrowed to
+    /// whatever the expert slot slab can host — so the counts below are
+    /// pinned at widths the fixture's pool comfortably fits, and the shape
+    /// properties are asserted for every width.
+    #[test]
+    fn prefill_progress_counts_every_chunk_to_the_total() {
+        let h = harness("gen-progress-prefill");
+        let prompt = [1u32, 2, 3, 4, 5, 6];
+        let n = prompt.len();
+
+        // Sweep, per chunk width. `chunk: 1` is the interesting one: it is
+        // the only width where "one event per chunk" and "one event per
+        // token" differ from each other and from a single event.
+        for (chunk, want) in [
+            (1usize, vec![1usize, 2, 3, 4, 5, 6]),
+            (2, vec![2, 4, 6]),
+            (3, vec![3, 6]),
+            (512, vec![6]),
+        ] {
+            let config = PrefillConfig {
+                chunk,
+                ..one_chunk_sweep()
+            };
+            let (events, _, stats) = run_with_progress(&h, config, &prompt, 2);
+            let prefill = prefill_events(&events);
+            assert_eq!(
+                prefill.iter().map(|e| e.0).collect::<Vec<_>>(),
+                want,
+                "chunk {chunk}"
+            );
+            assert!(
+                prefill.iter().all(|e| e.1 == n),
+                "chunk {chunk}: total is not the prompt length: {prefill:?}"
+            );
+            assert_eq!(stats.prompt_tokens, n);
+        }
+
+        // Token-major has no chunks, so its unit is the token. Same
+        // guarantees, finer granularity — documented on `PrefillProgressSink`
+        // rather than papered over with a synthetic chunk width.
+        let (events, _, _) = run_with_progress(
+            &h,
+            PrefillConfig {
+                mode: PrefillMode::TokenMajor,
+                ..one_chunk_sweep()
+            },
+            &prompt,
+            2,
+        );
+        assert_eq!(
+            prefill_events(&events),
+            (1..=n).map(|done| (done, n)).collect::<Vec<_>>()
+        );
+
+        // The shape properties, for every configuration above: strictly
+        // increasing, never past the total, and the last event is the total.
+        for config in [
+            PrefillConfig {
+                chunk: 1,
+                ..one_chunk_sweep()
+            },
+            PrefillConfig {
+                chunk: 4,
+                ..one_chunk_sweep()
+            },
+            one_chunk_sweep(),
+            PrefillConfig {
+                mode: PrefillMode::TokenMajor,
+                ..one_chunk_sweep()
+            },
+        ] {
+            let (events, _, _) = run_with_progress(&h, config, &prompt, 2);
+            let prefill = prefill_events(&events);
+            assert!(!prefill.is_empty(), "{config:?} reported nothing");
+            let mut previous = 0usize;
+            for &(done, total) in &prefill {
+                assert!(done > previous, "{config:?} went backwards: {prefill:?}");
+                assert!(done <= total, "{config:?} overshot: {prefill:?}");
+                previous = done;
+            }
+            assert_eq!(prefill.last().unwrap(), &(n, n), "{config:?}");
+        }
+    }
+
+    /// The trap this callback had to be threaded around: `on_token` fires one
+    /// **extra** trailing time to flush a partial UTF-8 character, repeating
+    /// an id that was already reported. A `DecodeToken` there would put the
+    /// event stream one ahead of [`GenerateStats::generated`] and give a UI a
+    /// token count its own stats contradict, so the flush reports nothing.
+    ///
+    /// Both halves are exercised: a run whose output is plain ASCII (no
+    /// flush) and one that ends mid-character (flush), the second on a
+    /// byte-alphabet fixture because a 32-id vocabulary of ASCII punctuation
+    /// can never reach the branch at all.
+    #[test]
+    fn decode_progress_fires_once_per_token_and_not_for_the_flush() {
+        let h = harness("gen-progress-decode");
+        let (events, tokens, stats) = run_with_progress(&h, one_chunk_sweep(), &[1, 2, 3], 5);
+        assert_eq!(stats.generated, 5);
+        assert_eq!(
+            decode_events(&events),
+            (0..stats.generated).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            tokens.len(),
+            stats.generated,
+            "this fixture's vocabulary is ASCII punctuation; nothing can be withheld"
+        );
+
+        // Every event precedes its own `on_token` call, and the last prefill
+        // event precedes every decode event: the ordering a UI relies on to
+        // switch from a progress bar to a token stream.
+        let first_decode = events
+            .iter()
+            .position(|e| matches!(e, GenerateProgress::DecodeToken { .. }))
+            .expect("decode reported");
+        assert!(
+            events[..first_decode]
+                .iter()
+                .all(|e| matches!(e, GenerateProgress::PrefillChunk { .. })),
+            "a decode event arrived before prefill finished"
+        );
+
+        // The flush case. Ids 106..=255 of the pinned vocabulary are raw
+        // bytes 0xAE..=0xFF, so a greedy run that ends on one leaves the
+        // stream decoder holding an incomplete character.
+        let w = byte_harness("gen-progress-flush");
+        let (events, tokens, stats) = run_with_progress(&w, one_chunk_sweep(), &[3, 15], 3);
+        assert_eq!(
+            stats.generated_ids,
+            vec![134, 134, 134],
+            "the fixture's greedy output moved; pick a new prompt that ends mid-character"
+        );
+        assert_eq!(
+            tokens.len(),
+            stats.generated + 1,
+            "this run was supposed to reach the trailing flush"
+        );
+        assert_eq!(
+            tokens.last().unwrap().0,
+            *stats.generated_ids.last().unwrap(),
+            "the flush repeats the last id rather than reporting a new one"
+        );
+        // The point: one event per *sampled* token, flush or no flush.
+        assert_eq!(decode_events(&events), vec![0, 1, 2]);
+    }
+
+    /// The one that matters. `generate_from` is `generate_from_with_progress`
+    /// with `None`, and an installed callback observes without perturbing:
+    /// same ids, same text, byte for byte, in both prefill modes and on the
+    /// fixture whose output reaches the trailing flush. Instrumentation that
+    /// moves a number is not instrumentation.
+    #[test]
+    fn progress_does_not_perturb_generation() {
+        for tag in ["gen-progress-noop", "gen-progress-noop-wide"] {
+            let wide = tag.ends_with("-wide");
+            let h = if wide {
+                byte_harness(tag)
+            } else {
+                harness(tag)
+            };
+            let prompt: &[u32] = if wide { &[3, 15] } else { &[1, 2, 3] };
+            for config in [
+                one_chunk_sweep(),
+                PrefillConfig {
+                    chunk: 2,
+                    ..one_chunk_sweep()
+                },
+                PrefillConfig {
+                    mode: PrefillMode::TokenMajor,
+                    ..one_chunk_sweep()
+                },
+            ] {
+                let (want_tokens, want) = run_plain(&h, config, prompt, 4);
+                let (events, tokens, stats) = run_with_progress(&h, config, prompt, 4);
+
+                assert_eq!(
+                    tokens, want_tokens,
+                    "{tag} {config:?}: the token stream moved"
+                );
+                assert_eq!(stats.generated_ids, want.generated_ids, "{tag} {config:?}");
+                assert_eq!(stats.generated, want.generated, "{tag} {config:?}");
+                assert_eq!(stats.prompt_tokens, want.prompt_tokens, "{tag} {config:?}");
+                assert_eq!(stats.stop, want.stop, "{tag} {config:?}");
+
+                // And the observer really did observe, so the equality above
+                // is not the equality of two uninstrumented runs.
+                assert!(!prefill_events(&events).is_empty(), "{tag} {config:?}");
+                assert_eq!(
+                    decode_events(&events).len(),
+                    want.generated,
+                    "{tag} {config:?}"
+                );
+            }
+        }
+    }
+
+    /// A fixture whose vocabulary spans the tokenizer's whole byte alphabet,
+    /// so greedy decode can land on a raw byte that is not a character on its
+    /// own — the only way to reach the trailing-flush branch with a synthetic
+    /// model.
+    fn byte_harness(tag: &str) -> Harness {
+        let fx = crate::io::testutil::build_install_with(
+            tag,
+            &crate::io::testutil::Geometry {
+                vocab: 256,
+                ..crate::io::testutil::NARROW
+            },
+        );
+        crate::model::testsupport::temper_install(&fx);
+        let model = Model::load(
+            &fx.root,
+            LoadOptions {
+                skip_hashes: true,
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap();
+        Harness {
+            _fx: fx,
+            model,
+            tokenizer: fixture_tokenizer(),
+        }
     }
 
     #[test]
