@@ -94,10 +94,12 @@ pub enum TokenizerError {
 
     /// A chat role string is not one this build renders.
     ///
-    /// The upstream template also knows `tool` (and silently drops anything
-    /// else); both are out of scope for v0, and rejecting them beats
-    /// rendering a prompt the model was not trained on.
-    #[error("unsupported chat role {0:?} (supported: system, user, assistant)")]
+    /// `tool` joined the list when the tool-calling branches landed. The
+    /// upstream template silently drops any role beyond these four, which is
+    /// the behaviour this rejects: a dropped turn renders a prompt the caller
+    /// did not ask for and the model was not trained on, and nothing
+    /// downstream can tell that it happened.
+    #[error("unsupported chat role {0:?} (supported: system, user, assistant, tool)")]
     UnsupportedRole(String),
 }
 
