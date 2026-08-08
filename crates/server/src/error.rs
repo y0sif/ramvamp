@@ -19,6 +19,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use ramvamp_core::generate::GenerateError;
+use ramvamp_core::model::ForwardError;
 use ramvamp_core::tokenizer::TokenizerError;
 
 /// OpenAI's `invalid_request_error`: the client sent something this server
@@ -147,9 +149,50 @@ pub enum ServerError {
     #[error("server is busy: this build serves one request at a time")]
     AtCapacity,
 
+    /// No route serves this method and path.
+    ///
+    /// A 404 with the same body shape as every other refusal, because a
+    /// client pointed at the wrong base URL parses the error before it can
+    /// report it, and an empty body or an HTML page turns "wrong path" into
+    /// "the server is broken".
+    #[error("invalid URL ({method} {path})")]
+    NotFound {
+        /// The request method, verbatim.
+        method: String,
+        /// The request path, query string stripped.
+        path: String,
+    },
+
+    /// The request body is larger than this server will buffer.
+    ///
+    /// The body is read into memory to be parsed, and this process is meant
+    /// to run inside a 3 GB cgroup alongside a model: an unbounded read is an
+    /// OOM with a `Content-Length` header for a trigger. The cap is generous
+    /// against a 4K context and small against the budget.
+    #[error("request body is larger than the {limit}-byte limit")]
+    BodyTooLarge {
+        /// The cap, in bytes.
+        limit: usize,
+    },
+
     /// Rendering or encoding the prompt failed.
     #[error(transparent)]
     Tokenizer(#[from] TokenizerError),
+
+    /// Generation failed inside the runtime.
+    ///
+    /// Reported as a 500 rather than mapped onto a 400: every input-shaped
+    /// failure is caught before generation starts (see
+    /// [`ServerError::ContextOverflow`] and
+    /// [`ChatCompletionRequest::validate`](crate::request::ChatCompletionRequest::validate)),
+    /// so anything that reaches here is this process's problem.
+    #[error(transparent)]
+    Generate(#[from] GenerateError),
+
+    /// The KV cache could not be rewound to the prefix a request shares with
+    /// the one before it. Same reasoning as [`ServerError::Generate`].
+    #[error(transparent)]
+    Forward(#[from] ForwardError),
 
     /// A response could not be serialized. Unreachable for the types in this
     /// crate (no maps with non-string keys, no failing `Serialize` impls);
@@ -169,15 +212,24 @@ impl ServerError {
             | ServerError::MissingPartText
             | ServerError::ToolsUnsupported
             | ServerError::ContextOverflow { .. } => 400,
+            ServerError::NotFound { .. } => 404,
+            ServerError::BodyTooLarge { .. } => 413,
             ServerError::ModelLoading | ServerError::AtCapacity => 503,
-            ServerError::Tokenizer(_) | ServerError::Serialize(_) => 500,
+            ServerError::Tokenizer(_)
+            | ServerError::Generate(_)
+            | ServerError::Forward(_)
+            | ServerError::Serialize(_) => 500,
         }
     }
 
     /// The `error.type` string.
+    ///
+    /// 404 and 413 join the 400s: all three say the client sent something
+    /// this server will not serve, which is what `invalid_request_error`
+    /// means to the SDKs that switch on it.
     pub fn kind(&self) -> &'static str {
         match self.status() {
-            400 => TYPE_INVALID_REQUEST,
+            400 | 404 | 413 => TYPE_INVALID_REQUEST,
             _ => TYPE_SERVER,
         }
     }
@@ -192,9 +244,13 @@ impl ServerError {
             | ServerError::ContextOverflow { .. } => Some("messages"),
             ServerError::MultipleChoices { .. } => Some("n"),
             ServerError::MalformedJson(_)
+            | ServerError::NotFound { .. }
+            | ServerError::BodyTooLarge { .. }
             | ServerError::ModelLoading
             | ServerError::AtCapacity
             | ServerError::Tokenizer(_)
+            | ServerError::Generate(_)
+            | ServerError::Forward(_)
             | ServerError::Serialize(_) => None,
         }
     }
@@ -211,9 +267,13 @@ impl ServerError {
             // OpenAI's own code for this case; clients special-case the
             // string, so it is worth matching exactly.
             ServerError::ContextOverflow { .. } => "context_length_exceeded",
+            ServerError::NotFound { .. } => "not_found",
+            ServerError::BodyTooLarge { .. } => "request_too_large",
             ServerError::ModelLoading => "model_loading",
             ServerError::AtCapacity => "server_busy",
             ServerError::Tokenizer(_) => "tokenizer_error",
+            ServerError::Generate(_) => "generate_error",
+            ServerError::Forward(_) => "forward_error",
             ServerError::Serialize(_) => "internal_error",
         }
     }
@@ -316,6 +376,23 @@ mod tests {
                 "context_length_exceeded",
             ),
             (
+                ServerError::NotFound {
+                    method: "GET".into(),
+                    path: "/v1/embeddings".into(),
+                },
+                404,
+                TYPE_INVALID_REQUEST,
+                None,
+                "not_found",
+            ),
+            (
+                ServerError::BodyTooLarge { limit: 1_048_576 },
+                413,
+                TYPE_INVALID_REQUEST,
+                None,
+                "request_too_large",
+            ),
+            (
                 ServerError::ModelLoading,
                 503,
                 TYPE_SERVER,
@@ -366,6 +443,11 @@ mod tests {
                 requested: 1,
                 limit: 0,
             },
+            ServerError::NotFound {
+                method: String::new(),
+                path: String::new(),
+            },
+            ServerError::BodyTooLarge { limit: 0 },
             ServerError::ModelLoading,
             ServerError::AtCapacity,
         ] {

@@ -1,13 +1,11 @@
-//! OpenAI-compatible protocol layer for the ramvamp runtime.
+//! OpenAI-compatible HTTP server for the ramvamp runtime.
 //!
-//! This crate is the *shapes and rules* of the HTTP surface and nothing else.
-//! It opens no socket, reads no file, and loads no model; a transport crate
-//! layers a server over it and an engine layers generation under it. The split
-//! is what makes the wire contract testable: every rule below is asserted by a
-//! unit test that runs in milliseconds without a 30B model on disk, and a
-//! streaming sequence can be pinned byte for byte.
+//! The crate is layered so that the wire contract can be tested without a 30B
+//! model on disk, and so that the *timing* of a stream can be tested without a
+//! socket. Every rule below is asserted by a unit test that runs in
+//! milliseconds, and a streaming sequence is pinned byte for byte.
 //!
-//! # The surface
+//! # The pure layer: shapes and rules
 //!
 //! * [`request`] — the `POST /v1/chat/completions` body, including the
 //!   array-form `content` that clients send routinely and a naive server
@@ -21,6 +19,22 @@
 //! * [`error`] — one typed error per refusal, each knowing its status, body and
 //!   headers.
 //!
+//! # The engine layer
+//!
+//! * [`engine`] — the [`Engine`] trait, which is the seam a stub token source
+//!   substitutes into, plus [`ModelEngine`]: model, forward state and
+//!   tokenizer on one thread, with the KV cache reused across requests by
+//!   longest-common-prefix match. The trap in that match — and why the match
+//!   is against generated ids and never against a re-render of the transcript
+//!   — is documented there, because getting it wrong is silent.
+//!
+//! # The transport layer
+//!
+//! * [`wire`] — HTTP/1.1 chunked framing written by hand, because
+//!   `tiny_http::Response` buffers a stream to completion and hides client
+//!   disconnects.
+//! * [`http`] — routing, body limits and the accept loop. Binds loopback only.
+//!
 //! # What it is sized for
 //!
 //! One session, on loopback, in front of a runtime that decodes at about 2
@@ -30,13 +44,21 @@
 //! Each of those has its reasoning recorded next to the code, because each of
 //! them looks like a bug until you know why.
 
+pub mod engine;
 pub mod error;
+pub mod http;
 pub mod prompt;
 pub mod request;
 pub mod response;
 pub mod sse;
+pub mod wire;
 
+pub use engine::{
+    Completion, Engine, EngineConfig, ModelEngine, NullSink, Plan, StreamError, TokenSink,
+    common_prefix, hush_stream_aborts,
+};
 pub use error::{ErrorDetail, ErrorResponse, RETRY_HEADERS, ServerError};
+pub use http::{ServeConfig, ServeError, serve, serve_with};
 pub use prompt::{Prompt, check_context};
 pub use request::{
     ChatCompletionRequest, Content, ContentPart, Message, MessageRole, StreamOptions,

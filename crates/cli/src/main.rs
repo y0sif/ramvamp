@@ -323,6 +323,11 @@ enum Command {
     /// Ctrl-D or /exit leaves; Ctrl-C stops the reply in progress.
     Chat(Box<ChatArgs>),
 
+    /// OpenAI-compatible HTTP server on 127.0.0.1. Serves
+    /// /v1/chat/completions (streaming and not), /v1/models and /health,
+    /// one request at a time, reusing the KV cache across requests.
+    Serve(Box<ServeArgs>),
+
     /// Print the top-N next-token logits for a raw prompt as JSON (the
     /// llama.cpp logit-comparison hook).
     Logits(LogitsArgs),
@@ -469,6 +474,75 @@ struct ChatArgs {
     runtime: RuntimeArgs,
 }
 
+/// `serve`: the same runtime and sampling dials as `chat`, minus everything
+/// that assumes a terminal.
+///
+/// There is no `--host`. The listener binds `127.0.0.1` and nothing else, on
+/// purpose — see the `ramvamp_server::http` module docs — so a flag here would
+/// only be a way to defeat that.
+#[derive(Args)]
+struct ServeArgs {
+    /// Installed model directory (the .rvmp dir).
+    #[arg(long, value_name = "DIR")]
+    model: PathBuf,
+
+    /// TCP port on 127.0.0.1. 0 picks a free one and logs it.
+    #[arg(long, default_value_t = 8080)]
+    port: u16,
+
+    /// The id to advertise on /v1/models and echo in every response.
+    /// Defaults to the install directory's name, which is what a model
+    /// picker should show. The `model` field of a request is not validated
+    /// against it: this process serves one install, so refusing a name could
+    /// only refuse a request it is able to answer.
+    #[arg(long, value_name = "NAME")]
+    served_model_name: Option<String>,
+
+    /// Reply cap for a request that does not send `max_completion_tokens`
+    /// or `max_tokens`. Reserved against the context cap, so a large value
+    /// shortens the conversation a client can send.
+    #[arg(long, default_value_t = 512)]
+    max_new: usize,
+
+    /// Deterministic argmax decoding for every request (the validation
+    /// mode). A request that sends its own `temperature` still overrides it,
+    /// since `temperature <= 0` is greedy either way.
+    #[arg(long)]
+    greedy: bool,
+
+    /// Sampling temperature (default: the checkpoint's). A request's own
+    /// `temperature` overrides this.
+    #[arg(long)]
+    temperature: Option<f32>,
+
+    /// Top-k cutoff (default: the checkpoint's).
+    #[arg(long)]
+    top_k: Option<u32>,
+
+    /// Top-p nucleus mass (default: the checkpoint's).
+    #[arg(long)]
+    top_p: Option<f32>,
+
+    /// Base PRNG seed. A request that pins `seed` is honoured exactly;
+    /// one that does not gets this plus the request number, so a repeated
+    /// question is not answered identically.
+    #[arg(long)]
+    seed: Option<u64>,
+
+    /// Seconds a stream may go silent before a keep-alive comment is sent.
+    /// Every client we care about gives up after 300s of no bytes and a 4K
+    /// prompt takes about six minutes to prefill, so this is what keeps a
+    /// long prompt alive. Values above 300 disable the protection.
+    #[arg(long, value_name = "SECONDS", default_value_t = 10)]
+    keepalive_secs: u64,
+
+    #[command(flatten)]
+    prefill: PrefillArgs,
+
+    #[command(flatten)]
+    runtime: RuntimeArgs,
+}
+
 #[derive(Args)]
 struct LogitsArgs {
     /// Installed model directory (the .rvmp dir).
@@ -513,6 +587,7 @@ fn main() -> anyhow::Result<()> {
         Command::Tokenize(args) => tokenize(&args.model, args.prompt, args.messages_file),
         Command::Generate(args) => run_generate(*args),
         Command::Chat(args) => run_chat(*args),
+        Command::Serve(args) => run_serve(*args),
         Command::Logits(args) => run_logits(args),
     }
 }
@@ -1876,6 +1951,92 @@ fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
         report_stream_stats_total(&state);
     }
     eprintln!("bye");
+    Ok(())
+}
+
+/// The OpenAI-compatible HTTP server.
+///
+/// This function is the wiring and nothing else: it loads what `chat` loads,
+/// with the same flags meaning the same things, and hands it to
+/// `ramvamp_server`. Every decision about the wire — routing, framing,
+/// streaming, prefix caching, error mapping — lives there, behind unit tests
+/// that need no model.
+///
+/// # Why the port is bound *after* the model loads
+///
+/// Loading is tens of seconds and there is only one thread, so a listener
+/// opened first could accept a connection it could not answer. A client then
+/// waits on a socket that will not reply for half a minute, which is
+/// indistinguishable from a hung server; connection-refused until the model is
+/// ready is the honest signal, and it is what a supervisor's retry loop
+/// already understands.
+fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
+    let model_dir = args.model.as_path();
+    let served_model_name = args.served_model_name.clone().unwrap_or_else(|| {
+        model_dir.file_name().map_or_else(
+            || "ramvamp".to_owned(),
+            |name| name.to_string_lossy().into(),
+        )
+    });
+
+    let tokenizer = load_tokenizer(model_dir)?;
+    let load_start = Instant::now();
+    let model = Model::load(model_dir, args.runtime.load_options())
+        .with_context(|| format!("loading model from {}", model_dir.display()))?;
+    // Built once for the process: every request continues this cache, rewound
+    // to whatever prefix it shares with the one before it.
+    let mut state = ForwardState::with_config(&model, CONTEXT_CAP, args.runtime.runtime_config())?;
+    args.prefill.apply(&mut state)?;
+    eprintln!(
+        "model loaded in {:.2}s; context cap {CONTEXT_CAP}, --max-new {} reserved per request; \
+         {} compute shards, {} expert slots/layer from a {} budget, {} reads",
+        load_start.elapsed().as_secs_f64(),
+        args.max_new,
+        state.shards(),
+        state.slots_per_layer(),
+        human_bytes(state.cache_bytes()),
+        state.stream_mode(),
+    );
+
+    let defaults = tokenizer.sampling_defaults();
+    let mut params = GenerateParams::from_defaults(defaults);
+    params.max_new = args.max_new;
+    params.greedy = args.greedy;
+    if let Some(t) = args.temperature {
+        params.temperature = t;
+    }
+    if let Some(k) = args.top_k {
+        params.top_k = Some(k);
+    }
+    if let Some(p) = args.top_p {
+        params.top_p = p;
+    }
+    if let Some(seed) = args.seed {
+        params.seed = seed;
+    }
+
+    let mut engine = ramvamp_server::ModelEngine::new(
+        model,
+        state,
+        tokenizer,
+        ramvamp_server::EngineConfig {
+            model_id: served_model_name.clone(),
+            context_limit: CONTEXT_CAP,
+            default_max_new: args.max_new,
+            params,
+        },
+    );
+    let config = ramvamp_server::ServeConfig {
+        port: args.port,
+        keepalive: Duration::from_secs(args.keepalive_secs.max(1)),
+        ..ramvamp_server::ServeConfig::default()
+    };
+    eprintln!(
+        "serving {served_model_name} on http://127.0.0.1:{}{}  (Ctrl-C to stop)",
+        args.port,
+        if args.port == 0 { " (ephemeral)" } else { "" }
+    );
+    ramvamp_server::serve(&mut engine, config)?;
     Ok(())
 }
 
