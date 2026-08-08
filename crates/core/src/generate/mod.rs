@@ -978,7 +978,7 @@ mod tests {
     use super::*;
     use crate::io::LoadOptions;
     use crate::io::testutil::build_install;
-    use crate::model::{ForwardState, PrefillConfig, PrefillMode, RuntimeConfig};
+    use crate::model::{ForwardState, PrefillConfig, PrefillMode, RuntimeConfig, prefill_prompt};
 
     /// Fixture-sized runtime dials: an unpinned two-shard pool and a small
     /// expert budget, so a test suite that runs many states in parallel
@@ -1853,6 +1853,151 @@ mod tests {
             "a continued cache diverged from a rebuilt one"
         );
         assert_eq!(state.seq_len().unwrap(), fresh.seq_len().unwrap());
+    }
+
+    /// A stateless chat request resends the whole conversation, so the runtime
+    /// keeps the KV cache up to the longest common prefix and re-prefills only
+    /// the divergent suffix. [`ForwardState::truncate`] is that rewind, and
+    /// this is the test that earns it: a cache cut back to `n` positions must
+    /// be **indistinguishable** from one that only ever held `n`.
+    ///
+    /// The claim is proved at two levels, in both prefill modes:
+    ///
+    /// 1. **Bits.** The next forward pass off the rewound cache is
+    ///    `to_bits()`-identical to the same pass off the cache that never
+    ///    grew, with zero tolerance — the same shape as
+    ///    `attention_at_is_bit_identical_to_truncated_decode`, one level up.
+    /// 2. **Ids.** And it stays identical through a whole generation, which is
+    ///    the level the server ships.
+    ///
+    /// The rewound state genuinely writes positions past the seam first — the
+    /// `assert_ne!` on the two prefills' logits is what makes that non-vacuous
+    /// — so a stale row surviving the truncate, or a position off by one,
+    /// fails here rather than passing invisibly.
+    #[test]
+    fn a_truncated_cache_is_bit_identical_to_one_that_never_grew() {
+        let h = harness("gen-truncate");
+        let prefix = [1u32, 2, 3, 4];
+        let divergent = [5u32, 6, 7];
+        let next = 8u32;
+
+        for mode in [PrefillMode::Sweep, PrefillMode::TokenMajor] {
+            let config = PrefillConfig {
+                mode,
+                ..one_chunk_sweep()
+            };
+
+            // The state that overshoots: prefill the common prefix *and* a
+            // suffix the next request will turn out not to share, so the
+            // positions past the seam hold real f16 bits.
+            let mut whole: Vec<u32> = prefix.to_vec();
+            whole.extend(divergent);
+            let mut rewound = small(&h.model, 24);
+            rewound.set_prefill_config(config).unwrap();
+            let long_logits = prefill_prompt(&h.model, &mut rewound, &whole, None)
+                .unwrap()
+                .to_vec();
+            assert_eq!(rewound.seq_len().unwrap(), whole.len());
+
+            // The reference: a state that only ever saw the prefix.
+            let mut short = small(&h.model, 24);
+            short.set_prefill_config(config).unwrap();
+            let short_logits = prefill_prompt(&h.model, &mut short, &prefix, None)
+                .unwrap()
+                .to_vec();
+
+            // Non-vacuity: the suffix has to have moved the computation, or
+            // "identical after the rewind" would have been true before it too.
+            assert_ne!(
+                long_logits, short_logits,
+                "{mode:?}: the divergent suffix changed nothing, so this test \
+                 would pass with a truncate that did nothing"
+            );
+
+            rewound.truncate(prefix.len()).unwrap();
+            assert_eq!(rewound.seq_len().unwrap(), prefix.len());
+            assert_eq!(rewound.seq_len().unwrap(), short.seq_len().unwrap());
+
+            // Level 1, the proof.
+            let got = forward_token(&h.model, &mut rewound, next, prefix.len(), true)
+                .unwrap()
+                .expect("logits were requested");
+            let got = got.to_vec();
+            let want = forward_token(&h.model, &mut short, next, prefix.len(), true)
+                .unwrap()
+                .expect("logits were requested");
+            let want = want.to_vec();
+            assert_eq!(got.len(), want.len());
+            for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "{mode:?} logit {i}: off a truncated cache {g:e} vs off one \
+                     that never grew {w:e}"
+                );
+            }
+
+            // Level 2: the same through a whole turn, sampled ids included.
+            let params = greedy_params(3);
+            let segment = [11u32, 12];
+            let at = prefix.len() + 1;
+            let turn = |state: &mut ForwardState| {
+                generate_with_stops(
+                    &h.model,
+                    state,
+                    &h.tokenizer,
+                    &segment,
+                    at,
+                    &params,
+                    &[],
+                    &mut |_, _| {},
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            let continued = turn(&mut rewound);
+            let reference = turn(&mut short);
+            assert_eq!(
+                continued.generated_ids, reference.generated_ids,
+                "{mode:?}: a rewound cache diverged from one that never grew"
+            );
+            assert_eq!(rewound.seq_len().unwrap(), short.seq_len().unwrap());
+        }
+    }
+
+    /// The rewind is refused, not fudged: past the cached length there is
+    /// nothing to keep, only stale bits from a longer sequence. It comes back
+    /// typed through [`ForwardError::Kv`], the cursor does not move, and the
+    /// state is still usable afterwards. (The other refusal, a ragged cache,
+    /// has no public way to be produced here and is pinned at the cache level
+    /// by `truncate_refuses_ragged_and_upward`.)
+    #[test]
+    fn truncate_refuses_what_it_cannot_honour() {
+        let h = harness("gen-truncate-refuse");
+        let mut state = small(&h.model, 16);
+        state.set_prefill_config(one_chunk_sweep()).unwrap();
+        prefill_prompt(&h.model, &mut state, &[1u32, 2, 3], None).unwrap();
+
+        let err = state.truncate(4).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ForwardError::Kv(crate::kv::KvError::TruncateBeyondLength {
+                    requested: 4,
+                    len: 3
+                })
+            ),
+            "unexpected error: {err}"
+        );
+        assert_eq!(state.seq_len().unwrap(), 3, "a refused truncate rewound");
+
+        // And the cache still works: truncating to a real prefix succeeds and
+        // the next token is accepted at the seam.
+        state.truncate(2).unwrap();
+        assert_eq!(state.seq_len().unwrap(), 2);
+        forward_token(&h.model, &mut state, 5, 2, true).unwrap();
+        assert_eq!(state.seq_len().unwrap(), 3);
     }
 
     /// `start_position` is validated, not trusted: an off-by-one would prefill

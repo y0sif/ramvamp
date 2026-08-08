@@ -816,6 +816,53 @@ impl ForwardState {
         self.prefill_charging = false;
     }
 
+    /// Rewind the cached sequence to its first `new_len` positions, keeping
+    /// every allocation.
+    ///
+    /// [`ForwardState::reset`] restricted to a prefix, and correct for the
+    /// same reason at both levels:
+    ///
+    /// - **The cache.** Only the per-layer cursors move; no plane is zeroed,
+    ///   because every read is bounded by the cursor this resets, so the f16
+    ///   bits of the dropped suffix are unreachable and the next append
+    ///   overwrites them in place. See [`KvCache::truncate`].
+    /// - **Everything else.** Nothing outside the KV cache carries
+    ///   sequence-position state: the RoPE position, the causal mask width and
+    ///   the attention span are all derived from the cursor on every pass, and
+    ///   [`forward_token`] re-validates `position == seq_len()` before using
+    ///   it. There is no second place a rewind would have to reach.
+    ///
+    /// What survives is what [`ForwardState::reset`] deliberately preserves,
+    /// and for the reason it gives: the expert slot cache, its LFU history and
+    /// the streaming counters describe the process, not the sequence, and a
+    /// rewind of the sequence is even less of an event for them than a reset
+    /// is — the same experts are about to be read again. The timing and
+    /// diagnostic fields are dropped, exactly as [`ForwardState::reset`] drops
+    /// them: they describe one prefill of one sequence, and a split left over
+    /// from a prompt that has just been cut back would be read as belonging to
+    /// the one that replaces it.
+    ///
+    /// This is what lets a stateless chat request reuse the cache up to its
+    /// longest common prefix with the previous turn and re-prefill only the
+    /// divergent suffix.
+    ///
+    /// # Errors
+    ///
+    /// [`ForwardError::Kv`] wrapping
+    /// [`KvError::RaggedLayers`](crate::kv::KvError::RaggedLayers) if a
+    /// previous pass failed mid-token and left the cache ragged (use
+    /// [`ForwardState::reset`] to recover), or
+    /// [`KvError::TruncateBeyondLength`](crate::kv::KvError::TruncateBeyondLength)
+    /// if `new_len` is past the cached length. Nothing moves on either error.
+    pub fn truncate(&mut self, new_len: usize) -> Result<(), ForwardError> {
+        self.kv.truncate(new_len)?;
+        self.prefill_timing = PrefillTiming::default();
+        self.decode_timing = PrefillTiming::default();
+        self.decode_gemv = GemvSplit::default();
+        self.prefill_charging = false;
+        Ok(())
+    }
+
     /// Borrow the pieces the chunked prefill driver needs, all at once.
     ///
     /// Field-by-field so the compute pool, the streamer, the KV cache and the
