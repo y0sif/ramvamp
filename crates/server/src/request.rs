@@ -313,6 +313,17 @@ impl ChatCompletionRequest {
         {
             return Err(ServerError::MultipleChoices { n });
         }
+        // Tool definitions are parsed and preserved, but nothing renders them
+        // into the prompt: the vendored ChatML template has no tool branch and
+        // core's `ChatMessage` has no tool role. Answering 200 while dropping
+        // them is the failure this crate refuses everywhere else, and it is
+        // worse here than elsewhere because the reply looks reasonable: the
+        // model simply says it cannot read files, and `prompt_tokens` is
+        // identical with and without the `tools` array. Measured 2026-08-08,
+        // 14 tokens either way. Refuse until the template can carry them.
+        if self.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+            return Err(ServerError::ToolsUnsupported);
+        }
         for message in &self.messages {
             // Flattening is the check: it is the only thing that inspects
             // every part, and doing it here means a bad part is refused before
@@ -452,6 +463,23 @@ mod tests {
             request.validate().expect_err("must be non-empty"),
             ServerError::EmptyMessages
         ));
+    }
+
+    #[test]
+    fn a_request_carrying_tools_is_refused_rather_than_answered_without_them() {
+        // Accepting these and dropping them returns a reply that reads fine
+        // and was produced from a prompt the caller never sent.
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}"#;
+        let req = ChatCompletionRequest::from_json(body).expect("parses");
+        assert!(matches!(req.validate(), Err(ServerError::ToolsUnsupported)));
+    }
+
+    #[test]
+    fn an_empty_tools_array_is_not_a_refusal() {
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[]}"#;
+        let req = ChatCompletionRequest::from_json(body).expect("parses");
+        req.validate().expect("an empty list asks for nothing");
     }
 
     #[test]
