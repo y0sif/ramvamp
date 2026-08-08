@@ -111,13 +111,52 @@ pub enum ServerError {
     #[error("content part of type `text` is missing its `text` field")]
     MissingPartText,
 
-    /// A `tool` message, or an assistant turn carrying `tool_calls`.
+    /// A tool name outside the charset OpenAI itself constrains names to.
     ///
-    /// Parsing preserves both (a later wave re-sorts tool results by
-    /// `tool_call_id`), but the vendored template has no tool branch, so a
-    /// prompt cannot be built from them yet.
-    #[error("tool messages are not supported by this build")]
-    ToolsUnsupported,
+    /// Validated and refused rather than sanitized, unlike message content.
+    /// A name is not prose: the model echoes it back verbatim and the client
+    /// matches the reply against the name it sent, so breaking a hostile name
+    /// with a zero-width marker would produce a call nobody can match and a
+    /// difference nobody can see in a log. Refusing the request is the only
+    /// outcome the client can act on.
+    #[error(
+        "invalid tool name `{name}`: names must match {}",
+        crate::request::TOOL_NAME_PATTERN
+    )]
+    InvalidToolName {
+        /// The offending name, verbatim, so a client can find it.
+        name: String,
+        /// Which request field carried it: `tools` for a definition,
+        /// `messages` for a call echoed back on an assistant turn.
+        param: &'static str,
+    },
+
+    /// A `tool_choice` this build cannot honour: `required`, a named
+    /// function, or any value that is not `auto` or `none`.
+    ///
+    /// The vendored template has no way to express "you must call a
+    /// function": it branches on `tools` alone. Rendering the definitions and
+    /// letting the model choose freely would answer 200 to a request whose
+    /// central constraint was dropped.
+    #[error(
+        "`tool_choice` {choice} is not supported: this build cannot force a particular \
+         call; send `auto`, `none`, or omit it"
+    )]
+    UnsupportedToolChoice {
+        /// What the client asked for, as JSON.
+        choice: String,
+    },
+
+    /// A non-empty `stop`.
+    ///
+    /// Accepted-and-ignored until now: nothing in the runtime consumes a stop
+    /// string, so generation ran past where the caller asked it to end and the
+    /// client had no way to tell. Refused until stop strings exist.
+    #[error(
+        "`stop` is not supported by this build: generation ends on the model's own \
+         stop tokens, so a stop sequence would be accepted and never applied"
+    )]
+    StopUnsupported,
 
     /// The prompt plus the reservation for the reply exceeds the context.
     ///
@@ -210,7 +249,9 @@ impl ServerError {
             | ServerError::MultipleChoices { .. }
             | ServerError::UnsupportedContentPart { .. }
             | ServerError::MissingPartText
-            | ServerError::ToolsUnsupported
+            | ServerError::InvalidToolName { .. }
+            | ServerError::UnsupportedToolChoice { .. }
+            | ServerError::StopUnsupported
             | ServerError::ContextOverflow { .. } => 400,
             ServerError::NotFound { .. } => 404,
             ServerError::BodyTooLarge { .. } => 413,
@@ -240,8 +281,12 @@ impl ServerError {
             ServerError::EmptyMessages
             | ServerError::UnsupportedContentPart { .. }
             | ServerError::MissingPartText
-            | ServerError::ToolsUnsupported
             | ServerError::ContextOverflow { .. } => Some("messages"),
+            // The one error that can come from either of two fields, so it
+            // carries the answer rather than guessing one.
+            ServerError::InvalidToolName { param, .. } => Some(*param),
+            ServerError::UnsupportedToolChoice { .. } => Some("tool_choice"),
+            ServerError::StopUnsupported => Some("stop"),
             ServerError::MultipleChoices { .. } => Some("n"),
             ServerError::MalformedJson(_)
             | ServerError::NotFound { .. }
@@ -263,7 +308,9 @@ impl ServerError {
             ServerError::MultipleChoices { .. } => "unsupported_value",
             ServerError::UnsupportedContentPart { .. } => "unsupported_content_part",
             ServerError::MissingPartText => "invalid_content_part",
-            ServerError::ToolsUnsupported => "tools_unsupported",
+            ServerError::InvalidToolName { .. } => "invalid_tool_name",
+            ServerError::UnsupportedToolChoice { .. } => "unsupported_value",
+            ServerError::StopUnsupported => "unsupported_value",
             // OpenAI's own code for this case; clients special-case the
             // string, so it is worth matching exactly.
             ServerError::ContextOverflow { .. } => "context_length_exceeded",
@@ -359,11 +406,40 @@ mod tests {
                 "invalid_content_part",
             ),
             (
-                ServerError::ToolsUnsupported,
+                ServerError::InvalidToolName {
+                    name: "get weather".into(),
+                    param: "tools",
+                },
+                400,
+                TYPE_INVALID_REQUEST,
+                Some("tools"),
+                "invalid_tool_name",
+            ),
+            (
+                ServerError::InvalidToolName {
+                    name: "get weather".into(),
+                    param: "messages",
+                },
                 400,
                 TYPE_INVALID_REQUEST,
                 Some("messages"),
-                "tools_unsupported",
+                "invalid_tool_name",
+            ),
+            (
+                ServerError::UnsupportedToolChoice {
+                    choice: r#"{"type":"function"}"#.into(),
+                },
+                400,
+                TYPE_INVALID_REQUEST,
+                Some("tool_choice"),
+                "unsupported_value",
+            ),
+            (
+                ServerError::StopUnsupported,
+                400,
+                TYPE_INVALID_REQUEST,
+                Some("stop"),
+                "unsupported_value",
             ),
             (
                 ServerError::ContextOverflow {
@@ -438,7 +514,14 @@ mod tests {
                 kind: String::new(),
             },
             ServerError::MissingPartText,
-            ServerError::ToolsUnsupported,
+            ServerError::InvalidToolName {
+                name: String::new(),
+                param: "tools",
+            },
+            ServerError::UnsupportedToolChoice {
+                choice: String::new(),
+            },
+            ServerError::StopUnsupported,
             ServerError::ContextOverflow {
                 requested: 1,
                 limit: 0,
@@ -473,6 +556,22 @@ mod tests {
         let message = error.body().error.message;
         assert!(message.contains("4096"), "{message}");
         assert!(message.contains("5000"), "{message}");
+    }
+
+    /// The offending name has to reach the client: a caller whose tool list is
+    /// generated cannot find the bad entry from "invalid tool name" alone.
+    #[test]
+    fn an_invalid_tool_name_error_quotes_the_name_and_the_rule() {
+        let error = ServerError::InvalidToolName {
+            name: "read<file>".into(),
+            param: "tools",
+        };
+        let message = error.body().error.message;
+        assert!(message.contains("read<file>"), "{message}");
+        assert!(
+            message.contains(crate::request::TOOL_NAME_PATTERN),
+            "{message}"
+        );
     }
 
     #[test]

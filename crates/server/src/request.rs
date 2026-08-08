@@ -29,15 +29,78 @@
 //! `image_url` part would be the same bug wearing a smaller hat.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::ServerError;
 
-/// Who is speaking.
+/// The charset a tool name has to match, as a regex, for error messages.
 ///
-/// `tool` parses and round-trips even though the vendored template cannot
-/// render it: a later wave re-sorts tool results by `tool_call_id`, and data
-/// that was never parsed cannot be re-sorted. [`crate::prompt`] is where the
-/// refusal happens, not here.
+/// OpenAI's own constraint, reproduced rather than invented so a client that
+/// already satisfies the upstream API satisfies this one. Checked by
+/// [`is_valid_tool_name`], which spells it out in code because this crate does
+/// not take a regex dependency for one character class.
+pub const TOOL_NAME_PATTERN: &str = "^[A-Za-z0-9_-]{1,64}$";
+
+/// Whether `name` is a tool name this server will render.
+///
+/// Names are *validated*, never sanitized. Every other untrusted string in a
+/// request goes through the tokenizer's sanitizer, which breaks added-token
+/// literals with a zero-width marker; doing that to a name would be silent
+/// corruption, because the model echoes the name back and the client matches
+/// the call against the name it sent. An invisible marker inside it makes the
+/// call unmatchable and the log unreadable. So a bad name is a 400.
+///
+/// Byte length is character length here: every accepted character is ASCII, so
+/// a name with a multi-byte character fails the charset test first.
+pub fn is_valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Check one tool name, naming the request field it came from.
+fn check_tool_name(name: &str, param: &'static str) -> Result<(), ServerError> {
+    if is_valid_tool_name(name) {
+        return Ok(());
+    }
+    Err(ServerError::InvalidToolName {
+        name: name.to_owned(),
+        param,
+    })
+}
+
+/// Check a tool name that arrived as untyped JSON.
+///
+/// A definition whose `name` is absent or not a string goes down the same
+/// path, with the offending JSON (`null`, `123`) quoted back: a nameless
+/// definition can never produce a call the client is able to match.
+fn check_json_tool_name(name: &Value, param: &'static str) -> Result<(), ServerError> {
+    match name.as_str() {
+        Some(name) => check_tool_name(name, param),
+        None => Err(ServerError::InvalidToolName {
+            name: name.to_string(),
+            param,
+        }),
+    }
+}
+
+/// The `name` of one tool definition.
+///
+/// Accepts both shapes the renderer accepts: the OpenAI wrapper
+/// (`{"type":"function","function":{"name":…}}`) and the bare
+/// `{"name":…}`, mirroring the template's own `if tool_call.function`
+/// flattening. Indexing a [`Value`] with a missing key yields `Null`, which
+/// [`check_json_tool_name`] refuses.
+fn definition_name(tool: &Value) -> &Value {
+    match tool.get("function") {
+        Some(function) => &function["name"],
+        None => &tool["name"],
+    }
+}
+
+/// Who is speaking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
@@ -47,7 +110,8 @@ pub enum MessageRole {
     User,
     /// A model turn.
     Assistant,
-    /// The result of a tool call.
+    /// The result of a tool call. Rendered as a `<tool_response>` block
+    /// inside a `user` turn; see [`crate::prompt`].
     Tool,
 }
 
@@ -136,8 +200,9 @@ impl Content {
 /// A function call the model asked for, echoed back by the client on the next
 /// turn.
 ///
-/// Preserved verbatim through parsing so a later wave can pair each result
-/// with its call; nothing in this lane reads it.
+/// Preserved verbatim through parsing and re-rendered into the prompt as the
+/// `<tool_call>` block the model originally emitted, so the conversation the
+/// model sees on turn *n+1* contains the call it made on turn *n*.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Call id, matched by a `tool` message's `tool_call_id`.
@@ -201,6 +266,23 @@ impl Message {
             Some(content) => content.text(),
             None => Ok(String::new()),
         }
+    }
+
+    /// The calls this turn carries, empty when it carries none.
+    pub fn calls(&self) -> &[ToolCall] {
+        self.tool_calls.as_deref().unwrap_or(&[])
+    }
+
+    /// Refuse a call whose name is outside [`TOOL_NAME_PATTERN`].
+    ///
+    /// A name echoed back on an assistant turn gets the same check as a
+    /// definition: it is rendered into the prompt the same way, and the next
+    /// `tool` turn is matched against it by the client.
+    pub fn check_tool_calls(&self) -> Result<(), ServerError> {
+        for call in self.calls() {
+            check_tool_name(&call.function.name, "messages")?;
+        }
+        Ok(())
     }
 }
 
@@ -280,15 +362,16 @@ pub struct ChatCompletionRequest {
     pub n: Option<u32>,
     /// Tool definitions, preserved verbatim.
     ///
-    /// Held as raw JSON rather than a typed schema: this lane does not render
-    /// tools, and giving them a Rust shape now would either drop fields the
-    /// shape does not know about or freeze a contract before there is a
-    /// consumer to hold it to.
+    /// Held as raw JSON rather than a typed schema because the renderer takes
+    /// them that way: each definition is serialized into the `# Tools` system
+    /// block exactly as it arrived, so a Rust shape here could only lose
+    /// fields (`strict`, vendor extensions) that the reference template keeps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<serde_json::Value>>,
-    /// Tool selection policy, preserved verbatim for the same reason.
+    pub tools: Option<Vec<Value>>,
+    /// Tool selection policy. Only `auto` and `none` are honourable here; see
+    /// [`ChatCompletionRequest::check_tool_choice`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<serde_json::Value>,
+    pub tool_choice: Option<Value>,
 }
 
 impl ChatCompletionRequest {
@@ -313,24 +396,60 @@ impl ChatCompletionRequest {
         {
             return Err(ServerError::MultipleChoices { n });
         }
-        // Tool definitions are parsed and preserved, but nothing renders them
-        // into the prompt: the vendored ChatML template has no tool branch and
-        // core's `ChatMessage` has no tool role. Answering 200 while dropping
-        // them is the failure this crate refuses everywhere else, and it is
-        // worse here than elsewhere because the reply looks reasonable: the
-        // model simply says it cannot read files, and `prompt_tokens` is
-        // identical with and without the `tools` array. Measured 2026-08-08,
-        // 14 tokens either way. Refuse until the template can carry them.
-        if self.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
-            return Err(ServerError::ToolsUnsupported);
+        // A stop sequence has no consumer: `GenerateParams` carries no stop
+        // strings and the generate entry points stop on the tokenizer's own
+        // stop tokens. Accepting one would let generation run past where the
+        // caller asked it to end, with nothing in the response to say so.
+        if !self.stop_sequences().is_empty() {
+            return Err(ServerError::StopUnsupported);
         }
+        self.check_tool_choice()?;
+        self.check_tools()?;
         for message in &self.messages {
             // Flattening is the check: it is the only thing that inspects
             // every part, and doing it here means a bad part is refused before
             // the session is claimed rather than mid-prefill.
             message.text()?;
+            message.check_tool_calls()?;
         }
         Ok(())
+    }
+
+    /// The tool definitions, empty when none were sent.
+    pub fn tools(&self) -> &[Value] {
+        self.tools.as_deref().unwrap_or(&[])
+    }
+
+    /// Refuse a tool definition whose name the model could not call back.
+    ///
+    /// Separate from [`validate`](Self::validate) so [`crate::prompt::build`],
+    /// which is the thing that actually renders these, enforces it too rather
+    /// than trusting that validation ran.
+    pub fn check_tools(&self) -> Result<(), ServerError> {
+        for tool in self.tools() {
+            check_json_tool_name(definition_name(tool), "tools")?;
+        }
+        Ok(())
+    }
+
+    /// Refuse a `tool_choice` this build cannot honour.
+    ///
+    /// `auto`, `none` and absent are accepted and all render the same prompt,
+    /// because that is what the template does: it branches on `tools` alone
+    /// and has no way to say "you must call something". `required` and a named
+    /// function therefore cannot be expressed at all, and serving them by
+    /// letting the model choose freely would drop the one constraint the
+    /// request was about.
+    pub fn check_tool_choice(&self) -> Result<(), ServerError> {
+        let Some(choice) = &self.tool_choice else {
+            return Ok(());
+        };
+        if matches!(choice.as_str(), Some("auto" | "none")) {
+            return Ok(());
+        }
+        Err(ServerError::UnsupportedToolChoice {
+            choice: choice.to_string(),
+        })
     }
 
     /// Whether to stream. Absent means false.
@@ -356,6 +475,11 @@ impl ChatCompletionRequest {
     }
 
     /// The stop sequences, empty when none were sent.
+    ///
+    /// Read by [`validate`](Self::validate) only, to refuse a non-empty one.
+    /// When the runtime grows stop strings this becomes the accessor that
+    /// feeds them; until then it exists so the refusal has one definition of
+    /// "sent a stop sequence" across both `stop` spellings.
     pub fn stop_sequences(&self) -> &[String] {
         self.stop.as_ref().map_or(&[], StringOrArray::as_slice)
     }
@@ -465,14 +589,15 @@ mod tests {
         ));
     }
 
+    /// The refusal this replaced answered 400 to every tools request; the
+    /// renderer can carry them now, so a well-formed one is served.
     #[test]
-    fn a_request_carrying_tools_is_refused_rather_than_answered_without_them() {
-        // Accepting these and dropping them returns a reply that reads fine
-        // and was produced from a prompt the caller never sent.
+    fn a_request_carrying_tools_is_accepted() {
         let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
-            "tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}"#;
+            "tools":[{"type":"function","function":{"name":"read_file","parameters":{}}}]}"#;
         let req = ChatCompletionRequest::from_json(body).expect("parses");
-        assert!(matches!(req.validate(), Err(ServerError::ToolsUnsupported)));
+        req.validate().expect("the renderer has a tools branch");
+        assert_eq!(req.tools().len(), 1);
     }
 
     #[test]
@@ -480,6 +605,168 @@ mod tests {
         let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[]}"#;
         let req = ChatCompletionRequest::from_json(body).expect("parses");
         req.validate().expect("an empty list asks for nothing");
+        assert!(req.tools().is_empty());
+    }
+
+    #[test]
+    fn the_tool_name_charset_is_openais() {
+        for good in ["f", "get_weather", "read-file", "a1", &"n".repeat(64)] {
+            assert!(is_valid_tool_name(good), "{good}");
+        }
+        for bad in [
+            "",
+            "get weather",
+            "say\"hi",
+            "read<file>",
+            "a.b",
+            "naïve",
+            "a\u{200b}b",
+            &"n".repeat(65),
+        ] {
+            assert!(!is_valid_tool_name(bad), "{bad}");
+        }
+    }
+
+    /// A name is refused rather than repaired: the model echoes it back and
+    /// the client matches on it, so a sanitizer marker inside one would make
+    /// the call unmatchable and the difference invisible.
+    #[test]
+    fn a_tool_definition_name_outside_the_charset_is_refused_with_the_name() {
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"read<file>"}}]}"#;
+        let error = ChatCompletionRequest::from_json(body)
+            .expect("parses")
+            .validate()
+            .expect_err("hostile name");
+        assert!(
+            matches!(&error, ServerError::InvalidToolName { name, param }
+                if name == "read<file>" && *param == "tools"),
+            "{error:?}"
+        );
+        assert_eq!(error.status(), 400);
+        assert!(error.to_string().contains("read<file>"));
+    }
+
+    #[test]
+    fn a_definition_with_no_usable_name_is_refused_too() {
+        for tools in [
+            r#"[{"type":"function","function":{"parameters":{}}}]"#,
+            r#"[{"type":"function","function":{"name":42}}]"#,
+            r#"[{"type":"function"}]"#,
+            r#"[{}]"#,
+        ] {
+            let body = format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"tools":{tools}}}"#
+            );
+            let error = parse(&body)
+                .expect("parses")
+                .validate()
+                .expect_err("a nameless tool cannot be called back");
+            assert!(
+                matches!(error, ServerError::InvalidToolName { .. }),
+                "{tools}: {error:?}"
+            );
+        }
+    }
+
+    /// The bare shape the renderer also accepts, so the check has to see it.
+    #[test]
+    fn a_bare_tool_definition_is_named_by_its_own_name_field() {
+        let ok = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"name":"read_file","parameters":{}}]}"#;
+        parse(ok).expect("parses").validate().expect("valid name");
+
+        let bad = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"name":"read file","parameters":{}}]}"#;
+        assert!(matches!(
+            parse(bad).expect("parses").validate().expect_err("refused"),
+            ServerError::InvalidToolName { .. }
+        ));
+    }
+
+    #[test]
+    fn a_tool_name_echoed_back_on_an_assistant_turn_is_checked_against_messages() {
+        let body = r#"{"model":"m","messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_1","type":"function",
+                 "function":{"name":"say\"hi","arguments":"{}"}}
+            ]}
+        ]}"#;
+        let error = parse(body)
+            .expect("parses")
+            .validate()
+            .expect_err("hostile name");
+        assert!(
+            matches!(&error, ServerError::InvalidToolName { name, param }
+                if name == "say\"hi" && *param == "messages"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn tool_choice_accepts_only_what_the_template_can_express() {
+        let base = r#""model":"m","messages":[{"role":"user","content":"hi"}]"#;
+        for accepted in ["\"auto\"", "\"none\""] {
+            parse(&format!("{{{base},\"tool_choice\":{accepted}}}"))
+                .expect("parses")
+                .validate()
+                .unwrap_or_else(|e| panic!("{accepted} is renderable: {e}"));
+        }
+        parse(&format!("{{{base}}}"))
+            .expect("parses")
+            .validate()
+            .expect("absent is auto");
+
+        for refused in [
+            "\"required\"",
+            r#"{"type":"function","function":{"name":"read_file"}}"#,
+            "\"banana\"",
+        ] {
+            let error = parse(&format!("{{{base},\"tool_choice\":{refused}}}"))
+                .expect("parses")
+                .validate()
+                .expect_err("cannot be forced");
+            assert!(
+                matches!(error, ServerError::UnsupportedToolChoice { .. }),
+                "{refused}: {error:?}"
+            );
+            assert_eq!(error.param(), Some("tool_choice"));
+            assert!(error.to_string().contains("auto"), "{refused}");
+        }
+    }
+
+    /// Nothing in the runtime applies a stop string, so accepting one lets
+    /// generation run past where the caller asked it to end with nothing in
+    /// the response to say so.
+    #[test]
+    fn a_non_empty_stop_is_refused_rather_than_dropped() {
+        let base = r#""model":"m","messages":[{"role":"user","content":"hi"}]"#;
+        for sent in ["\"<end>\"", r#"["a","b"]"#] {
+            let error = parse(&format!("{{{base},\"stop\":{sent}}}"))
+                .expect("parses")
+                .validate()
+                .expect_err("no consumer for stop strings");
+            assert!(
+                matches!(error, ServerError::StopUnsupported),
+                "{sent}: {error:?}"
+            );
+            assert_eq!(error.status(), 400);
+            assert_eq!(error.param(), Some("stop"));
+        }
+        // Absent and empty ask for nothing, so they are served.
+        parse(&format!("{{{base}}}"))
+            .expect("parses")
+            .validate()
+            .expect("absent asks for nothing");
+        parse(&format!("{{{base},\"stop\":[]}}"))
+            .expect("parses")
+            .validate()
+            .expect("an empty list asks for nothing");
+        parse(&format!("{{{base},\"stop\":null}}"))
+            .expect("parses")
+            .validate()
+            .expect("null is absent");
     }
 
     #[test]

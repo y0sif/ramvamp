@@ -5,7 +5,7 @@
 //! enforces is unit-testable without a model on disk. [`build`] is the thin
 //! wrapper that hands the result to the tokenizer.
 //!
-//! # Why `encode_chat_sanitized`
+//! # Why the sanitized encoder
 //!
 //! `RvmpTokenizer::encode_chat` is reference-faithful by recorded decision: a
 //! literal `<|im_start|>` inside message content encodes to the *real* control
@@ -13,10 +13,17 @@
 //! that reaches this server fabricate a turn the model then obeys. That is
 //! defensible for a local CLI where the operator types every byte. It is not
 //! defensible here — the server's input is a socket. So this module uses
-//! [`RvmpTokenizer::encode_chat_sanitized`] and nothing else; the sanitizer
-//! breaks added-token literals with a zero-width marker, so a user asking
-//! "what does `<|im_start|>` mean?" still sees the literal in the transcript
-//! but cannot forge a turn with it.
+//! [`RvmpTokenizer::encode_chat_with_tools_sanitized`] and nothing else; the
+//! sanitizer breaks added-token literals with a zero-width marker, so a user
+//! asking "what does `<|im_start|>` mean?" still sees the literal in the
+//! transcript but cannot forge a turn with it. With tools in play the same
+//! marker covers the definitions (rewritten as JSON trees, so the serialized
+//! schema cannot be corrupted) and each call's arguments.
+//!
+//! Tool *names* are the exception, and they are validated in
+//! [`crate::request`] rather than repaired here — see
+//! [`is_valid_tool_name`](crate::request::is_valid_tool_name) for why a
+//! zero-width marker inside a name would be silent corruption.
 //!
 //! # What is not here
 //!
@@ -25,7 +32,7 @@
 //! sequence and the mapped messages and lets the engine decide how much of it
 //! is already prefilled.
 
-use ramvamp_core::tokenizer::{ChatMessage, Role, RvmpTokenizer};
+use ramvamp_core::tokenizer::{ChatMessage, Role, RvmpTokenizer, ToolArguments, ToolCall};
 
 use crate::error::ServerError;
 use crate::request::{ChatCompletionRequest, Message, MessageRole};
@@ -59,32 +66,55 @@ impl Prompt {
 
 /// Map the wire role onto the renderer's role.
 ///
-/// `tool` has no target: the vendored 2507-Instruct template deliberately
-/// omits the tool branch, so there is no faithful rendering to fall back on.
-/// Refused rather than folded into a user turn, which would put words in the
-/// user's mouth and change what the model believes it was told.
-fn role_of(message: &Message) -> Result<Role, ServerError> {
+/// Total: every role the wire format has, the renderer has. `tool` is not a
+/// ChatML marker — the template wraps tool results in a `user` turn as
+/// `<tool_response>` blocks, and consecutive ones share that turn — but that
+/// is the renderer's business, not this mapping's.
+fn role_of(message: &Message) -> Role {
     match message.role {
-        MessageRole::System => Ok(Role::System),
-        MessageRole::User => Ok(Role::User),
-        MessageRole::Assistant => Ok(Role::Assistant),
-        MessageRole::Tool => Err(ServerError::ToolsUnsupported),
+        MessageRole::System => Role::System,
+        MessageRole::User => Role::User,
+        MessageRole::Assistant => Role::Assistant,
+        MessageRole::Tool => Role::Tool,
+    }
+}
+
+/// Map one wire call onto the renderer's.
+///
+/// The wire `arguments` is a **string** — that is what the OpenAI schema says
+/// and what every client sends — so it becomes [`ToolArguments::Raw`] and is
+/// spliced into the prompt verbatim. Parsing it and re-serializing would
+/// rewrite the model's own bytes (key order, spacing) and would turn the
+/// commonplace case of a model emitting slightly invalid JSON into a 400 on
+/// the *next* turn, long after the reply the client already accepted.
+///
+/// `id` and `type` are dropped: the template has no slot for either, so
+/// rendering them would put text in the prompt the reference never produces.
+/// The client keeps them and matches results by them; nothing here needs to.
+fn tool_call_of(call: &crate::request::ToolCall) -> ToolCall {
+    ToolCall {
+        name: call.function.name.clone(),
+        arguments: ToolArguments::Raw(call.function.arguments.clone()),
     }
 }
 
 /// Map a request's messages onto core chat messages.
 ///
-/// Flattens both content forms, refuses non-text parts, and refuses anything
-/// tool-shaped. `name` is dropped: the pinned template has no slot for it, so
-/// rendering it would put text into the turn that the reference template never
-/// produces.
+/// Flattens both content forms, refuses non-text parts, and carries tool
+/// calls through. `name` and `tool_call_id` are dropped: the pinned template
+/// has no slot for either, so rendering them would put text into the turn that
+/// the reference template never produces. Dropping `tool_call_id` is why the
+/// order of `tool` messages is the order the client sent — the template pairs
+/// results with calls positionally, exactly as the reference does.
 pub fn chat_messages(messages: &[Message]) -> Result<Vec<ChatMessage>, ServerError> {
     let mut out = Vec::with_capacity(messages.len());
     for message in messages {
-        if message.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) {
-            return Err(ServerError::ToolsUnsupported);
-        }
-        out.push(ChatMessage::new(role_of(message)?, message.text()?));
+        message.check_tool_calls()?;
+        out.push(ChatMessage {
+            role: role_of(message),
+            content: message.text()?,
+            tool_calls: message.calls().iter().map(tool_call_of).collect(),
+        });
     }
     Ok(out)
 }
@@ -93,7 +123,9 @@ pub fn chat_messages(messages: &[Message]) -> Result<Vec<ChatMessage>, ServerErr
 ///
 /// Assumes [`ChatCompletionRequest::validate`] has already run; it re-checks
 /// nothing it cannot cheaply re-check, but every rule it does enforce is
-/// enforced here too, so calling it directly is still safe.
+/// enforced here too, so calling it directly is still safe. That includes the
+/// tool-name charset, checked here as well as in `validate` because this is
+/// the function that renders the names.
 pub fn build(
     tokenizer: &RvmpTokenizer,
     request: &ChatCompletionRequest,
@@ -101,8 +133,9 @@ pub fn build(
     if request.messages.is_empty() {
         return Err(ServerError::EmptyMessages);
     }
+    request.check_tools()?;
     let messages = chat_messages(&request.messages)?;
-    let token_ids = tokenizer.encode_chat_sanitized(&messages, true)?;
+    let token_ids = tokenizer.encode_chat_with_tools_sanitized(&messages, request.tools(), true)?;
     Ok(Prompt {
         token_ids,
         messages,
@@ -134,6 +167,7 @@ pub fn check_context(
 mod tests {
     use super::*;
     use crate::request::{Content, ContentPart, FunctionCall, ToolCall};
+    use ramvamp_core::tokenizer::ToolCall as CoreToolCall;
 
     fn message(role: MessageRole, content: &str) -> Message {
         Message::new(role, content)
@@ -181,34 +215,70 @@ mod tests {
         ));
     }
 
+    /// The template renders a tool result inside a `user` turn; folding it
+    /// into one *here* would be the same text arrived at by lying about the
+    /// role, and the renderer could no longer group consecutive results.
     #[test]
-    fn tool_messages_are_refused_rather_than_folded_into_a_user_turn() {
+    fn a_tool_message_maps_onto_the_tool_role() {
         let mut tool = message(MessageRole::Tool, "31C");
         tool.tool_call_id = Some("call_abc".to_owned());
-        assert!(matches!(
-            chat_messages(&[tool]).expect_err("no tool branch in the template"),
-            ServerError::ToolsUnsupported
-        ));
+        assert_eq!(
+            chat_messages(&[tool]).expect("the renderer has a tool branch"),
+            vec![ChatMessage::tool("31C")]
+        );
     }
 
     #[test]
-    fn assistant_tool_calls_are_refused_but_an_empty_list_is_not() {
+    fn assistant_tool_calls_reach_the_renderer_with_their_arguments_verbatim() {
+        // Deliberately not canonical JSON: spacing and key order are the
+        // model's own bytes and must survive to the prompt unchanged.
+        let arguments = r#"{ "city":"Cairo", "unit" : "C" }"#;
         let mut assistant = message(MessageRole::Assistant, "");
         assistant.tool_calls = Some(vec![ToolCall {
             id: "call_abc".to_owned(),
             kind: "function".to_owned(),
             function: FunctionCall {
                 name: "get_weather".to_owned(),
+                arguments: arguments.to_owned(),
+            },
+        }]);
+        let mapped = chat_messages(&[assistant.clone()]).expect("calls are rendered");
+        assert_eq!(
+            mapped,
+            vec![ChatMessage::assistant_calling(
+                "",
+                vec![CoreToolCall::raw("get_weather", arguments)]
+            )]
+        );
+        // `Raw`, not `Value`: a re-serialization would not round-trip these
+        // bytes, and the template splices a string argument in as text.
+        assert!(matches!(
+            mapped[0].tool_calls[0].arguments,
+            ToolArguments::Raw(_)
+        ));
+
+        assistant.tool_calls = Some(Vec::new());
+        let mapped = chat_messages(&[assistant]).expect("an empty list is not a tool call");
+        assert!(mapped[0].tool_calls.is_empty());
+    }
+
+    /// The one string in a tools request that is refused instead of
+    /// sanitized, because the client matches the reply against it.
+    #[test]
+    fn a_hostile_call_name_stops_the_mapping() {
+        let mut assistant = message(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call_abc".to_owned(),
+            kind: "function".to_owned(),
+            function: FunctionCall {
+                name: "get\"weather".to_owned(),
                 arguments: "{}".to_owned(),
             },
         }]);
         assert!(matches!(
-            chat_messages(&[assistant.clone()]).expect_err("refused"),
-            ServerError::ToolsUnsupported
+            chat_messages(&[assistant]).expect_err("refused, not repaired"),
+            ServerError::InvalidToolName { .. }
         ));
-
-        assistant.tool_calls = Some(Vec::new());
-        chat_messages(&[assistant]).expect("an empty list is not a tool call");
     }
 
     #[test]
@@ -218,6 +288,78 @@ mod tests {
         assert_eq!(
             chat_messages(&[named]).expect("valid"),
             vec![ChatMessage::user("hi")]
+        );
+    }
+
+    /// The committed pinned tokenizer, reached across the workspace on
+    /// purpose: the acceptance criterion for tool support is a *token count*,
+    /// and only the real vocabulary produces one that means anything.
+    fn fixture_tokenizer() -> RvmpTokenizer {
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/src/tokenizer/fixtures");
+        RvmpTokenizer::load(&fixtures).expect("fixture tokenizer loads")
+    }
+
+    fn request(body: &str) -> ChatCompletionRequest {
+        let request = ChatCompletionRequest::from_json(body).expect("valid body");
+        request.validate().expect("valid request");
+        request
+    }
+
+    /// The bug this wave exists to fix, stated the only way it is observable
+    /// from outside: a request that offers tools must produce a longer prompt
+    /// than the same request without them. Both counts were 14 when the
+    /// definitions were parsed and dropped.
+    #[test]
+    fn tool_definitions_lengthen_the_prompt_they_are_sent_with() {
+        let tokenizer = fixture_tokenizer();
+        let messages = r#""model":"m","messages":[{"role":"user","content":"read main.rs"}]"#;
+        let bare = request(&format!("{{{messages}}}"));
+        let armed = request(&format!(
+            r#"{{{messages},"tools":[{{"type":"function","function":{{
+                "name":"read_file","description":"Read a file",
+                "parameters":{{"type":"object","properties":{{"path":{{"type":"string"}}}}}}
+            }}}}]}}"#
+        ));
+
+        let bare = build(&tokenizer, &bare).expect("builds");
+        let armed = build(&tokenizer, &armed).expect("builds");
+        assert!(
+            armed.len() > bare.len(),
+            "tools must reach the model: {} with, {} without",
+            armed.len(),
+            bare.len()
+        );
+
+        let rendered = tokenizer.decode(&armed.token_ids, false).expect("decodes");
+        assert!(rendered.contains("# Tools"), "{rendered}");
+        assert!(rendered.contains("read_file"), "{rendered}");
+    }
+
+    /// The other half of a tool turn: the call the model made and the result
+    /// the client fed back both have to be in the prompt on the next turn, or
+    /// the model re-issues the call it already made.
+    #[test]
+    fn a_call_and_its_result_both_reach_the_prompt() {
+        let tokenizer = fixture_tokenizer();
+        let request = request(
+            r#"{"model":"m","messages":[
+                {"role":"user","content":"weather?"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_abc","type":"function",
+                     "function":{"name":"get_weather","arguments":"{\"city\": \"Cairo\"}"}}
+                ]},
+                {"role":"tool","tool_call_id":"call_abc","content":"31C"}
+            ]}"#,
+        );
+        let prompt = build(&tokenizer, &request).expect("builds");
+        let rendered = tokenizer.decode(&prompt.token_ids, false).expect("decodes");
+        assert!(rendered.contains("<tool_call>"), "{rendered}");
+        // Spliced verbatim, spacing included, rather than re-serialized.
+        assert!(rendered.contains(r#"{"city": "Cairo"}"#), "{rendered}");
+        assert!(
+            rendered.contains("<tool_response>\n31C\n</tool_response>"),
+            "{rendered}"
         );
     }
 

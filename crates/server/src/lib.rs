@@ -43,6 +43,12 @@
 //! than 429, and `Retry-After` is a small fiction rather than an honest wait.
 //! Each of those has its reasoning recorded next to the code, because each of
 //! them looks like a bug until you know why.
+//!
+//! The same rule governs the parameters this build cannot implement rather
+//! than cannot afford: a non-empty `stop` and a `tool_choice` that forces a
+//! particular call are 400s, because nothing downstream applies either one and
+//! a 200 that quietly ignored them would be indistinguishable from a correct
+//! answer. `tools` themselves *are* served — see [`prompt`].
 
 pub mod engine;
 pub mod error;

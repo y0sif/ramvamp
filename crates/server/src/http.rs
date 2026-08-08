@@ -181,6 +181,18 @@ fn chat_completions(engine: &mut dyn Engine, mut request: Request, config: &Serv
         Ok(parsed) => parsed,
         Err(e) => return respond_error(request, &e),
     };
+    // Which optional capabilities this client actually asked for, logged
+    // before anything is refused. Kept because the refusals above it are only
+    // defensible against evidence: `stop` and a forced `tool_choice` are 400s
+    // here, and whether that makes the server unusable depends entirely on
+    // what the clients pointed at it send on every request.
+    tracing::debug!(
+        stop = parsed.stop_sequences().len(),
+        tools = parsed.tools().len(),
+        tool_choice = ?parsed.tool_choice,
+        stream = parsed.stream(),
+        "chat request"
+    );
     // Everything that can be refused is refused here, before a status is
     // committed: once a stream's head is out, 200 is the answer whatever
     // happens next.
