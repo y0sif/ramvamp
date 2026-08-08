@@ -66,40 +66,57 @@ remaining experiment in the project.
 | Numerics gates 1-4 | **done**: bitident 8/8, KL 1.04e-2, greedy 24/24 |
 | Decode throughput | **settled per drive**, 2026-08-08 |
 | **Gate 5: perplexity** | **OPEN**: reference banked in phase 4 (llama.cpp PPL 6.3810 +/- 0.16588, wiki.test.raw `-c 512 --chunks 40`); **the ramvamp side has never been run** |
-| **Shipping surface** | **OPEN**, see next section |
+| **Shipping surface** | **SETTLED 2026-08-08: `ramvamp-server`.** The TUI ships as a development affordance only |
 
 Everything except gate 5 and a shipping surface is finished. v0 is not blocked
 on runtime work.
 
 ## Next: the shipping surface (v0 exit)
 
-**SETTLED 2026-08-08: the harness first, the server second.** Both get built;
-this is an ordering, not a choice between them.
+**SETTLED 2026-08-08 (revised, same day): the server is the shipping surface.
+The TUI is a development affordance and gets no further investment.**
 
-The reason is that a Chat Completions request is **stateless**, so a server
-re-prefills the whole conversation every turn. At the measured 11.25 tok/s
-prefill that is ~44 s for a 500-token history, ~3 min at 2,000 and ~6 min at
-4,000, before a single token comes back. **KV prefix caching is therefore a
-prerequisite for the server, not a follow-up to it**, and it is the larger
-piece of work. The harness has no such dependency: the REPL already retains KV
-across turns through `generate_from(.., start_position, ..)`.
+This reverses a decision taken earlier the same day, and the reversal is
+recorded rather than quietly applied, because the first decision was taken on
+a claim that did not survive checking.
 
-**This reverses a recorded stance and does so deliberately.**
-`docs/handoff-phase8.md` records the REPL as "a development affordance, and
-the project's direction is to drive ramvamp from another harness rather than
-to build one here." That was right when the runtime was unfinished and the
-REPL was a means to an end. It is wrong now, for one measured reason: **a 4K
-prompt is about six minutes of total silence before the first character**,
-because prefill emits nothing and the timing line only lands at the end. The
-genesis session identified exactly this failure mode when it cut thinking mode
-("at our 4-8 tok/s, a 1,000-token think block is 2-4 minutes of silence before
-the first useful word"). The harness is not a nicer REPL. It is the thing that
-makes the runtime's slowness legible, and that is a v0 concern.
+**What the first decision rested on, and why it was wrong.** The argument was
+that a Chat Completions request is stateless, so a server re-prefills the whole
+conversation every turn (~3 min at 2,000 tokens of history at 11.25 tok/s), and
+that KV prefix caching was therefore a phase-sized prerequisite that the harness
+did not have. The throughput arithmetic is right. The sizing was not.
+`generate_from(.., start_position, ..)` already does incremental prefill and the
+REPL already relies on it; `KvCache` lacks only a `truncate`, which on a flat
+per-layer buffer with a length counter is small. What a server adds over the
+REPL is a longest-common-prefix comparison, because the REPL knows it only ever
+appends while a server must discover where the conversation diverged. That is a
+comparison loop, not a phase. Prefix caching is scoped properly in the server
+plan rather than used as a reason to reorder the work.
 
-Scope discipline: the harness is the **local operator console**, not the
-integration surface. `ramvamp-server` remains the answer for OpenCode and
-anything OpenAI-speaking, and `generate` and `logits` keep their exact stdio
-because every rule-2 measurement in the project parses them.
+**What the project owner said at the outset, and was right about.** Building a
+terminal UI is reimplementing something that exists in many good versions
+already, and it is outside what this project contributes. The contribution is
+the streaming runtime. `docs/handoff-phase8.md` had it right: the REPL is "a
+development affordance, and the project's direction is to drive ramvamp from
+another harness rather than to build one here."
+
+The measured problem the TUI was built to solve is real and stands: a 4K prompt
+is about six minutes of total silence before the first character, and genesis
+named that failure mode when it cut thinking mode. **The server solves it the
+same way**, because SSE streaming needs exactly the same progress events. That
+work is not lost: `GenerateProgress` (added in `c7ec450`) is what an SSE stream
+emits, and the `repl.rs` extraction gives the server `Transcript`, `TurnCodec`
+and `plan_turn` without reimplementation.
+
+### The TUI's status
+
+Kept, not deleted, per the standing rule that set-aside work is preserved.
+`chat --tui` works, gates green, and it is genuinely useful as an operator
+console when watching a cold run's hit rate move. It is **not** the shipping
+surface, it is not on the v0 path, and it should not accrue features. `chat`
+without `--tui` remains the reference behaviour, and `generate` and `logits`
+keep their exact stdio because every rule-2 measurement in the project parses
+them.
 
 ### The server, when its turn comes
 
@@ -181,7 +198,7 @@ for four consecutive phases.
 | Decision | Raised | Status |
 | --- | --- | --- |
 | The tok/s floor | Phase 5, 7, 9 | **SETTLED 2026-08-08**, per drive |
-| Shipping surface: server, richer CLI, or both | Genesis, reopened 2026-08-08 | **SETTLED 2026-08-08: harness first, server second.** See below |
+| Shipping surface: server, richer CLI, or both | Genesis, reopened 2026-08-08 | **SETTLED 2026-08-08: the server.** Decided harness-first earlier the same day on an oversized prefix-caching estimate, then reversed. See above |
 | Merge `feat/decode-compute`? | Phase 9 | **SETTLED 2026-08-08, merged** at `2f52545`, gate re-verified on `main` |
 | Core API additions for TUI progress | Phase 10 | **SETTLED 2026-08-08, approved.** Per-chunk prefill callback plus a stats snapshot passed into `on_token` |
 | `ratatui` as a CLI dependency | Phase 10 | **SETTLED 2026-08-08, approved.** +31 crates against 137 |
