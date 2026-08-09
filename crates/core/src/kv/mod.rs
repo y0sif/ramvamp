@@ -109,6 +109,18 @@ pub enum KvError {
         /// Largest per-layer length.
         longest: usize,
     },
+
+    /// A truncation asked for a length the cache has never reached.
+    #[error(
+        "kv cache truncate to {requested} exceeds the {len} positions held: \
+         truncation only rewinds, it cannot extend"
+    )]
+    TruncateBeyondLength {
+        /// The rejected target length.
+        requested: usize,
+        /// Positions every layer currently holds.
+        len: usize,
+    },
 }
 
 /// Linear append-only FP16 KV cache for full-attention layers.
@@ -303,8 +315,49 @@ impl KvCache {
     /// behind are unreachable through the public surface. This is what lets a
     /// second sequence start on an existing [`crate::model::ForwardState`]
     /// instead of paying for a new expert slot pool.
+    ///
+    /// Deliberately **not** `truncate(0)`, even though the two agree on every
+    /// well-formed cache: this is the infallible recovery path, and it levels
+    /// a ragged cache (the state a prefill that failed mid-chunk leaves
+    /// behind) where [`Self::truncate`] refuses it. Dropping everything is
+    /// always sound; keeping a prefix of a cache whose layers disagree is not.
     pub fn clear(&mut self) {
         self.lens.fill(0);
+    }
+
+    /// Rewind every layer's cursor to `new_len`, keeping the planes allocated
+    /// and the first `new_len` positions exactly as they were.
+    ///
+    /// The reachability argument is [`Self::clear`]'s, and it is
+    /// length-agnostic: only the per-layer cursors move, no plane is zeroed,
+    /// and every read is bounded by the cursor this resets — so the f16 bits
+    /// of the dropped suffix are unreachable through the public surface, and
+    /// the next [`Self::append`] overwrites them in place. This is what lets a
+    /// stateless chat request re-prefill only the tokens that diverged from
+    /// the cached conversation instead of the whole of it.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::RaggedLayers`] if the layers disagree. A ragged cache means
+    /// an append sequence was abandoned mid-token, and truncating it would
+    /// either fabricate positions for the short layers or quietly leave it
+    /// ragged; [`Self::clear`] is the recovery, not this.
+    ///
+    /// [`KvError::TruncateBeyondLength`] if `new_len` exceeds the current
+    /// length. Truncating upward would publish stale f16 bits from an earlier,
+    /// longer sequence as if they were positions of this one.
+    ///
+    /// Nothing moves on either error.
+    pub fn truncate(&mut self, new_len: usize) -> Result<(), KvError> {
+        let len = self.seq_len()?;
+        if new_len > len {
+            return Err(KvError::TruncateBeyondLength {
+                requested: new_len,
+                len,
+            });
+        }
+        self.lens.fill(new_len);
+        Ok(())
     }
 
     /// The K row (f16 bits, `kv_dim` elements) for `pos` in `layer`.
@@ -567,6 +620,137 @@ mod tests {
             cache.append(0, &row, &row).unwrap();
         }
         assert_eq!(cache.len(0).unwrap(), 3);
+    }
+
+    /// `truncate` rewinds every cursor to a *prefix*: the positions below the
+    /// new length are bit-for-bit what they were, the ones above are
+    /// unreachable again, and the next append lands exactly on the seam.
+    #[test]
+    fn truncate_rewinds_every_layer_to_a_prefix() {
+        let kv_dim = 2 * 4;
+        let mut cache = KvCache::new(2, 2, 4, 6).unwrap();
+        let rows: Vec<Vec<f32>> = (0..5).map(|t| filled_row(t, kv_dim)).collect();
+        for row in &rows {
+            cache.append(0, row, row).unwrap();
+            cache.append(1, row, row).unwrap();
+        }
+        assert_eq!(cache.seq_len().unwrap(), 5);
+
+        // Snapshot the prefix that must survive, taken before the rewind so
+        // the comparison is against real stored bits and not a recomputation.
+        let before: Vec<(Vec<u16>, Vec<u16>)> = (0..3)
+            .map(|pos| {
+                (
+                    cache.k_row(0, pos).unwrap().to_vec(),
+                    cache.v_row(1, pos).unwrap().to_vec(),
+                )
+            })
+            .collect();
+
+        cache.truncate(3).unwrap();
+
+        // Every layer reports the new length, and so does the folded view.
+        assert_eq!(cache.seq_len().unwrap(), 3);
+        assert_eq!(cache.len(0).unwrap(), 3);
+        assert_eq!(cache.len(1).unwrap(), 3);
+        assert!(!cache.is_empty());
+        assert_eq!(cache.k_layer(0).unwrap().len(), 3 * kv_dim);
+        assert_eq!(cache.v_layer(1).unwrap().len(), 3 * kv_dim);
+
+        // The kept prefix is untouched — no plane was zeroed or shifted.
+        for (pos, (k, v)) in before.iter().enumerate() {
+            assert_eq!(cache.k_row(0, pos).unwrap(), &k[..], "k row {pos} moved");
+            assert_eq!(cache.v_row(1, pos).unwrap(), &v[..], "v row {pos} moved");
+        }
+
+        // The dropped suffix is unreachable through the public surface again,
+        // exactly as after `clear`, even though its bits are still in the
+        // plane.
+        assert_eq!(
+            cache.k_row(0, 3).unwrap_err(),
+            KvError::PositionOutOfRange {
+                layer: 0,
+                pos: 3,
+                len: 3,
+            }
+        );
+
+        // And the next append lands *at* the seam, overwriting position 3
+        // rather than appending after the stale one.
+        let fresh = filled_row(99, kv_dim);
+        cache.append(0, &fresh, &fresh).unwrap();
+        cache.append(1, &fresh, &fresh).unwrap();
+        assert_eq!(cache.seq_len().unwrap(), 4);
+        assert_eq!(cache.k_row(0, 3).unwrap()[0], f32_to_f16(fresh[0]));
+        assert_ne!(
+            cache.k_row(0, 3).unwrap(),
+            cache.k_row(0, 2).unwrap(),
+            "the fixture rows must differ or this test proves nothing"
+        );
+
+        // Truncating to the current length is a no-op, and to zero is `clear`.
+        cache.truncate(4).unwrap();
+        assert_eq!(cache.seq_len().unwrap(), 4);
+        cache.truncate(0).unwrap();
+        assert!(cache.is_empty());
+        assert_eq!(cache.seq_len().unwrap(), 0);
+    }
+
+    /// The two refusals: a ragged cache and an upward "truncation". Both are
+    /// typed, neither panics, and neither moves a cursor.
+    #[test]
+    fn truncate_refuses_ragged_and_upward() {
+        let mut cache = KvCache::new(2, 2, 4, 4).unwrap();
+        let row = [0.5f32; 8];
+
+        // Ragged: layer 0 is one ahead, which is what a prefill that failed
+        // mid-token leaves behind. Rewinding to *any* length would fabricate a
+        // position for the short layer, so every target is refused.
+        cache.append(0, &row, &row).unwrap();
+        let ragged = KvError::RaggedLayers {
+            shortest: 0,
+            longest: 1,
+        };
+        assert_eq!(cache.truncate(0).unwrap_err(), ragged);
+        assert_eq!(cache.truncate(1).unwrap_err(), ragged);
+        assert_eq!(
+            cache.len(0).unwrap(),
+            1,
+            "a refused truncate moved a cursor"
+        );
+        assert_eq!(cache.len(1).unwrap(), 0);
+        // `clear` is the recovery from exactly this state, and still is.
+        cache.clear();
+        assert_eq!(cache.seq_len().unwrap(), 0);
+
+        // Upward: the plane still holds the bits of the longer sequence, so
+        // extending the cursor would serve them as if they were positions of
+        // this one.
+        cache.append(0, &row, &row).unwrap();
+        cache.append(1, &row, &row).unwrap();
+        cache.append(0, &row, &row).unwrap();
+        cache.append(1, &row, &row).unwrap();
+        assert_eq!(
+            cache.truncate(3).unwrap_err(),
+            KvError::TruncateBeyondLength {
+                requested: 3,
+                len: 2,
+            }
+        );
+        // Past capacity is the same refusal, not a capacity error: nothing was
+        // ever written there either.
+        assert_eq!(
+            cache.truncate(usize::MAX).unwrap_err(),
+            KvError::TruncateBeyondLength {
+                requested: usize::MAX,
+                len: 2,
+            }
+        );
+        assert_eq!(
+            cache.seq_len().unwrap(),
+            2,
+            "a refused truncate moved a cursor"
+        );
     }
 
     #[test]

@@ -1,0 +1,24 @@
+[package]
+name = "ramvamp-server"
+description = "OpenAI-compatible HTTP server for the ramvamp runtime: request/response shapes, SSE streaming, prompt assembly, prefix-cached generation, and error mapping"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ramvamp-core = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The only transport dependency, and a deliberately small one: it brings
+# `ascii`, `chunked_transfer` and `httpdate` and nothing else, all
+# MIT OR Apache-2.0 like the rest of the tree. Its `Response` type is used
+# for the buffered endpoints only — the streaming path writes chunked
+# framing by hand through `Request::into_writer`, because `Response` routes
+# SSE through an 8 KiB `chunked_transfer::Encoder` into a 1 KiB `BufWriter`
+# and delivers a whole stream in one burst at the end (see `wire`).
+tiny_http = "0.12"

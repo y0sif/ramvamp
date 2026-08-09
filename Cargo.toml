@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/repack", "crates/cli"]
+members = ["crates/core", "crates/repack", "crates/server", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,7 @@ rust-version = "1.85"
 # Internal
 ramvamp-core = { path = "crates/core" }
 ramvamp-repack = { path = "crates/repack" }
+ramvamp-server = { path = "crates/server" }
 
 # Errors and logging
 anyhow = "1"
@@ -23,7 +24,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Serialization and integrity
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` swaps serde_json's object map from BTreeMap to IndexMap
+# workspace-wide, so `Value` round-trips keep the input's key order. Chat
+# templates render tool schemas with Python's `json.dumps`, which emits
+# insertion order; sorting them would silently change the prompt the model
+# sees (see `tokenizer::pyjson`).
+serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 
 # Model I/O (source format is GGUF; parsing is implemented in-repo, see docs/architecture.md)
