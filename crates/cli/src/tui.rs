@@ -30,6 +30,16 @@
 //! Neither is called here, which is also why the `scrolling-regions` cargo
 //! feature is not enabled: it only alters `insert_before`.
 //!
+//! # What moves, and how often
+//!
+//! As little as possible. The panel redraws on a *state* change at once — a
+//! new phase, a new detail line, a new chunk — and otherwise at [`TICK`], once
+//! a second, which is faster than any number on it can meaningfully change.
+//! For [`SETTLE`] after a phase change nothing time-driven redraws at all, so
+//! arriving at a phase is one event rather than a flicker. There is no
+//! spinner: the prefill bar's half-step is the only thing that animates, and
+//! at a realistic prompt size its head advances about every two seconds.
+//!
 //! # Wiring
 //!
 //! [`Harness`], [`panel`] and [`input`] are presentation only: nothing in them
@@ -40,9 +50,11 @@
 //! feeds this one by message. That split is forced rather than stylistic; see
 //! its module docs.
 
+mod glyphs;
 mod input;
 mod panel;
 mod session;
+mod style;
 
 pub use session::run_chat_tui;
 
@@ -63,8 +75,10 @@ use ratatui::text::{Line, Span};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 use crate::repl::CONTEXT_CAP;
+use glyphs::Glyphs;
 use input::LineEditor;
 use panel::Layout;
+use style::Palette;
 
 /// What the runtime is doing right now.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -75,15 +89,37 @@ pub enum Phase {
     Decode,
 }
 
+/// How far through the prompt a prefill is.
+///
+/// The total is an `Option` because the panel has to be able to say something
+/// honest without one: a prefill whose length is not known draws no bar, no
+/// percent and no ETA, rather than an indeterminate sweep that implies
+/// progress nobody measured.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Prefilling {
+    /// Prompt positions committed so far.
+    pub done: usize,
+    /// Positions this prefill will consume, when that is known.
+    pub total: Option<usize>,
+}
+
 /// Everything the panel shows, as of one instant.
 ///
 /// The caller owns this: the harness never derives a number for itself, so
-/// what the panel says and what the run reports cannot drift.
-#[derive(Clone, Debug, Default)]
+/// what the panel says and what the run reports cannot drift. The two derived
+/// numbers on it — [`Status::rate`] and [`Status::eta`] — are derived by the
+/// UI thread from events it already received, and they are fields here rather
+/// than arithmetic in `panel.rs` so that a snapshot test is a pure function of
+/// its input and never of a clock.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Status {
     pub phase: Phase,
-    /// `(done, total)` prompt positions, while prefill is running.
-    pub prefill: Option<(usize, usize)>,
+    /// What the model is called, for the idle row.
+    pub model: Option<String>,
+    /// Where the prefill is, while one is running.
+    pub prefill: Option<Prefilling>,
+    /// `(chunk, chunks)` of the chunked prefill sweep.
+    pub chunk: Option<(usize, usize)>,
     /// Tokens decoded so far this turn.
     pub tokens: usize,
     /// Time the current phase has been running.
@@ -92,8 +128,41 @@ pub struct Status {
     pub context: (usize, usize),
     /// Expert cache hit rate, `0.0..=1.0`.
     pub hit_rate: Option<f32>,
-    /// One short line, e.g. an error.
+    /// Bytes this turn has streamed from NVMe, where the runtime reports
+    /// them.
+    pub read_bytes: Option<u64>,
+    /// Positions or tokens per second, over a rolling window.
+    pub rate: Option<f64>,
+    /// What is left of the prefill at that rate.
+    pub eta: Option<Duration>,
+    /// One short line that replaces whatever the detail row would have said.
     pub detail: Option<String>,
+}
+
+/// What a status is *about*, as opposed to what its numbers happen to be:
+/// the phase, the line it is saying, the chunk it is on, and the model it is
+/// talking to. See [`Status::state`].
+type StatusKind<'a> = (
+    Phase,
+    Option<&'a str>,
+    Option<(usize, usize)>,
+    Option<&'a str>,
+);
+
+impl Status {
+    /// The parts of a status whose change is a *state* change rather than a
+    /// tick: what is running, what it is doing, and what it is called.
+    ///
+    /// A change here redraws immediately; a change in the numbers waits for
+    /// the next [`TICK`]. That is the whole of the panel's motion policy.
+    fn state(&self) -> StatusKind<'_> {
+        (
+            self.phase,
+            self.detail.as_deref(),
+            self.chunk,
+            self.model.as_deref(),
+        )
+    }
 }
 
 /// Something the user did.
@@ -101,7 +170,7 @@ pub struct Status {
 pub enum UiEvent {
     /// Enter on a non-empty line. May contain newlines, from a paste.
     Submit(String),
-    /// Ctrl-C while a turn is running.
+    /// Ctrl-C or Esc while a turn is running.
     Interrupt,
     /// Ctrl-D on an empty line, or Ctrl-C while idle.
     Exit,
@@ -128,18 +197,37 @@ pub struct Harness {
     layout: Layout,
     editor: LineEditor,
     status: Status,
+    palette: &'static Palette,
+    glyphs: &'static Glyphs,
     /// Set by [`Harness::set_status`], cleared by a draw.
     dirty: bool,
-    /// Throttles status-driven redraws; input and resize always redraw.
+    /// Throttles status-driven redraws; input, resize and state changes
+    /// always redraw.
     last_draw: Instant,
+    /// When the phase last changed, which is what [`SETTLE`] is measured
+    /// from.
+    phase_since: Instant,
     /// Set by [`Harness::suspend`]: the terminal is the user's again and
     /// this harness must not touch it.
     suspended: bool,
 }
 
-/// Floor on status-driven redraws. Prefill advances a few dozen times a
-/// second and there is no point drawing faster than that.
-const REDRAW_INTERVAL: Duration = Duration::from_millis(33);
+/// Floor on status-driven redraws.
+///
+/// A second, because nothing on the panel says anything new faster than that:
+/// the clock counts whole seconds, and at 3,961 positions across 80 columns
+/// the bar's half-step lands about every two. Anything faster is motion for
+/// its own sake in a window the user is going to be looking at for minutes.
+const TICK: Duration = Duration::from_millis(1_000);
+
+/// How long a phase change buys before anything *time-driven* redraws again.
+///
+/// Arriving at a phase should read as one event, and for this long after one
+/// nothing moves on its own: not the clock, not the bar's half-step. What
+/// still redraws inside the window is a state change (a detail line arriving,
+/// a chunk landing) and a keystroke — those are information, not animation,
+/// and holding them back would only make the panel feel slow.
+const SETTLE: Duration = Duration::from_millis(400);
 
 /// Why [`Harness::apply_layout`] is claiming the scroll region, which decides
 /// whether the rows it is about to park on are ours to erase.
@@ -187,13 +275,17 @@ impl Harness {
         }
         out.flush()?;
 
+        let now = Instant::now();
         let mut harness = Self {
             term: build_terminal(layout)?,
             layout,
             editor: LineEditor::default(),
             status: Status::default(),
+            palette: Palette::detect(),
+            glyphs: Glyphs::detect(),
             dirty: true,
-            last_draw: Instant::now() - REDRAW_INTERVAL,
+            last_draw: now - TICK,
+            phase_since: now - SETTLE,
             suspended: false,
         };
         // Where the newlines left us, so entering does not open a gap under
@@ -206,6 +298,12 @@ impl Harness {
         harness.apply_layout(Arrival::Enter(park))?;
         harness.draw()?;
         Ok(harness)
+    }
+
+    /// The colour roles and the characters this terminal resolved to, for
+    /// whatever is writing straight into the scroll region.
+    pub fn marks(&self) -> (&'static Palette, &'static Glyphs) {
+        (self.palette, self.glyphs)
     }
 
     /// Write model output, user turns, banners — anything that belongs in
@@ -241,14 +339,23 @@ impl Harness {
     /// Replace what the panel is showing.
     ///
     /// Cheap and infallible by contract, so it can be called per decoded
-    /// token or per prefilled position. The draw it triggers is throttled
-    /// and its errors are swallowed; a caller that wants to see a failure
-    /// should look at [`Harness::poll`], which it has to call anyway to
-    /// notice Ctrl-C.
+    /// token or per prefilled position. The draw it triggers is throttled —
+    /// see [`TICK`] and [`SETTLE`], and [`Status::state`] for what jumps the
+    /// queue — and its errors are swallowed; a caller that wants to see a
+    /// failure should look at [`Harness::poll`], which it has to call anyway
+    /// to notice Ctrl-C.
     pub fn set_status(&mut self, status: Status) {
+        let changed = status.state() != self.status.state();
+        if status.phase != self.status.phase {
+            self.phase_since = Instant::now();
+        }
         self.status = status;
         self.dirty = true;
-        let _ = self.maybe_draw();
+        let _ = if changed {
+            self.draw()
+        } else {
+            self.maybe_draw()
+        };
     }
 
     /// Wait up to `timeout` for the user to do something.
@@ -269,6 +376,8 @@ impl Harness {
         }
         let event = event::read()?;
         let out = self.handle(event)?;
+        // A keystroke is not animation: what the user typed echoes now,
+        // whatever the tick and the settle window have to say about it.
         self.draw()?;
         Ok(out)
     }
@@ -308,15 +417,22 @@ impl Harness {
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<UiEvent> {
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
         let alt = modifiers.contains(KeyModifiers::ALT);
+        let running = self.status.phase != Phase::Idle;
         match code {
             // No signal handler: in raw mode Ctrl-C is just a keystroke.
             // It stops the turn that is running, and leaves when there is
             // nothing to stop.
-            KeyCode::Char('c') if ctrl => Some(if self.status.phase == Phase::Idle {
-                UiEvent::Exit
-            } else {
+            KeyCode::Char('c') if ctrl => Some(if running {
                 UiEvent::Interrupt
+            } else {
+                UiEvent::Exit
             }),
+            // Esc is the key the detail row advertises while a turn runs,
+            // because it is the one that cannot be mistaken for "leave".
+            // Idle it does nothing: there is no turn to stop, and quitting on
+            // a stray Esc from a half-parsed escape sequence would be a
+            // spectacular way to lose a conversation.
+            KeyCode::Esc => running.then_some(UiEvent::Interrupt),
             KeyCode::Char('d') if ctrl => self.editor.is_empty().then_some(UiEvent::Exit),
             KeyCode::Char('u') if ctrl => {
                 self.editor.clear();
@@ -421,7 +537,7 @@ impl Harness {
     }
 
     fn maybe_draw(&mut self) -> io::Result<()> {
-        if self.dirty && self.last_draw.elapsed() >= REDRAW_INTERVAL {
+        if self.dirty && self.last_draw.elapsed() >= TICK && self.phase_since.elapsed() >= SETTLE {
             self.draw()?;
         }
         Ok(())
@@ -432,7 +548,13 @@ impl Harness {
             self.dirty = false;
             return Ok(());
         }
-        let view = panel::panel_view(self.layout, &self.status, &self.editor);
+        let view = panel::panel_view(
+            self.layout,
+            &self.status,
+            &self.editor,
+            self.palette,
+            self.glyphs,
+        );
         self.term.draw(|frame| render(frame, &view))?;
         self.dirty = false;
         self.last_draw = Instant::now();
@@ -472,7 +594,12 @@ fn render(frame: &mut Frame, view: &panel::PanelView) {
             break;
         }
         let rect = ratatui::layout::Rect::new(area.x, area.y + offset, area.width, 1);
-        frame.render_widget(Line::from(Span::styled(row.text.as_str(), row.style)), rect);
+        let spans: Vec<Span<'_>> = row
+            .spans
+            .iter()
+            .map(|span| Span::styled(span.text.as_str(), span.style))
+            .collect();
+        frame.render_widget(Line::from(spans), rect);
     }
     // Setting a cursor position is also what keeps the cursor *visible*:
     // ratatui hides it for a frame that does not ask for one.
@@ -551,6 +678,193 @@ fn install_panic_hook() {
 }
 
 // ---------------------------------------------------------------------------
+// the transcript
+// ---------------------------------------------------------------------------
+
+/// Everything written into the scroll region, and the two bytes of styling it
+/// is allowed.
+///
+/// # What is styled, and what is not
+///
+/// The prefixes, and nothing else. Model prose goes in at full strength with
+/// no colouring, no timestamps and no rules between turns: it is the thing the
+/// user came for, and a transcript that decorates it is a transcript that
+/// cannot be pasted into an issue. What does the work is the blank line either
+/// side of a turn.
+///
+/// # Three rules, all learned the hard way
+///
+/// - **A span never crosses a newline.** This is the terminal's own
+///   scrollback: a style still open at the end of a line is inherited by every
+///   line after it, including everything the user scrolls back to. Multi-line
+///   text is styled one line at a time.
+/// - **A span is closed with [`Palette::muted_sgr_end`], never `ESC [ 0 m`.**
+///   SGR 0 resets attributes the user's shell set outside the region and
+///   expects to still be there when the process exits.
+/// - **SGR is zero width.** Column accounting is unaffected, and so is a
+///   selection: what the user copies is the text, prefixes included, with no
+///   escape bytes of ours in the middle of a word.
+struct Ribbon {
+    palette: &'static Palette,
+    /// The user's mark: the same character the input row is prompted with, so
+    /// a turn in the scrollback and the row it was typed on match.
+    turn_mark: &'static str,
+    /// The model's mark. The one character the transcript needs that the
+    /// panel's glyph set does not carry — it marks a turn rather than drawing
+    /// a panel — so it is resolved here, against the same two sets.
+    speech_mark: &'static str,
+    /// Newlines at the tail of what has been written. Two is a blank line.
+    newlines: usize,
+    /// A model turn is open, and the next chunk continues its line.
+    speaking: bool,
+}
+
+/// Where a [`Ribbon`] puts what it writes.
+///
+/// A trait with one implementation in the binary, so that the blank lines and
+/// the escape bytes — the whole of what this module promises about the
+/// transcript — can be asserted on without a terminal.
+trait Ink {
+    fn ink(&mut self, text: &str) -> io::Result<()>;
+}
+
+impl Ink for Harness {
+    fn ink(&mut self, text: &str) -> io::Result<()> {
+        self.write_transcript(text)
+    }
+}
+
+/// `ESC [ 1 m` / `ESC [ 22 m`: bold on, bold off.
+const SGR_BOLD: &str = "\x1b[1m";
+const SGR_BOLD_OFF: &str = "\x1b[22m";
+
+/// `ESC [ 31 m` / `ESC [ 39 m`: red foreground, and default foreground.
+const SGR_RED: &str = "\x1b[31m";
+const SGR_FG_DEFAULT: &str = "\x1b[39m";
+
+impl Ribbon {
+    fn new(palette: &'static Palette, glyphs: &'static Glyphs) -> Self {
+        // Two, so the first thing written does not open with a blank line it
+        // has nothing above.
+        Self {
+            palette,
+            turn_mark: glyphs.prompt,
+            speech_mark: if *glyphs == Glyphs::ASCII {
+                "*"
+            } else {
+                "\u{2022}" // • BULLET: one char, one column, like the rest.
+            },
+            newlines: 2,
+            speaking: false,
+        }
+    }
+
+    /// `ESC[1m` `{muted}` `› ` `{end}` `ESC[22m`: bold *and* muted, so the
+    /// marker is findable when scrolling and quieter than the words after it.
+    fn user_mark(&self) -> String {
+        format!(
+            "{SGR_BOLD}{}{} {}{SGR_BOLD_OFF}",
+            self.palette.muted_sgr(),
+            self.turn_mark,
+            self.palette.muted_sgr_end(),
+        )
+    }
+
+    /// `{muted}` `• ` `{end}`, and then the reply at full strength.
+    fn speech_mark(&self) -> String {
+        format!(
+            "{}{} {}",
+            self.palette.muted_sgr(),
+            self.speech_mark,
+            self.palette.muted_sgr_end(),
+        )
+    }
+
+    /// `ESC[31m` `• ` `ESC[39m`: the one place the transcript raises its
+    /// voice.
+    fn system_mark(&self) -> String {
+        format!("{SGR_RED}{} {SGR_FG_DEFAULT}", self.speech_mark)
+    }
+
+    /// One line of secondary text, opened and closed within the line.
+    fn muted_line(&self, line: &str) -> String {
+        format!(
+            "{}{line}{}",
+            self.palette.muted_sgr(),
+            self.palette.muted_sgr_end()
+        )
+    }
+
+    /// The user's turn: a bold muted marker, then their words untouched.
+    fn user(&mut self, out: &mut impl Ink, text: &str) -> io::Result<()> {
+        self.open(out)?;
+        out.ink(&self.user_mark())?;
+        // Trailing newlines are the gap's business, not the text's.
+        out.ink(text.trim_end_matches('\n'))?;
+        out.ink("\n")?;
+        self.newlines = 1;
+        Ok(())
+    }
+
+    /// A chunk of the model's reply, exactly as it was produced.
+    fn say(&mut self, out: &mut impl Ink, text: &str) -> io::Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if !self.speaking {
+            self.open(out)?;
+            out.ink(&self.speech_mark())?;
+            self.newlines = 0;
+            self.speaking = true;
+        }
+        out.ink(text)?;
+        self.newlines = text.chars().rev().take_while(|c| *c == '\n').count();
+        Ok(())
+    }
+
+    /// A refusal, a save, an error: red marker, muted text, one line at a
+    /// time.
+    fn system(&mut self, out: &mut impl Ink, text: &str) -> io::Result<()> {
+        self.open(out)?;
+        for (index, line) in text.trim_end_matches('\n').split('\n').enumerate() {
+            if index == 0 {
+                out.ink(&self.system_mark())?;
+            }
+            if !line.is_empty() {
+                out.ink(&self.muted_line(line))?;
+            }
+            out.ink("\n")?;
+        }
+        self.newlines = 1;
+        Ok(())
+    }
+
+    /// Close a reply that stopped mid-word, so whatever comes next starts on
+    /// a line of its own.
+    fn hush(&mut self, out: &mut impl Ink) -> io::Result<()> {
+        if self.speaking {
+            self.speaking = false;
+            if self.newlines == 0 {
+                out.ink("\n")?;
+                self.newlines = 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Close whatever was open and leave exactly one blank line above the
+    /// turn about to be written.
+    fn open(&mut self, out: &mut impl Ink) -> io::Result<()> {
+        self.hush(out)?;
+        while self.newlines < 2 {
+            out.ink("\n")?;
+            self.newlines += 1;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Self-test
 // ---------------------------------------------------------------------------
 
@@ -560,41 +874,60 @@ fn install_panic_hook() {
 ///
 /// ```text
 /// RAMVAMP_TUI_SELFTEST=1 cargo run -p ramvamp
+/// RAMVAMP_TUI_SELFTEST=1 RAMVAMP_ASCII=1 cargo run -p ramvamp
 /// ```
 ///
-/// Runs one fake turn immediately — a 3,961-position prefill compressed into
-/// a few seconds, then about forty tokens of decode at roughly the 2 tok/s
-/// the real runtime manages — and then waits for more. Ctrl-C stops a turn,
-/// Ctrl-D leaves.
+/// Walks all four looks in one run — a fresh idle panel with nothing to
+/// report, a prefill advancing across a 3,961-position prompt, a decode
+/// streaming tokens, and the idle panel that a finished turn leaves behind —
+/// and then waits for more. Enter runs another fake turn, Esc or Ctrl-C stops
+/// one, Ctrl-D leaves. `RAMVAMP_ASCII=1` is honoured throughout, because the
+/// glyph set is resolved by `Glyphs::detect` and never chosen here.
 pub fn selftest() -> anyhow::Result<()> {
     let mut harness = Harness::enter()?;
-    harness.write_transcript(BANNER)?;
+    let (palette, glyphs) = harness.marks();
+    let mut ribbon = Ribbon::new(palette, glyphs);
+    ribbon.system(&mut harness, BANNER)?;
 
-    let mut outcome = fake_turn(&mut harness, "Why is prefill the slow part?")?;
+    // Look one: a panel with nothing behind it. No hit rate, no context
+    // share, no focal metric — the state the user meets first.
+    let mut outcome = if let Some(UiEvent::Exit) =
+        hold(&mut harness, &fresh_status(), Duration::from_millis(1_800))?
+    {
+        Outcome::Exit
+    } else {
+        Outcome::Finished
+    };
+    if outcome != Outcome::Exit {
+        outcome = fake_turn(&mut harness, &mut ribbon, "Why is prefill the slow part?")?;
+    }
     while outcome != Outcome::Exit {
         harness.set_status(idle_status());
         match harness.poll(Duration::from_millis(100))? {
-            Some(UiEvent::Submit(line)) => outcome = fake_turn(&mut harness, &line)?,
+            Some(UiEvent::Submit(line)) => outcome = fake_turn(&mut harness, &mut ribbon, &line)?,
             Some(UiEvent::Exit) => break,
             _ => {}
         }
     }
-    harness.write_transcript("\nself-test done.\n")?;
+    ribbon.system(&mut harness, "self-test done.")?;
     harness.suspend()?;
     Ok(())
 }
 
 const BANNER: &str = "\
 ramvamp terminal harness — self-test. No model is loaded and every number \
-below is fabricated.\r\n\
-The transcript above the rule is written by the terminal itself, so it \
-scrolls, wraps and selects natively.\r\n\
+below is fabricated.\n\
+The transcript above the panel is written by the terminal itself, so it \
+scrolls, wraps and selects natively.\n\
 Type to edit the input line, paste multi-line text, Enter to run another \
-fake turn, Ctrl-C to interrupt one, Ctrl-D to leave.\n";
+fake turn, Esc to interrupt one, Ctrl-D to leave.";
 
 /// Fabricated prompt length: a full 4K-ish prompt, which is the case the
 /// progress bar exists for.
 const FAKE_PROMPT_POSITIONS: usize = 3961;
+
+/// Fabricated prefill chunk width, matching the runtime's default.
+const FAKE_CHUNK: usize = 512;
 
 /// Fabricated decode length.
 const FAKE_DECODE_TOKENS: usize = 40;
@@ -603,6 +936,15 @@ const FAKE_DECODE_TOKENS: usize = 40;
 /// status row shows the rate v0 actually manages.
 const FAKE_PREFILL_RATE: f64 = 11.0;
 
+/// Tokens per second the fabricated decode clock is scaled to.
+const FAKE_DECODE_RATE: f64 = 2.1;
+
+/// Bytes the fabricated decode claims to have streamed per token.
+const FAKE_BYTES_PER_TOKEN: u64 = 78 * 1024 * 1024;
+
+/// What the fabricated model is called.
+const FAKE_MODEL: &str = "Qwen3-30B-A3B";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Outcome {
     Finished,
@@ -610,37 +952,71 @@ enum Outcome {
     Exit,
 }
 
-fn idle_status() -> Status {
+/// The panel with nothing behind it: no turn has run, so there is no hit rate
+/// to report and no context to report a share of.
+fn fresh_status() -> Status {
     Status {
         phase: Phase::Idle,
+        model: Some(FAKE_MODEL.to_owned()),
         context: (0, CONTEXT_CAP),
-        detail: Some("idle — Enter runs a fake turn, Ctrl-D leaves".to_string()),
         ..Status::default()
     }
 }
 
-fn fake_turn(harness: &mut Harness, prompt: &str) -> io::Result<Outcome> {
-    harness.write_transcript(&format!("\nyou> {prompt}\n"))?;
+/// The panel a finished turn leaves behind.
+fn idle_status() -> Status {
+    Status {
+        phase: Phase::Idle,
+        model: Some(FAKE_MODEL.to_owned()),
+        context: (FAKE_PROMPT_POSITIONS + FAKE_DECODE_TOKENS, CONTEXT_CAP),
+        hit_rate: Some(fake_hit_rate(FAKE_PROMPT_POSITIONS + FAKE_DECODE_TOKENS)),
+        ..Status::default()
+    }
+}
+
+/// Show one status for a while, keeping the panel and the keyboard live.
+fn hold(harness: &mut Harness, status: &Status, span: Duration) -> io::Result<Option<UiEvent>> {
+    harness.set_status(status.clone());
+    let deadline = Instant::now() + span;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        if let Some(event @ (UiEvent::Exit | UiEvent::Interrupt)) = harness.poll(remaining)? {
+            return Ok(Some(event));
+        }
+    }
+    Ok(None)
+}
+
+fn fake_turn(harness: &mut Harness, ribbon: &mut Ribbon, prompt: &str) -> io::Result<Outcome> {
+    ribbon.user(harness, prompt)?;
 
     // Prefill. The real thing is 3,961 positions at about 11 tok/s, i.e. six
-    // minutes; this walks the same bar in about three seconds so the panel
-    // can actually be reviewed. The *clock* is fabricated to match the real
-    // rate rather than measured, so the row reads like a real run instead of
+    // minutes; this walks the same bar in a few seconds so the panel can
+    // actually be reviewed. The *clock* is fabricated to match the real rate
+    // rather than measured, so the row reads like a real run instead of
     // claiming four figures of tok/s.
+    let chunks = FAKE_PROMPT_POSITIONS.div_ceil(FAKE_CHUNK);
     let mut done = 0;
     while done < FAKE_PROMPT_POSITIONS {
         done = (done + 53).min(FAKE_PROMPT_POSITIONS);
+        let remaining = (FAKE_PROMPT_POSITIONS - done) as f64 / FAKE_PREFILL_RATE;
         harness.set_status(Status {
             phase: Phase::Prefill,
-            prefill: Some((done, FAKE_PROMPT_POSITIONS)),
-            tokens: 0,
+            model: Some(FAKE_MODEL.to_owned()),
+            prefill: Some(Prefilling {
+                done,
+                total: Some(FAKE_PROMPT_POSITIONS),
+            }),
+            chunk: Some((done.div_ceil(FAKE_CHUNK).max(1), chunks)),
             elapsed: Duration::from_secs_f64(done as f64 / FAKE_PREFILL_RATE),
             context: (done, CONTEXT_CAP),
-            hit_rate: Some(fake_hit_rate(done)),
-            detail: None,
+            rate: Some(FAKE_PREFILL_RATE),
+            eta: Some(Duration::from_secs_f64(remaining)),
+            // No byte figure: the runtime reports none between prefill
+            // chunks, and the self-test does not get to invent one.
+            ..Status::default()
         });
         match harness.poll(Duration::from_millis(40))? {
-            Some(UiEvent::Interrupt) => return interrupted(harness),
+            Some(UiEvent::Interrupt) => return interrupted(harness, ribbon),
             Some(UiEvent::Exit) => return Ok(Outcome::Exit),
             _ => {}
         }
@@ -649,41 +1025,41 @@ fn fake_turn(harness: &mut Harness, prompt: &str) -> io::Result<Outcome> {
     // Decode, at roughly the real 2 tok/s, in fragments that land mid-word
     // on purpose: that is what the real token stream looks like, and it is
     // what `write_transcript` has to survive.
-    let started = Instant::now();
-    harness.set_status(decode_status(0, Duration::ZERO));
-    harness.write_transcript("bot> ")?;
+    harness.set_status(decode_status(0));
     for (index, piece) in fake_tokens(LOREM, FAKE_DECODE_TOKENS).iter().enumerate() {
         let deadline = Instant::now() + Duration::from_millis(500);
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             match harness.poll(remaining)? {
-                Some(UiEvent::Interrupt) => return interrupted(harness),
+                Some(UiEvent::Interrupt) => return interrupted(harness, ribbon),
                 Some(UiEvent::Exit) => return Ok(Outcome::Exit),
                 _ => {}
             }
         }
-        harness.write_transcript(piece)?;
-        harness.set_status(decode_status(index + 1, started.elapsed()));
+        ribbon.say(harness, piece)?;
+        harness.set_status(decode_status(index + 1));
     }
-    harness.write_transcript("\n")?;
+    ribbon.hush(harness)?;
     Ok(Outcome::Finished)
 }
 
-/// Decode is the one phase the self-test runs at the real speed, so its
-/// clock is measured rather than fabricated.
-fn decode_status(tokens: usize, elapsed: Duration) -> Status {
+/// Decode's numbers, at the rate the real runtime manages rather than the one
+/// the self-test is walking through.
+fn decode_status(tokens: usize) -> Status {
     Status {
         phase: Phase::Decode,
-        prefill: None,
+        model: Some(FAKE_MODEL.to_owned()),
         tokens,
-        elapsed,
+        elapsed: Duration::from_secs_f64(tokens as f64 / FAKE_DECODE_RATE),
         context: (FAKE_PROMPT_POSITIONS + tokens, CONTEXT_CAP),
         hit_rate: Some(fake_hit_rate(FAKE_PROMPT_POSITIONS + tokens)),
-        detail: None,
+        read_bytes: Some(tokens as u64 * FAKE_BYTES_PER_TOKEN),
+        rate: (tokens > 0).then_some(FAKE_DECODE_RATE),
+        ..Status::default()
     }
 }
 
-fn interrupted(harness: &mut Harness) -> io::Result<Outcome> {
-    harness.write_transcript("\n[interrupted]\n")?;
+fn interrupted(harness: &mut Harness, ribbon: &mut Ribbon) -> io::Result<Outcome> {
+    ribbon.system(harness, "[interrupted]")?;
     Ok(Outcome::Interrupted)
 }
 
@@ -722,6 +1098,139 @@ fn fake_tokens(text: &str, count: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// A transcript in a `String`, so what the ribbon writes can be read back
+    /// byte for byte.
+    #[derive(Default)]
+    struct Sheet(String);
+
+    impl Ink for Sheet {
+        fn ink(&mut self, text: &str) -> io::Result<()> {
+            self.0.push_str(text);
+            Ok(())
+        }
+    }
+
+    fn ribbon(glyphs: &'static Glyphs) -> Ribbon {
+        // The palette every terminal resolves to today; `style.rs` pins that.
+        Ribbon::new(Palette::detect(), glyphs)
+    }
+
+    /// The prefixes, to the byte. Everything the transcript is allowed to
+    /// style is in these four strings.
+    #[test]
+    fn the_transcript_marks_are_exactly_the_documented_bytes() {
+        let unicode = ribbon(&Glyphs::UNICODE);
+        assert_eq!(unicode.user_mark(), "\x1b[1m\x1b[2m› \x1b[22m\x1b[22m");
+        assert_eq!(unicode.speech_mark(), "\x1b[2m• \x1b[22m");
+        assert_eq!(unicode.system_mark(), "\x1b[31m• \x1b[39m");
+        assert_eq!(unicode.muted_line("saved"), "\x1b[2msaved\x1b[22m");
+        // SGR 0 would reset attributes the user's shell set outside the
+        // scroll region and expects back when the process exits.
+        for mark in [
+            unicode.user_mark(),
+            unicode.speech_mark(),
+            unicode.system_mark(),
+            unicode.muted_line("x"),
+        ] {
+            assert!(!mark.contains("\x1b[0m"), "{mark:?}");
+        }
+        // Same shapes in the invariant subset.
+        let ascii = ribbon(&Glyphs::ASCII);
+        assert_eq!(ascii.user_mark(), "\x1b[1m\x1b[2m> \x1b[22m\x1b[22m");
+        assert_eq!(ascii.speech_mark(), "\x1b[2m* \x1b[22m");
+        assert_eq!(ascii.system_mark(), "\x1b[31m* \x1b[39m");
+    }
+
+    /// One blank line either side of every turn, however the turns arrive —
+    /// which is what makes the transcript readable without a single rule,
+    /// timestamp or colour in the prose.
+    #[test]
+    fn every_turn_gets_a_blank_line_either_side_of_it() {
+        let mut sheet = Sheet::default();
+        let mut ribbon = ribbon(&Glyphs::UNICODE);
+        ribbon.system(&mut sheet, "ramvamp chat.").unwrap();
+        ribbon.user(&mut sheet, "why is prefill slow?").unwrap();
+        // A reply arrives in fragments that land mid-word.
+        ribbon.say(&mut sheet, "Experts stream ").unwrap();
+        ribbon.say(&mut sheet, "from NVMe.").unwrap();
+        ribbon.hush(&mut sheet).unwrap();
+        ribbon.user(&mut sheet, "thanks").unwrap();
+
+        let plain = strip_sgr(&sheet.0);
+        assert_eq!(
+            plain,
+            "• ramvamp chat.\n\n› why is prefill slow?\n\n• Experts stream from NVMe.\n\n› thanks\n"
+        );
+        // Never two blank lines, at any point.
+        assert!(!plain.contains("\n\n\n"), "{plain:?}");
+    }
+
+    /// The blank line is a *gap*, not a newline count: a turn that already
+    /// ends on a blank line does not get another, and one that stops
+    /// mid-word gets its line closed first.
+    #[test]
+    fn the_gap_does_not_double_up_or_leave_a_turn_open() {
+        let mut sheet = Sheet::default();
+        let mut ribbon = ribbon(&Glyphs::UNICODE);
+        // A reply whose last fragment is a newline.
+        ribbon.say(&mut sheet, "one\n").unwrap();
+        ribbon.system(&mut sheet, "[interrupted]").unwrap();
+        // And a multi-line turn, which is what a paste produces.
+        ribbon.user(&mut sheet, "first\nsecond\n").unwrap();
+        assert_eq!(
+            strip_sgr(&sheet.0),
+            "• one\n\n• [interrupted]\n\n› first\nsecond\n"
+        );
+    }
+
+    /// A style left open at the end of a line is inherited by every line
+    /// after it, including everything already in the scrollback.
+    #[test]
+    fn no_transcript_span_ever_crosses_a_newline() {
+        let mut sheet = Sheet::default();
+        let mut ribbon = ribbon(&Glyphs::UNICODE);
+        // Multi-line system text is the case that has to be split: `/help` is
+        // eight lines long.
+        ribbon
+            .system(&mut sheet, "commands:\n  /help\n\n  /exit")
+            .unwrap();
+        ribbon.user(&mut sheet, "a\nb").unwrap();
+        ribbon.say(&mut sheet, "one\ntwo\n").unwrap();
+
+        let mut open: Option<&str> = None;
+        for (index, piece) in sheet.0.split('\n').enumerate() {
+            for mark in piece.match_indices('\x1b').map(|(at, _)| &piece[at..]) {
+                let code = mark
+                    .strip_prefix("\x1b[")
+                    .and_then(|rest| rest.split('m').next())
+                    .expect("an SGR sequence");
+                open = match code {
+                    "22" | "39" | "0" => None,
+                    _ => Some("open"),
+                };
+            }
+            assert!(
+                open.is_none(),
+                "line {index} of {:?} left a span open",
+                sheet.0
+            );
+        }
+    }
+
+    /// Everything but the SGR sequences, which are zero width and must not
+    /// affect what the user copies.
+    fn strip_sgr(text: &str) -> String {
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(at) = rest.find('\x1b') {
+            out.push_str(&rest[..at]);
+            let end = rest[at..].find('m').expect("an SGR sequence") + at;
+            rest = &rest[end + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
     #[test]
     fn crlf_translation_is_idempotent_over_mixed_line_endings() {
         assert_eq!(to_crlf("a\nb"), "a\r\nb");
@@ -753,6 +1262,73 @@ mod tests {
         for step in [0, 1, 100, 3961, 100_000] {
             let rate = fake_hit_rate(step);
             assert!((0.0..=1.0).contains(&rate), "step {step} gave {rate}");
+        }
+    }
+
+    /// The four looks the self-test walks are four *different* looks, and the
+    /// fresh one claims nothing it has not measured.
+    #[test]
+    fn the_self_test_walks_four_distinct_states() {
+        let states = [
+            fresh_status(),
+            Status {
+                phase: Phase::Prefill,
+                prefill: Some(Prefilling {
+                    done: 1024,
+                    total: Some(FAKE_PROMPT_POSITIONS),
+                }),
+                ..Status::default()
+            },
+            decode_status(FAKE_DECODE_TOKENS),
+            idle_status(),
+        ];
+        for (index, state) in states.iter().enumerate() {
+            for other in &states[index + 1..] {
+                assert_ne!(state, other);
+            }
+        }
+        assert_eq!(fresh_status().hit_rate, None);
+        assert_eq!(fresh_status().context, (0, CONTEXT_CAP));
+        assert!(idle_status().hit_rate.is_some());
+        // The prefill look is the one with a bar, so it is the one that has
+        // to have a total to draw it against.
+        assert_eq!(
+            decode_status(1).prefill,
+            None,
+            "decode draws the rule, not a bar"
+        );
+    }
+
+    /// A status change that is only a number waits for the tick; a change in
+    /// what is *happening* does not.
+    #[test]
+    fn a_state_change_is_more_than_a_new_number() {
+        let quiet = decode_status(1);
+        let mut ticked = quiet.clone();
+        ticked.tokens = 2;
+        ticked.elapsed = Duration::from_secs(9);
+        ticked.read_bytes = Some(1);
+        assert_eq!(quiet.state(), ticked.state());
+
+        for changed in [
+            Status {
+                phase: Phase::Idle,
+                ..quiet.clone()
+            },
+            Status {
+                detail: Some("stopping this reply...".to_owned()),
+                ..quiet.clone()
+            },
+            Status {
+                chunk: Some((2, 8)),
+                ..quiet.clone()
+            },
+            Status {
+                model: None,
+                ..quiet.clone()
+            },
+        ] {
+            assert_ne!(quiet.state(), changed.state());
         }
     }
 }

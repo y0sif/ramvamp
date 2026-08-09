@@ -27,10 +27,10 @@
 //! # What is reused
 //!
 //! All of the REPL's logic: [`parse_repl_input`], [`Transcript`],
-//! [`TurnCodec`], [`plan_turn`], [`turn_seed`], [`PhaseStats`]. This module
-//! adds a front end and a thread boundary, not a second implementation of the
-//! chat policy — and in particular not a second copy of the context
-//! accounting, which is the part that is easy to get subtly wrong.
+//! [`TurnCodec`], [`plan_turn`], [`turn_seed`]. This module adds a front end
+//! and a thread boundary, not a second implementation of the chat policy — and
+//! in particular not a second copy of the context accounting, which is the
+//! part that is easy to get subtly wrong.
 //!
 //! # Interrupt
 //!
@@ -44,9 +44,10 @@
 //! signal handler at all.
 //!
 //! A consequence worth stating: `on_token` is the only place the flag is read,
-//! so Ctrl-C during *prefill* is honoured at the first decoded token rather
+//! so a stop during *prefill* is honoured at the first decoded token rather
 //! than immediately. Prefill has no comparably safe unwind point and inventing
-//! one is not in scope; the panel says so instead.
+//! one is not in scope; the panel says so instead, on the detail row, until
+//! the first chunk lands.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -63,10 +64,10 @@ use ramvamp_core::io::StreamStats;
 use ramvamp_core::model::{ForwardState, Model, StreamPhase};
 use ramvamp_core::tokenizer::{ChatMessage, Role, RvmpTokenizer};
 
-use super::{Harness, Phase, Status, UiEvent};
+use super::{Harness, Phase, Prefilling, Ribbon, Status, UiEvent};
 use crate::repl::{
-    CONTEXT_CAP, PhaseStats, REPL_HELP, ReplInput, Transcript, TurnCodec, TurnPlan,
-    parse_repl_input, plan_turn, turn_seed,
+    CONTEXT_CAP, REPL_HELP, ReplInput, Transcript, TurnCodec, TurnPlan, parse_repl_input,
+    plan_turn, turn_seed,
 };
 use crate::{ChatAbort, ChatArgs, human_bytes, hush_control_flow_panics, load_tokenizer};
 
@@ -87,7 +88,7 @@ const WORKER_STACK: usize = 8 * 1024 * 1024;
 
 const GREETING: &str = "\
 ramvamp chat. Type a message and press Enter. /help lists the commands, \
-Ctrl-C stops a reply, Ctrl-D leaves.\n";
+Esc stops a reply, Ctrl-D leaves.";
 
 // ---------------------------------------------------------------------------
 // the messages
@@ -110,14 +111,14 @@ enum Command {
 /// What the worker tells the UI.
 #[derive(Debug)]
 enum Output {
-    /// The model is up. The text is the load banner.
-    Ready(String),
+    /// The model is up: the load banner, and what the model is called.
+    Ready { banner: String, model: String },
     /// A chunk of reply text, exactly as `on_token` produced it.
     Token(String),
     /// Where the run is, as of one progress event.
     Progress(Snapshot),
     /// The turn is over, one way or another.
-    TurnDone { context: usize, detail: String },
+    TurnDone { context: usize },
     /// One line for the transcript: a refusal, a save, a warning.
     Notice(String),
     /// The worker is giving up and this is why.
@@ -133,10 +134,14 @@ enum Output {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Snapshot {
     phase: Phase,
-    prefill: Option<(usize, usize)>,
+    prefill: Option<Prefilling>,
+    /// `(chunk, chunks)` of the prefill sweep, once its width is known.
+    chunk: Option<(usize, usize)>,
     tokens: usize,
     context: usize,
     hit_rate: Option<f32>,
+    /// Bytes this turn has streamed, where the runtime reports them.
+    read_bytes: Option<u64>,
 }
 
 impl Snapshot {
@@ -145,9 +150,20 @@ impl Snapshot {
         Self {
             phase: Phase::Idle,
             prefill: None,
+            chunk: None,
             tokens: 0,
             context,
             hit_rate: None,
+            read_bytes: None,
+        }
+    }
+
+    /// What the rolling rate is measured over in this phase, if anything.
+    fn progress(&self) -> Option<usize> {
+        match self.phase {
+            Phase::Idle => None,
+            Phase::Prefill => self.prefill.map(|prefill| prefill.done),
+            Phase::Decode => Some(self.tokens),
         }
     }
 }
@@ -156,29 +172,63 @@ impl Snapshot {
 ///
 /// `fed` is what the KV cache held before this turn and `prompt` is how many
 /// ids this turn feeds, so the context figure is the conversation's position
-/// rather than this call's offset into it.
-fn snapshot_of(event: GenerateProgress, fed: usize, prompt: usize) -> Snapshot {
+/// rather than this call's offset into it. `width` is the prefill chunk the
+/// first event revealed, and `read_base` is where the decode byte counter
+/// stood when the turn started, so what the panel shows is this turn's
+/// streaming rather than the session's.
+fn snapshot_of(
+    event: GenerateProgress,
+    fed: usize,
+    prompt: usize,
+    width: usize,
+    read_base: u64,
+) -> Snapshot {
     match event {
         GenerateProgress::PrefillChunk {
             positions_done,
             positions_total,
         } => Snapshot {
             phase: Phase::Prefill,
-            prefill: Some((positions_done, positions_total)),
+            prefill: Some(Prefilling {
+                done: positions_done,
+                total: Some(positions_total),
+            }),
+            chunk: chunk_of(positions_done, positions_total, width),
             tokens: 0,
             context: fed + positions_done,
             // The chunked sweep bypasses the expert cache, so there is no hit
-            // rate to report until decode starts asking it for anything.
+            // rate to report until decode starts asking it for anything. Nor
+            // is there a byte figure: `PrefillChunk` carries positions and
+            // nothing else, and the `ForwardState` that holds the counters is
+            // borrowed by the generate call for its whole duration.
             hit_rate: None,
+            read_bytes: None,
         },
         GenerateProgress::DecodeToken { index, stats } => Snapshot {
             phase: Phase::Decode,
             prefill: None,
+            chunk: None,
             tokens: index + 1,
             context: fed + prompt + index,
             hit_rate: hit_rate(&stats),
+            read_bytes: Some((stats.bytes_read + stats.sweep_bytes_read).saturating_sub(read_base)),
         },
     }
+}
+
+/// Which chunk of the sweep `done` positions is, and how many chunks the
+/// prompt is, given the `width` the first event revealed.
+///
+/// `None` unless there is something to count: a width of one is
+/// [`PrefillMode::TokenMajor`](ramvamp_core::model::PrefillMode) reporting per
+/// token rather than per chunk, and a prompt that is one chunk long has a
+/// progress bar for exactly this reason.
+fn chunk_of(done: usize, total: usize, width: usize) -> Option<(usize, usize)> {
+    if width < 2 {
+        return None;
+    }
+    let chunks = total.div_ceil(width);
+    (chunks >= 2).then(|| (done.div_ceil(width).clamp(1, chunks), chunks))
 }
 
 /// Share of routed experts the cache had ready, `hits` against `hits +
@@ -211,7 +261,6 @@ pub fn run_chat_tui(args: ChatArgs) -> anyhow::Result<()> {
     // hook and the panel is left alone; a real panic passes through it, the
     // terminal is restored, and only then is the backtrace printed.
     hush_control_flow_panics();
-    harness.write_transcript(GREETING)?;
 
     let (commands, from_ui) = mpsc::channel::<Command>();
     let (to_ui, outputs) = mpsc::channel::<Output>();
@@ -258,6 +307,53 @@ struct Ended {
     join: bool,
 }
 
+/// Progress samples, oldest first, for a rate that describes the last stretch
+/// of a run rather than the whole of it.
+///
+/// A cumulative rate — everything done over everything elapsed — is wrong in
+/// the one place a rate is worth showing. The first seconds of a prefill
+/// include the model's first touch of every expert file, so the cumulative
+/// figure starts low, climbs for ten or twenty seconds, and drags an ETA
+/// computed from it minutes off. A window that forgets the beginning settles
+/// within a chunk or two and then stays put.
+#[derive(Debug, Default)]
+struct Meter {
+    samples: VecDeque<(Instant, usize)>,
+}
+
+/// Samples the rolling rate is measured over. Prefill reports once per chunk
+/// and decode once per token, so this is a minute or two of either.
+const WINDOW: usize = 64;
+
+impl Meter {
+    fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    fn observe(&mut self, at: Instant, done: usize) {
+        self.samples.push_back((at, done));
+        while self.samples.len() > WINDOW {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Positions or tokens per second across the window, or `None` while
+    /// there is not yet enough of one to divide by.
+    fn rate(&self) -> Option<f64> {
+        let (first_at, first_done) = *self.samples.front()?;
+        let (last_at, last_done) = *self.samples.back()?;
+        let seconds = last_at.saturating_duration_since(first_at).as_secs_f64();
+        let done = last_done.checked_sub(first_done)?;
+        (seconds > 0.0 && done > 0).then(|| done as f64 / seconds)
+    }
+
+    /// How long `remaining` more would take at that rate.
+    fn eta(&self, remaining: usize) -> Option<Duration> {
+        let seconds = remaining as f64 / self.rate()?;
+        Duration::try_from_secs_f64(seconds).ok()
+    }
+}
+
 /// Everything the UI thread knows, which is only what the worker told it plus
 /// a clock.
 struct Screen {
@@ -268,10 +364,11 @@ struct Screen {
     /// is the honest way to have a live rate: the counts are the worker's, the
     /// elapsed time is measured here, and a phase change restarts it.
     phase_started: Instant,
+    /// The rolling rate behind the panel's tok/s and its ETA.
+    meter: Meter,
+    /// What the model is called, once the worker has loaded one.
+    model: Option<String>,
     detail: Option<String>,
-    /// Set while the transcript's last write was a token, so a notice knows to
-    /// break the line first.
-    speaking: bool,
     /// A draw is worth doing.
     dirty: bool,
 }
@@ -281,8 +378,9 @@ impl Screen {
         Self {
             snapshot: Snapshot::idle(0),
             phase_started: Instant::now(),
+            meter: Meter::default(),
+            model: None,
             detail: Some("loading the model...".to_owned()),
-            speaking: false,
             dirty: true,
         }
     }
@@ -296,6 +394,12 @@ impl Screen {
     fn observe_at(&mut self, snapshot: Snapshot, now: Instant) {
         if snapshot.phase != self.snapshot.phase {
             self.phase_started = now;
+            // Prefill's rate is not decode's, and neither is measured across
+            // the boundary between them.
+            self.meter.clear();
+        }
+        if let Some(done) = snapshot.progress() {
+            self.meter.observe(now, done);
         }
         self.snapshot = snapshot;
         self.dirty = true;
@@ -306,25 +410,33 @@ impl Screen {
         self.dirty = true;
     }
 
+    /// Drop the transient line, so the detail row goes back to reporting what
+    /// the phase is actually doing.
+    fn clear_detail(&mut self) {
+        if self.detail.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
     fn status(&self) -> Status {
+        let remaining = self
+            .snapshot
+            .prefill
+            .and_then(|prefill| Some(prefill.total?.saturating_sub(prefill.done)));
         Status {
             phase: self.snapshot.phase,
+            model: self.model.clone(),
             prefill: self.snapshot.prefill,
+            chunk: self.snapshot.chunk,
             tokens: self.snapshot.tokens,
             elapsed: self.phase_started.elapsed(),
             context: (self.snapshot.context, CONTEXT_CAP),
             hit_rate: self.snapshot.hit_rate,
+            read_bytes: self.snapshot.read_bytes,
+            rate: self.meter.rate(),
+            eta: remaining.and_then(|remaining| self.meter.eta(remaining)),
             detail: self.detail.clone(),
         }
-    }
-
-    /// One whole line of chrome, after closing a reply that was mid-word.
-    fn line(&mut self, harness: &mut Harness, text: &str) -> io::Result<()> {
-        if self.speaking {
-            harness.write_transcript("\n")?;
-            self.speaking = false;
-        }
-        harness.write_transcript(text)
     }
 }
 
@@ -362,7 +474,10 @@ fn drive(
     interrupt: &AtomicBool,
 ) -> anyhow::Result<Ended> {
     let mut screen = Screen::loading();
+    let (palette, glyphs) = harness.marks();
+    let mut ribbon = Ribbon::new(palette, glyphs);
     let mut failure: Option<String> = None;
+    ribbon.system(harness, GREETING)?;
 
     'session: loop {
         // Everything the worker has said since the last pass. Draining rather
@@ -370,7 +485,14 @@ fn drive(
         loop {
             match outputs.try_recv() {
                 Ok(output) => {
-                    if absorb(harness, &mut screen, &mut failure, interrupt, output)? {
+                    if absorb(
+                        harness,
+                        &mut ribbon,
+                        &mut screen,
+                        &mut failure,
+                        interrupt,
+                        output,
+                    )? {
                         break 'session;
                     }
                 }
@@ -391,12 +513,12 @@ fn drive(
         match harness.poll(POLL)? {
             Some(UiEvent::Submit(line)) => match route(&line) {
                 Routed::Nothing => {}
-                Routed::Local(text) => screen.line(harness, &format!("\n{text}\n"))?,
+                Routed::Local(text) => ribbon.system(harness, &text)?,
                 Routed::Leave => break 'session,
                 Routed::Send(command) => {
                     if let Command::Submit(message) = &command {
-                        screen.line(harness, &format!("\nyou> {message}\n"))?;
-                        // Before the worker has said a word: from here Ctrl-C
+                        ribbon.user(harness, message)?;
+                        // Before the worker has said a word: from here Esc
                         // means "stop this", not "leave", and the panel stops
                         // claiming to be idle during the seconds before the
                         // first prefill chunk lands.
@@ -404,7 +526,7 @@ fn drive(
                             phase: Phase::Prefill,
                             ..Snapshot::idle(screen.snapshot.context)
                         });
-                        screen.say("prefilling; Ctrl-C stops the reply at its first token");
+                        screen.say("prefilling; the stop lands at the first token");
                     }
                     if commands.send(command).is_err() {
                         break 'session;
@@ -413,7 +535,7 @@ fn drive(
             },
             Some(UiEvent::Interrupt) => {
                 interrupt.store(true, Ordering::SeqCst);
-                screen.say("stopping this reply...");
+                screen.say("stopping at the next token...");
             }
             Some(UiEvent::Exit) => break 'session,
             _ => {}
@@ -434,7 +556,14 @@ fn drive(
                 // A fatal error raised on the way out still gets reported, but
                 // it cannot cut the wait short: the point of this loop is to
                 // see the channel close.
-                absorb(harness, &mut screen, &mut failure, interrupt, output)?;
+                absorb(
+                    harness,
+                    &mut ribbon,
+                    &mut screen,
+                    &mut failure,
+                    interrupt,
+                    output,
+                )?;
                 screen.say("stopping; Ctrl-C again to leave without waiting");
             }
             Err(TryRecvError::Disconnected) => break,
@@ -466,41 +595,36 @@ fn drive(
 /// lands on the wrong turn.
 fn absorb(
     harness: &mut Harness,
+    ribbon: &mut Ribbon,
     screen: &mut Screen,
     failure: &mut Option<String>,
     interrupt: &AtomicBool,
     output: Output,
 ) -> io::Result<bool> {
     match output {
-        Output::Ready(banner) => {
-            screen.line(harness, &format!("{banner}\n"))?;
-            screen.say("idle - Enter sends, /help lists the commands");
+        Output::Ready { banner, model } => {
+            ribbon.system(harness, &banner)?;
+            screen.model = Some(model);
+            // The keys the idle row shows are the panel's own; nothing needs
+            // to be said over them.
+            screen.clear_detail();
         }
-        Output::Token(text) => {
-            if !screen.speaking {
-                harness.write_transcript("bot> ")?;
-                screen.speaking = true;
-            }
-            harness.write_transcript(&text)?;
-        }
+        Output::Token(text) => ribbon.say(harness, &text)?,
         Output::Progress(snapshot) => {
-            if screen.snapshot.phase != snapshot.phase && snapshot.phase == Phase::Decode {
-                screen.say("decoding; Ctrl-C stops the reply");
-            }
+            // The first event of a phase is where the row stops being told
+            // what is about to happen and starts reporting what is.
+            screen.clear_detail();
             screen.observe(snapshot);
         }
-        Output::Notice(text) => screen.line(harness, &format!("{text}\n"))?,
-        Output::TurnDone { context, detail } => {
-            if screen.speaking {
-                harness.write_transcript("\n")?;
-                screen.speaking = false;
-            }
+        Output::Notice(text) => ribbon.system(harness, &text)?,
+        Output::TurnDone { context } => {
+            ribbon.hush(harness)?;
             screen.observe(Snapshot::idle(context));
-            screen.say(detail);
+            screen.clear_detail();
             interrupt.store(false, Ordering::SeqCst);
         }
         Output::Failed(reason) => {
-            screen.line(harness, &format!("\n{reason}\n"))?;
+            ribbon.system(harness, &reason)?;
             *failure = Some(reason);
             return Ok(true);
         }
@@ -621,7 +745,16 @@ fn worker_session(
         human_bytes(state.cache_bytes()),
         state.stream_mode(),
     );
-    if !tell(outputs, Output::Ready(banner)) {
+    if !tell(
+        outputs,
+        Output::Ready {
+            banner,
+            // The install's own identifier, verbatim: a prettier name would
+            // have to be guessed at, and the panel is not the place to guess
+            // which model the user is talking to.
+            model: model.manifest().model_id.clone(),
+        },
+    ) {
         return Ok(());
     }
 
@@ -674,13 +807,8 @@ fn worker_session(
                 if !tell(
                     outputs,
                     Output::Notice(format!("reset: dropped {dropped} turns, kept the seed")),
-                ) || !tell(
-                    outputs,
-                    Output::TurnDone {
-                        context: 0,
-                        detail: "reset - the next turn prefills the seed again".to_owned(),
-                    },
-                ) {
+                ) || !tell(outputs, Output::TurnDone { context: 0 })
+                {
                     break;
                 }
             }
@@ -726,7 +854,6 @@ fn worker_session(
                                 outputs,
                                 Output::TurnDone {
                                     context: state.seq_len().unwrap_or(0),
-                                    detail: "the turn was refused; nothing was sent".to_owned(),
                                 },
                             )
                         {
@@ -766,7 +893,6 @@ fn worker_session(
                 }
                 let done = Output::TurnDone {
                     context: state.seq_len().unwrap_or(0),
-                    detail: turn_detail(&outcome),
                 };
                 if !tell(outputs, done) || outcome.ui_gone {
                     break;
@@ -777,16 +903,10 @@ fn worker_session(
     Ok(())
 }
 
-/// What one turn produced, and what it cost.
+/// What one turn produced.
 struct TurnOutcome {
     reply: String,
     interrupted: bool,
-    /// Tokens the model actually produced, from the stats on the ordinary path
-    /// and from the ids seen on the aborted one.
-    generated: usize,
-    /// The streaming counters for this turn alone.
-    span: PhaseStats,
-    elapsed: Duration,
     /// The UI stopped listening mid-turn.
     ui_gone: bool,
 }
@@ -823,10 +943,14 @@ fn run_turn(
     let prompt = history.len() - fed;
 
     // Where this turn's streaming starts. The state's counters run from
-    // session start and `reset` keeps them, so the summary below is the delta
-    // against this or it is a session total wearing a turn's label.
-    let at_turn_start = PhaseStats::take(state);
-    let started = Instant::now();
+    // session start and `reset` keeps them, so the panel's byte figure is the
+    // delta against this or it is a session total wearing a turn's label.
+    let at_turn_start = state.stream_stats_in(StreamPhase::Decode);
+    let read_base = at_turn_start.bytes_read + at_turn_start.sweep_bytes_read;
+    // The sweep narrows its chunk to whatever the slot slab can host, so the
+    // configured width is not necessarily the width in use. The first event is,
+    // and it is the only place that width is observable from out here.
+    let chunk_width = Cell::new(0usize);
     let mut reply = String::new();
     // Only read on the interrupted path, where `generate_from_with_progress`
     // never returns its stats: the unwind leaves `on_token` before the id is
@@ -847,8 +971,20 @@ fn run_turn(
     };
 
     let outcome = {
-        let mut on_progress =
-            |event: GenerateProgress| post(Output::Progress(snapshot_of(event, fed, prompt)));
+        let mut on_progress = |event: GenerateProgress| {
+            if let GenerateProgress::PrefillChunk { positions_done, .. } = event
+                && chunk_width.get() == 0
+            {
+                chunk_width.set(positions_done);
+            }
+            post(Output::Progress(snapshot_of(
+                event,
+                fed,
+                prompt,
+                chunk_width.get(),
+                read_base,
+            )));
+        };
         let mut on_token = |id: u32, text: &str| {
             reply.push_str(text);
             spoken.push(id);
@@ -885,9 +1021,6 @@ fn run_turn(
             Ok(TurnOutcome {
                 reply,
                 interrupted: false,
-                generated: stats.generated,
-                span: PhaseStats::take(state).since(&at_turn_start),
-                elapsed: started.elapsed(),
                 ui_gone,
             })
         }
@@ -900,49 +1033,14 @@ fn run_turn(
             // so it has to be in the history too — otherwise the next turn
             // would prefill from a position the model reached by a route the
             // conversation no longer records.
-            let generated = spoken.len();
             history.extend_from_slice(&spoken);
             Ok(TurnOutcome {
                 reply,
                 interrupted: true,
-                generated,
-                span: PhaseStats::take(state).since(&at_turn_start),
-                elapsed: started.elapsed(),
                 ui_gone,
             })
         }
     }
-}
-
-/// The one line the panel shows between turns.
-///
-/// Deliberately **not** any of the `report_*` footers: those go to stderr in a
-/// shape `scripts/cold_bench.py` and the phase 8/9 sweeps parse, and a front
-/// end that reworded them would break a benchmark rather than a screen. This
-/// says the same things in a sentence that cannot be mistaken for one of them
-/// — no `tok/s`, no `prefill:`, no `decode:` — and it never leaves stdout.
-fn turn_detail(outcome: &TurnOutcome) -> String {
-    let decode = outcome.span.phase(StreamPhase::Decode);
-    let prefill = outcome.span.phase(StreamPhase::Prefill);
-    let streamed =
-        prefill.bytes_read + prefill.sweep_bytes_read + decode.bytes_read + decode.sweep_bytes_read;
-    let resolved = decode.hits + decode.misses;
-    let experts = if resolved == 0 {
-        "no experts routed".to_owned()
-    } else {
-        format!("{} of {resolved} experts warm", decode.hits)
-    };
-    format!(
-        "last turn: {} tokens in {:.1} s{}; {experts}; {} streamed",
-        outcome.generated,
-        outcome.elapsed.as_secs_f64(),
-        if outcome.interrupted {
-            " (stopped)"
-        } else {
-            ""
-        },
-        human_bytes(streamed),
-    )
 }
 
 #[cfg(test)]
@@ -956,18 +1054,6 @@ mod tests {
             pending_hits: pending,
             ..StreamStats::default()
         }
-    }
-
-    /// A turn span in which only decode streamed anything, laid out in
-    /// `StreamPhase::ALL` order rather than by casting the enum.
-    fn decode_only(decode: StreamStats) -> PhaseStats {
-        let mut span = PhaseStats::default();
-        for (slot, phase) in span.0.iter_mut().zip(StreamPhase::ALL) {
-            if phase == StreamPhase::Decode {
-                *slot = decode;
-            }
-        }
-        span
     }
 
     /// Every command the line REPL understands has to work here too, including
@@ -1014,33 +1100,73 @@ mod tests {
     fn progress_events_become_panel_numbers() {
         let prefill = snapshot_of(
             GenerateProgress::PrefillChunk {
-                positions_done: 512,
+                positions_done: 1024,
                 positions_total: 3961,
             },
             1000,
             3961,
+            512,
+            0,
         );
         assert_eq!(prefill.phase, Phase::Prefill);
-        assert_eq!(prefill.prefill, Some((512, 3961)));
-        assert_eq!(prefill.context, 1512);
+        assert_eq!(
+            prefill.prefill,
+            Some(Prefilling {
+                done: 1024,
+                total: Some(3961)
+            })
+        );
+        assert_eq!(prefill.chunk, Some((2, 8)));
+        assert_eq!(prefill.context, 2024);
         assert_eq!(prefill.tokens, 0);
-        // The sweep bypasses the cache, so there is no rate to claim yet.
+        // The sweep bypasses the cache, so there is no rate to claim yet —
+        // and it reports no bytes either.
         assert_eq!(prefill.hit_rate, None);
+        assert_eq!(prefill.read_bytes, None);
 
         let decode = snapshot_of(
             GenerateProgress::DecodeToken {
                 index: 0,
-                stats: stats(30, 10, 5),
+                stats: StreamStats {
+                    bytes_read: 3_000_000_000,
+                    sweep_bytes_read: 500_000_000,
+                    ..stats(30, 10, 5)
+                },
             },
             1000,
             3961,
+            512,
+            1_000_000_000,
         );
         assert_eq!(decode.phase, Phase::Decode);
         assert_eq!(decode.prefill, None);
+        assert_eq!(decode.chunk, None);
         // `index` is 0-based over the tokens generated; the panel counts them.
         assert_eq!(decode.tokens, 1);
         assert_eq!(decode.context, 4961);
         assert_eq!(decode.hit_rate, Some(0.75));
+        // This turn's streaming, not the session's: the counters run from the
+        // state's construction and the baseline comes off them.
+        assert_eq!(decode.read_bytes, Some(2_500_000_000));
+    }
+
+    /// The sweep's chunk width is not the configured one — it is narrowed to
+    /// whatever the slot slab can host — so the panel takes it from the first
+    /// event and counts from there. A width that is not a chunking says so by
+    /// reporting nothing.
+    #[test]
+    fn the_chunk_counter_is_derived_from_the_width_the_run_revealed() {
+        assert_eq!(chunk_of(512, 3961, 512), Some((1, 8)));
+        assert_eq!(chunk_of(1024, 3961, 512), Some((2, 8)));
+        assert_eq!(chunk_of(3961, 3961, 512), Some((8, 8)));
+        // The last chunk is short, and it is still the eighth of eight.
+        assert_eq!(chunk_of(3900, 3961, 512), Some((8, 8)));
+        // Position zero is in the first chunk, not the zeroth.
+        assert_eq!(chunk_of(0, 3961, 512), Some((1, 8)));
+        // Nothing to count: one chunk, per-token reporting, or no width yet.
+        assert_eq!(chunk_of(100, 400, 512), None);
+        assert_eq!(chunk_of(100, 3961, 1), None);
+        assert_eq!(chunk_of(100, 3961, 0), None);
     }
 
     /// Pending hits issue no read and avoid none, so they belong in neither
@@ -1059,50 +1185,18 @@ mod tests {
         }
     }
 
-    /// The idle row has to say something true about the turn that just ran,
-    /// and it has to say it in words no benchmark parser is looking for:
-    /// `scripts/cold_bench.py`'s `TIMING_RE` and the phase 8/9 sweeps key off
-    /// `prefill:`, `decode:` and `tok/s`.
-    #[test]
-    fn the_idle_detail_cannot_be_mistaken_for_a_timing_line() {
-        let span = decode_only(StreamStats {
-            hits: 812,
-            misses: 212,
-            bytes_read: 3 * 1024 * 1024 * 1024,
-            ..StreamStats::default()
-        });
-        let detail = turn_detail(&TurnOutcome {
-            reply: "hello".to_owned(),
-            interrupted: false,
-            generated: 37,
-            span,
-            elapsed: Duration::from_millis(18_400),
-            ui_gone: false,
-        });
-        assert_eq!(
-            detail,
-            "last turn: 37 tokens in 18.4 s; 812 of 1024 experts warm; 3.0 GiB streamed"
-        );
-        for forbidden in ["tok/s", "prefill:", "decode:"] {
-            assert!(
-                !detail.contains(forbidden),
-                "{detail:?} contains {forbidden}"
-            );
+    /// A prefill snapshot at `done` of 3,961 positions.
+    fn prefilling(done: usize) -> Snapshot {
+        Snapshot {
+            phase: Phase::Prefill,
+            prefill: Some(Prefilling {
+                done,
+                total: Some(3961),
+            }),
+            chunk: chunk_of(done, 3961, 512),
+            context: done,
+            ..Snapshot::idle(done)
         }
-
-        // An aborted turn says so rather than reporting a stop it never had.
-        let stopped = turn_detail(&TurnOutcome {
-            reply: String::new(),
-            interrupted: true,
-            generated: 2,
-            span: PhaseStats::default(),
-            elapsed: Duration::from_millis(900),
-            ui_gone: false,
-        });
-        assert_eq!(
-            stopped,
-            "last turn: 2 tokens in 0.9 s (stopped); no experts routed; 0 B streamed"
-        );
     }
 
     /// The panel's clock belongs to the UI, and a phase change restarts it —
@@ -1114,33 +1208,21 @@ mod tests {
         assert_eq!(screen.status().context, (0, CONTEXT_CAP));
 
         let prefill_at = Instant::now();
-        screen.observe_at(
-            Snapshot {
-                phase: Phase::Prefill,
-                prefill: Some((512, 3961)),
-                tokens: 0,
-                context: 512,
-                hit_rate: None,
-            },
-            prefill_at,
-        );
+        screen.observe_at(prefilling(512), prefill_at);
         assert_eq!(screen.phase_started, prefill_at);
 
         // Another chunk of the same phase keeps the clock running, so the rate
         // is over the whole prefill and not over the last chunk.
-        screen.observe_at(
-            Snapshot {
-                phase: Phase::Prefill,
-                prefill: Some((1024, 3961)),
-                tokens: 0,
-                context: 1024,
-                hit_rate: None,
-            },
-            prefill_at + Duration::from_secs(46),
-        );
+        screen.observe_at(prefilling(1024), prefill_at + Duration::from_secs(46));
         assert_eq!(screen.phase_started, prefill_at);
         let status = screen.status();
-        assert_eq!(status.prefill, Some((1024, 3961)));
+        assert_eq!(
+            status.prefill,
+            Some(Prefilling {
+                done: 1024,
+                total: Some(3961)
+            })
+        );
         assert_eq!(status.context, (1024, CONTEXT_CAP));
 
         // Decode restarts it, or its rate would be computed over prefill's
@@ -1149,16 +1231,93 @@ mod tests {
         screen.observe_at(
             Snapshot {
                 phase: Phase::Decode,
-                prefill: None,
                 tokens: 1,
                 context: 3962,
                 hit_rate: Some(0.5),
+                ..Snapshot::idle(3962)
             },
             decode_at,
         );
         assert_eq!(screen.phase_started, decode_at);
         assert_eq!(screen.status().tokens, 1);
         assert_eq!(screen.status().hit_rate, Some(0.5));
+        // And the rate went with it: decode has one sample, which is not a
+        // rate, rather than prefill's.
+        assert_eq!(screen.status().rate, None);
+    }
+
+    /// The rate the panel shows is over a window, not over the whole run, and
+    /// the ETA is that rate against what is left.
+    ///
+    /// This is the case the window exists for: the first stretch of a prefill
+    /// is slow — it is where every expert file is touched for the first time —
+    /// and a cumulative rate carries that stretch for the rest of the run, so
+    /// an ETA derived from it is minutes long and visibly wrong.
+    #[test]
+    fn the_rate_is_rolling_and_the_eta_follows_it() {
+        let start = Instant::now();
+        let steady = |step: usize| {
+            start + Duration::from_secs(64) + Duration::from_secs_f64(step as f64 * 32.0 / 11.0)
+        };
+        let mut screen = Screen::loading();
+        screen.observe_at(prefilling(0), start);
+        screen.observe_at(prefilling(128), start + Duration::from_secs(64));
+        let slow = screen.status().rate.expect("two samples is a rate");
+        assert!((slow - 2.0).abs() < 0.01, "{slow}");
+
+        // Thirty steady chunks: the slow start is still in the window, so the
+        // rate has climbed without having caught up.
+        for step in 1..=30 {
+            screen.observe_at(prefilling(128 + step * 32), steady(step));
+        }
+        let climbing = screen.status().rate.expect("a window of samples");
+        assert!(climbing > slow && climbing < 11.0, "{climbing}");
+
+        // Far enough in that the slow start has fallen out of the window
+        // entirely, and the rate is the one the run is actually managing.
+        for step in 31..=94 {
+            screen.observe_at(prefilling(128 + step * 32), steady(step));
+        }
+        let status = screen.status();
+        let rate = status.rate.expect("a full window");
+        assert!((rate - 11.0).abs() < 0.001, "{rate}");
+        // 3,961 - 3,136 positions left, at eleven a second.
+        let eta = status.eta.expect("an ETA once there is a rate");
+        assert!((eta.as_secs_f64() - 75.0).abs() < 0.01, "{eta:?}");
+    }
+
+    /// One sample is not a rate, and neither is a stalled one; the panel is
+    /// handed nothing rather than a zero, an infinity or a NaN.
+    #[test]
+    fn a_rate_needs_two_samples_and_some_progress_between_them() {
+        let start = Instant::now();
+        let meter = |samples: &[(u64, usize)]| {
+            let mut meter = Meter::default();
+            for (at, done) in samples {
+                meter.observe(start + Duration::from_secs(*at), *done);
+            }
+            meter
+        };
+        assert_eq!(meter(&[]).rate(), None, "no samples");
+        assert_eq!(meter(&[(0, 10)]).rate(), None, "one sample");
+        assert_eq!(meter(&[(0, 10), (0, 20)]).rate(), None, "no time");
+        assert_eq!(meter(&[(0, 10), (10, 10)]).rate(), None, "no progress");
+        // A count that went backwards is not a negative rate.
+        assert_eq!(meter(&[(0, 20), (10, 10)]).rate(), None, "backwards");
+
+        let running = meter(&[(0, 10), (10, 20), (20, 30)]);
+        assert_eq!(running.rate(), Some(1.0));
+        assert_eq!(running.eta(30), Some(Duration::from_secs(30)));
+        assert_eq!(running.eta(0), Some(Duration::ZERO));
+
+        // The window forgets, so it never grows without bound and the rate
+        // stays the recent one.
+        let mut long = Meter::default();
+        for step in 0..1_000u64 {
+            long.observe(start + Duration::from_secs(step), step as usize);
+        }
+        assert_eq!(long.samples.len(), WINDOW);
+        assert_eq!(long.rate(), Some(1.0));
     }
 
     /// Leaving has to be prompt even when the user typed ahead: two queued
@@ -1196,6 +1355,8 @@ mod tests {
         });
         assert_eq!(screen.status().phase, Phase::Prefill);
         assert_eq!(screen.status().prefill, None, "no counts to claim yet");
+        // And no bar, no percent, no ETA to go with them.
+        assert_eq!(screen.status().eta, None);
 
         screen.observe(Snapshot::idle(4096));
         assert_eq!(screen.status().phase, Phase::Idle);
