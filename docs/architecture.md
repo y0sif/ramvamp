@@ -1476,17 +1476,22 @@ Same GGUF bytes on both sides. Gates, in order:
    was the point.
 
    PASSED in phase 4 against llama.cpp b10217 full-vocab reference dumps
-   (`models/llamacpp-ref/`, recomputable via
-   `scripts/kl_vs_reference.py` with no llama.cpp install): mean
-   1.039e-2, worst prompt 2.72e-2, top-1 8/8, 8/8 prompts scored.
+   (`models/llamacpp-ref/`, rescorable via `scripts/kl_vs_reference.py`
+   with no llama.cpp install once the dumps are on disk). That tree is
+   **not in the repository**: `.gitignore` excludes `/models/`, so a fresh
+   clone has nothing to rescore and re-banks the dumps from b10217 first.
+   Mean 1.039e-2, worst prompt 2.72e-2, top-1 8/8, 8/8 prompts scored.
 4. Greedy smoke: first N tokens identical on short prompts (expected to
    diverge eventually from fp reordering; report length, do not gate).
    Measured in EXP-003: 3/3 prompts matched all 16 generated tokens
    character-identically, exceeding the "first tokens" bar.
 5. Perplexity on a standard slice within noise of llama.cpp same-quant.
    Reference banked (EXP-004): PPL 6.3810 +/- 0.16588, llama-perplexity
-   b10217, wiki.test.raw, `-c 512 --chunks 40`; corpus and log in
-   `models/llamacpp-ref/`. Phase 7 implements the ramvamp side.
+   b10217, wiki.test.raw, `-c 512 --chunks 40`. The corpus and the
+   per-chunk log sit under `models/llamacpp-ref/`, which is **not in the
+   repository**: `.gitignore` excludes `/models/`, so a fresh clone
+   regenerates the reference by re-running that command at b10217 on the
+   same GGUF. Phase 7 implements the ramvamp side.
 
 ## Performance model (rebuilt 2026-08-03 from measured inputs)
 

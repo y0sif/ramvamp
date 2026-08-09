@@ -437,7 +437,7 @@ A record of which work changed measured behaviour, not of who did what when.
 | Forward pass | Greedy output character-identical to llama.cpp; gate 3's tolerance re-baselined from 1e-3 to 3e-2 on measured evidence, against a 4.5e-3 to 1.3e-2 float-reordering noise floor of the same order as the cross-engine gap (EXP-003, EXP-004) |
 | io_uring streaming and the expert cache | The first configuration measurable under rule 2: decode 1.88 tok/s, peak 2,471 MiB (EXP-014). The policy behind it, expert-indexed ghost LFU at 512 B per layer, came from EXP-005; the O_DIRECT requirement from EXP-009, where the same 1.4 GiB of reads peaked the cgroup at 1,092 MiB buffered against 5.0 MiB direct |
 | Sequential-sweep prefill | Prefill **2.56x cold** and **11.55x fewer bytes read**, by reading each expert once per layer per chunk instead of once per token (EXP-018) |
-| Attention rebuild | Prefill **6.65x cold**, decode about 1.6x. The largest verified win in the project (EXP-020 warm, EXP-021 cold) |
+| Attention rebuild | Prefill **6.65x cold**, decode **1.69x in one session and 1.56x in a second**, which EXP-021 records as two figures and does not average. The largest verified win in the project (EXP-020 warm, EXP-021 cold) |
 | Decode measurement | The per-token phase split across five context rungs, the 11-slot hit rate, and the slot dial. `T_BLOCK` 4 to 8 worth 1.014x at 4K. Closed `RING_ENTRIES`, queue depth, and "just read faster" as levers (EXP-022, EXP-023) |
 | Fused decode fan-out | **1.257x on decode's GEMV bucket cold at ctx 512** with disjoint ranges, and 1.158x at 3,961 (EXP-025) |
 

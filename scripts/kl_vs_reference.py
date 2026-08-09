@@ -53,6 +53,11 @@ Exit codes, shared with the repo's other gate scripts (`bitident.py`,
 Example:
   scripts/kl_vs_reference.py --rvmp models/qwen3.rvmp \
       --ref models/llamacpp-ref/llamacpp_ref
+
+`models/llamacpp-ref/` is **not in the repository**: `.gitignore` excludes
+/models/, so that path is a default layout rather than a promise that the
+dumps are there. A fresh clone re-banks them from llama.cpp b10217 first;
+until it does, this script exits 2 as "the gate could not run".
 """
 
 from __future__ import annotations
@@ -244,7 +249,11 @@ def main() -> int:
     parser.add_argument("--rvmp", default="models/qwen3.rvmp",
                         help="installed .rvmp model dir")
     parser.add_argument("--ref", default="models/llamacpp-ref/llamacpp_ref",
-                        help="reference dump dir (meta.json + single_*.npz)")
+                        help="reference dump dir (meta.json + single_*.npz). "
+                             "Not in the repository -- `.gitignore` excludes "
+                             "/models/ -- so the default resolves to nothing "
+                             "in a fresh clone and the dumps have to be "
+                             "re-banked from llama.cpp b10217")
     parser.add_argument("--ramvamp",
                         help="ramvamp binary (default: cargo run --release)")
     parser.add_argument("--refresh", action="store_true",

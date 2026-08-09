@@ -9,7 +9,11 @@ position 37 — a cache that returns a stale expert, a completion that
 lands after the consumer read the buffer, or a KV write racing a read all
 produce a correct first token and garbage afterwards. This script is the
 gate for that failure mode. It consumes the two fixtures under
-`models/llamacpp-ref/llamacpp_ref/` that nothing else reads:
+`models/llamacpp-ref/llamacpp_ref/` that nothing else reads. That tree is
+**not in the repository**: `.gitignore` excludes /models/, so a fresh
+clone holds neither fixture and this gate cannot run until they are
+re-banked from llama.cpp b10217. Every `models/llamacpp-ref/...` path
+here is a default layout, not a promise that the bytes are present:
 
   greedy_texts.json  128-token greedy continuations of the 8 single
                      prompts (llama.cpp b10217, temperature 0). Metric:
@@ -788,12 +792,17 @@ def main() -> int:
                         help="installed .rvmp model dir")
     parser.add_argument("--ref", default="models/llamacpp-ref/llamacpp_ref",
                         help="reference dump dir (meta.json, greedy_texts.json, "
-                             "path_*.npz)")
+                             "path_*.npz). Not in the repository -- "
+                             "`.gitignore` excludes /models/ -- so the default "
+                             "resolves to nothing in a fresh clone and the "
+                             "dumps have to be re-banked from llama.cpp b10217")
     parser.add_argument("--ramvamp",
                         help="ramvamp binary (default: cargo run --release)")
     parser.add_argument("--cache", default="models/llamacpp-ref/greedy-cache",
                         help="where baseline.json, results.json and the "
-                             "per-binary output caches live")
+                             "per-binary output caches live. Under the same "
+                             "gitignored /models/ tree, so a fresh clone "
+                             "starts with no baseline to regress against")
     parser.add_argument("--refresh", action="store_true",
                         help="recompute every cached ramvamp output even for "
                              "an unchanged binary; a changed binary already "

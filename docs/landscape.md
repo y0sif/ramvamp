@@ -190,8 +190,14 @@ citations check out against the repository, so both survive.
   Q4_K_M at the shipped 11 slots/layer) decode **MEASURES 1.46 to 2.19 tok/s
   cold** across five context rungs (EXP-023: 2.19 / 1.91 / 1.82 / 1.75 / 1.46
   at 64 / 512 / 1,024 / 2,048 / 3,961 prompt tokens, medians of three scored
-  runs at `--max-new 64`). Against a **15-25 tok/s ESTIMATED** in-RAM compute
-  ceiling, an estimate with no direct public benchmark behind it, that is
+  runs at `--max-new 64`). That band is a fact about the session EXP-023
+  measured rather than a property of the build on this drive: EXP-025 re-ran
+  the **byte-identical** binary on the same prompt files a day later and read
+  1.85 against 1.91 at ctx 512 and 1.33 against 1.46 at 3,961, and its own
+  fused ladder over the same five rungs (2.16 / 1.87 / 1.74 / 1.65 / 1.43) is
+  a second ladder rather than five more points on this one. Against a
+  **15-25 tok/s ESTIMATED** in-RAM compute ceiling, an estimate with no
+  direct public benchmark behind it, that is
   roughly **7-17x on that device**, and the width of that range is mostly the
   softness of the estimate rather than anything measured. A mainstream TLC Gen4
   drive would narrow the gap; by how much is **UNKNOWN**, since no such drive

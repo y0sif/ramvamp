@@ -125,8 +125,8 @@
 #         the warm 1.264x sits far outside that rung's own noise.
 #
 #   3961  is where GEMV's share is smallest, so it bounds the win from the
-#         unfavourable side. EXP-023 measured attention at 33.5% of decode at
-#         3,961 tokens against 5.9% at 512: the fan-out change cannot touch
+#         unfavourable side. EXP-023 measured attention at 31.6% of decode at
+#         3,961 tokens against 6.4% at 512: the fan-out change cannot touch
 #         attention, and at the top rung attention is a third of the budget.
 #         If the change still wins there, it is not a short-context artifact.
 #
@@ -1126,7 +1126,7 @@ say "scratch/phase8-ref/ramvamp (8e1eee8, phase 8 complete), back to back in"
 say "this session. 512 is the primary target — where the fused fan-out was"
 say "measured warm at 1.264x, and the tightest rung on EXP-023's ladder."
 say "3961 is where GEMV has the least room: EXP-023 measured attention at"
-say "33.5% of decode there against 5.9% at 512, and the fan-out cannot touch"
+say "31.6% of decode there against 6.4% at 512, and the fan-out cannot touch"
 say "attention. Between them the two pairs bound the change from both ends."
 
 for ctx in "${CTX_RUNGS[@]}"; do

@@ -40,7 +40,7 @@ NVMe) running Qwen3-30B-A3B Q4_K_M with a cold page cache inside
 | --- | --- |
 | Decode | **about 2 tok/s**: 1.46 to 2.19 over ctx 64-3,961 (EXP-023), and 1.43 to 2.16 over the same rungs on a later branch (EXP-025) |
 | Prefill | **11.25 tok/s** at ctx 512 |
-| Peak RAM | **2.5-2.9 GiB** of a 3.0 GiB ceiling |
+| Peak RAM | **2,497 to 2,929 MiB** of a 3,072 MiB ceiling: 2,497.0 at ctx 64 (EXP-025) and 2,929.3 at ctx 3,961 (EXP-023) |
 | Model on disk | 17.35 GiB, a **~6x** memory saving |
 | Fidelity | mean full-vocab KL **1.04e-2** vs llama.cpp, top-1 agreement 8/8 |
 
