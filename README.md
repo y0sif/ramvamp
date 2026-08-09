@@ -123,12 +123,6 @@ All four must pass before a push. [CONTRIBUTING.md](CONTRIBUTING.md) covers the 
 the measurement rules a performance change has to follow; security issues go through
 [SECURITY.md](SECURITY.md).
 
-## The name
-
-In music, *vamping* is holding a repeating riff while the soloist gets ready. That is the runtime's
-whole trick: keep computing on the weights already in RAM while the experts stream in from disk,
-which is why the banner sets the name inside a repeat sign. Also, it revamps what your RAM can hold.
-
 ## Prior art
 
 Inspired by [TurboFieldfare](https://github.com/drumih/turbo-fieldfare), a Swift + Metal runtime
