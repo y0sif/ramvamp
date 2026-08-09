@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cold, cgroup-confined benchmark with *verified* measurement hygiene.
 
-`docs/experiments/README.md` rule: published numbers come from cold runs
+`docs/experiments.md` rule: published numbers come from cold runs
 inside a `memory.max=3G` cgroup with `memory.swap.max=0`. Every part of
 that sentence is easy to believe and hard to actually get, so this
 harness verifies each one instead of assuming it, and prints a hygiene
@@ -82,7 +82,7 @@ What it checks, and why each check exists:
 8. The workload argv is handed to the inner wrapper through a **file**,
    not through `systemd-run`'s command line. systemd expands `${NAME}` and
    unescapes `$$` inside `ExecStart=` arguments, and it does so silently:
-   measured on systemd 261, `A ${HOME} B` arrives as `A /home/y0sif B`,
+   measured on systemd 261, `A ${HOME} B` arrives as `A /home/you B`,
    `A ${UNSET} B` arrives as `A  B`, and `A $$VAR B` arrives as `A $VAR B`.
    (Bare `$VAR`, `%` specifiers, newlines, tabs, quotes and backslashes all
    survive, so short English prompts never tripped it.) At phase-6 prefill
@@ -141,7 +141,7 @@ above) rather than a pgsteal of 0. So no phase-4
 number from this harness is publishable under the docs rule, and phase 5
 (O_DIRECT, which keeps expert bytes out of the page cache entirely)
 should be the thing that first turns this verdict CLEAN. That transition
-is itself a result worth recording in `docs/experiments/README.md`.
+is itself a result worth recording in `docs/experiments.md`.
 
 Python stdlib only. Linux **>= 6.5** + cgroup v2 + systemd --user only, by
 design. The kernel floor is `memory.swap.peak`, which first appears in

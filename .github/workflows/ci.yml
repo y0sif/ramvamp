@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check, Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `apt-get` step on purpose. The tree has no C dependencies: the only
+      # network client is `ureq` on rustls, and io_uring is reached through
+      # `io-uring`/`rustix`, which are pure Rust against the kernel ABI.
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # This is the gate from CLAUDE.md, in the order it is written there.
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Release build
+        run: cargo build --release
+
+  features:
+    name: Build — ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default (io-uring)
+            flags: "--workspace"
+          - name: no-default-features (pread fallback)
+            flags: "-p ramvamp-core --no-default-features"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `ramvamp-core`'s `io-uring` feature is on by default. The portable
+      # pread path exists so the runtime builds where io_uring does not, so it
+      # has to be built and tested on its own.
+      #
+      # The `-p ramvamp-core` is load-bearing, not tidiness. `--no-default-features`
+      # at the workspace root does NOT disable the feature: repack, server and cli
+      # all depend on core with default features, and cargo's feature unification
+      # turns `io-uring` back on for the whole graph. That leg then passes as a
+      # green duplicate of the default one and the pread path is never compiled.
+      # Confirm with `cargo tree --workspace --no-default-features -i io-uring`,
+      # which still resolves the crate.
+      - name: Build
+        run: cargo build --all-targets ${{ matrix.flags }}
+
+      - name: Test
+        run: cargo test ${{ matrix.flags }}
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The workspace is edition 2024 with `rust-version = "1.85"`, the first
+      # release that stabilized that edition. Stable alone will not catch a
+      # newer-than-1.85 API creeping in, so pin the floor explicitly. Keep this
+      # version in step with `rust-version` in the root Cargo.toml.
+      # The toolchain is given as an input rather than as an action ref
+      # (`@1.85.0`) so this does not depend on a per-version branch existing.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build on MSRV
+        run: cargo build --all-targets --workspace
+
+      # `-p ramvamp-core` for the same reason as the features job above: at the
+      # workspace root, feature unification re-enables `io-uring` and this leg
+      # silently becomes a copy of the one before it.
+      - name: Build on MSRV (pread fallback)
+        run: cargo build --all-targets -p ramvamp-core --no-default-features

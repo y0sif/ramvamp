@@ -36,12 +36,12 @@
 #   4. The tail prints every stderr block WHOLE. Phase 8's printer found the
 #      first line containing "split" or starting with "experts:", printed
 #      twelve lines and broke. Because `experts:` matches first, the decode
-#      split came out cut off after two of its six rows — see
-#      scratch/phase8/sweep-20260806-165322/SUMMARY.txt lines 587-588, where
-#      the 3,961-token arm's decode split ends one row in, at `attention:`,
-#      and its expert-compute, expert-io, projections, elementwise and other
-#      rows are absent from the artifact EXP-023 was written from. Phase 9 also emits a SECOND block, `decode
-#      gemv split (submitting thread):`, which that printer would have
+#      split came out cut off after two of its six rows: in the phase-8 sweep
+#      artifact the 3,961-token arm's decode split ends one row in, at
+#      `attention:`, and its expert-compute, expert-io, projections,
+#      elementwise and other rows are absent from the summary EXP-023 was
+#      written from. Phase 9 also emits a SECOND block, `decode gemv split
+#      (submitting thread):`, which that printer would have
 #      dropped entirely. The replacement takes each block's extent from
 #      indentation, so it depends on no block's line count.
 #
@@ -125,8 +125,8 @@
 #         the warm 1.264x sits far outside that rung's own noise.
 #
 #   3961  is where GEMV's share is smallest, so it bounds the win from the
-#         unfavourable side. EXP-023 measured attention at 33.5% of decode at
-#         3,961 tokens against 5.9% at 512: the fan-out change cannot touch
+#         unfavourable side. EXP-023 measured attention at 31.6% of decode at
+#         3,961 tokens against 6.4% at 512: the fan-out change cannot touch
 #         attention, and at the top rung attention is a third of the budget.
 #         If the change still wins there, it is not a short-context artifact.
 #
@@ -139,7 +139,7 @@
 # The reference binary's sha256 is
 # d36036b6485b00e741b7448e8d963e8a0916eb0aeb36b69c48c89ea857eb8b4c, which is
 # byte-identical to the branch binary EXP-023 measured (recorded there at
-# `c78122b` as `d36036b6485b...`, docs/experiments/README.md). 8e1eee8 is the
+# `c78122b` as `d36036b6485b...`, docs/experiments.md). 8e1eee8 is the
 # merge that made feat/decode main, and `git diff --name-only c78122b
 # 8e1eee8` touches only docs/, so the two commits have the same runtime and
 # the rebuild reproduced EXP-023's bytes exactly. The reference arm is not a
@@ -352,6 +352,11 @@ SLOTS_DEFAULT=11
 # file_bytes and file_sha256 in every entry.
 CTX_RUNGS=(64 512 1024 2048 3961)
 
+# Resolves a rung to its prompt file. Every path here is under the gitignored
+# /models/ or /scratch/ trees described above, so none of them exists in a
+# fresh clone; the preflight is what turns a missing one into a clear failure
+# rather than a silently short run. The phase-8 paths are deliberate: phase 9
+# reuses phase 8's files byte for byte rather than cutting its own.
 prompt_for() {
     case "$1" in
         64)   printf '%s\n' "$ROOT/scratch/phase8/prompts/ctx64.txt" ;;
@@ -935,8 +940,8 @@ say ""
 say "--- estimated wall time (ESTIMATED, not measured) ---"
 say ""
 say "Derived from the phase-8 sweep's own MEASURED step walls, which ran this"
-say "exact seven-arm list on this machine and this drive"
-say "(scratch/phase8/sweep-20260806-165322/exitcodes.tsv):"
+say "exact seven-arm list on this machine and this drive (the sweep behind"
+say "EXP-023):"
 say ""
 say "  measured  ctx   64  branch arm              202 s"
 say "  measured  ctx  512  branch arm              327 s"
@@ -1126,7 +1131,7 @@ say "scratch/phase8-ref/ramvamp (8e1eee8, phase 8 complete), back to back in"
 say "this session. 512 is the primary target — where the fused fan-out was"
 say "measured warm at 1.264x, and the tightest rung on EXP-023's ladder."
 say "3961 is where GEMV has the least room: EXP-023 measured attention at"
-say "33.5% of decode there against 5.9% at 512, and the fan-out cannot touch"
+say "31.6% of decode there against 6.4% at 512, and the fan-out cannot touch"
 say "attention. Between them the two pairs bound the change from both ends."
 
 for ctx in "${CTX_RUNGS[@]}"; do
@@ -1375,13 +1380,12 @@ def split_blocks(lines):
     Two things were wrong with that and both are why this exists. Because
     `experts:` matches before `decode split (forward_token):`, the twelve
     lines were spent on the experts block and the two split blocks, so the
-    decode split was cut off after two of its six rows -- visible in
-    scratch/phase8/sweep-20260806-165322/SUMMARY.txt, where the 3,961-token
-    arm ends at `attention:` and its expert-compute, expert-io, projections,
-    elementwise and other rows are simply not in the artifact EXP-023 was
-    written from. And it broke after one block, so phase 9's second block,
-    `decode gemv split (submitting thread):`, would never have printed at
-    all.
+    decode split was cut off after two of its six rows -- visible in the
+    phase-8 sweep artifact, where the 3,961-token arm ends at `attention:` and
+    its expert-compute, expert-io, projections, elementwise and other rows are
+    simply not in the summary EXP-023 was written from. And it broke after one
+    block, so phase 9's second block, `decode gemv split (submitting
+    thread):`, would never have printed at all.
 
     Counting to a bigger number would fix today's stderr and break on the
     next block anyone adds. The block boundary is already in the text.
@@ -1507,7 +1511,7 @@ say "Nothing was substituted for it. Re-run that arm."
 say ""
 say "The paired table is what CLAUDE.md's rule needs to be discharged: the"
 say "fused decode fan-out (70cf304) is a performance change and owes"
-say "docs/experiments a baseline, a result and a verdict. The baseline is"
+say "docs/experiments.md a baseline, a result and a verdict. The baseline is"
 say "$REF8_EXPECT_SHA"
 say "(8e1eee8's build, byte-identical to EXP-023's branch binary), the result"
 say "is the paired table, and the verdict is yours. The 1.264x measured warm"

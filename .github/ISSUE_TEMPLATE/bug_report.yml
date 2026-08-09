@@ -1,0 +1,160 @@
+name: Bug report
+description: Something in ramvamp behaves incorrectly, crashes, or produces wrong output.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most ramvamp bugs are storage bugs wearing a runtime costume. The
+        fields below are the ones that decide whether a report is
+        reproducible, so please fill them in even when they look irrelevant:
+        the same binary on the same weights behaves differently on a
+        different filesystem, and the I/O mode alone changes the memory
+        contract.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Where the problem shows up. Pick the closest one, and say so in the description if you are guessing.
+      options:
+        - runtime (model load, forward pass, generation, expert streaming)
+        - repacker (ramvamp-repack, downloads, .rvmp packing)
+        - server (ramvamp serve, OpenAI-compatible HTTP)
+        - CLI (flags, chat, REPL, TUI panel)
+        - kernels (numerics, AVX2/F16C paths, dequantization)
+        - docs
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: What you expected, what you got instead, and the shortest path to reproduce it.
+      placeholder: |
+        Expected: ...
+        Got: ...
+        Steps: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: banner
+    attributes:
+      label: Load banner
+      description: |
+        Paste the whole line ramvamp prints on stderr after loading. It looks
+        like `model loaded in 12.34s (512 prompt tokens); 6 compute shards, 8
+        expert slots/layer from a 1.2 GiB budget, io_uring+O_DIRECT reads`.
+        The last field is the achieved I/O mode, one of `io_uring+O_DIRECT`,
+        `io_uring+buffered` or `pread`, and it is the single most useful line
+        in a bug report. It reports what the runtime got, not what it asked
+        for, and each of the three has a different memory and throughput
+        profile.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: ramvamp version
+      description: Release tag, or `git rev-parse --short HEAD` for a build from source.
+      placeholder: "v0.1.0, or 96d31a9"
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      description: Output of `uname -r`. io_uring capability and O_DIRECT behaviour both move with the kernel.
+      placeholder: "6.12.4-arch1-1"
+    validations:
+      required: true
+
+  - type: input
+    id: filesystem
+    attributes:
+      label: Filesystem holding the model
+      description: |
+        Type and any relevant mount options, from `findmnt -no FSTYPE,OPTIONS
+        /path/to/model`. Whether O_DIRECT is honoured or silently downgraded
+        is a filesystem property, and it is why the banner may say
+        `io_uring+buffered` on a machine that supports io_uring perfectly
+        well.
+      placeholder: "ext4, rw,relatime; or btrfs on LUKS; or overlayfs in a container"
+    validations:
+      required: true
+
+  - type: input
+    id: drive
+    attributes:
+      label: NVMe drive model
+      description: |
+        The exact model of the drive the model file lives on, from `nvme list`
+        or `lsblk -o NAME,MODEL`. Say if it is DRAM-less or QLC when you know,
+        and say so too if the model is on something other than NVMe.
+      placeholder: "Micron 2400 (DRAM-less QLC), 1 TB"
+    validations:
+      required: true
+
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      description: Model name from `lscpu`, plus whether it has AVX2 and F16C. The fast kernels need both.
+      placeholder: "Intel Core Ultra 9 185H (AVX2, F16C)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: cgroup
+    attributes:
+      label: Was the run inside a memory cgroup?
+      description: |
+        A run confined by `memory.max` and a run on a machine with free RAM
+        are different experiments, and a bug that only appears under memory
+        pressure is a different bug.
+      options:
+        - "No, the run had the machine's whole RAM available"
+        - "Yes, inside a memory cgroup with swap off (memory.swap.max=0)"
+        - "Yes, inside a memory cgroup but swap was available"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: input
+    id: cgroup_limit
+    attributes:
+      label: Memory limit, if any
+      description: The value of `memory.max` for the run. Leave blank if the run was unconfined.
+      placeholder: "3G"
+
+  - type: input
+    id: model
+    attributes:
+      label: Model and quantization
+      description: Which weights, at what quantization, and where they came from.
+      placeholder: "Qwen3-30B-A3B Q4_K_M, repacked from the official GGUF"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and output
+      description: |
+        The failing command and everything it printed. `RUST_LOG=debug` gives
+        much more, and for anything I/O related it is usually the difference
+        between a guess and a diagnosis. Trim secrets and absolute paths you
+        would rather not share.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Backtraces, a bisect, a workaround you found, or the reason you think this is happening.

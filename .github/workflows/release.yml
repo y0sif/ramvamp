@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# This workflow builds and releases the tarball. It does not publish to
+# crates.io: that is done by hand with `cargo publish` after a release is cut,
+# because crates.io has no undo and a version can be yanked but never
+# republished under the same number. See CONTRIBUTING.md for the order.
+#
+# Scoped per job rather than workflow-wide: only `release` writes anything.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Refuse a tag that does not match the version it claims to release.
+  #
+  # Without this, tagging v0.1.1 without bumping Cargo.toml cuts a GitHub
+  # Release labelled v0.1.1 containing binaries that report 0.1.0, and the run
+  # goes green. It also strands the manual `cargo publish` that follows, since
+  # the crate version would not match the tag anyone downloaded. Caught here,
+  # before anything is built.
+  guard:
+    name: Tag matches version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: check
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "ramvamp-core") | .version')
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "releasing $version"
+
+  build:
+    needs: guard
+    name: Build — ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          # Linux x86_64 only, and deliberately so.
+          #
+          # io_uring is a Linux kernel interface, and the expert streamer is
+          # built on it: every other platform falls back to the pread path,
+          # which is correct but is not what any published figure describes.
+          # The fast kernels are AVX2 plus F16C, which is x86_64. So this is
+          # the one target where the numbers in the README mean anything, and
+          # shipping a binary for a target we have never measured would imply
+          # otherwise. Cross-platform builds wait for kernels and an I/O path
+          # worth measuring there.
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            artifact: ramvamp-linux-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `apt-get` step: the tree has no C dependencies, and `ureq` uses
+      # rustls rather than OpenSSL.
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          mkdir -p staging
+          cp target/release/ramvamp staging/
+          cp target/release/ramvamp-repack staging/
+          cp README.md LICENSE-MIT LICENSE-APACHE staging/
+          cd staging
+          tar czf ../${{ matrix.artifact }}.tar.gz *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*

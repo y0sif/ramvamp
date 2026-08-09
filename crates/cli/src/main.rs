@@ -1413,7 +1413,7 @@ fn generate_stats_line(stats: &GenerateStats, note: Option<&str>) -> String {
 /// must call [`report_stream_stats_since`] instead, or every turn's footer
 /// reports the session.
 ///
-/// This is what a `docs/experiments/README.md` entry quotes: what fraction
+/// This is what a `docs/experiments.md` entry quotes: what fraction
 /// of routed experts the cache served, how the misses split between cold and
 /// evicted, how many bytes actually left the drive, how long the decode
 /// thread spent blocked on them, and — because O_DIRECT can be silently
@@ -4070,7 +4070,7 @@ mod tests {
     /// `chat` keeps one `ForwardState` for the session and its counters are
     /// cumulative from construction (`reset` keeps them on purpose), so a
     /// footer built from them straight would put every turn's traffic under
-    /// the third turn's reply — a number `docs/experiments/README.md` quotes,
+    /// the third turn's reply — a number `docs/experiments.md` quotes,
     /// silently meaning something else. The footer is a delta.
     #[test]
     fn a_chat_turn_reports_its_own_traffic_and_not_the_session() {

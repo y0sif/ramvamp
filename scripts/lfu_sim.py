@@ -87,7 +87,12 @@ import os
 import struct
 import sys
 
-# Measured sequential read ceiling of the expert blobs on the dev NVMe.
+# UNSOURCED. This was once described as a measured sequential read ceiling;
+# it is not. EXP-008 tabulates the drive probes and none of them is 1.59, the
+# value sits between that entry's random-read and large-block numbers so it can
+# be neither, and EXP-019's rule-2 re-measurement does not find it either. Any
+# io ms/token or tok/s figure derived from it is not publishable until the
+# probe is redone under rule 2. The hit rates below do not depend on it.
 DEFAULT_BANDWIDTH_GBPS = 1.59
 # Slot budgets swept by default (slots per layer). 8/16/24/32 are the slot
 # counts TurboFieldfare ships and published hit rates for.

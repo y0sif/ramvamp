@@ -2,10 +2,11 @@
 //!
 //! Owned by wave-1 lane B. Policy is LFU with recency as tie-breaker and
 //! **frequency counters indexed by expert id, not by slot**, so a count
-//! survives its expert's eviction. That detail is the policy: measured on
-//! real routing traces (EXP-005), ghost-history LFU beats per-slot LFU by
-//! +2.2 points and LRU by +2.2 at 10 slots/layer, while per-slot LFU beats
-//! LRU by only 0.0-1.7 points and loses outright at 48 slots.
+//! survives its expert's eviction. That detail is the policy: simulated over
+//! real recorded routing traces (EXP-005 replays traces the runtime captured,
+//! but the hit rates are the simulator's, not the runtime's), ghost-history
+//! LFU beats per-slot LFU by +2.2 points and LRU by +2.2 at 10 slots/layer,
+//! while per-slot LFU is worth -1.7 to 0.0 points against LRU.
 //!
 //! The per-expert state is two arrays, both sized by the id space: the `u32`
 //! ghost counters, and the `bool` "has ever been fetched" flags behind the
@@ -45,8 +46,11 @@
 //! evict, so the cache thrashes between the same few experts. With ghost
 //! history a re-admitted expert keeps everything it earned and is hard to
 //! evict again, which is where the entire LFU-over-LRU margin comes from
-//! (EXP-005, 556 decode tokens, 10 slots/layer: ghost-history LFU 44.8%,
-//! windowed 44.7%, aged 43.0%, per-slot 42.6%, LRU 42.6%, Belady 55.8%).
+//! (EXP-005, simulated over 556 decode tokens of recorded routing, 10
+//! slots/layer: ghost-history LFU 44.8%, windowed 44.7%, aged 43.0%, per-slot
+//! 42.6%, LRU 42.6%, Belady 55.8%. Simulator rates, and the ranking is what
+//! they are for; the shipped cache measures about 5 points higher because it
+//! pins a whole step).
 //!
 //! # Lifecycle
 //!
@@ -169,8 +173,8 @@ pub enum CacheError {
     /// buffer under a live O_DIRECT read, so the step fails instead.
     ///
     /// (What aliasing costs on btrfs — spurious EIO from checksum failure —
-    /// was measured during io bring-up but is not yet an entry in
-    /// `docs/experiments/README.md`; treat the figure quoted on
+    /// was measured during io bring-up but is not recorded in
+    /// `docs/experiments.md`; treat the figure quoted on
     /// [`CachePlan::hits`] as provisional.)
     #[error(
         "layer needs {needed} more slot(s) but only {free} of {n_slots} are free \
@@ -264,8 +268,8 @@ impl CachePlan {
     /// A hit may name a slot whose fill is still in flight: `plan` never
     /// issues a second read for an expert that already owns a slot, because
     /// two O_DIRECT reads aliasing one buffer make btrfs report spurious EIO
-    /// (provisional: 13-27% during io bring-up, not yet recorded in
-    /// `docs/experiments/README.md`). Callers that plan more than once per
+    /// (provisional: 13-27% during io bring-up, not recorded in
+    /// `docs/experiments.md`). Callers that plan more than once per
     /// step must therefore wait for outstanding completions (see
     /// [`LayerCache::is_ready`]) before computing on a hit. Those requests
     /// are counted as [`CacheStats::pending_hits`], not as hits.

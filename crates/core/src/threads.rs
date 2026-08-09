@@ -29,7 +29,7 @@
 //!
 //! # Handoff cost
 //!
-//! Recorded as EXP-010 in `docs/experiments/README.md`, and provisional under
+//! Recorded as EXP-010 in `docs/experiments.md`, and provisional under
 //! that log's rule 2 (measured on a machine that was not quiet, and a
 //! microbenchmark rather than an end-to-end run): treat the figures as
 //! ordering evidence, not as published numbers.
@@ -790,7 +790,7 @@ fn smt_primaries(sysfs: &Path, candidates: &[usize]) -> Option<Vec<usize>> {
 ///   pinned threads on six physical cores, announced only by a `debug!`;
 /// * `None` propagates to [`smt_primaries`] and disables pinning for the
 ///   whole machine. Running unpinned is a measurable slowdown that shows up
-///   in `docs/experiments`; double-booking physical cores is a silent
+///   in `docs/experiments.md`; double-booking physical cores is a silent
 ///   violation of this module's one-thread-per-physical-core invariant, so
 ///   the two are not symmetric and the tie goes to unpinned.
 fn read_siblings(sysfs: &Path, cpu: usize) -> Option<Vec<usize>> {

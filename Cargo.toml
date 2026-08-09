@@ -7,14 +7,19 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/y0sif/ramvamp"
+homepage = "https://github.com/y0sif/ramvamp"
+# Inherited `readme` paths resolve against the workspace root, so all four
+# crates ship the same top-level README to crates.io.
+readme = "README.md"
 authors = ["y0sif"]
 rust-version = "1.85"
 
 [workspace.dependencies]
-# Internal
-ramvamp-core = { path = "crates/core" }
-ramvamp-repack = { path = "crates/repack" }
-ramvamp-server = { path = "crates/server" }
+# Internal. Each carries both a `path` and a `version`: the path wins for local
+# builds, and `cargo publish` rejects a path dependency that has no version.
+ramvamp-core = { path = "crates/core", version = "0.1.0" }
+ramvamp-repack = { path = "crates/repack", version = "0.1.0" }
+ramvamp-server = { path = "crates/server", version = "0.1.0" }
 
 # Errors and logging
 anyhow = "1"

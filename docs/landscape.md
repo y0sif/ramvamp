@@ -1,8 +1,9 @@
 # Competitive landscape
 
 Researched 2026-08-01, before any code was written. Attributions corrected
-2026-08-03 after phase-5 re-checked the sources. This document records why
-ramvamp exists given what already ships.
+2026-08-03 after phase-5 re-checked the sources, and again 2026-08-09 before
+publication. This document records why ramvamp exists given what already
+ships.
 
 Citation rule for this document: a number gets the machine, the quant, and
 the cache size it was measured with, or it does not get quoted. Several
@@ -29,8 +30,8 @@ ramvamp earns its existence because:
 
 | Project | Type / language | Approach | Status (Aug 2026) | Gap ramvamp fills |
 | --- | --- | --- | --- | --- |
-| [TurboFieldfare](https://github.com/drumih/turbo-fieldfare) | OSS, Swift + Metal | Explicit pread + per-layer LFU expert cache + custom quantized kernels; 5.1-6.3 tok/s in ~2 GB on an 8 GB M2 Air | Active, ~3.2k stars | Apple-only by design (Swift, Metal, unified memory); one pinned model |
-| [llama.cpp](https://github.com/ggml-org/llama.cpp) | OSS, C++ | mmap demand paging when the model exceeds RAM; `--n-cpu-moe` offloads experts to RAM, not SSD | Very active | No merged SSD expert streaming; [discussion #19163](https://github.com/ggml-org/llama.cpp/discussions/19163), issues [#19825](https://github.com/ggml-org/llama.cpp/issues/19825) and [#20757](https://github.com/ggml-org/llama.cpp/issues/20757) request it; closest work is the unmerged RFC [#23324](https://github.com/ggml-org/llama.cpp/discussions/23324) (pread expert-slot prototype; 13 tok/s Qwen3-30B-A3B self-reported on a 16 GB M1 Pro, **Q6_K, 48 slots/layer, GPU-accelerated, "after warmup"**; see the caveat below) |
+| [TurboFieldfare](https://github.com/drumih/turbo-fieldfare) | OSS, Swift + Metal | Explicit pread + per-layer LFU expert cache + custom quantized kernels; 5.1-6.3 tok/s in ~2 GB on an 8 GB M2 Air | Active; **~5,495 stars and 305 forks on 2026-08-09**, repo created 2026-07-17 | Apple-only by design (Swift, Metal, unified memory); one pinned model |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) | OSS, C++ | mmap demand paging when the model exceeds RAM; `--n-cpu-moe` offloads experts to RAM, not SSD | Very active | No merged SSD expert streaming; [discussion #19163](https://github.com/ggml-org/llama.cpp/discussions/19163), issues [#19825](https://github.com/ggml-org/llama.cpp/issues/19825) and [#20757](https://github.com/ggml-org/llama.cpp/issues/20757) request it; closest work is the unmerged RFC [#23324](https://github.com/ggml-org/llama.cpp/discussions/23324) (pread expert-slot prototype; 13 tok/s Qwen3-30B-A3B self-reported on a 16 GB M1 Pro, **Q6_K, 48 slots/layer, GPU-accelerated, "after warmup"**; see the caveat below), and PR [#25294](https://github.com/ggml-org/llama.cpp/pull/25294) (per-layer expert slots, async I/O worker pool, O_DIRECT), **open, not merged, as of 2026-08-09** |
 | [MoE-Infinity](https://github.com/EfficientMoE/MoE-Infinity) | OSS, Python/PyTorch | Activation-aware expert cache across GPU/host/SSD tiers, prefetching | Active, academic | Server-oriented; needs CUDA and large host RAM; not a 2 GB consumer play |
 | [Micro-Expert-Router](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER) | OSS, Rust | io_uring + O_DIRECT NVMe expert streaming, CPU kernels | Early-stage | Closest precedent, but its performance numbers are stated by the author to be theoretical projections, not measurements |
 | [mistral.rs](https://github.com/EricLBuehler/mistral.rs) / [candle](https://github.com/huggingface/candle) | OSS, Rust | Full inference engines with quantization and device offload | Active | No SSD expert streaming; useful as building blocks and kernel references |
@@ -42,7 +43,7 @@ ramvamp earns its existence because:
 | --- | --- | --- | --- | --- |
 | Dense 26B | none | n/a | ~13 GB | Unusable: multiple seconds per token at NVMe speeds |
 | Coarse MoE (Mixtral 8x7B) | 8, top-2 | ~90 MB | ~5.6 GB | Unusable: experts too large to stream or cache |
-| Fine-grained MoE (Gemma 4 26B-A4B, Qwen3-30B-A3B) | 128, top-8 | ~2.5-3.4 MB | ~0.8-1.1 GB worst case depending on model; a small LFU cache absorbs roughly half (50.0-54.5% on measured Qwen3 routing traces, EXP-005) | The regime this project targets |
+| Fine-grained MoE (Gemma 4 26B-A4B, Qwen3-30B-A3B) | 128, top-8 | ~2.5-3.4 MB | ~0.8-1.1 GB worst case depending on model; a small LFU cache absorbs roughly half. **Measured live and cold at 53.0-59.3%** at the shipped 11 slots/layer, across five context rungs, no trend in context (EXP-023; reference machine, Qwen3-30B-A3B Q4_K_M, in-cgroup). Two lower figures exist and are different quantities, not disagreements: replaying the shipped cache over EXP-005's recorded routing traces gives 50.02% at 10 slots and 54.48% at 12, and `scripts/lfu_sim.py`'s sequential simulator sits about 5 points under that replay at 44.8% and 49.9% | The regime this project targets |
 
 Fine-grained MoE is the direction the field converged on (DeepSeek-V3, Qwen3,
 Gemma 4, GLM-4.5-Air), so the class of runnable models grows over time.
@@ -67,9 +68,12 @@ implementation of this technique:
    as written: lower is better, so those numbers say LFU *lost*. Which policy
    is which cannot be recovered from our notes, so the pair is **withdrawn**
    pending a re-read of their log. The LFU-versus-LRU question is settled on
-   our own traces anyway: EXP-005 measures ghost-history LFU at 44.8% against
-   LRU's 42.6% at 10 slots/layer, and finds that per-slot LFU without ghost
-   history is worth -1.7 to 0.0 points against LRU. **Our traces also do not
+   our own traces anyway: EXP-005's simulator, replaying recorded routing
+   traces rather than measuring the runtime, gives ghost-history LFU 44.8%
+   against LRU's 42.6% at 10 slots/layer, and finds that per-slot LFU without
+   ghost history is worth -1.7 to 0.0 points against LRU. Both are simulated
+   rates, quotable for the ranking and not as the runtime's hit rate. **Our
+   traces also do not
    reproduce their 66.6% absolute level**: EXP-005 gives 58.1% at 16 slots on
    Qwen3-30B-A3B, 8.5 points low, but that is not a like-for-like comparison
    either, because 58.1% is the simulator's sequential lower bound and the
@@ -87,9 +91,16 @@ implementation of this technique:
    ships (hence the cgroup benchmark methodology in this project).
 6. A dedicated I/O executor is not automatically a win: they measured 8.59
    vs 8.42 ms for one, and a 4-worker I/O pool as mixed across repeats, and
-   rejected both. (Cross-project note, not theirs: flash-moe measured +4.6%
-   for a persistent pool, so the evidence is genuinely mixed. ramvamp treats
-   it as an open experiment rather than a premise.)
+   rejected both. (Cross-project note, not theirs:
+   [flash-moe](https://github.com/danveloper/flash-moe) measured a persistent
+   expert `pread` pool at **4.28 against 4.09 tok/s**, which is the +4.6% this
+   project quotes, and 3.81 against 3.97 ms/layer, verdict "keep". Their
+   machine is a 48 GB MacBook Pro, their model is Qwen3.5-397B-A17B with
+   **2-bit experts**, and there is **no slot count to state** because they run
+   no expert cache of their own and read through the macOS page cache. Their
+   pool dispatches `pread` through GCD, not io_uring. So the evidence is
+   genuinely mixed, and ramvamp treats it as an open experiment rather than a
+   premise.)
 
 Note that TurboFieldfare's headline throughput, 5.1-6.3 tok/s in ~2 GB, is on
 an 8 GB M2 Air: Apple unified memory, Metal compute, and a macOS page cache
@@ -127,11 +138,25 @@ bad versions do not come back.
   upstream attempts. The backlog item in `docs/architecture.md` is
   downgraded accordingly.
 
-**Needs verification:** *flash-moe* is cited in `docs/architecture.md` for
-two measurements (+4.6% for a persistent I/O worker pool; waiting on all
-reads before a single batched dispatch). No repository URL has been recorded
-for it in this document. Add the link, or drop the citation, before either
-number appears in anything published.
+**Verified 2026-08-09, was "needs verification":** *flash-moe*, cited in
+`docs/architecture.md` for two measurements, is
+[danveloper/flash-moe](https://github.com/danveloper/flash-moe). Both
+citations check out against the repository, so both survive.
+
+- **"+4.6% for a persistent I/O worker pool."** Its `results.tsv` records
+  "Persistent expert pread pool beats dispatch_apply": 4.28 against 4.09
+  tok/s, which is the +4.6%, and 3.81 against 3.97 ms/layer, output
+  identical, verdict "keep". The qualifiers this document's citation rule
+  demands travel with it: a 48 GB MacBook Pro, Qwen3.5-397B-A17B at **2-bit
+  experts**, and **no slot count**, because flash-moe keeps no expert cache
+  and reads through the macOS page cache. It is also a GCD `pread` pool, not
+  io_uring, which is the axis that matters most for whether the result
+  transfers here.
+- **"Waits on all reads before a single batched dispatch."** Its
+  `docs/plan-io-experiments.md` describes exactly that shape: `aio_suspend`
+  "blocks until all 4 complete (single wait vs 4 thread joins)". This one is
+  a structural claim rather than a number, so the citation rule has nothing
+  to attach to it.
 
 ## Known trade-offs to state honestly
 
@@ -142,7 +167,20 @@ number appears in anything published.
   ~half its per-token time on expert reads. That is a claim about decode, and
   it does not carry to prefill on the swept path: EXP-017 measured expert I/O
   at 1.7% of a 512-token swept prefill and 0.5% at 1891 tokens, with attention
-  taking 61.3% and 85.2%. That is confirmed cold on our own path: **MEASURED**
+  taking 61.3% and 85.2%. **EXP-017's own qualifier travels with those four
+  figures.** They are warm, uncgrouped, and taken on a machine its Method
+  records as busy, and EXP-017 states head-on that they are not publishable
+  numbers: what survives is the shape of the split and ratios within a single
+  run, never the absolute seconds. They are superseded directionally as well.
+  On the phase-7 kernel, measured cold and in-cgroup at 4K on the reference
+  machine (Qwen3-30B-A3B Q4_K_M, 11 slots/layer), the prefill split is
+  **expert compute 42.1%, projections 22.8%, attention 20.4%**, elementwise
+  12.2%, expert I/O 2.5% (EXP-021, with EXP-023 reproducing 41.8 / 22.8
+  / 20.8 in a different session). Attention is not the wall in prefill any
+  more, it is the third largest term. Those are different entries, sessions
+  and kernels, so the only licensed statement is that direction and not a
+  curve drawn through both. Expert I/O staying small in prefill is confirmed
+  cold on our own path: **MEASURED**
   at ctx 512, expert I/O is 44.4% of a decode token and 2.8% of a prefill token
   (EXP-023, five context rungs, cold, in-cgroup, hygiene PASS). The slowdown
   versus a fits-in-RAM engine is **drive-dependent and larger than the "2-3x"
@@ -152,8 +190,14 @@ number appears in anything published.
   Q4_K_M at the shipped 11 slots/layer) decode **MEASURES 1.46 to 2.19 tok/s
   cold** across five context rungs (EXP-023: 2.19 / 1.91 / 1.82 / 1.75 / 1.46
   at 64 / 512 / 1,024 / 2,048 / 3,961 prompt tokens, medians of three scored
-  runs at `--max-new 64`). Against a **15-25 tok/s ESTIMATED** in-RAM compute
-  ceiling — an estimate with no direct public benchmark behind it — that is
+  runs at `--max-new 64`). That band is a fact about the session EXP-023
+  measured rather than a property of the build on this drive: EXP-025 re-ran
+  the **byte-identical** binary on the same prompt files a day later and read
+  1.85 against 1.91 at ctx 512 and 1.33 against 1.46 at 3,961, and its own
+  fused ladder over the same five rungs (2.16 / 1.87 / 1.74 / 1.65 / 1.43) is
+  a second ladder rather than five more points on this one. Against a
+  **15-25 tok/s ESTIMATED** in-RAM compute ceiling, an estimate with no
+  direct public benchmark behind it, that is
   roughly **7-17x on that device**, and the width of that range is mostly the
   softness of the estimate rather than anything measured. A mainstream TLC Gen4
   drive would narrow the gap; by how much is **UNKNOWN**, since no such drive
@@ -163,12 +207,12 @@ number appears in anything published.
   that ratio on is withdrawn.** It bracketed the 10- and 12-slot rows while 11
   is what ships; its hit rates were a replay of the shipped cache over recorded
   routing traces rather than a decode run (this document called them
-  "simulated", which was imprecise — the simulator is a different, lower
-  figure); its bandwidth input was EXP-019's 1.55-1.69 GB/s where decode's own
+  "simulated", which was imprecise, because the simulator is a different and
+  lower figure); its bandwidth input was EXP-019's 1.55-1.69 GB/s where decode's own
   effective rate is **2.16 GB/s DERIVED** (EXP-023); and, decisively, **an
   I/O-only ceiling computed as `1 / expert_io` overstates**, because EXP-023
-  Note 4 establishes that the `expert io` bucket is a residual left after hit
-  compute has already covered part of the read. No replacement band is offered.
+  establishes that the `expert io` bucket is a residual left after hit compute
+  has already covered part of the read. No replacement band is offered.
 
   All bandwidth figures here come from a threaded-`preadv` probe rather than
   io_uring, so they characterise the drive and not the runtime's submission

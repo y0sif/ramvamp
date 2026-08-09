@@ -11,8 +11,8 @@ guessed at. Update this file when any of it changes.
 | CPU | Intel Core Ultra 9 185H: 6 P-cores (SMT), 8 E-cores, 2 LP E-cores, 22 threads |
 | P-core primaries | 0, 1, 3, 6, 8, 10 (SMT pairs are 0-5, 1-2, 3-4, 6-7, 8-9, 10-11) |
 | E-cores with L3 | 12-19. LP E-cores 20-21 are on the SoC tile with no L3 |
-| CPU ISA | `avx`, `avx2`, `f16c`, `fma`, `avx_vnni`, `bmi1`, `bmi2`, `sha_ni`. **No AVX-512 of any flavour** — Meteor Lake ships none, and `/proc/cpuinfo` carries zero `avx512*` flags |
-| RAM | 15.3 GiB (`MemTotal` reads 15,711,132 kB = **14.98 GiB**; the 15.3 figure is the older reading and the two have never been reconciled — use `MemTotal` for arithmetic) |
+| CPU ISA | `avx`, `avx2`, `f16c`, `fma`, `avx_vnni`, `bmi1`, `bmi2`, `sha_ni`. **No AVX-512 of any flavour**: Meteor Lake ships none, and `/proc/cpuinfo` carries zero `avx512*` flags |
+| RAM | 15.3 GiB (`MemTotal` reads 15,711,132 kB = **14.98 GiB**; the 15.3 figure is the older reading and the two have never been reconciled, so use `MemTotal` for arithmetic) |
 | Swap | zram, 7.5 GiB. Counts as swap, so benchmark runs set `memory.swap.max=0` |
 | Storage | Micron 2400 `MTFDKBA1T0QFM-1BD1AABGB`, DRAM-less QLC, PCI `1344:5413`, Gen4 x4 |
 | Filesystem | btrfs on `/dev/nvme0n1p2`, `compress=zstd:3,ssd,discard=async`, data profile `single` |
@@ -21,8 +21,8 @@ guessed at. Update this file when any of it changes.
 | earlyoom | active |
 
 **The ISA row is load-bearing from phase 7 onward.** `crates/core/src/kernels/
-attention/x86.rs` is gated on `avx2` **and** `f16c` — separate CPUID bits, so it
-is not the same probe `quants::avx2` uses — and it deliberately does **not**
+attention/x86.rs` is gated on `avx2` **and** `f16c`, separate CPUID bits, so it
+is not the same probe `quants::avx2` uses, and it deliberately does **not**
 enable `fma`, because a fused multiply-add is one rounding where the scalar
 reference has two and the bit-identity gate would fail. `avx_vnni` is present
 and unused. The absence of AVX-512 is why the vector width in every kernel here
@@ -62,9 +62,11 @@ Cause of the recorded 138,407, established and reproduced (EXP-007): a
 benchmark harness indexed its buffer pool with modulo arithmetic, so two
 in-flight O_DIRECT reads could target the same buffer. btrfs verifies the
 checksum after DMA into the user buffer, so one read's verification ran over
-bytes the other had already overwritten. Measured 13-27% spurious `EIO` with
-aliased buffers versus 0 across 4,000 reads with an explicit free list. The
-data on disk was never affected: the model files hash-match `manifest.json`,
+bytes the other had already overwritten. Aliased buffers returned spurious
+`EIO` frequently but not always; the probe's 13-27% spread is across repeats on
+a machine that was not quiet and is not a rate to quote. An explicit free list
+measured 0 `EIO` across 4,000 reads. The data on disk was never affected: the
+model files hash-match `manifest.json`,
 the failing regions re-read clean, and an instrumented run confirmed 6,000
 blocks delivered byte-correct while 256 checksum failures were logged.
 
@@ -113,7 +115,7 @@ btrfs device stats /home
   Consequences for benchmarking, in order of importance: **pin the same file
   set**, because a run that changes which files it touches has changed its own
   baseline; **an aggregate that hides a spread is worse than no aggregate**;
-  and **never quote a per-file spread as a fact about this drive** — it is a
+  and **never quote a per-file spread as a fact about this drive**. It is a
   fact about the session that measured it, and it must be re-measured inside
   any entry that leans on it.
 
@@ -125,7 +127,7 @@ btrfs device stats /home
   984,027 B, median 884,736 B, zero extents physically adjacent to their
   successor, zero compressed extents (EXP-019, EXP-023). But the probe that
   supported that statement only ever computed extent count, extent sizes and
-  successor adjacency — it never computed physical span or clustering — so it
+  successor adjacency, and never physical span or clustering, so it
   could see *fragmentation* and could not see *placement*. EXP-024 added the
   missing statistics and measured them over the whole population:
 
@@ -137,11 +139,11 @@ btrfs device stats /home
   - **Pearson r between bandwidth and largest-region byte fraction is
     -0.043** over those 48 files. Bandwidth correlates with block size (r =
     0.835) and with dispersion not at all.
-  - `layer_00` is the **only** physically dispersed file of the 48 — 26
+  - `layer_00` is the **only** physically dispersed file of the 48, at 26
     regions, 23.0% of its bytes in its largest, 72.46 GB median inter-extent
-    seek — against **43 of 48 at >= 99% of bytes in one region**. It is
+    seek, against **43 of 48 at >= 99% of bytes in one region**. It is
     **not** the slowest file: rank 17 of 48. The 99.6%-clustered `layer_06`,
-    with a 0.11 GB median seek, ranks 16 — indistinguishable from `layer_00`
+    with a 0.11 GB median seek, ranks 16, indistinguishable from `layer_00`
     in that run (1.6165 against 1.6169) and clearly slower in the four-file
     arm (1.607 against 1.672).
   - Sixteen 2 MiB windows **inside `layer_00`**, dense against scattered, are
@@ -151,8 +153,8 @@ btrfs device stats /home
   Dispersion is reported as **btrfs LOGICAL bytenr from `filefrag`, not device
   LBA**; resolving it needs `sudo btrfs inspect-internal dump-tree -t 3
   /dev/nvme0n1p2`, which the probe never runs. What is left as the mechanism is
-  drive-internal and invisible to any filesystem-level probe — pSLC residency
-  or FTL state on this DRAM-less QLC part — and it is not addressable from the
+  drive-internal and invisible to any filesystem-level probe, either pSLC
+  residency or FTL state on this DRAM-less QLC part, and it is not addressable from the
   runtime. Vendor SMART would be the next evidence and is unavailable here:
   `nvme-cli` and `smartmontools` are not installed on this machine. See EXP-024
   for the commands, and for why a "fix" that only holds while data sits in

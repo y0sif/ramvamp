@@ -1,0 +1,203 @@
+name: Benchmark report
+description: Report ramvamp's throughput on your drive. This is the most useful thing you can send.
+title: "[bench] "
+labels: ["benchmark"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This is the contribution the project wants most.**
+
+        Every published throughput number for ramvamp comes from a single
+        machine with a single DRAM-less QLC NVMe drive. The central claim is
+        that decode is I/O-bound and therefore scales with the device, and
+        that claim currently rests on one data point. A run from a different
+        drive either supports it or refutes it, and both outcomes are worth
+        more than another round of tuning on the same hardware.
+
+        Slow results are as valuable as fast ones. A drive where ramvamp
+        performs badly is information, not a complaint, so please send it.
+
+        `CONTRIBUTING.md` has the full procedure. The short version: run
+        cold, run inside the cgroup, and check the generated text before you
+        trust the tokens per second.
+
+  - type: input
+    id: drive
+    attributes:
+      label: Drive model and interface
+      description: |
+        Exact model from `nvme list` or `lsblk -o NAME,MODEL`, plus the
+        interface it is attached over. If you know the cell type and whether
+        it has a DRAM cache, say so: that is the axis the project cares
+        about most.
+      placeholder: "Samsung 990 Pro 2 TB, PCIe 4.0 x4, TLC with DRAM"
+    validations:
+      required: true
+
+  - type: input
+    id: filesystem
+    attributes:
+      label: Filesystem and mount options
+      description: |
+        From `findmnt -no FSTYPE,OPTIONS /path/to/model`. Include encryption,
+        RAID, LVM or a container overlay if the model file sits behind any of
+        them, since each can quietly disable O_DIRECT.
+      placeholder: "ext4, rw,relatime,discard"
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel
+      description: Output of `uname -r`, and the distribution if it patches the kernel.
+      placeholder: "6.12.4-arch1-1"
+    validations:
+      required: true
+
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU and ISA level
+      description: |
+        Model name from `lscpu`, core and thread counts, and which vector
+        extensions are present. AVX2 and F16C are the ones the fast kernels
+        use, so please confirm both explicitly.
+      placeholder: "AMD Ryzen 9 7950X, 16C/32T, AVX2 yes, F16C yes"
+    validations:
+      required: true
+
+  - type: input
+    id: ram
+    attributes:
+      label: RAM
+      description: Total installed memory, and its speed if you know it.
+      placeholder: "32 GB DDR5-6000"
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model and quantization
+      description: Which weights at what quantization, and the size of the .rvmp file on disk.
+      placeholder: "Qwen3-30B-A3B Q4_K_M, 17.35 GiB"
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command
+      description: |
+        The full command line, verbatim, including context length, generated
+        token count, and every flag. Paste the harness invocation too if you
+        used `scripts/cold_bench.py`.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: conditions
+    attributes:
+      label: Cold and in-cgroup?
+      description: |
+        Warm-cache and unconfined runs measure the page cache rather than the
+        drive, so they are diagnostics only. A number is only comparable to
+        the published figures if the cache was dropped first and the run was
+        confined by `memory.max` with `memory.swap.max=0`, remembering that
+        zram counts as swap.
+      options:
+        - "Cold page cache, inside a memory cgroup with swap off"
+        - "Cold page cache, but not inside a cgroup"
+        - "Warm cache, inside a cgroup"
+        - "Warm cache, no cgroup (diagnostic only)"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: input
+    id: memory_max
+    attributes:
+      label: Memory limit
+      description: The `memory.max` for the run. Say so if you raised it above 3G and why.
+      placeholder: "3G"
+
+  - type: textarea
+    id: hygiene
+    attributes:
+      label: Hygiene counters
+      description: |
+        The counters that say whether the measurement is clean. If you used
+        `scripts/cold_bench.py` these are printed for every run and you can
+        paste the block as is: `memory.peak`, `memory.events`, `pgscan`,
+        `pgsteal`, `read_bytes`, and the hygiene verdict. Non-zero `pgsteal`
+        means the kernel reclaimed pages during the run and the timing
+        describes reclaim as much as it describes the drive.
+
+        If you ran ramvamp by hand, give at least `memory.peak` and
+        `memory.events` from the cgroup, and `read_bytes` from
+        `/proc/<pid>/io`.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: |
+        Load time, prefill tokens per second, decode tokens per second, and
+        peak RSS, at whichever context lengths you ran. Please report every
+        repeat rather than only the best one: on a DRAM-less part the same
+        binary has read almost 9% apart on consecutive days, so a single run
+        describes its session more than its device.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Generated output
+      description: |
+        Paste what the model actually produced. A tokens per second figure
+        from a run that looped, emitted garbage, or was truncated is not a
+        benchmark, and this is the cheapest possible check that the number
+        means something. A few hundred characters is plenty.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: output_checked
+    attributes:
+      label: Did you check the output for looping or truncation?
+      options:
+        - "Yes, the text is coherent and ends normally"
+        - "Yes, and it looped or repeated"
+        - "Yes, and it was truncated or cut off"
+        - "Yes, and it was incoherent"
+        - "No"
+    validations:
+      required: true
+
+  - type: textarea
+    id: banner
+    attributes:
+      label: Load banner
+      description: |
+        The line ramvamp prints on stderr after loading, which ends in the
+        achieved I/O mode. A run that says `pread` or `io_uring+buffered` is
+        measuring a different code path from one that says
+        `io_uring+O_DIRECT`, and the three are not comparable.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Thermal throttling, a busy machine, an unusual power profile, or anything else that might have coloured the run.

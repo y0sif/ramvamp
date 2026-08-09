@@ -685,8 +685,9 @@ impl<'a> LayerSweep<'a> {
     /// nothing is still writing into the pool. The window ring is reused layer
     /// after layer, and every sweep starts by submitting into buffer 0, so a
     /// previous layer's windows still in flight would be a second O_DIRECT read
-    /// onto a live DMA destination: the corruption EXP-007 measured as 13-27%
-    /// spurious btrfs `EIO` plus permanent `corruption_errs`.
+    /// onto a live DMA destination: the corruption EXP-007 measured as
+    /// spurious btrfs `EIO`, frequently and not always (its 13-27% is not a
+    /// rate to quote), plus permanent `corruption_errs`.
     ///
     /// A `LayerSweep` drains its own windows in `teardown`, which both `?` and
     /// a panic run — but [`std::mem::forget`] is safe Rust and skips it, and
@@ -2408,7 +2409,8 @@ mod tests {
         // borrow that made the session unusable; the next `split` then computed
         // `arena_offset = ring_base + 0`, the exact address layer 0's still-live
         // window read was writing into. Two O_DIRECT reads on one destination,
-        // which EXP-007 measured as 13-27% spurious btrfs EIO.
+        // which EXP-007 measured as spurious btrfs EIO, frequently and not
+        // always (its 13-27% is not a rate to quote).
         let fx = build_install("prefill-leaked-sweep");
         let mut stream = open(&fx, 4);
         let config = SweepConfig {

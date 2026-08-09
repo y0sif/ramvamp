@@ -57,7 +57,7 @@
 //! a weight byte feeds `n_acts` MACs instead of one. No effective-bandwidth
 //! figure is quoted here on purpose: the argument is a ratio, and this repo
 //! has no cold, cgroup-bounded measurement of expert-GEMV bandwidth to cite
-//! (see `docs/experiments/README.md` for what is and is not measured).
+//! (see `docs/experiments.md` for what is and is not measured).
 //!
 //! **No arithmetic changes.** The batched path issues the *same* per-row
 //! `vec_dot` call, on the same `(weight_row, activation_row)` bytes, as the

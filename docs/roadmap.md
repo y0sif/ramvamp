@@ -1,239 +1,469 @@
 # Roadmap
 
-**This file is the plan of record.** Handoff docs describe one phase to the
-next and are written by a session that has just spent its whole context on one
-narrow problem; they are not the plan. When they disagree with this file, this
-file wins, and the handoff is stale.
+ramvamp is a Rust runtime that runs fine-grained Mixture-of-Experts models
+without loading the checkpoint into memory. The always-needed common weights
+stay memory-mapped; the routed experts, which are most of the model, live on
+NVMe in a page-aligned packed format and are fetched with io_uring and
+O_DIRECT only when the router asks for them, through a small per-layer cache.
+CPU only, Linux first.
 
-Every phase updates this file. A phase that does not update it has not
-finished.
+**v0 delivers**: Qwen3-30B-A3B Q4_K_M generating coherent text inside a 3 GB
+memory cgroup with a cold page cache, validated against llama.cpp on
+byte-identical weights, driven from a CLI, a chat REPL, or a loopback
+OpenAI-compatible HTTP server with streaming and tool calls.
 
-Last updated 2026-08-08, after a cross-session audit of phases 1-9.
+This file is the plan of record for **what is done, what is next, and what is
+open**. Three companions carry the rest, and each is authoritative on its own
+subject: `docs/architecture.md` is ground truth for the design and is worth
+reading before touching the runtime, `docs/experiments.md` is the record of
+what was measured, and `docs/landscape.md` is why the design decisions were
+made the way they were.
 
-## Why this file exists
-
-The phase-6 session identified that the phase plan lived only in chat, proposed
-committing it, and it was never done. Every session since re-derived its own
-numbering from a handoff doc. The numbering was reconciled at least twice and
-never held: phase 6 ended believing phases 8-13 would be "finish attention,
-decode I/O, v0 completion, server, Gemma 4, Vulkan", and none of that survived.
-That is the whole reason the plan looked different every session.
+Numbered `EXP-NNN` citations point at `docs/experiments.md`, which records the
+conditions each figure was taken under and the verdict it earned. A figure in
+this file with no experiment behind it says so.
 
 ## The bar
 
-**SETTLED 2026-08-08: decode throughput is stated per drive, not as one
-number.** See `docs/architecture.md` "Goal" and "Performance model".
+Five rules govern every number the project publishes. They are the reason the
+claims are worth anything.
 
-The floor read `>= 3 tok/s` from phase 1 to phase 9 and was never met at any
-measured rung. Three phases derived independently that it is not reachable on
-this drive by code alone (phase 5 on bandwidth, phase 7 as a stated risk,
-phase 9 on post-fusion compute headroom), and the decision was escalated three
-times without being taken. Stacking every remaining lever optimistically lands
-around 2.7-2.8 tok/s (DERIVED); phase 9's own research lane computed 2.83 by an
-independent route before writing any code.
+1. A microbenchmark may start an experiment. End-to-end speed and output
+   quality decide what ships.
+2. **Publication.** Only cold, in-cgroup, hygiene-PASS numbers are publishable.
+   Everything else is a diagnostic and is labelled one. **Correctness
+   measurements are exempt.** *Cold* means every model file evicted with
+   `posix_fadvise(POSIX_FADV_DONTNEED)`, the eviction proven with `mincore`
+   rather than trusted from a return code, and non-zero block-layer
+   `read_bytes` as a positive control that the run really was cold.
+   *In-cgroup* means `systemd-run --user` at `MemoryMax=3G` and
+   `MemorySwapMax=0`, with counters read from inside the cgroup before exit;
+   zram counts as swap. *Hygiene PASS* means the reclaimers stole zero pages,
+   every `memory.events` counter is zero, swap peak is zero, and both processes
+   exited 0. This rule is also why a simulated or replayed cache hit rate is
+   always named as a simulation or a replay and is never quoted as the
+   runtime's hit rate.
+3. **Comparison.** Every entry records its own baseline. Figures from different
+   entries, sessions or machine states are never drawn on one curve. A ratio is
+   quotable only when both arms ran back to back, on the same prompt at the
+   same dials, in one run of the harness.
+4. A change claiming identical math must produce identical bits. A change that
+   reorders floating-point work must pass tolerance tests against reference
+   output.
+5. Negative results get entries too. They are the cheapest way to stop a bad
+   idea coming back.
 
-What v0 publishes, on the reference machine (Micron 2400, DRAM-less QLC),
-Qwen3-30B-A3B Q4_K_M, cold, inside `memory.max=3G` with swap off:
+**The reference machine**, recorded in full in `docs/benchmark-machine.md`:
+Intel Core Ultra 9 185H (6 P-cores, 8 E-cores, 2 LP E-cores; AVX2 and F16C, no
+AVX-512 of any kind), 14.98 GiB RAM, and a **Micron 2400 DRAM-less QLC** NVMe
+on a Gen4 x4 link, btrfs with `compress=zstd:3`. Cold O_DIRECT reads on the
+installed model measure **1.54 to 2.37 GB/s** across the whole probe matrix
+(EXP-019), but that top end comes from large sequential reads the runtime never
+issues. At decode's own geometry, one expert blob at a time in random order,
+the drive sustains about **1.6 GB/s**: 1.565 to 1.694, median 1.633, measured
+across all 48 expert files (EXP-024). Quote the second figure when reasoning
+about decode. There is no
+passwordless sudo on this machine, so cold runs evict with
+`posix_fadvise(POSIX_FADV_DONTNEED)` plus a `mincore` residency assertion
+rather than `drop_caches` (`scripts/cold_bench.py`).
+
+**Standing rule: decode throughput is stated per drive, not as one number.**
+Decode is I/O-bound: expert reads are 54.1% of a token at ctx 64 falling to
+33.2% at 3,961 (EXP-023), and the reference part is DRAM-less QLC. A single
+global floor would contradict at the headline what the performance model
+enforces in the body. It was written as `>= 3 tok/s` early on and was never
+met at any measured rung. Three independent lines of evidence found it
+unreachable on this drive by code alone: the measured read bandwidth, the
+attention work's own stated risk, and the compute headroom left after the
+decode fan-out was fused. It is stated per drive rather than lowered because
+the device is the dominant term.
+
+What v0 publishes, on the reference machine, Qwen3-30B-A3B Q4_K_M, cold,
+inside `memory.max=3G` with swap off, at the shipped 11 slots per layer:
 
 | | measured |
 | --- | --- |
-| Decode, 11 slots, ctx 64 to 3,961 | **1.46 to 2.19 tok/s** (EXP-023) and **1.43 to 2.16** (EXP-025): two sessions, **not one curve** |
+| Decode, ctx 64 to 3,961, `--max-new 64`, medians of three scored runs | **1.46 to 2.19 tok/s** (EXP-023) and **1.43 to 2.16 tok/s** (EXP-025). Two sessions, **not one curve** |
 | Decode, 13 slots, ctx 512 | **2.06 tok/s** (EXP-023) |
-| Prefill, ctx 512 | **11.25** (EXP-023), **11.07** (EXP-025) |
-| `memory.peak` | **2,497 to 2,929 MiB** of 3,072 |
-| Fidelity | mean full-vocab KL **1.04e-2** vs llama.cpp, top-1 8/8 |
+| Prefill, ctx 512 | **11.25 tok/s** (EXP-023), **11.07** (EXP-025) |
+| Expert cache hit rate, ctx 64 to 3,961 | **53.0% to 59.3%**, no trend in context (EXP-023) |
+| `memory.peak` | **2,497 to 2,929 MiB** of 3,072 (2,497.0 is EXP-025's fused arm at ctx 64, 2,929.3 is EXP-023 at ctx 3,961) |
+| Fidelity | mean full-vocab KL **1.04e-2** against llama.cpp, top-1 agreement 8/8 (EXP-004) |
+| Model on disk | 17.35 GiB, about a 6x memory saving |
 
-The one-line summary is **"about 2 tok/s"**. Rule 3 forbids one curve through
-those two ladders: EXP-025 re-ran EXP-023's byte-identical binary and read it
-3.1% slower at 512 and 8.9% slower at 3,961.
+The one-line summary is **"about 2 tok/s"**. Rule 3 forbids drawing one curve
+through those two decode ladders: EXP-025 re-ran EXP-023's byte-identical
+binary on the same prompts and read it 3.1% slower at ctx 512 and 8.9% slower
+at 3,961. On a DRAM-less QLC part a decode figure describes its session as
+well as its device.
 
-A faster drive should move this and by how much is **UNKNOWN**: no mainstream
-TLC Gen4 part has been measured here. Measuring a second drive is the cheapest
-remaining experiment in the project.
+One caveat those decode figures carry, stated rather than buried: at
+`--max-new 64` the run starts from a cache the prefill sweep emptied, so the
+published curve describes **the first 63 tokens after a prompt**. Steady-state
+decode at 256 generated tokens and beyond has not been measured cold. It is on
+the list below.
+
+A faster drive should move this and by how much is **unknown**. No mainstream
+TLC Gen4 part has been measured here. That is the cheapest remaining
+experiment in the project.
 
 ## Where v0 stands
 
 | | status |
 | --- | --- |
-| Packed `.rvmp` format, streaming installer | **done**, phase 1 |
-| Tokenizer + vendored ChatML | **done**, phase 2 |
-| CPU kernels (AVX2, scalar reference) | **done**, phase 3 |
-| Forward pass, KV cache, generation | **done**, phase 4 |
-| io_uring + O_DIRECT streaming, ghost-LFU cache | **done**, phase 5 |
-| Sequential-sweep prefill, chat REPL | **done**, phase 6 |
-| Attention (GQA hoist, AVX2+F16C, fan-out) | **done**, phase 7 |
-| Memory contract inside 3 GB, verified at 4K | **done**, phase 7 |
-| Numerics gates 1-4 | **done**: bitident 8/8, KL 1.04e-2, greedy 24/24 |
-| Decode throughput | **settled per drive**, 2026-08-08 |
-| **Gate 5: perplexity** | **OPEN**: reference banked in phase 4 (llama.cpp PPL 6.3810 +/- 0.16588, wiki.test.raw `-c 512 --chunks 40`); **the ramvamp side has never been run** |
-| **Shipping surface** | **SETTLED 2026-08-08: `ramvamp-server`.** The TUI ships as a development affordance only |
-| Tool calling | **done**, 2026-08-09, streaming and buffered. Renderer byte-identical to 20 transformers fixtures; both paths share one parser and one id minter. Verified against OpenCode driving real tool calls |
-| Configurable context and profiles | **done**, 2026-08-09. `--context`, a JSON profile file, `--no-config`, and a `plan` subcommand that prices a configuration in 4 ms. An impossible one is refused before allocation instead of OOM-killed mid-prefill |
-| Server usable by an agent client | **done**, 2026-08-09. OpenCode drives the server with working tool calls on a 32K profile, projected 5,649 MiB. Not inside 3 GB: the agent profile needs a larger budget on the box that runs it, which is what profiles exist to express |
+| Packed `.rvmp` format, streaming installer | **done**. Real 17.35 GiB install, resume, verify |
+| Tokenizer and vendored ChatML | **done**. Token-exact against transformers on 17 committed fixtures |
+| CPU kernels (AVX2 and F16C, scalar reference) | **done**. 3.2-5.1x per row over scalar (EXP-001, EXP-002) |
+| Forward pass, KV cache, generation | **done** (EXP-003, EXP-004) |
+| io_uring and O_DIRECT streaming, ghost-LFU expert cache | **done** (EXP-005 to EXP-014) |
+| Sequential-sweep prefill, chat REPL | **done** (EXP-015 to EXP-019) |
+| Attention rebuild, memory contract verified at 4K context | **done** (EXP-020, EXP-021) |
+| Numerics gates 1 to 4 | **done**: tensor bit-identity 8/8, KL 1.04e-2, greedy 24/24 |
+| Decode throughput | **settled**, published per drive |
+| Shipping surface: `ramvamp-server` | **done**. Loopback OpenAI-compatible HTTP on 127.0.0.1: `/v1/chat/completions` streaming and buffered, `/v1/models`, `/health`, one request at a time, KV cache reused across requests |
+| Tool calling | **done**. Streaming and buffered, parsed from Qwen's native `<tool_call>` tokens; both paths share one parser and one id minter. The renderer is byte-identical to 20 committed transformers fixtures. Verified against OpenCode driving real tool calls |
+| Configurable context and profiles | **done**. `--context`, `RAMVAMP_CONTEXT`, a JSON profile file, `--no-config`, and a `plan` subcommand that resolves the dials and projects the memory footprint without loading the model. A configuration that cannot fit is refused before allocation instead of OOM-killed part way through prefill |
+| Usable by an agent client | **done**. OpenCode drives the server with working tool calls on a 32K-context profile. That profile does **not** fit in 3 GB: it projects roughly 5,649 MiB, about 5.5 GiB, which is what profiles exist to express. The 3 GB contract is a property of the 4K default, not of the runtime |
+| **Gate 5: perplexity** | **open**, and it is the only open v0 gate |
 
-Everything except gate 5 and a shipping surface is finished. v0 is not blocked
-on runtime work.
+Four claims above have no numbered experiment behind them, which is worth
+saying in a project with this file's rules. The tokenizer's 17 fixtures, the
+tool-call renderer's 20 fixtures and the `plan` subcommand's behaviour are
+covered by committed fixtures and `cargo test`: reproducible in a clone, just
+not performance results. The 32K profile's footprint is a **projection**,
+computed by `Footprint::project` rather than measured. That projection is
+pinned tenant by tenant to the architecture document's memory table by a test,
+and it inherits that table's caveats, including a provisional anonymous-memory
+row that overpredicted the one measured 4K point by 31.7 MiB.
 
-## Next: the shipping surface (v0 exit)
+### Gate 5 is a good task and it is unclaimed
 
-**SETTLED 2026-08-08 (revised, same day): the server is the shipping surface.
-The TUI is a development affordance and gets no further investment.**
+The llama.cpp side is banked: **PPL 6.3810 +/- 0.16588** (EXP-004). The
+reference is `llama-perplexity` from llama.cpp b10217, run on the WikiText-2
+raw test split (`wiki.test.raw`) at `-c 512 --chunks 40`, against the same
+Qwen3-30B-A3B Q4_K_M GGUF the runtime installs from. The corpus and the
+per-chunk log are kept outside the repository, and nothing about them is
+private: build llama.cpp at b10217, fetch `wiki.test.raw` from the
+wikitext-2-raw-v1 archive, and re-run that command on your own GGUF to
+regenerate the reference locally. **The ramvamp side has never been run.**
 
-This reverses a decision taken earlier the same day, and the reversal is
-recorded rather than quietly applied, because the first decision was taken on
-a claim that did not survive checking.
+The work is to compute perplexity over the same corpus with the same chunking
+on the same GGUF bytes and compare. It is self-contained. It needs an
+installed model, but it is a correctness measurement, which rule 2 exempts, so
+it does not need the benchmark cgroup or a quiet machine, and the reference is
+one llama.cpp command away. The other gates are the pattern to follow,
+including their shared exit-code convention: `scripts/bitident.py`,
+`scripts/kl_vs_reference.py` and `scripts/greedy_regression.py`.
 
-**What the first decision rested on, and why it was wrong.** The argument was
-that a Chat Completions request is stateless, so a server re-prefills the whole
-conversation every turn (~3 min at 2,000 tokens of history at 11.25 tok/s), and
-that KV prefix caching was therefore a phase-sized prerequisite that the harness
-did not have. The throughput arithmetic is right. The sizing was not.
-`generate_from(.., start_position, ..)` already does incremental prefill and the
-REPL already relies on it; `KvCache` lacks only a `truncate`, which on a flat
-per-layer buffer with a length counter is small. What a server adds over the
-REPL is a longest-common-prefix comparison, because the REPL knows it only ever
-appends while a server must discover where the conversation diverged. That is a
-comparison loop, not a phase. Prefix caching is scoped properly in the server
-plan rather than used as a reason to reorder the work.
+## v1
 
-**What the project owner said at the outset, and was right about.** Building a
-terminal UI is reimplementing something that exists in many good versions
-already, and it is outside what this project contributes. The contribution is
-the streaming runtime. `docs/handoff-phase8.md` had it right: the REPL is "a
-development affordance, and the project's direction is to drive ramvamp from
-another harness rather than to build one here."
+These are commitments to sequence, not to dates.
 
-The measured problem the TUI was built to solve is real and stands: a 4K prompt
-is about six minutes of total silence before the first character, and genesis
-named that failure mode when it cut thinking mode. **The server solves it the
-same way**, because SSE streaming needs exactly the same progress events. That
-work is not lost: `GenerateProgress` (added in `c7ec450`) is what an SSE stream
-emits, and the `repl.rs` extraction gives the server `Transcript`, `TurnCodec`
-and `plan_turn` without reimplementation.
+### 1. Gemma 4 26B-A4B as model #2
 
-### The TUI's status
+Structurally cheaper than the v0 pin. It has 30 layers against 48, and it has
+a **shared expert**: unconditional per-layer compute that reads can be
+overlapped against. Qwen3 has none, which is why the decode loop's only cover
+for an outstanding read is cache-hit compute, and it is the mechanism
+TurboFieldfare's pipeline depends on.
 
-Kept, not deleted, per the standing rule that set-aside work is preserved.
-`chat --tui` works, gates green, and it is genuinely useful as an operator
-console when watching a cold run's hit rate move. It is **not** the shipping
-surface, it is not on the v0 path, and it should not accrue features. `chat`
-without `--tui` remains the reference behaviour, and `generate` and `logits`
-keep their exact stdio because every rule-2 measurement in the project parses
-them.
+Worst-case expert bytes per token is the other half of the case, and the two
+figures are not on the same footing:
 
-### The server, when its turn comes
+- **Qwen3-30B-A3B: 1,097 MB per token, exact arithmetic on audited strides.**
+  Every Q4_K projection slab is 884,736 B and every Q6_K down slab is
+  1,290,240 B, so a layer's per-expert stride is 3,059,712 B on the 24 layers
+  with a Q6_K down projection and 2,654,208 B on the other 24. At top-8 that
+  is `8 x (24 x 3,059,712 + 24 x 2,654,208)` = 1,097,072,640 B.
+- **Gemma 4 26B-A4B: ~816 MB per token is an ESTIMATE.** No derivation for it
+  is recorded anywhere in this project, and Gemma 4's expert count, top-k,
+  expert intermediate size and quantization are not recorded either. It
+  becomes a fact the moment someone audits a real checkpoint's per-tensor type
+  map and strides the way the Qwen3 pin was audited. Until then it is a
+  plausible number and not a published one.
 
-TurboFieldfare ships a CLI, an installer, a Mac app and a loopback
-OpenAI-compatible server; ramvamp ships a CLI and an installer. The gap is the
-server.
+What it brings that v0 does not implement: sliding-window KV rings, a
+per-layer attention-type mix, logit softcap, a `(1 + w)` RMSNorm variant,
+query scaling folded differently from Qwen3, and possibly a second quant
+scheme. Some of that is already anticipated in the design rather than
+implemented. `crates/core/src/kv/mod.rs` documents bounded ring buffers for
+Gemma 4's 25 sliding-window layers, which keep the KV cache flat as context
+grows, and states that v0 implements the linear variant only. One format
+constraint to design around: `ProjectionName`
+(`crates/core/src/format/layout.rs`) is a closed `Gate | Up | Down` enum, so
+an expert blob has no slot for a shared-expert slab today, even though
+`shared_expert` is already expressible in the manifest.
 
-`ramvamp-server` was recorded as post-v0 direction in the genesis session and
-is the single component that unlocks every integration at once:
+### 2. A GPU backend behind the existing kernel trait, Vulkan or CUDA
 
-- **OpenAI-compatible Chat Completions on loopback, streaming SSE.** OpenCode
-  and every OpenAI-speaking client work with no adapter.
-- **Tool calls parsed from Qwen's native `<tool_call>` tokens.**
-- **Claude Code** needs an Anthropic Messages endpoint or a translation proxy;
-  the second endpoint is small once the first exists.
-- **Special-token sanitization is mandatory here.** `encode_chat` is
-  reference-faithful by recorded decision, so untrusted content reaching the
-  server must go through `encode_chat_sanitized` (phase 6 built it).
+**Standing rule: the README promises that no GPU is required, so a GPU backend
+is an additional configuration and never a substitute for the CPU path.** The
+kernel trait exists for exactly this, and the CPU path stays the reference
+that correctness is measured against.
 
-**State the throughput reality before building against it.** At ~2 tok/s
-decode and ~11 tok/s prefill, a 4K-token prompt costs ~6 minutes to ingest and
-a 500-token reply costs ~4 minutes. That is workable for low-volume local
-chat and completion. It is **not** workable as an agentic coding backend,
-where a single turn is thousands of output tokens. The server is still the
-right thing to build (it is the universal interface and it is what makes the
-project consumable), but v0 should be positioned as *a local 30B endpoint for
-a machine that could not otherwise run one*, not as a Claude Code replacement.
+### 3. Bring your own model
 
-KV prefix caching (below) is what would move the agentic story, because it
-attacks prefill on repeated system prompts rather than decode.
+This is closer than it sounds, which is worth saying precisely, because it is
+the item most likely to attract a contributor. **The `.rvmp` format is already
+model-agnostic**, and that is verified in the code rather than asserted:
 
-## v1 candidates, not yet committed
+- `ArchInfo` (`crates/core/src/format/manifest.rs`) carries `n_layers`,
+  `n_experts`, `top_k`, `hidden`, `moe_intermediate`, `n_heads`, `n_kv_heads`,
+  `head_dim`, `vocab`, `context_length`, `rope_theta`, `rms_eps`,
+  `norm_topk_prob`, `tie_embeddings`, and critically `shared_expert: bool` and
+  `sliding_window: Option<u32>`, which are Gemma 4 features Qwen3 does not
+  have. `ArchInfo::validate` is bounds-only and arch-neutral.
+- Nothing in the shipped format or I/O layer is Qwen-shaped. There is no
+  architecture name, no tensor-name literal and no pinned layer or expert
+  count outside `#[cfg(test)]` fixtures and doc comments. Layer geometry comes
+  from the manifest at runtime.
 
-To be discussed and ordered before any is started. Recorded here so they stop
-being re-derived.
+**Three things are pinned, and all three were checked against the code:**
+
+1. **The repacker refuses any architecture but `qwen3moe` by name.**
+   `SUPPORTED_ARCH` (`crates/repack/src/plan.rs`) is checked in
+   `RepackPlan::from_gguf`, which is the single choke point. The heavier cost
+   is next to it and is easy to miss: **11 GGUF metadata keys are read as
+   arch-prefixed literals** (`qwen3moe.block_count`, `qwen3moe.expert_count`
+   and so on). GGUF namespaces metadata by architecture, so a second
+   architecture needs that whole table rebuilt per arch. `norm_topk_prob`,
+   `shared_expert` and `sliding_window` are hardcoded there rather than read.
+2. **The forward pass implements one attention variant and one quant
+   scheme.** Every entry point in `crates/core/src/kernels/attention.rs` is
+   the same full causal GQA over the whole KV prefix: no sliding window, no
+   per-layer attention-type mix, no logit softcap, and `KvCache` has no ring
+   mode. The kernels dispatch over Q4_K, Q5_K, Q6_K and Q8_0, but
+   `validate_expert_layer` (`crates/core/src/model/weights.rs`) freezes the
+   allow-list to the audited Q4_K_M map: gate and up must be Q4_K, down must
+   be Q4_K or Q6_K. `shared_expert` and `sliding_window` are the only two
+   `ArchInfo` fields with no reader outside the manifest.
+3. **The GGUF tensor-name mapping is written for Qwen3's naming.** The
+   repacker's own dependence is thin: three expert-tensor suffixes plus
+   `token_embd.weight` and `output.weight`, all GGUF-canonical names that
+   other MoE checkpoints share. The sharper pin is on the loader side, where
+   `crates/core/src/model/weights.rs` requires `attn_q_norm` and `attn_k_norm`
+   unconditionally. QK-RMSNorm is a Qwen3 feature, and a checkpoint without
+   those tensors fails to load.
+
+**Gemma 4 is the forcing function that proves this rather than a separate
+task.** Doing item 1 honestly means generalizing the metadata table, adding a
+second attention variant, and giving the shared expert somewhere to live. What
+is left after that is a much smaller job than it looks like today.
+
+### 4. Architectures beyond linux x86_64
+
+The fast kernels are AVX2 plus F16C and the streamer assumes io_uring. Both
+have fallbacks, a scalar reference and a pread path respectively, so the
+runtime runs elsewhere, slowly. **aarch64 NEON kernels are the obvious first
+target.** The kernel trait and the two existing fallbacks are the whole
+scaffolding for it.
+
+### Then, in no fixed order
+
+Recorded so they stop being re-derived.
 
 **Throughput**
-- Expert cache policy. The largest measured lever: ghost-LFU replays 49.9%
-  against Belady's 72.0% at 12 slots, and nobody has tried anything between.
-  Answerable **offline** against recorded traces with `scripts/lfu_sim.py`:
-  candidates are LRU-K, ARC, S3-FIFO, layer-aware. One cold sweep to confirm.
-  See `docs/handoff-phase9.md` item 1 for the full case.
-- Overlap instrumentation. `expert io` is a residual and that is load-bearing;
-  split it into submitting / waiting on a read in flight / waiting with the
-  queue empty. Until it exists nobody can say how much of it is reducible.
-- Progressive miss execution. **Escalated in phase 8 and never answered.**
-  TurboFieldfare's DEC-17 rejection rests on divergent output, which this
-  codebase structurally cannot have: the staged reduction is order-independent
-  by construction. Phase 8 derived ~60 ms of a 502 ms token. Reopening a
-  recorded "no" is a decision, not a task.
-- The slot dial. 13 slots measured **2.06 tok/s at ctx 512** against 1.91 at
-  11, ranges separating (EXP-023). Held because the 13-slot config has never
-  been run at 4K. A rider on the cache-policy work, not a phase.
-- Why workers are slower per row than the submitter. Six cores buy 1.43x
-  post-fusion, 11.00 GB/s aggregate. Most interesting, most likely to eat a
-  phase for nothing: timebox it.
-- **Prefill rate against prompt length.** Every estimate in this file uses
-  EXP-023's cold ctx-512 figure of 11.25 tok/s, and an uncontrolled
-  observation on 2026-08-09 put a ~32K OpenCode conversation at roughly 23
-  minutes, about **2x faster** than that basis predicts. Either the estimate's
-  basis is wrong for long prompts or prefix caching was doing more of the work
-  than assumed, and the two have very different consequences for what the
-  agent profile is worth recommending. Cheap to settle: the cold sweep already
-  walks five rungs, and this is one more column of what it already records.
+
+- **Expert cache policy. The largest measured lever, and it is answerable
+  offline.** See "Good first contributions" below for the numbers and the
+  method. One paired cold sweep confirms whatever the offline work picks.
+- **Overlap instrumentation.** The `expert io` bucket is a residual, not the
+  drive's busy time: miss reads are already in flight during hit compute, so
+  the bucket measures only the part of a read that hit compute did not cover.
+  That is load-bearing, and it moved 1.85 s between paired arms in EXP-025
+  while request, hit, miss and byte counts were identical. Split it into
+  submitting, waiting on a read genuinely in flight, and waiting with the
+  queue empty. Until that exists nobody can say how much of it is reducible.
+- **Progressive miss execution.** Currently a recorded "no", inherited from
+  upstream: TurboFieldfare's DEC-17 measured it slower **with divergent
+  output** and disabled it. The reason to reopen is that the divergence
+  structurally cannot happen here, because ramvamp's staged reduction is
+  fixed-order and bit-exact regardless of the order experts actually complete
+  in. The reason to be cautious is on the record too: a compute saving on this
+  path is partly taken straight back as newly exposed I/O, so it must be
+  priced net rather than gross. Reopening a recorded "no" is a decision, not a
+  task. The "~60 ms of a 502 ms token" figure that used to appear here has no
+  surviving source and is withdrawn.
+- **The slot dial.** 13 slots measured **2.06 tok/s at ctx 512** against 1.91
+  at 11 slots, with separating ranges (EXP-023). Held because the 13-slot
+  configuration has never been run at 4K, where the memory contract is
+  tightest. A rider on the cache-policy work rather than a project of its own.
+- **Why pool workers are slower per row than the submitting thread.** The
+  finding that stands: decode's GEMV is memory-bound, not dispatch-bound, so
+  six cores do not buy 6x and no spin policy reaches the barrier wait, which
+  scales with work rather than with fan-out count. The figures behind it are
+  **warm diagnostics under rule 2, not results**: the single-shard control is
+  a single run on the pre-fusion binary, there is no single-shard control on
+  the fused binary at all, and the 1.43x and the 11.00 GB/s aggregate derived
+  from it inherit both limitations. A related structural ceiling is already
+  documented and is not in dispute: decode attention fans out over kv heads,
+  and the v0 pin has only 4 of them against six pinned cores, so two cores take
+  an empty range on every decode attention call. Most interesting of the
+  remaining levers, and most likely to consume a lot of work for nothing.
+  Timebox it.
+- **Prefill rate against prompt length.** Every prefill estimate in this file
+  rests on EXP-023's cold ctx-512 figure of 11.25 tok/s. An uncontrolled
+  observation put a roughly 32K-token conversation at about 23 minutes, some
+  2x faster than that basis predicts. Either the basis is wrong for long
+  prompts or prefix reuse was doing more of the work than assumed, and the two
+  have very different consequences. Cheap to settle: the cold sweep already
+  walks five rungs and this is one more column of what it already records.
   Until it is settled, no prefill-time claim about a large context belongs in
   a published number.
-- A second drive. Turns the published band into a curve and tests the project's
-  central claim that the design scales with the device.
+- **Steady-state decode.** Every published decode figure is a 63-token window
+  starting from a cache the prefill sweep emptied. A longer `--max-new` on the
+  same paired prompt is what turns that into a steady-state number, and it is
+  one more arm on a sweep that already runs.
+- **A second drive.** Turns the published band into a curve and tests the
+  project's central claim, that the design scales with the device.
 
 **Reach**
-- KV prefix caching: prefill the system prompt once, reuse across turns. The
-  prerequisite for any agentic client.
-- Gemma 4 26B-A4B as model #2. **Structurally cheaper than the v0 pin**: 30
-  layers against 48, ~816 MB of worst-case expert bytes per token against
-  ~1,097, and it has a **shared expert**, unconditional per-layer compute to
-  overlap reads with, which Qwen3 does not have and which is the mechanism
-  TurboFieldfare's pipeline depends on. Brings SWA KV rings, per-layer
-  attention-type mix, logit softcap, and possibly a second quant scheme.
-- Larger context via Q8 KV; unlocks the Thinking-2507 variant.
-- Vulkan behind the kernel trait. `README.md` promises "No GPU required". A
-  GPU backend is an additional configuration, never a substitute.
+
+- **KV prefix caching beyond one conversation.** The single-conversation case
+  already ships: the server keeps the KV cache across requests and re-prefills
+  only the divergent suffix, matching a longest common prefix against the ids
+  that were actually fed rather than against a re-render of the reply, because
+  re-encoding assistant text does not reproduce the ids the model generated.
+  What does not exist is reuse across conversations or across restarts.
+- **Larger context via Q8 KV**, which also unlocks the Thinking-2507 variant.
+- **An Anthropic Messages endpoint** alongside the OpenAI one. Small once the
+  first exists; until then a translation proxy works.
+
+## Positioning, stated plainly
+
+At about 2 tok/s decode and about 11 tok/s prefill on the reference drive, a
+4K-token prompt costs roughly six minutes to ingest and a 500-token reply
+roughly four minutes. That is workable for low-volume local chat and
+completion. It is **not** workable as an agentic coding backend, where one
+turn is thousands of output tokens. v0 is *a local 30B endpoint for a machine
+that could not otherwise run one*, not a replacement for a hosted coding
+model. Prefix reuse within a conversation already ships and is why an agent
+client is usable at all; a faster drive and reuse across conversations are
+what would move it further, because both attack prefill and the device rather
+than decode compute.
 
 ## Open decisions
 
-Decisions only the author can take. **A phase that hits one of these should
-stop and ask rather than default to measuring more**, which is what happened
-for four consecutive phases.
+These are the author's to take. Work that runs into one should stop and ask
+rather than default to measuring more.
 
-| Decision | Raised | Status |
-| --- | --- | --- |
-| The tok/s floor | Phase 5, 7, 9 | **SETTLED 2026-08-08**, per drive |
-| Shipping surface: server, richer CLI, or both | Genesis, reopened 2026-08-08 | **SETTLED 2026-08-08: the server.** Decided harness-first earlier the same day on an oversized prefix-caching estimate, then reversed. See above |
-| Merge `feat/decode-compute`? | Phase 9 | **SETTLED 2026-08-08, merged** at `2f52545`, gate re-verified on `main` |
-| Core API additions for TUI progress | Phase 10 | **SETTLED 2026-08-08, approved.** Per-chunk prefill callback plus a stats snapshot passed into `on_token` |
-| `ratatui` as a CLI dependency | Phase 10 | **SETTLED 2026-08-08, approved.** +31 crates against 137 |
-| Keep or drop the `attn_q` + `attn_v` fusion | Phase 9, recommended dropped 3x | **SETTLED 2026-08-08, dropped.** The expert-phase fusion stays |
-| Reopen progressive miss execution | Phase 8 | **open** |
-| Move the slot dial to 12 or 13 | Phase 8 ("lets hold it for now") | **held**, needs a 13-slot 4K arm |
+| Decision | Status |
+| --- | --- |
+| The tok/s floor | **settled**: stated per drive, not as one number |
+| Shipping surface | **settled**: `ramvamp-server`. Building a terminal UI reimplements something that already exists in many good versions and is outside what this project contributes; the contribution is the streaming runtime, and a server is the universal interface to it |
+| The `attn_q` + `attn_v` fusion | **settled**: dropped, its bucket did not separate at either rung. The expert-phase fusion stays |
+| Reopen progressive miss execution | **open** |
+| Move the slot dial to 12 or 13 | **held**, needs a 13-slot arm at 4K context |
 
-## Phase history
+The TUI (`chat --tui`) is kept rather than deleted, under the standing rule
+that measured-and-set-aside work is preserved. It is genuinely useful as an
+operator console for watching a cold run's hit rate move. It is not the
+shipping surface, it is not on the v0 path, and it should not accrue features.
+`chat` without `--tui` remains the reference behaviour, and `generate` and
+`logits` keep their exact stdio, because the measurement scripts parse them.
 
-| # | What | Result |
-| --- | --- | --- |
-| 1 | Repacker and `.rvmp` | Real 17.35 GiB install, resume, verify |
-| 2 | Tokenizer and ChatML | Token-exact vs transformers on 17 fixtures |
-| 3 | CPU kernels | 3.2-5.1x per row over scalar (EXP-001, EXP-002) |
-| 4 | Forward pass | Greedy character-identical to llama.cpp; gate 3 re-baselined 1e-3 to 3e-2 on measured evidence (EXP-003, EXP-004) |
-| 5 | io_uring streaming, LFU cache | First rule-2 measurable configuration. Decode 1.88 tok/s, peak 2,471 MiB (EXP-005..014) |
-| 6 | Sweep prefill, chat REPL | Prefill **2.56x cold**, 11.55x fewer bytes (EXP-015..019) |
-| 7 | Attention rebuild | Prefill **6.65x cold**, decode ~1.6x. Largest verified win (EXP-020, EXP-021) |
-| 8 | Decode measurement | The decode split across five rungs; `T_BLOCK` 4->8 worth 1.014x at 4K. Closed `RING_ENTRIES`, queue depth, "faster reads" (EXP-022, EXP-023) |
-| 9 | Decode compute | Fused fan-out: 1.257x on decode's GEMV bucket cold (on the binary EXP-025 measured, which still had both halves), **1.011x at 512 / 1.070x at 4K end to end**. Adaptive spin reverted; `attn_q` + `attn_v` half dropped 2026-08-08. Per-file read spread refuted (EXP-024, EXP-025) |
+## Good first contributions
 
-Decode at ctx 512, cold, across the project: 1.17 (phase 5) -> **1.83-1.99
-(phase 7)** -> 1.91 (phase 8) -> 1.87 (phase 9). Phase 7 is the last phase that
-moved it. Rule 3 forbids drawing those on one curve; they are listed to show
-the shape, not to subtract.
+Things a newcomer can do without a 3 GB cgroup or the reference drive. Read
+`CONTRIBUTING.md` first for the gate a change has to pass.
+
+**Offline expert-cache policy work.** This is the largest measured lever in
+the project and it is answerable on a laptop. `scripts/lfu_sim.py` replays
+recorded `--trace-experts` routing traces against the real per-layer strides,
+sweeps slot counts, and already scores `lfu`, `lfu-aged`, `lfu-ghost`,
+`lfu-window`, `lru` and `opt` (Belady's offline optimum). **LRU-K, ARC,
+S3-FIFO and a layer-aware variant exploiting the per-layer slot arrays are all
+untried.**
+
+The headroom is real, and here is the evidence stated at matched conditions,
+because it is easy to quote wrongly:
+
+- Replaying the shipped `io/cache.rs` over four recorded traces (213,504
+  accesses) the way the runtime actually calls it, with the whole step
+  pinned, gives **50.02% at 10 slots and 54.48% at 12** (EXP-005 Correction).
+  That is the shipped policy's number on this instrument.
+- On the simulator's own scale, ghost-LFU against Belady's offline optimum is
+  **44.8% against 55.8% at 10 slots** and **58.1% against 72.0% at 16 slots**.
+  Belady at 12 slots was never computed. If you meet the pairing "49.9%
+  against 72.0% at 12 slots" in older material, it is wrong twice over: 49.9%
+  is the simulator rather than the replay, and 72.0% is the 16-slot row.
+- The simulator understates the shipped cache by about 5 points because of how
+  it models pinning, so the true oracle gap is smaller than a raw subtraction
+  of those columns. It is still 11 points or more at matched slots.
+- Live, cold, at the shipped 11 slots, the runtime measures **53.0% to 59.3%**
+  across five context rungs (EXP-023).
+
+Why it is worth doing beyond the size of the gap: a cache-policy change is
+**bit-safe by construction**, because which experts are resident changes
+nothing about what is computed, and it **costs no memory**, because it works
+inside the existing slot budget rather than asking for more. It also attacks
+the largest term. At ctx 512 expert I/O is 44.4% of a decode token, cold
+(EXP-023), and it is the largest single term below 2,048 tokens of context.
+Fewer misses is the direct lever on it, and unlike a compute win it cannot be
+handed straight back as newly exposed read latency.
+
+The loop is fast: add a policy, score it in seconds, and hand over a candidate
+worth exactly one paired cold sweep. One honest caveat, which is itself a
+contribution: **no routing trace is committed to the repository today.**
+Capturing one needs an installed model and one run of
+`ramvamp generate --trace-experts`, not a benchmark cgroup and not the
+reference drive. Committing a small trace, so that this work needs no model
+download at all, would be a genuinely useful first patch.
+
+**Benchmark reports from other NVMe drives.** The single cheapest experiment
+in the project, and the one that turns a published band into a curve. The
+project's central claim is that the design scales with the device, and it has
+been tested on exactly one device, a DRAM-less QLC part that is close to the
+worst realistic case. A run on a mainstream TLC Gen4 drive would answer an
+open question in this file. `CONTRIBUTING.md` carries the protocol and what a
+report has to contain; `docs/benchmark-machine.md` is the template for
+recording the machine so the result stays interpretable.
+
+**Documentation.** The docs carry their own corrections and withdrawn numbers
+on purpose, which makes them honest and makes them long. Worked examples, a
+quickstart that survives a fresh clone, and clearer entry points are all
+welcome. So is catching a figure whose source does not support it; several
+have been found that way.
+
+## What moved the numbers
+
+A record of which work changed measured behaviour, not of who did what when.
+
+| Work | Result |
+| --- | --- |
+| Repacker and the `.rvmp` format | A real 17.35 GiB install with resume and verify, never materializing a full tensor in heap |
+| Tokenizer and ChatML | Token-exact against transformers on 17 committed fixtures (covered by `cargo test`, no experiment entry) |
+| CPU kernels | 3.2-5.1x per row over the scalar reference (EXP-001, EXP-002) |
+| Forward pass | Greedy output character-identical to llama.cpp; gate 3's tolerance re-baselined from 1e-3 to 3e-2 on measured evidence, against a 4.5e-3 to 1.3e-2 float-reordering noise floor of the same order as the cross-engine gap (EXP-003, EXP-004) |
+| io_uring streaming and the expert cache | The first configuration measurable under rule 2: decode 1.88 tok/s, peak 2,471 MiB (EXP-014). The policy behind it, expert-indexed ghost LFU at 512 B per layer, came from EXP-005; the O_DIRECT requirement from EXP-009, where the same 1.4 GiB of reads peaked the cgroup at 1,092 MiB buffered against 5.0 MiB direct |
+| Sequential-sweep prefill | Prefill **2.56x cold** and **11.55x fewer bytes read**, by reading each expert once per layer per chunk instead of once per token (EXP-018) |
+| Attention rebuild | Prefill **6.65x cold**, decode **1.69x in one session and 1.56x in a second**, which EXP-021 records as two figures and does not average. The largest verified win in the project (EXP-020 warm, EXP-021 cold) |
+| Decode measurement | The per-token phase split across five context rungs, the 11-slot hit rate, and the slot dial. `T_BLOCK` 4 to 8 worth 1.014x at 4K. Closed `RING_ENTRIES`, queue depth, and "just read faster" as levers (EXP-022, EXP-023) |
+| Fused decode fan-out | **1.257x on decode's GEMV bucket cold at ctx 512** with disjoint ranges, and 1.158x at 3,961 (EXP-025) |
+
+That last row is the one most likely to be quoted wrongly, so it is stated in
+full. End to end, cold and paired, the fusion measured **1.011x at ctx 512
+with the two scored ranges overlapping heavily, which is neither a gain nor a
+regression and must not be quoted as either**, and 1.070x at ctx 3,961 with
+disjoint ranges. Even the 4K separation cannot be attributed cleanly, because
+the unchanged attention bucket moved 1.16-1.18x the same way at both rungs;
+subtracting it run by run leaves 1.025x. **Quote 1.025x to 1.070x at 4K, not
+the top of it.** The gain is real in the bucket and mostly does not reach the
+token, because a compute saving on this path leaves less work to hide
+outstanding reads behind, and some of that read latency becomes visible
+instead.
+
+**On reading decode figures across the project.** At ctx 512, cold, the
+project has recorded 1.17, then 1.83-1.99, then 1.91, then 1.87 tok/s. Do not
+read that as a trend. Rule 3 already forbids one curve through four sessions,
+and there is a larger problem: **the first two figures are at `--max-new 256`
+and the last two at `--max-new 64`.** They also differ in statistics, single
+runs against medians of three scored runs. Those are different quantities.
+Decode slows as the generation window grows, because context grows with it and
+attention's per-token cost grows with context. Measured on the same prompt,
+going from `--max-new 4` to `--max-new 256` costs **0.63-0.65x on the build
+before the attention rebuild** and 0.96x on the build after it (EXP-021).
+Comparing a 256-token window against a 64-token window therefore flatters the
+shorter one, by an amount that depends on which build is being measured. The
+attention rebuild is the last work that clearly moved decode; the figures
+after it are not evidence either way.

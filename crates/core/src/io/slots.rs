@@ -8,8 +8,8 @@
 //!
 //! Two hard requirements. Both follow from the kernel source cited below;
 //! the percentages attached to them come from bring-up runs on btrfs that
-//! are **not yet an entry in `docs/experiments/README.md`**, so treat every
-//! number here as provisional until they are.
+//! are **not recorded in `docs/experiments.md`**, so treat every number here
+//! as provisional until they are.
 //!
 //! - The backing pages must be touched before any O_DIRECT read targets
 //!   them. btrfs runs direct reads with page faults disabled

@@ -30,6 +30,12 @@ mkdir -p "$OUT" "$ROOT/scratch/cold-bench" || exit 1
 SUMMARY="$OUT/SUMMARY.txt"
 : > "$SUMMARY"
 
+# None of the paths below is in the repository: .gitignore excludes /models/
+# (line 5) and /scratch/ (line 9). They are a default layout, not a promise
+# that the bytes are present. A fresh clone holds neither the installed .rvmp
+# model nor the llama.cpp reference tree that supplies P512 -- that tree has
+# to be re-banked from llama.cpp b10217 -- and neither the phase-5 reference
+# binary nor the 4K prompt under /scratch/.
 RAMVAMP="$ROOT/target/release/ramvamp"
 REF5="$ROOT/scratch/phase5-ref/ramvamp"
 RVMP="$ROOT/models/qwen3.rvmp"
