@@ -1,0 +1,185 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build — ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          # Linux x86_64 only, and deliberately so.
+          #
+          # io_uring is a Linux kernel interface, and the expert streamer is
+          # built on it: every other platform falls back to the pread path,
+          # which is correct but is not what any published figure describes.
+          # The fast kernels are AVX2 plus F16C, which is x86_64. So this is
+          # the one target where the numbers in the README mean anything, and
+          # shipping a binary for a target we have never measured would imply
+          # otherwise. Cross-platform builds wait for kernels and an I/O path
+          # worth measuring there.
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            artifact: ramvamp-linux-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `apt-get` step: the tree has no C dependencies, and `ureq` uses
+      # rustls rather than OpenSSL.
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          mkdir -p staging
+          cp target/release/ramvamp staging/
+          cp target/release/ramvamp-repack staging/
+          cp README.md LICENSE-MIT LICENSE-APACHE staging/
+          cd staging
+          tar czf ../${{ matrix.artifact }}.tar.gz *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+
+  publish:
+    name: Publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    # Manual approval gate rather than `continue-on-error`.
+    #
+    # crates.io has no undo: a version can be yanked but never republished, so
+    # a half-finished run leaves `ramvamp-core 0.1.0` on the registry with no
+    # way to fix it under the same number. `continue-on-error` would paint that
+    # outcome green. An environment with a required reviewer means the tag is
+    # already built and released before anyone is asked to approve the one step
+    # that cannot be taken back.
+    #
+    # This needs a repository environment named `crates-io` with a required
+    # reviewer and the `CARGO_REGISTRY_TOKEN` secret. Without the reviewer the
+    # job simply runs, so configure it before the first tag.
+    environment: crates-io
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Publish order is forced by the dependency graph:
+      #
+      #   ramvamp-core
+      #     -> ramvamp-repack, ramvamp-server
+      #        -> ramvamp
+      #
+      # It has to be serialized, and each step has to wait for the sparse index
+      # to catch up. crates.io acknowledges a publish before the index serves
+      # it, so a back-to-back run fails when the next crate tries to resolve
+      # the one just uploaded and gets told it does not exist.
+      #
+      # `wait_for_index` polls the same sparse index cargo resolves against,
+      # which is the thing that lags. `publish` is idempotent enough to retry:
+      # a rerun after a successful upload gets "already uploaded", which is
+      # treated as success so a flaky network cannot strand the sequence.
+      - name: Publish crates in dependency order
+        run: |
+          set -euo pipefail
+
+          index_path() {
+            local name="$1"
+            case ${#name} in
+              1) printf '1/%s' "$name" ;;
+              2) printf '2/%s' "$name" ;;
+              3) printf '3/%s/%s' "${name:0:1}" "$name" ;;
+              *) printf '%s/%s/%s' "${name:0:2}" "${name:2:2}" "$name" ;;
+            esac
+          }
+
+          wait_for_index() {
+            local name="$1" version="$2"
+            local url="https://index.crates.io/$(index_path "$name")"
+            echo "waiting for $name $version to appear in the sparse index"
+            for attempt in $(seq 1 60); do
+              if curl -sSf "$url" 2>/dev/null \
+                | jq -e --arg v "$version" 'select(.vers == $v)' >/dev/null; then
+                echo "  $name $version is in the index (attempt $attempt)"
+                return 0
+              fi
+              sleep 10
+            done
+            echo "::error::$name $version never appeared in the sparse index"
+            return 1
+          }
+
+          publish() {
+            local name="$1"
+            for attempt in 1 2 3 4 5; do
+              echo "publishing $name (attempt $attempt)"
+              if output=$(cargo publish -p "$name" 2>&1); then
+                echo "$output"
+                return 0
+              fi
+              echo "$output"
+              if grep -qi 'already uploaded\|already exists' <<<"$output"; then
+                echo "  $name is already on crates.io, continuing"
+                return 0
+              fi
+              echo "  publish failed, retrying in 30s"
+              sleep 30
+            done
+            echo "::error::failed to publish $name"
+            return 1
+          }
+
+          version=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "ramvamp-core") | .version')
+          echo "publishing workspace version $version"
+
+          publish ramvamp-core
+          wait_for_index ramvamp-core "$version"
+
+          publish ramvamp-repack
+          wait_for_index ramvamp-repack "$version"
+
+          publish ramvamp-server
+          wait_for_index ramvamp-server "$version"
+
+          publish ramvamp

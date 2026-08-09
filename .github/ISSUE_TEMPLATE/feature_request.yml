@@ -1,0 +1,80 @@
+name: Feature request
+description: Propose a capability, a flag, a format change, or a different design.
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before you write this up, `docs/roadmap.md` is the plan of record: it
+        says what v0 needs, what is already done, and which decisions are
+        still open. If your idea is one of the open decisions, saying so and
+        arguing a side is more useful than a fresh proposal.
+
+        `docs/landscape.md` records why several tempting designs were
+        rejected, usually with a measurement attached. A proposal that
+        already knows about that measurement is much easier to act on.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - runtime (model load, forward pass, generation, expert streaming)
+        - repacker (ramvamp-repack, downloads, .rvmp packing)
+        - server (ramvamp serve, OpenAI-compatible HTTP)
+        - CLI (flags, chat, REPL, TUI panel)
+        - kernels (numerics, AVX2/F16C paths, dequantization)
+        - packed format (.rvmp layout)
+        - docs
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: |
+        What you were trying to do and where ramvamp got in the way. Describe
+        the situation rather than the fix, so the solution stays open.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+      description: The change you have in mind, concretely enough to argue with. Flag names, output shapes, and API sketches all welcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Anything you tried first, and why it was not enough. Include workarounds that exist today.
+
+  - type: dropdown
+    id: cost
+    attributes:
+      label: Does this cost memory or throughput?
+      description: |
+        The project's whole claim is a 26-30B model in about 3 GB of RAM.
+        Proposals that hold more bytes resident, or that add work to the
+        decode path, need to say so up front so the trade is discussed
+        instead of discovered.
+      options:
+        - "No, this is neutral on both"
+        - "It costs some memory"
+        - "It costs some throughput"
+        - "It costs both"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Links, prior art in other runtimes, papers, or measurements you already have.

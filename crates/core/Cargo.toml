@@ -5,8 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+documentation = "https://docs.rs/ramvamp-core"
+keywords = ["llm", "inference", "moe", "nvme", "io-uring"]
+categories = ["science", "filesystem", "caching", "os::linux-apis"]
 
 [features]
 default = ["io-uring"]

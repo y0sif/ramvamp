@@ -5,8 +5,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+# No `documentation`: this crate is bin-only, so a docs.rs link would point at
+# an empty page. The README and the repository are the documentation.
+keywords = ["llm", "inference", "moe", "nvme", "quantization"]
+categories = ["command-line-utilities", "science", "filesystem"]
 
 [[bin]]
 name = "ramvamp"
