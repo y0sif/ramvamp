@@ -2,11 +2,14 @@
 
 The public record of what ramvamp measured: one row per experiment, in ID
 order. It is curated from a fuller internal log kept during development, and
-every row here cites the entry it came from by ID. Those IDs are stable, and
-every figure this repository's other documents publish traces to a row below.
-The internal log holds the full working detail behind each one: the per-run
-tables, the counters, the notes and the arguments a row compresses to a
-sentence.
+every row here cites the entry it came from by ID. Those IDs are stable, so
+every `EXP-NNN` cited anywhere in this repository resolves to a row below, and
+the row states the conditions that make its figures valid.
+
+A row is a summary, not a transcript. Where another document quotes a number
+this file does not repeat, the row it cites is still the entry that produced
+it, and the internal log holds the working detail: the per-run tables, the
+counters, and the arguments a row compresses to a sentence.
 
 Raw logs, run artifacts, harness output and working notes are not part of this
 record and are not published. The internal log argues with itself, withdraws

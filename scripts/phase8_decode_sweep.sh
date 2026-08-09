@@ -245,6 +245,10 @@ SLOTS_DEFAULT=11
 # file_bytes and file_sha256 in every entry.
 CTX_RUNGS=(64 512 1024 2048 3961)
 
+# Resolves a rung to its prompt file. Every path here is under the gitignored
+# /models/ or /scratch/ trees described above, so none of them exists in a
+# fresh clone; the preflight is what turns a missing one into a clear failure
+# rather than a silently short run.
 prompt_for() {
     case "$1" in
         64)   printf '%s\n' "$ROOT/scratch/phase8/prompts/ctx64.txt" ;;

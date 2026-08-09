@@ -175,7 +175,7 @@ citations check out against the repository, so both survive.
   On the phase-7 kernel, measured cold and in-cgroup at 4K on the reference
   machine (Qwen3-30B-A3B Q4_K_M, 11 slots/layer), the prefill split is
   **expert compute 42.1%, projections 22.8%, attention 20.4%**, elementwise
-  12.2%, expert I/O 2.5% (EXP-021 Note 9, with EXP-023 reproducing 41.8 / 22.8
+  12.2%, expert I/O 2.5% (EXP-021, with EXP-023 reproducing 41.8 / 22.8
   / 20.8 in a different session). Attention is not the wall in prefill any
   more, it is the third largest term. Those are different entries, sessions
   and kernels, so the only licensed statement is that direction and not a
@@ -211,8 +211,8 @@ citations check out against the repository, so both survive.
   lower figure); its bandwidth input was EXP-019's 1.55-1.69 GB/s where decode's own
   effective rate is **2.16 GB/s DERIVED** (EXP-023); and, decisively, **an
   I/O-only ceiling computed as `1 / expert_io` overstates**, because EXP-023
-  Note 4 establishes that the `expert io` bucket is a residual left after hit
-  compute has already covered part of the read. No replacement band is offered.
+  establishes that the `expert io` bucket is a residual left after hit compute
+  has already covered part of the read. No replacement band is offered.
 
   All bandwidth figures here come from a threaded-`preadv` probe rather than
   io_uring, so they characterise the drive and not the runtime's submission

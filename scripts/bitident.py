@@ -21,6 +21,13 @@ Usage:
     scripts/bitident.py capture <dir> --set longs      # chunk-boundary set
     scripts/bitident.py compare <dir> --dry-run        # list, run nothing
 
+Every `models/...` path here is a default layout, not a promise that the
+bytes are present. That tree is **not in the repository**: `.gitignore`
+excludes /models/, so a fresh clone holds neither the reference dump nor
+any captured baseline. The reference dump has to be re-banked from
+llama.cpp b10217, and the baseline directory is written by this script's
+own `capture` before any `compare` has something to compare against.
+
 `capture` runs `ramvamp logits --top N --skip-hashes` over a prompt set
 drawn from the reference `meta.json`, and writes each raw stdout plus a
 `manifest.json` of per-prompt SHA-256 digests, the binary's identity
@@ -637,7 +644,11 @@ def main() -> int:
     parser.add_argument("--rvmp", default="models/qwen3.rvmp",
                         help="installed .rvmp model dir")
     parser.add_argument("--ref", default="models/llamacpp-ref/llamacpp_ref",
-                        help="reference dir supplying the prompt set (meta.json)")
+                        help="reference dir supplying the prompt set "
+                             "(meta.json). Not in the repository -- "
+                             "`.gitignore` excludes /models/ -- so the default "
+                             "resolves to nothing in a fresh clone and the "
+                             "dump has to be re-banked from llama.cpp b10217")
     parser.add_argument("--ramvamp",
                         help="ramvamp binary (default: cargo run --release)")
     parser.add_argument("--set", dest="prompt_set", choices=PROMPT_SETS,

@@ -700,7 +700,7 @@ buys back the scheduling.
 property of the shape rather than an accident.** Step 4's hit compute is the
 only work hiding step 5's outstanding reads, and the `expert io` bucket
 measures the part of those reads that hit compute did not cover: it is a
-residual, not the drive's busy time (EXP-023 Note 4). So **making the hit
+residual, not the drive's busy time (EXP-023). So **making the hit
 compute faster does not buy its full saving: it leaves less to hide behind, and
 some of the same read latency becomes visible instead.** MEASURED cold and
 paired at ctx 512 (EXP-025): the fused fan-out handed back 3.32 s of GEMV over
@@ -766,7 +766,7 @@ ranges overlapping, which is the control that says the change is decode-only.
 on context.** End to end, cold and paired: **1.011x at ctx 512 with the two
 scored ranges overlapping heavily, which is not a result**, and **1.070x at ctx
 3,961 with disjoint ranges** (reference 47.57-48.76 s of `decode_s` against
-44.47-46.59). EXP-025 Note 1 records that even the 3,961 separation cannot be
+44.47-46.59). EXP-025 records that even the 3,961 separation cannot be
 attributed cleanly: the unchanged `attention` bucket moved 1.16-1.18x the same
 way at both rungs, and subtracting it run by run leaves 1.025x. **Quote the
 range 1.025x-1.070x, not the top of it.**
@@ -787,7 +787,7 @@ pooled GEMV bucket is a set of disjoint spans strictly inside the phase split's
 `projections` and `expert compute`, and the cold pairing could not use it at
 all because the phase-8 reference binary predates that instrument and emits no
 `decode gemv split` block. Two nested measures of the same work agreeing is
-corroboration, not one number measured twice (EXP-025 Note 7).
+corroboration, not one number measured twice (EXP-025).
 
 Four things the warm arms refute, and they matter more than the 1.264x:
 
@@ -1557,7 +1557,7 @@ withdrawn.
      measured counters, is 2.16 GB/s** (EXP-023: 28.3 GiB against 14.05 s of
      `io wait` at 3,961 prompt tokens).
   4. **An I/O-only ceiling computed as `1 / expert_io` OVERSTATES what decode
-     can reach.** EXP-023 Note 4 establishes that the `expert io` bucket is a
+     can reach.** EXP-023 establishes that the `expert io` bucket is a
      **residual**: the miss reads are already in flight during hit compute, so
      the bucket measures only the part of the read that hit compute did not
      cover. Inverting it therefore prices the drive as if it were idle during
@@ -1571,7 +1571,7 @@ withdrawn.
   | --- | --- | --- |
   | decode tok/s at 11 slots | **2.19 / 1.91 / 1.82 / 1.75 / 1.46** at ctx 64 / 512 / 1,024 / 2,048 / 3,961 | nothing: this **is** decode, end to end, and it is the number to beat |
   | decode hit rate at 11 slots | **53.0-59.3%** over the same rungs | the miss volume; no trend in context |
-  | decode effective read rate (DERIVED) | **2.16 GB/s** at ctx 3,961 | an **upper** bound on the drive's average delivery rate over the window it was busy (Note 4 above) |
+  | decode effective read rate (DERIVED) | **2.16 GB/s** at ctx 3,961 | an **upper** bound on the drive's average delivery rate over the window it was busy (point 4 above) |
   | expert io share of a token | **54.1% at ctx 64 falling to 33.2% at 3,961** | a **lower** bound on drive-busy time, for the same residual reason |
 
   So the honest statement is: **decode measures 1.46-2.19 tok/s cold on this
@@ -1580,7 +1580,7 @@ withdrawn.
   attention at 3,961, and **no I/O-only ceiling is offered**, because the only
   one this document knows how to compute overstates. The bandwidth inputs
   remain rule-2 clean but come through a threaded-`preadv` queue rather than
-  io_uring (EXP-019, EXP-023 Note 10, EXP-024), so they characterise the drive
+  io_uring (EXP-019, EXP-023, EXP-024), so they characterise the drive
   and not the runtime's submission path. The 1,097 MB/token is still exact
   arithmetic.
 
@@ -1595,7 +1595,7 @@ withdrawn.
   tok/s from one session against a decode tok/s from another. Per rule 3 that
   is a statement about the two sessions rather than about either binary; the
   most likely cause is the drive behaviour EXP-024 characterises as not
-  reproducible across sessions, and EXP-025 Note 5 records that as a hypothesis
+  reproducible across sessions, and EXP-025 records that as a hypothesis
   it did not test. For the record and **not** as a second point on EXP-023's
   curve, the fused branch measured **2.16 / 1.87 / 1.74 / 1.65 / 1.43 tok/s**
   over the same five rungs in the EXP-025 session.
@@ -1610,7 +1610,7 @@ withdrawn.
   reads **28.3 GiB of experts against 14.05 s of `io wait`**, which is **2.16
   GB/s** (2.01 GiB/s). Read it as an **upper bound** rather than a point: miss
   reads are in flight during hit compute, so the drive's average delivery rate
-  over the window it was actually busy is at most that (see EXP-023 Note 4 on
+  over the window it was actually busy is at most that (see EXP-023 on
   why `expert io` is a residual). This figure is not merged into the retired
   table's rows and never was: that would be the curve rule 3 forbids.
 
@@ -1624,7 +1624,7 @@ withdrawn.
   left to buy: more would take more concurrent misses, which needs the
   cross-layer prefetch that is closed as a no.
 
-  **The per-file spread is NOT a lever, and EXP-023 Note 12's suggestion that
+  **The per-file spread is NOT a lever, and EXP-023's suggestion that
   it is has been withdrawn.** EXP-023 measured 1.568 / 3.455 / 1.654 / 3.469
   GB/s on four files at K=1, random, QD 8 (a **2.21x spread**), and pointed at
   it as the thing to attack. **EXP-024 re-ran that exact cell the next day and
@@ -1662,7 +1662,7 @@ withdrawn.
   elementwise 2.6%. At ctx 3,961: expert io **33.2%**, attention **31.6%**,
   expert compute 21.1%, projections 12.1%. So expert I/O is the largest single
   term below 2,048 tokens of context, and at 3,961 it is level with attention
-  and the ordering inverts run to run (EXP-023 Note 2). Everything that is
+  and the ordering inverts run to run (EXP-023). Everything that is
   **not** `expert io` is **45.9% of a token at ctx 64 rising to 66.8% at
   3,961** (DERIVED as `100 - expert io%` on the same rows), and what grows
   across that ladder is attention, not the GEMVs. The old phase-4 figures
@@ -1677,7 +1677,7 @@ withdrawn.
   12.49-13.96) and **1.158x at ctx 3,961** (15.39 s, 14.71-15.72, against
   13.29 s, 13.18-13.31), **disjoint ranges at both**. End to end: **1.011x at
   512 with ranges overlapping heavily, which is not a result**, and **1.070x at
-  3,961 with disjoint ranges**, of which EXP-025 Note 1 attributes only
+  3,961 with disjoint ranges**, of which EXP-025 attributes only
   1.025x-1.070x to the change, because the unchanged `attention` bucket moved
   1.16-1.18x the same way at both rungs. **Nothing is merged**; the branch stays
   unmerged and no dial moved.
@@ -1915,10 +1915,10 @@ are neither now, and they should not come back without new evidence.
   1.257x is legible. **Two follow-ups it opened. The first will not be run**:
   an arm isolating the `attn_q` + `attn_v` half has nothing left to isolate,
   because that half was **removed on 2026-08-08** on the evidence EXP-025
-  already had (its bucket does not separate at either rung, EXP-025 Note 3).
+  already had (its bucket does not separate at either rung, EXP-025).
   **The second is still open**: a control that separates the 1.16-1.18x
   movement in the *unchanged* attention bucket into session drift or a
-  second-order effect of fusion on pool-worker parking (EXP-025 Note 1). It is
+  second-order effect of fusion on pool-worker parking (EXP-025). It is
   the one that bounds how much of the 3,961 result the change may claim
   (EXP-023, EXP-025)
 - **Softmax, and unfreezing `primitives`.** `primitives::softmax` is 23.5% of
@@ -1981,7 +1981,7 @@ Dropped from the backlog:
   carried an **estimated** "roughly 1.5-2x on the QK dot", and the whole-kernel
   measurement is 1.00x to 1.07x across the 64-to-4096 ladder, growing
   monotonically with context because attention is memory-bound at the long end
-  (EXP-020 Note 3). The estimate is superseded by measurement, not merely
+  (EXP-020). The estimate is superseded by measurement, not merely
   unconfirmed; do not re-quote 1.5-2x. Warm, so **the cold pair is owed and
   EXP-023 is reserved for it**. See "AVX2 + F16C, and why the obvious axis is
   illegal"

@@ -33,6 +33,12 @@ mkdir -p "$ROOT/scratch/cold-bench" || exit 1
 SUMMARY="$OUT/SUMMARY.txt"
 : > "$SUMMARY"
 
+# None of the paths below is in the repository: .gitignore excludes /models/
+# (line 5) and /scratch/ (line 9). They are a default layout, not a promise
+# that the bytes are present. A fresh clone holds neither the installed .rvmp
+# model nor the llama.cpp reference tree that supplies P512 and the numerics
+# gate's fixtures -- that tree has to be re-banked from llama.cpp b10217 --
+# and neither the phase-5 reference binary nor the 4K prompt under /scratch/.
 RAMVAMP="$ROOT/target/release/ramvamp"
 REF5="$ROOT/scratch/phase5-ref/ramvamp"
 RVMP="$ROOT/models/qwen3.rvmp"
@@ -122,6 +128,11 @@ run "in-process attention bench (warm, diagnostic)" "01-bench.log" \
 # ------------------------------------------------------- 2. numerics gate ----
 # Cheapest way to find out whether bits moved. If 2a fails, the performance
 # numbers below are meaningless, but they still get collected.
+#
+# Both models/llamacpp-ref/... paths below sit under the gitignored /models/
+# tree (see the note above the path variables), so neither is present in a
+# fresh clone: the phase-4 baseline is written by `bitident.py capture` and
+# the reference dump is re-banked from llama.cpp b10217.
 
 run "bitident vs phase-4 baseline" "02-bitident.log" \
     python3 scripts/bitident.py compare models/llamacpp-ref/phase4-baseline \
@@ -169,7 +180,7 @@ run "cold decode max-new 256, phase-7 arm" "08-cold-decode-p7.log" \
         --max-new 256 --warmup 0 --repeats 1 \
         --json scratch/cold-bench/p7-p7-512-n256.json
 
-# The last open item on the 11-slot dial (EXP-014 Note 2). p4k.txt is ~3,920
+# The last open item on the 11-slot dial (EXP-014). p4k.txt is ~3,920
 # tokens, inside CONTEXT_CAP = 4096. Do not substitute prompt.txt, which is
 # ~13,800 tokens and over the cap.
 if [ -e "$P4K" ]; then

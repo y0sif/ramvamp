@@ -39,7 +39,7 @@ NVMe) running Qwen3-30B-A3B Q4_K_M with a cold page cache inside
 | | measured |
 | --- | --- |
 | Decode | **about 2 tok/s**: 1.46 to 2.19 over ctx 64-3,961 (EXP-023), and 1.43 to 2.16 over the same rungs on a later branch (EXP-025) |
-| Prefill | **11.25 tok/s** at ctx 512 |
+| Prefill | **11.25 tok/s** at ctx 512 (EXP-023) |
 | Peak RAM | **2,497 to 2,929 MiB** of a 3,072 MiB ceiling: 2,497.0 at ctx 64 (EXP-025) and 2,929.3 at ctx 3,961 (EXP-023) |
 | Model on disk | 17.35 GiB, a **~6x** memory saving |
 | Fidelity | mean full-vocab KL **1.04e-2** vs llama.cpp, top-1 agreement 8/8 |
@@ -120,7 +120,8 @@ than weights.
 ## Run it
 
 ```bash
-# Price the configuration before running it: about 4 ms, no model load.
+# Price the configuration before running it. Reads the manifest and the expert
+# layout only, so it answers without loading a single weight.
 # Exits nonzero if the configuration will not fit, naming every term.
 ./target/release/ramvamp plan --model ~/models/qwen3-30b-a3b.rvmp
 
@@ -197,8 +198,8 @@ Prompt plus reserved output over the context cap is a `400` with OpenAI's own
 
 </details>
 
-**Position it honestly.** At about 2 tok/s decode and about 11 tok/s prefill on
-the reference drive, this is a local 30B endpoint for a machine that could not
+**Position it honestly.** At about 2 tok/s decode and about 11 tok/s prefill at
+ctx 512 on the reference drive, this is a local 30B endpoint for a machine that could not
 otherwise run one. It is workable for low-volume local chat and completion. It
 is not an agentic coding backend, where a single turn is thousands of output
 tokens.
@@ -283,9 +284,9 @@ while the experts stream in from disk. Also, it revamps what your RAM can hold.
 
 The approach is inspired by
 [TurboFieldfare](https://github.com/drumih/turbo-fieldfare), a Swift + Metal
-runtime that proved the physics on Apple Silicon (26B in ~2 GB at 5-6 tok/s on
-an 8 GB M2 Air). ramvamp exists because that proof is locked to Macs with
-M-series chips.
+runtime that proved the physics on Apple Silicon: Gemma 4 26B-A4B in about 2 GB
+at 5.1 to 6.3 tok/s on an 8 GB M2 Air. ramvamp exists because that proof is
+locked to Macs with M-series chips.
 
 ## License
 
