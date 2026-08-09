@@ -89,12 +89,21 @@ Three findings, and the first two retire what this section used to say:
   ~170 MB. Both shipped dials sit under that ceiling: the decode ring is at
   most 24.5 MB outstanding, the prefill sweep 49.0 MB. It is a constraint on
   *raising* them, not a reason to change them.
-- **Per-file variance persists and is unexplained.** `layer_00` at 1.578 GB/s
-  against `layer_20` at 2.271 in the same sweep, with byte-identical extent
-  geometry (both 398 extents, mean 984,027 B, zero physically adjacent
+- **Per-file variance appears within a session and does not reproduce across
+  them; "so it reproduces" is withdrawn (EXP-024).** This sweep measured
+  `layer_00` at 1.578 GB/s against `layer_20` at 2.271, with byte-identical
+  extent geometry (both 398 extents, mean 984,027 B, zero physically adjacent
   successor pairs), so fragmentation as `filefrag` reports it does not predict
-  it. `docs/benchmark-machine.md` records a 1.46x spread between the same two
-  files from an earlier measurement, so it reproduces.
+  it, and `docs/benchmark-machine.md` records a 1.46x spread between the same
+  two files from an earlier measurement. That agreement was read as
+  reproduction and it does not survive a test: EXP-024 re-ran EXP-023's
+  four-file cell, a **2.21x** spread, the next day and measured **1.044x**,
+  the fast files roughly halving and the slow ones unmoved. Over all 48 expert
+  files, measured for the first time, the population spread is **1.082x**,
+  most of even that is blob size rather than any property of a file, and
+  physical dispersion does not predict it (Pearson r = **-0.043**). These are
+  three sessions and rule 3 forbids drawing one curve through them; see
+  "Performance model" for what follows.
 
 Sequentiality is worth restating precisely, because it is easy to get
 backwards. At the single-blob size, reading in order is worth 1.34x to 1.50x
@@ -210,15 +219,33 @@ Q6_K down have a larger stride (~2.92 MiB) than pure-Q4_K layers
             "tie_embeddings": false, "shared_expert": false,
             "sliding_window": null },
   "quant": { "scheme": "gguf", "tensor_types": { "...": "q4_k" } },
+  "common_tensors": { "blk.0.attn_k.weight": { "offset": 0, "len": 1114112,
+                                               "dtype": "q8_0" },
+                      "...": { "offset": 0, "len": 0, "dtype": "f32" } },
   "files": { "common.bin": { "size": 0, "sha256": "..." },
              "experts/layer_00.bin": { "size": 0, "sha256": "..." } }
 }
 ```
 
+`common_tensors` is the index into `common.bin` and it is the **only** way
+anything locates a tensor in that file: name to `{offset, len, dtype}`, offsets
+64-byte aligned (`COMMON_TENSOR_ALIGN`), validated in-bounds and
+non-overlapping. The Qwen3 v0 install carries **435 entries**. Every key in the
+schema above is required: `Manifest` and each of its nested structs are
+`deny_unknown_fields` and none carries a serde default
+(`crates/core/src/format/manifest.rs`), so a manifest that omits a key or
+invents one is rejected rather than loaded with a hole in it.
+
 Repacker rules (unchanged from scaffold): bounded HTTP range requests, fixed
 small scratch, quantized bytes copied unchanged, resumable, `manifest.json`
 validates before atomic promotion. The runtime hashes `manifest.json`,
-`common.bin`, and `layout.json` at load and each layer file on first use.
+`common.bin`, and `layout.json` at load. It does **not** hash the layer files,
+and that is deliberate rather than unfinished: hashing them is a buffered
+sequential read of 16.35 GiB, which charges the whole model to the page cache
+and defeats the point of streaming experts with O_DIRECT
+(`crates/core/src/io/mod.rs`). Every layer file is size-checked on first open,
+unconditionally; the full digest is opt-in behind `--verify-layer-hashes`, and
+the thorough path is `ramvamp-repack verify-install`.
 
 ## Memory contract (option B, agreed; dial revised 2026-08-03, twice)
 
@@ -426,9 +453,14 @@ slots/layer), fewer slots/layer. A global slot pool shared across layers is
   2.8 GB/s explicit comes from koren1712's Windows/CUDA fork on **PCIe 3.0**,
   posted as a comment in llama.cpp discussion #23324, not from the RFC
   itself. None of these are ours; see `docs/landscape.md`.
-- Reads: io_uring + O_DIRECT with `register_files` and plain `opcode::Read`.
-  Interrupt-driven completions; no SQPOLL/IOPOLL (they burn a core the GEMVs
-  need).
+- Reads: io_uring + O_DIRECT, plain `opcode::Read` on a raw fd. **Nothing is
+  registered**, neither files nor buffers: there is no `register_files`, no
+  `register_buffers` and no `ReadFixed` anywhere in the workspace, which is
+  the next bullet's decision as it actually appears in the code. Ring setup
+  is a four-level flag ladder that degrades on `EINVAL`
+  (`crates/core/src/io/stream.rs`), so an older kernel loses
+  `SINGLE_ISSUER`/`DEFER_TASKRUN` rather than the runtime. Interrupt-driven
+  completions; no SQPOLL/IOPOLL (they burn a core the GEMVs need).
 - **Registered buffers (`ReadFixed`) are out.** Reasons, in order of weight:
   1. Registering the slot pool pins the whole pool with `FOLL_LONGTERM`
      (1.4-1.6 GiB at the dials under consideration; 1,438.6 MiB at the
@@ -498,9 +530,14 @@ slots/layer), fewer slots/layer. A global slot pool shared across layers is
   rather than argued: reading the same 1.4 GiB of experts inside the same
   cgroup peaked at **1,092.2 MiB** buffered versus **5.0 MiB** with O_DIRECT
   (provisional, EXP-009). Buffered reads charge the page cache to our cgroup
-  and thrash it. The transition itself has not landed: the decode loop still
-  reads experts with buffered `pread`, which is why no rule-2 baseline exists
-  yet (EXP-006).
+  and thrash it. **The transition has landed (EXP-013).** The decode loop
+  reads experts through io_uring + O_DIRECT: layer files are opened with
+  `custom_flags(O_DIRECT)` (`crates/core/src/io/direct.rs`), the streamer
+  reports that path as `StreamMode::ODirect`, which renders
+  `io_uring+O_DIRECT` in every run's stderr, and a filesystem that refuses the
+  flag gets a buffered reopen rather than a failed load. EXP-014 is the first
+  rule-2 baseline it made possible: cold, inside `memory.max=3G`, **1.88 tok/s
+  decode at a 2,471.1 MiB cgroup peak**.
 - **O_DIRECT can be silently downgraded to buffered I/O, so it must be
   verified at runtime.** On btrfs a read can fall back to `filemap_read()`
   with no error and a full byte count returned. Four confirmed triggers:
@@ -519,7 +556,19 @@ slots/layer), fewer slots/layer. A global slot pool shared across layers is
   loop-backed filesystems accept an O_DIRECT open and then do buffered I/O.
   **Consequence: the runtime must assert empirically at startup that expert
   reads are not populating the page cache**, rather than trusting that the
-  O_DIRECT open succeeded. The exact probe is deferred to implementation.
+  O_DIRECT open succeeded. **The probe ships** (`crates/core/src/io/direct.rs`):
+  once at startup, into a real slot-pool buffer, it clears a 4096-byte window
+  with `posix_fadvise(POSIX_FADV_DONTNEED)`, reads it through the O_DIRECT
+  handle, and requires `mincore` over a separate mapping to report the window
+  still non-resident. `mincore` rather than `preadv2(RWF_NOWAIT)`, because
+  NOWAIT was measured on this volume reporting "cached" for a range both
+  `mincore` and `fincore(1)` called non-resident. A buffered read of the same
+  range is then required to *grow* the cache, as a positive control, so a host
+  with no residency signal at all cannot pass by silence. Ownership is checked
+  first, since `mincore` reports everything resident for a file this process
+  neither owns nor may write. Every failure degrades to buffered reads with a
+  warning rather than refusing to run, and the mode the probe and the ring add
+  up to is what `StreamMode` names in the run's stderr.
 - Cache policy: per-layer slot arrays with **LFU over frequency counters
   indexed by expert id, sized `n_experts`, whose counts survive eviction**
   (ghost history). That detail is the policy, and it is where the win comes
@@ -532,9 +581,11 @@ slots/layer), fewer slots/layer. A global slot pool shared across layers is
   worth **-1.7 to 0.0 points against LRU** at the slot counts measured: tied
   at 42.6% at 10 slots, and 55.4% against LRU's 57.1% at 16. It is not a
   weaker win than ghost history, it is a small loss, which is the strongest
-  form of the argument for indexing counters by expert id. Counters cost
-  `n_experts * u32` per layer (512 B for Qwen3, 24 KiB across 48 layers). No
-  cross-layer prefetch (measured ~7% predictability upstream).
+  form of the argument for indexing counters by expert id. The per-expert
+  state is two arrays sized by the id space, the `u32` ghost counters and the
+  `bool` "has ever been fetched" flags behind the cold/eviction split, so
+  `n_experts * (u32 + bool)` per layer: 512 B + 128 B for Qwen3, 30 KiB across
+  48 layers. No cross-layer prefetch (measured ~7% predictability upstream).
 - Concurrency invariant: a slot owned by an in-flight read or by queued
   compute is never reassigned. This is not hygiene, it is a correctness
   requirement with a measured failure mode: aliasing two concurrent O_DIRECT
@@ -558,9 +609,11 @@ slots/layer), fewer slots/layer. A global slot pool shared across layers is
 
 ## Thread topology (v0)
 
-- Compute pool: 6 threads pinned to P-cores, one per physical core, no SMT
-  siblings. Spin barrier within a token step (ggml-style), condvar sleep
-  between generations.
+- Compute pool: 6 shards pinned to P-cores, one per physical core, no SMT
+  siblings. Six shards is **five spawned threads** at the default
+  `PoolConfig::inline_caller`: the submitting decode thread runs shard 0
+  itself, and only `inline_caller: false` makes all six workers. Spin barrier
+  within a token step (ggml-style), condvar sleep between generations.
 - What the pool runs: expert and projection GEMVs, and since phase 7 attention
   as well: over **rows** in prefill and over **kv heads** in decode. Two
   things follow. `ComputePool::run` runs a job inline as a single shard when
@@ -574,11 +627,17 @@ slots/layer), fewer slots/layer. A global slot pool shared across layers is
   premise. Earlier revisions of this document assumed the dedicated thread
   was free; it is not. TurboFieldfare measured a dedicated I/O executor at
   8.59 vs 8.42 ms and a 4-worker I/O pool as mixed across repeats, rejecting
-  both; flash-moe measured +4.6% for a persistent pool (flash-moe citation
-  needs a source link, see `docs/landscape.md`). The evidence is genuinely
+  both; [flash-moe](https://github.com/danveloper/flash-moe) measured +4.6%
+  for a persistent pool, on a 48 GB MacBook Pro reading through the macOS
+  page cache with no expert cache, so it is a GCD `pread` result rather than
+  an io_uring one. The evidence is genuinely
   mixed, and io_uring changes the calculus (submission is cheap and batched,
   so there is less work to move off-thread than in a pread design). So it
-  becomes a measurement.
+  becomes a measurement. Topology detection is ready for the answer either
+  way: `Topology::reactor_cpu()` already picks an E-core that shares L3 with
+  the compute cores (`None` when no E-core has any), and the choice is printed
+  with the rest of the topology, but nothing outside the tests consumes it. It
+  is a latent hook, not a live thread.
 - Signalling cost, measured (provisional, EXP-010), for the
   reactor-to-compute handoff: futex p50 3.1 us at 0.07 cores; atomic spin
   502 ns but 1.03 cores burned; `std::sync::mpsc` p99 237 us. The spin path
@@ -664,11 +723,8 @@ the phase-8 reference binary in one session (EXP-025); they are results. The
 *warm* figures are MEASURED WARM (ctx 512, 63 decode tokens, three runs per
 arm, medians with ranges, pooled GEMV bucket = `projections + experts +
 lm_head`, the router serial and excluded), and under rule 2 they stay
-**diagnostics**. Artifacts: cold in
-`scratch/phase9/sweep-20260807-203558/` and
-`scratch/cold-bench/p9-20260807-203558-*.json`; warm in
-`scratch/phase9/wave0-baseline/*.err` and
-`scratch/phase9/wave1-measure/rep/*.err`.
+**diagnostics**. The run artifacts behind both sets are kept locally and are
+not published; EXP-025 in `docs/experiments.md` is the citable record.
 
 Step 4-5's expert work fans out **once per expert phase, not once per matrix**
 (`70cf304`), and **the fusion is expert-phase only**. A phase's routed experts
@@ -755,8 +811,8 @@ Four things the warm arms refute, and they matter more than the 1.264x:
   to wait for, so `own` is the serial arithmetic and 16.35 is the figure the
   ratios below and the derivations in `kernels::gemv` use. Against the
   six-shard arm run in the same session and on the same binary that is **1.16x
-  pre-fusion** (16.35 against **14.11 s**, both from
-  `scratch/phase9/wave0-baseline/`, single runs rather than medians). Against
+  pre-fusion** (16.35 against **14.11 s**, both single runs rather than
+  medians, from unpublished local artifacts). Against
   the fused arm it is **1.43x** (16.35 against 11.42 s), which is legitimate to
   pair only because fusion moves no arithmetic, so 16.35 s is the same serial
   arithmetic either side of it: **there is no single-shard control on the
@@ -1707,22 +1763,35 @@ Prior-art anchors, with the qualifiers that were previously missing:
 
 ## v0 scope caps
 
-Single sequence, 4K context, CLI chat + raw completion, greedy +
-standard sampling, no server, no batching, no speculative anything, Linux
-only, x86-64 with AVX2 required. Attention additionally probes **F16C**, a
-separate CPUID bit from AVX2 and FMA, and falls back to the scalar reference
-without it; it deliberately does not enable FMA (see "Attention: the kernel and
-its fan-out"). Gemma 4 26B-A4B is model #2 and brings:
-shared-expert overlap, SWA KV rings, per-layer attention-type mix, logit
-softcap, and (if we adopt their quant source) a second quant scheme decision.
+Single sequence, CLI chat + raw completion, greedy + standard sampling, no
+batching, no speculative anything, Linux only, x86-64 with AVX2 required.
+Attention additionally probes **F16C**, a separate CPUID bit from AVX2 and
+FMA, and falls back to the scalar reference without it; it deliberately does
+not enable FMA (see "Attention: the kernel and its fan-out").
+
+Two things that used to be listed here as caps are not caps:
+
+- **Context is a dial.** `--context`, `RAMVAMP_CONTEXT`, or the selected
+  profile's `context` set it, in that precedence, and it **defaults to 4096**.
+  It is refused above the manifest's `arch.context_length`, since positions
+  past the trained window produce fluent nonsense rather than an error, and it
+  is refused below that whenever the projected footprint does not fit the
+  budget (see "Memory contract"). 4K is the default, not the ceiling.
+- **The server ships.** `crates/server` (`ramvamp-server`) is a workspace
+  member and `ramvamp serve` is a subcommand: a loopback OpenAI-compatible
+  HTTP server on 127.0.0.1, serving `/v1/chat/completions` streaming (SSE) and
+  not, plus `/v1/models` and `/health`, one request at a time. Tool calls are
+  parsed from Qwen's native `<tool_call>` tokens, and every prompt goes
+  through `encode_chat_with_tools_sanitized`: `encode_chat` stays
+  reference-faithful by recorded decision, so untrusted content reaches the
+  model only through the sanitizing entry point.
+
+Gemma 4 26B-A4B is model #2 and brings: shared-expert overlap, SWA KV rings,
+per-layer attention-type mix, logit softcap, and (if we adopt their quant
+source) a second quant scheme decision.
 
 ## Post-v0 direction (recorded 2026-08-01, not commitments)
 
-- `ramvamp-server`: loopback OpenAI-compatible Chat Completions (streaming
-  SSE, tool calls parsed from Qwen's native `<tool_call>` tokens). This is
-  the integration path for OpenCode and anything OpenAI-speaking. Must add
-  special-token sanitization for untrusted content (recorded decision:
-  `encode_chat` is reference-faithful).
 - KV prefix caching (prefill the system prompt once, reuse across turns);
   prerequisite for agentic clients whose prompts dominate the context.
 - Larger context via Q8 KV + budget growth; unlocks the Thinking-2507
