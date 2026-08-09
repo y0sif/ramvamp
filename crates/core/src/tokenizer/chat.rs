@@ -760,10 +760,11 @@ impl ContentSanitizer {
             // continuation byte and a candidate offset is always a character
             // boundary. The explicit check keeps the slice below infallible
             // even if that ever stops holding.
-            if self.first_bytes[bytes[at] as usize] && content.is_char_boundary(at) {
-                if let Some(literal) = self.literal_at(&content[at..]) {
-                    return Some((at, literal));
-                }
+            if self.first_bytes[bytes[at] as usize]
+                && content.is_char_boundary(at)
+                && let Some(literal) = self.literal_at(&content[at..])
+            {
+                return Some((at, literal));
             }
             at += 1;
         }

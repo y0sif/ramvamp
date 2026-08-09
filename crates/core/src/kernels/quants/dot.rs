@@ -33,7 +33,7 @@ fn weight_blocks<'a>(
     activation_blocks: usize,
 ) -> Result<std::slice::ChunksExact<'a, u8>, KernelError> {
     let block_bytes = format.block_bytes();
-    if bytes.len() % block_bytes != 0 {
+    if !bytes.len().is_multiple_of(block_bytes) {
         return Err(KernelError::RowBytesNotBlockMultiple {
             format,
             len: bytes.len(),

@@ -8,7 +8,7 @@
 ```
 
 <p align="center">
-  <a href="https://github.com/y0sif/ramvamp/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/y0sif/ramvamp/actions/workflows/ci.yml/badge.svg"></a> <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a> <img alt="Rust 1.85 or newer" src="https://img.shields.io/badge/rust-1.85%2B-orange.svg">
+  <a href="https://github.com/y0sif/ramvamp/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/y0sif/ramvamp/actions/workflows/ci.yml/badge.svg"></a> <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a> <img alt="Rust 1.88 or newer" src="https://img.shields.io/badge/rust-1.88%2B-orange.svg">
 </p>
 
 <p align="center">
@@ -62,8 +62,24 @@ cargo build --release
     --prompt "Explain io_uring in two sentences."
 ```
 
-`chat` is the terminal REPL and `serve` the HTTP endpoint. Requirements, the three I/O modes and
-the repacker's other subcommands: [docs/install.md](docs/install.md).
+Requirements, the three I/O modes and the repacker's other subcommands:
+[docs/install.md](docs/install.md).
+
+## Chat in the terminal
+
+The quickest way to try it, with nothing to wire up:
+
+```bash
+./target/release/ramvamp chat --model ~/models/qwen3-30b-a3b.rvmp
+
+# Same thing with a live status panel: prefill progress, tokens per second,
+# context used, and the expert cache hit rate, updated while it generates.
+./target/release/ramvamp chat --model ~/models/qwen3-30b-a3b.rvmp --tui
+```
+
+`--tui` exists because a long prompt is minutes of prefill before the first character
+appears, and silence is indistinguishable from a hang. It needs a terminal on stdout.
+Plain `chat` is the reference behaviour and stays that way.
 
 ## Serve and configure
 

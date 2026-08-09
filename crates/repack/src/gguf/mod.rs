@@ -150,7 +150,7 @@ impl GgufFile {
         // Always true for tensors this parser produced (size is a multiple
         // of every dim beyond the block axis), but `TensorInfo` fields are
         // public, so re-validate instead of trusting the caller.
-        if tensor.size_bytes % n_experts != 0 {
+        if !tensor.size_bytes.is_multiple_of(n_experts) {
             return Err(GgufError::SlabNotDivisible {
                 name: tensor.name.clone(),
                 size_bytes: tensor.size_bytes,

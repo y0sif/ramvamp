@@ -1764,7 +1764,7 @@ impl ExpertStream {
         // above, which together are what rule out a live DMA into these bytes.
         let base = unsafe { self.slots.slab_base() };
         debug_assert!(
-            base.as_ptr() as usize as u64 % direct::DIO_ALIGN == 0,
+            (base.as_ptr() as usize as u64).is_multiple_of(direct::DIO_ALIGN),
             "the slot pool slab is allocated 4096-aligned"
         );
         self.invalidate_all_slots();
@@ -2866,8 +2866,8 @@ impl ExpertStream {
         let dst = unsafe { base.add(read.filled as usize) };
         debug_assert!(
             read.dst == Dest::Slot
-                || (dst as usize as u64 % direct::DIO_ALIGN == 0
-                    && (read.base + u64::from(read.filled)) % direct::DIO_ALIGN == 0
+                || ((dst as usize as u64).is_multiple_of(direct::DIO_ALIGN)
+                    && (read.base + u64::from(read.filled)).is_multiple_of(direct::DIO_ALIGN)
                     && u64::from(read.remaining) % direct::DIO_ALIGN == 0),
             "a sweep read must be 4096-aligned in offset, length and destination"
         );

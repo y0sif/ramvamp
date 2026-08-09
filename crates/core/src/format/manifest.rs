@@ -276,7 +276,7 @@ impl ArchInfo {
         if self.context_length == 0 {
             return err("context_length must be nonzero".to_owned());
         }
-        if self.n_heads % self.n_kv_heads != 0 {
+        if !self.n_heads.is_multiple_of(self.n_kv_heads) {
             return err(format!(
                 "n_heads {} not divisible by n_kv_heads {} (GQA needs whole groups)",
                 self.n_heads, self.n_kv_heads

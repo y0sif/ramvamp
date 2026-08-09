@@ -525,7 +525,7 @@ impl<'a> LayerTensors<'a> {
 
 /// Bytes of one expert's contiguous slab of a 3-D `*_exps` tensor.
 fn slab_len(t: &TensorInfo, n_experts: u64) -> Result<u64, PlanError> {
-    if n_experts == 0 || t.size_bytes % n_experts != 0 {
+    if n_experts == 0 || !t.size_bytes.is_multiple_of(n_experts) {
         return Err(PlanError::SlabNotDivisible {
             name: t.name.clone(),
             size_bytes: t.size_bytes,

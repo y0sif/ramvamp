@@ -2283,10 +2283,10 @@ fn run_logits(args: LogitsArgs) -> anyhow::Result<()> {
             let mut failure: Option<anyhow::Error> = None;
             let logits = {
                 let mut sink = |position: usize, layer: u32, topk: &[(u32, f32)]| {
-                    if failure.is_none() {
-                        if let Err(e) = recorder.push(TracePhase::Prefill, position, layer, topk) {
-                            failure = Some(e);
-                        }
+                    if failure.is_none()
+                        && let Err(e) = recorder.push(TracePhase::Prefill, position, layer, topk)
+                    {
+                        failure = Some(e);
                     }
                 };
                 prefill_prompt(&model, &mut state, &ids, Some(&mut sink))?

@@ -6,7 +6,9 @@ in, and every `ramvamp-repack` subcommand beyond the one-line install.
 ## Requirements
 
 - **Linux on x86_64.** io_uring and O_DIRECT are the point of the design.
-- **Rust 1.85 or newer** (edition 2024).
+- **Rust 1.88 or newer.** Edition 2024 itself needs only 1.85, but `ratatui`,
+  which draws the `chat --tui` panel, needs 1.88, and cargo resolves the floor
+  across the whole workspace.
 - **An NVMe SSD** with about **17.35 GiB free** for the installed model. The
   installer streams the source GGUF into place: no doubling, no separate copy
   of the download kept on disk.

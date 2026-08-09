@@ -387,7 +387,7 @@ pub fn probe(path: &Path, buf: &mut [u8]) -> DirectSupport {
 
 /// Whether `value` satisfies the direct-I/O alignment requirement.
 pub fn is_aligned(value: u64) -> bool {
-    value % DIO_ALIGN == 0
+    value.is_multiple_of(DIO_ALIGN)
 }
 
 /// Whether [`resident_pages`] will tell the truth about `file`.

@@ -57,7 +57,7 @@ pub fn rope_neox(
     position: u32,
     theta_base: f32,
 ) -> Result<(), PrimitiveError> {
-    if head_dim == 0 || head_dim % 2 != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
         return Err(PrimitiveError::InvalidHeadDim { head_dim });
     }
     if q_or_k.len() != head_dim {
@@ -86,7 +86,7 @@ pub fn rope_neox_heads(
     position: u32,
     theta_base: f32,
 ) -> Result<(), PrimitiveError> {
-    if head_dim == 0 || head_dim % 2 != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
         return Err(PrimitiveError::InvalidHeadDim { head_dim });
     }
     let expected = n_heads.checked_mul(head_dim);

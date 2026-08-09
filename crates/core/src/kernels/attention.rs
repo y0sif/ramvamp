@@ -934,14 +934,14 @@ fn plan(
     let head_dim = cache.head_dim();
     let n_kv_heads = cache.n_kv_heads();
 
-    if q.is_empty() || q.len() % head_dim != 0 {
+    if q.is_empty() || !q.len().is_multiple_of(head_dim) {
         return Err(AttentionError::QLenIndivisible {
             q_len: q.len(),
             head_dim,
         });
     }
     let n_q_heads = q.len() / head_dim;
-    if n_q_heads % n_kv_heads != 0 {
+    if !n_q_heads.is_multiple_of(n_kv_heads) {
         return Err(AttentionError::GqaGroupMismatch {
             n_q_heads,
             n_kv_heads,

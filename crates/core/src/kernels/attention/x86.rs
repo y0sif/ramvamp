@@ -160,7 +160,7 @@ pub(super) const T_TAIL_BLOCK: usize = 4;
 const _: () = assert!(
     T_TAIL_BLOCK != 0
         && T_TAIL_BLOCK < T_BLOCK
-        && T_BLOCK % T_TAIL_BLOCK == 0
+        && T_BLOCK.is_multiple_of(T_TAIL_BLOCK)
         && T_BLOCK <= 2 * T_TAIL_BLOCK,
     "the stepped tail must *divide* the main block and be at least half of it, \
      not merely be narrower than it. Both halves are load-bearing for the \

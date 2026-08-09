@@ -235,7 +235,7 @@ fn parse_value(
 /// Exact byte size of a tensor from its dims and type block geometry.
 fn tensor_byte_size(name: &str, dims: &[u64], ty: GgmlType) -> Result<u64, GgufError> {
     let block = ty.block_weights();
-    if dims[0] % block != 0 {
+    if !dims[0].is_multiple_of(block) {
         return Err(GgufError::DimNotBlockAligned {
             name: name.to_owned(),
             dim0: dims[0],

@@ -75,20 +75,23 @@ jobs:
         run: cargo test ${{ matrix.flags }}
 
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # The workspace is edition 2024 with `rust-version = "1.85"`, the first
-      # release that stabilized that edition. Stable alone will not catch a
-      # newer-than-1.85 API creeping in, so pin the floor explicitly. Keep this
-      # version in step with `rust-version` in the root Cargo.toml.
-      # The toolchain is given as an input rather than as an action ref
-      # (`@1.85.0`) so this does not depend on a per-version branch existing.
+      # Edition 2024 needs 1.85, but `ratatui` 0.30 needs 1.88 and cargo
+      # resolves the floor across the whole workspace, so 1.88 is the real one.
+      # Stable alone will not catch a newer API creeping in, so pin the floor
+      # explicitly. Keep this in step with `rust-version` in the root
+      # Cargo.toml. This job caught the 1.85 claim being untrue on its first
+      # run, which is what it is for.
+      #
+      # The toolchain is an input rather than an action ref (`@1.88.0`) so this
+      # does not depend on a per-version branch existing.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
+          toolchain: "1.88"
 
       - uses: Swatinem/rust-cache@v2
 

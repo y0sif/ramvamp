@@ -81,7 +81,7 @@ fn validate_row(
     activation_blocks: usize,
 ) -> Result<(), KernelError> {
     let block_bytes = format.block_bytes();
-    if bytes.len() % block_bytes != 0 {
+    if !bytes.len().is_multiple_of(block_bytes) {
         return Err(KernelError::RowBytesNotBlockMultiple {
             format,
             len: bytes.len(),

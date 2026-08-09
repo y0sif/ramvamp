@@ -94,7 +94,7 @@ impl QuantFormat {
     /// Blocks span the innermost (contiguous) axis, so `in_dim` must be a
     /// multiple of [`Self::block_weights`].
     pub fn row_bytes(self, in_dim: usize) -> Result<usize, KernelError> {
-        if in_dim % self.block_weights() != 0 {
+        if !in_dim.is_multiple_of(self.block_weights()) {
             return Err(KernelError::IndivisibleRow {
                 format: self,
                 in_dim,

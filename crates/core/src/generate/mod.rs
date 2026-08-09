@@ -955,10 +955,10 @@ fn generate_with_stops(
     }
     // Flush a trailing incomplete character (attributed to the last id).
     let tail = stream.flush(tokenizer)?;
-    if !tail.is_empty() {
-        if let Some(id) = stream.last_id() {
-            on_token(id, &tail);
-        }
+    if !tail.is_empty()
+        && let Some(id) = stream.last_id()
+    {
+        on_token(id, &tail);
     }
 
     Ok(GenerateStats {

@@ -134,7 +134,7 @@ impl LayerLayout {
                 "layer {index}: stride is zero"
             )));
         }
-        if self.stride % EXPERT_BLOB_ALIGN != 0 {
+        if !self.stride.is_multiple_of(EXPERT_BLOB_ALIGN) {
             return Err(FormatError::Misaligned {
                 what: "expert blob stride",
                 name: self.file.clone(),
