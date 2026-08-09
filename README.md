@@ -40,20 +40,54 @@ machine (Intel Core Ultra 9 185H, CPU only, **Micron 2400 DRAM-less QLC** NVMe):
 1.6 GB/s at decode's own read geometry, so no figure appears without its drive. Full table,
 conditions and drive detail: [docs/benchmarks.md](docs/benchmarks.md).
 
-## Quickstart
+## Install
+
+```bash
+curl -sSL https://y0sif.github.io/ramvamp/install.sh | bash
+```
+
+Puts `ramvamp` and `ramvamp-repack` in `/usr/local/bin`. Pin a tag with
+`RAMVAMP_VERSION=v0.1.0`, move the destination with `RAMVAMP_INSTALL_DIR`, re-run the same
+line to upgrade. **Linux x86_64 only**, and on anything else it refuses and installs nothing:
+io_uring is a Linux interface, the fast kernels are AVX2 plus F16C, and a binary elsewhere
+would run on fallback paths that no number here describes.
+
+Then install the model. That is a **17.35 GiB download**, so the installer prints this and
+stops rather than starting it for you, and the path wants to be on an NVMe SSD:
+
+```bash
+# Download and repack the pinned Qwen3-30B-A3B in one streaming pass.
+ramvamp-repack install --output ~/models/qwen3-30b-a3b.rvmp
+
+# Generate. Text streams to stdout; timing and expert stats go to stderr.
+ramvamp generate --model ~/models/qwen3-30b-a3b.rvmp \
+    --prompt "Explain io_uring in two sentences."
+```
+
+<details>
+<summary><b>Other install methods (prebuilt tarball by hand, from source)</b></summary>
+
+**Prebuilt tarball.** What the one-liner does for you. Every tagged release publishes
+`ramvamp-linux-x86_64.tar.gz` on [Releases](https://github.com/y0sif/ramvamp/releases/latest),
+holding both binaries plus the README and both licences.
+
+```bash
+curl -sSL -o ramvamp.tar.gz \
+  https://github.com/y0sif/ramvamp/releases/latest/download/ramvamp-linux-x86_64.tar.gz
+tar xzf ramvamp.tar.gz
+sudo install -m755 ramvamp ramvamp-repack /usr/local/bin/
+```
+
+**From source.** Needs Rust 1.88 or newer, which a prebuilt binary does not. Nothing else:
+the tree has no C dependencies.
 
 ```bash
 git clone https://github.com/y0sif/ramvamp
 cd ramvamp
 cargo build --release
-
-# Download and repack the pinned Qwen3-30B-A3B in one streaming pass (17.35 GiB on disk).
-./target/release/ramvamp-repack install --output ~/models/qwen3-30b-a3b.rvmp
-
-# Generate. Text streams to stdout; timing and expert stats go to stderr.
-./target/release/ramvamp generate --model ~/models/qwen3-30b-a3b.rvmp \
-    --prompt "Explain io_uring in two sentences."
 ```
+
+</details>
 
 Requirements, the three I/O modes and the repacker's other subcommands:
 [docs/install.md](docs/install.md).
@@ -63,11 +97,11 @@ Requirements, the three I/O modes and the repacker's other subcommands:
 The quickest way to try it, with nothing to wire up:
 
 ```bash
-./target/release/ramvamp chat --model ~/models/qwen3-30b-a3b.rvmp
+ramvamp chat --model ~/models/qwen3-30b-a3b.rvmp
 
 # Same thing with a live status panel: prefill progress, tokens per second,
 # context used, and the expert cache hit rate, updated while it generates.
-./target/release/ramvamp chat --model ~/models/qwen3-30b-a3b.rvmp --tui
+ramvamp chat --model ~/models/qwen3-30b-a3b.rvmp --tui
 ```
 
 `--tui` exists because a long prompt is minutes of prefill before the first character
@@ -77,7 +111,7 @@ Plain `chat` is the reference behaviour and stays that way.
 ## Serve and configure
 
 ```bash
-./target/release/ramvamp serve --model ~/models/qwen3-30b-a3b.rvmp --port 8080
+ramvamp serve --model ~/models/qwen3-30b-a3b.rvmp --port 8080
 ```
 
 That is `/v1/chat/completions` (streaming SSE and buffered), `/v1/models` and `/health`, on

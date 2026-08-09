@@ -1,0 +1,73 @@
+name: Sync installer and site to gh-pages
+
+# Mirrors install.sh and site/index.html from main onto the gh-pages branch
+# whenever either changes, so the `curl | bash` recipe served from the landing
+# page never drifts from the canonical installer.
+#
+# main is the source of truth for both files. gh-pages is a publishing target
+# and nothing is edited there by hand; anything committed to it directly will
+# be overwritten by the next run.
+#
+# One-time setup, done in the web UI once this has run:
+#   Settings > Pages > Build and deployment > Deploy from a branch >
+#   gh-pages > / (root)
+# The branch itself does not need creating: the first run makes it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+      - site/index.html
+      - .github/workflows/sync-installer.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Publish to gh-pages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Stage the payload
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pages"
+          cp install.sh      "$RUNNER_TEMP/pages/install.sh"
+          cp site/index.html "$RUNNER_TEMP/pages/index.html"
+
+      - name: Commit and push if changed
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin +refs/heads/gh-pages:refs/remotes/origin/gh-pages
+            git checkout -B gh-pages origin/gh-pages
+          else
+            # First run: gh-pages has no history and should not inherit main's.
+            echo "gh-pages does not exist yet; creating it"
+            git checkout --orphan gh-pages
+            git rm -rf . >/dev/null
+          fi
+
+          cp "$RUNNER_TEMP/pages/install.sh" install.sh
+          cp "$RUNNER_TEMP/pages/index.html" index.html
+          chmod 755 install.sh
+          git add install.sh index.html
+
+          if git rev-parse --verify -q HEAD >/dev/null &&
+             git diff --quiet --cached HEAD -- install.sh index.html; then
+            echo "gh-pages already in sync with main"
+            exit 0
+          fi
+
+          git commit -m "Sync install.sh and landing page from main"
+          git push origin gh-pages
