@@ -10,6 +10,14 @@ phase to the next and go stale; when they disagree with the roadmap, it wins.
 Then `docs/architecture.md` before touching the runtime, and
 `docs/landscape.md` for why design decisions were made.
 
+Two paths in `docs/` are local-only and gitignored, so a fresh clone will not
+have them. Both are working records, not deliverables:
+
+- `docs/handoff-phase*.md`, one session's notes for the next.
+- `docs/experiments/README.md`, the raw experiment log. The public record is
+  the curated `docs/experiments.md`, one line per experiment, and every row
+  there cites an entry in the raw log.
+
 Every phase updates `docs/roadmap.md`. A phase that has not updated it has not
 finished. If work hits a question only the author can answer, **stop and ask**.
 Do not default to gathering more measurements: four consecutive phases did
@@ -34,6 +42,8 @@ Pre-push: all four must pass.
   compute pool), `model` (arch config + forward pass), `kv`, `tokenizer`,
   `generate`.
 - `crates/repack` (`ramvamp-repack`): streaming HF-to-.rvmp installer.
+- `crates/server` (`ramvamp-server`): OpenAI-compatible HTTP surface, library
+  only. The binary that serves it is `ramvamp serve`.
 - `crates/cli` (`ramvamp`): user-facing binary.
 
 ## Hard rules
@@ -50,9 +60,10 @@ Pre-push: all four must pass.
 - Library code returns typed errors (`thiserror`); binaries use `anyhow`.
   No panics in `ramvamp-core` on untrusted input.
 - Every performance change gets an entry in `docs/experiments/README.md`
-  (baseline, result, verdict). Published numbers come from cold runs inside
-  a `memory.max=3G` cgroup with `memory.swap.max=0` (zram counts as swap);
-  warm-cache runs are diagnostics.
+  (baseline, result, verdict), and a one-line row in the public
+  `docs/experiments.md` citing it. Published numbers come from cold runs
+  inside a `memory.max=3G` cgroup with `memory.swap.max=0` (zram counts as
+  swap); warm-cache runs are diagnostics.
 - Vectorized kernels must document and test the alignment they assume;
   packed sub-tensor offsets may be only 2-byte aligned.
 

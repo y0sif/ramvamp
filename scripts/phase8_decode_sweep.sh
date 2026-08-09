@@ -58,7 +58,7 @@
 #
 # feat/decode changes T_BLOCK from 4 to 8 — four QK dependency chains to
 # eight. CLAUDE.md's hard rule is that every performance change gets an entry
-# in docs/experiments/README.md with a baseline, a result and a verdict, and
+# in docs/experiments.md with a baseline, a result and a verdict, and
 # T_BLOCK has none. Left alone, phase 8 would measure its decode curve on a
 # binary carrying that change and silently attribute T_BLOCK's cost to
 # context length: the one confound this whole sweep exists to avoid.
@@ -73,7 +73,7 @@
 # The reference binary's sha256 is
 # d56dc034ebd3e94e83b59ad64503adf289baf22af112752593ec59068a586e66, which is
 # byte-identical to the binary EXP-021 measured (recorded there as
-# `d56dc034ebd3...` at `aade585`, docs/experiments/README.md:2148-2151). The
+# `d56dc034ebd3...` at `aade585`; see EXP-021 in docs/experiments.md). The
 # reference arm is not a lookalike rebuild of phase 7; it is the same bytes
 # phase 7 published from.
 #
@@ -1388,7 +1388,7 @@ say 'Any "NO SUMMARY" row means that step produced no measurement at all.'
 say "Nothing was substituted for it. Re-run that arm."
 say ""
 say "The T_BLOCK table is what CLAUDE.md's rule needs to be discharged:"
-say "T_BLOCK 4 -> 8 is a performance change and owes docs/experiments a"
+say "T_BLOCK 4 -> 8 is a performance change and owes docs/experiments.md a"
 say "baseline, a result and a verdict. The baseline is"
 say "$REF7_EXPECT_SHA"
 say "(main's build, byte-identical to EXP-021's binary), the result is the"

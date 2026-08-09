@@ -139,7 +139,7 @@ pub struct ProfileArgs {
 
     /// Ignore any config file and use the built-in defaults.
     ///
-    /// For measurement. Every published number in `docs/experiments/` assumes
+    /// For measurement. Every published number in `docs/experiments.md` assumes
     /// a known configuration, and a config file in the operator's home would
     /// otherwise change what a benchmark measures without appearing anywhere
     /// in the entry that records it. `scripts/cold_bench.py` passes this so a

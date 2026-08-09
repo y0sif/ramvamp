@@ -169,8 +169,8 @@ pub enum CacheError {
     /// buffer under a live O_DIRECT read, so the step fails instead.
     ///
     /// (What aliasing costs on btrfs — spurious EIO from checksum failure —
-    /// was measured during io bring-up but is not yet an entry in
-    /// `docs/experiments/README.md`; treat the figure quoted on
+    /// was measured during io bring-up but is not recorded in
+    /// `docs/experiments.md`; treat the figure quoted on
     /// [`CachePlan::hits`] as provisional.)
     #[error(
         "layer needs {needed} more slot(s) but only {free} of {n_slots} are free \
@@ -264,8 +264,8 @@ impl CachePlan {
     /// A hit may name a slot whose fill is still in flight: `plan` never
     /// issues a second read for an expert that already owns a slot, because
     /// two O_DIRECT reads aliasing one buffer make btrfs report spurious EIO
-    /// (provisional: 13-27% during io bring-up, not yet recorded in
-    /// `docs/experiments/README.md`). Callers that plan more than once per
+    /// (provisional: 13-27% during io bring-up, not recorded in
+    /// `docs/experiments.md`). Callers that plan more than once per
     /// step must therefore wait for outstanding completions (see
     /// [`LayerCache::is_ready`]) before computing on a hit. Those requests
     /// are counted as [`CacheStats::pending_hits`], not as hits.

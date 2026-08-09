@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Phase 7 measurement run, unattended.
 #
-# Runs the whole of docs/handoff-phase8.md's "Take the cold measurement" item in
-# one go: the numerics gate, the paired cold rule-2 runs, the 4K context run and
-# a quiet in-process bench. Roughly 2.5 to 3 hours. Nothing here is interactive.
+# Takes phase 7's whole cold measurement in one go: the numerics gate, the
+# paired cold rule-2 runs, the 4K context run and a quiet in-process bench.
+# Roughly 2.5 to 3 hours. Nothing here is interactive.
 #
 # Start it and walk away:
 #

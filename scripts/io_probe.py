@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reproducible O_DIRECT bandwidth probe over the *installed* expert files.
 
-`docs/experiments/README.md` lists re-measuring EXP-008 as the highest-value
+`docs/experiments.md` lists re-measuring EXP-008 as the highest-value
 item on the backlog, and EXP-008 cannot be re-run: its harness was never
 committed. This file is that harness, written so the entry it feeds is
 reproducible, self-describing, and rule-2 compliant.
@@ -1701,7 +1701,7 @@ def build_all_files_cases(files: list[dict], k: int, qd: int,
                           patterns: list[str]) -> tuple[list[dict], list[tuple[int, int]]]:
     """One cell — (K, QD) — across **every** layer file.
 
-    `docs/experiments/README.md` says decode "touches all 48 files every token
+    `docs/experiments.md` says decode "touches all 48 files every token
     so it pays that spread on all of them", but the spread it cites was
     measured on four files. Four is a sample, not the population, and the
     claim is about the population. This is the population: one decode-shaped
@@ -3341,7 +3341,7 @@ def main() -> int:
 
     if mode != "matrix":
         markdown = build_markdown(plan, agg, frag, machine, verdict)
-        print("\n=== markdown (paste into docs/experiments/README.md) ===\n")
+        print("\n=== markdown (summarise in docs/experiments.md) ===\n")
         print(markdown)
         return finish(args, plan, machine, cases, frag, agg, runs, verdict,
                       session_btrfs_before, session_btrfs_after, session_grew,
@@ -3404,7 +3404,7 @@ def main() -> int:
                   f"is the point, not the mean")
 
     markdown = build_markdown(plan, agg, frag, machine, verdict)
-    print("\n=== markdown (paste into docs/experiments/README.md) ===\n")
+    print("\n=== markdown (summarise in docs/experiments.md) ===\n")
     print(markdown)
 
     return finish(args, plan, machine, cases, frag, agg, runs, verdict,

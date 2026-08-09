@@ -139,7 +139,7 @@
 # The reference binary's sha256 is
 # d36036b6485b00e741b7448e8d963e8a0916eb0aeb36b69c48c89ea857eb8b4c, which is
 # byte-identical to the branch binary EXP-023 measured (recorded there at
-# `c78122b` as `d36036b6485b...`, docs/experiments/README.md). 8e1eee8 is the
+# `c78122b` as `d36036b6485b...`, docs/experiments.md). 8e1eee8 is the
 # merge that made feat/decode main, and `git diff --name-only c78122b
 # 8e1eee8` touches only docs/, so the two commits have the same runtime and
 # the rebuild reproduced EXP-023's bytes exactly. The reference arm is not a
@@ -1507,7 +1507,7 @@ say "Nothing was substituted for it. Re-run that arm."
 say ""
 say "The paired table is what CLAUDE.md's rule needs to be discharged: the"
 say "fused decode fan-out (70cf304) is a performance change and owes"
-say "docs/experiments a baseline, a result and a verdict. The baseline is"
+say "docs/experiments.md a baseline, a result and a verdict. The baseline is"
 say "$REF8_EXPECT_SHA"
 say "(8e1eee8's build, byte-identical to EXP-023's branch binary), the result"
 say "is the paired table, and the verdict is yours. The 1.264x measured warm"

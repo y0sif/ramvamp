@@ -8,6 +8,17 @@
 # Benchmark and experiment outputs
 /scratch/
 
+# Working notes, kept local on purpose.
+#
+# Handoff docs are written by one session for the next and go stale by design;
+# `docs/roadmap.md` is the plan of record and is public. The raw experiment log
+# is an internal working record: it argues with itself, withdraws numbers, and
+# records reasoning that was later refuted. The public record of what was
+# measured is the curated `docs/experiments.md`, and every entry there traces
+# back to an entry in the raw log.
+/docs/handoff-*.md
+/docs/experiments/
+
 # Environment
 .env
 
