@@ -63,7 +63,11 @@ pub use common::MappedCommon;
 pub use direct::{DIO_ALIGN, DirectFault, DirectSupport};
 pub use error::IoError;
 pub use expert::{ExpertReader, ExpertSlab, ExpertView};
-pub use slots::{MAX_POOL_BYTES, SLOT_ALIGN, SlotError, SlotGuard, SlotPool};
+pub(crate) use slots::mib;
+pub use slots::{
+    Footprint, FootprintError, MAX_POOL_BYTES, RUNTIME_ANON_BYTES, SLOT_ALIGN, SlotError,
+    SlotGuard, SlotPool, resident_ceiling,
+};
 pub use stream::{ExpertStream, StreamMode, StreamPhase, StreamStats};
 pub use sweep::{
     DEFAULT_EXPERTS_PER_WINDOW, DEFAULT_WINDOWS_IN_FLIGHT, LayerSweep, MAX_WINDOWS_IN_FLIGHT,

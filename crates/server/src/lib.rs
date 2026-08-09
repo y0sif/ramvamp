@@ -68,7 +68,10 @@ pub use engine::{
     common_prefix, hush_stream_aborts,
 };
 pub use error::{ErrorDetail, ErrorResponse, RETRY_HEADERS, ServerError};
-pub use http::{ServeConfig, ServeError, serve, serve_with};
+pub use http::{
+    BODY_BYTES_PER_CONTEXT_TOKEN, MIN_BODY_BYTES, ServeConfig, ServeError,
+    max_body_bytes_for_context, serve, serve_with,
+};
 pub use prompt::{Prompt, check_context};
 pub use request::{
     ChatCompletionRequest, Content, ContentPart, Message, MessageRole, StreamOptions,

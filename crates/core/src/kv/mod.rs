@@ -167,6 +167,32 @@ impl KvCache {
         head_dim: usize,
         capacity: usize,
     ) -> Result<Self, KvError> {
+        let (kv_dim, plane, total) = Self::geometry(n_layers, n_kv_heads, head_dim, capacity)?;
+        Ok(Self {
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            capacity,
+            kv_dim,
+            plane,
+            k: vec![0; total],
+            v: vec![0; total],
+            lens: vec![0; n_layers],
+        })
+    }
+
+    /// Row width, per-layer plane size, and whole-cache element count for a
+    /// geometry, in `usize` elements, with every product checked.
+    ///
+    /// The single place these three products are computed. [`KvCache::new`]
+    /// allocates from it and [`KvCache::projected_bytes`] predicts from it, so
+    /// a prediction cannot drift from the allocation it is predicting.
+    fn geometry(
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+    ) -> Result<(usize, usize, usize), KvError> {
         let invalid = |reason| KvError::InvalidDims {
             n_layers,
             n_kv_heads,
@@ -186,17 +212,51 @@ impl KvCache {
         let total = n_layers
             .checked_mul(plane)
             .ok_or_else(|| invalid("total size overflows usize"))?;
-        Ok(Self {
+        Ok((kv_dim, plane, total))
+    }
+
+    /// Bytes [`KvCache::new`] would allocate for this geometry, without
+    /// allocating them.
+    ///
+    /// `capacity * n_layers * n_kv_heads * head_dim * 2 * size_of::<u16>()` —
+    /// the trailing `2` is the K plane and the V plane, which are two separate
+    /// `Vec`s of the same length. For the v0 pin (48 layers, 4 kv heads,
+    /// head_dim 128) that is 96 KiB per position.
+    ///
+    /// This exists because the allocation itself cannot be trusted to fail:
+    /// `vec![0; total]` is `alloc_zeroed`, so under Linux overcommit it
+    /// succeeds instantly at any size and the pages are faulted later, during
+    /// prefill, where running out of them is an OOM kill rather than an error.
+    /// Anything that needs to *refuse* an oversized cache has to ask before
+    /// constructing one.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::InvalidDims`] on a zero dimension or on a product that
+    /// overflows `usize` — the same rejections, from the same arithmetic,
+    /// that [`KvCache::new`] would make.
+    pub fn projected_bytes(
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+    ) -> Result<u64, KvError> {
+        let (_, _, total) = Self::geometry(n_layers, n_kv_heads, head_dim, capacity)?;
+        let invalid = |reason| KvError::InvalidDims {
             n_layers,
             n_kv_heads,
             head_dim,
             capacity,
-            kv_dim,
-            plane,
-            k: vec![0; total],
-            v: vec![0; total],
-            lens: vec![0; n_layers],
-        })
+            reason,
+        };
+        // Two planes of `u16`. Checked for the same reason the products above
+        // are: a caller probing an absurd context must get this error rather
+        // than a wrapped number that looks affordable.
+        let bytes = total
+            .checked_mul(2)
+            .and_then(|elems| elems.checked_mul(size_of::<u16>()))
+            .ok_or_else(|| invalid("total size in bytes overflows usize"))?;
+        u64::try_from(bytes).map_err(|_| invalid("total size in bytes overflows u64"))
     }
 
     /// Number of layers.
@@ -464,6 +524,68 @@ mod tests {
         }
         assert!(matches!(
             KvCache::new(usize::MAX, usize::MAX, 2, 2).unwrap_err(),
+            KvError::InvalidDims { .. }
+        ));
+    }
+
+    /// The prediction and the allocation must be the same number, or the
+    /// check that runs before `new` is checking something else.
+    ///
+    /// Measured against the planes themselves rather than against a repeat of
+    /// the formula: the point is that `projected_bytes` describes the `Vec`s
+    /// `new` actually builds.
+    #[test]
+    fn projected_bytes_is_what_new_actually_allocates() {
+        for (l, h, d, c) in [(1, 1, 1, 1), (2, 2, 64, 8), (48, 4, 128, 3), (7, 3, 16, 40)] {
+            let cache = KvCache::new(l, h, d, c).unwrap();
+            let allocated = (cache.k.len() + cache.v.len()) * size_of::<u16>();
+            assert_eq!(
+                KvCache::projected_bytes(l, h, d, c).unwrap(),
+                allocated as u64,
+                "geometry {l}x{h}x{d} at capacity {c}"
+            );
+        }
+    }
+
+    /// The v0 pin the memory contract quotes: 48 layers, 4 kv heads, head_dim
+    /// 128 is 96 KiB a token, so the 4,096-token cap is 384 MiB.
+    #[test]
+    fn projected_bytes_is_ninety_six_kibibytes_a_token_at_the_v0_geometry() {
+        for cap in [1usize, 512, 4096, 16_384] {
+            assert_eq!(
+                KvCache::projected_bytes(48, 4, 128, cap).unwrap(),
+                cap as u64 * 96 * 1024
+            );
+        }
+        assert_eq!(
+            KvCache::projected_bytes(48, 4, 128, 4096).unwrap(),
+            384 << 20
+        );
+    }
+
+    /// Every rejection `new` makes, `projected_bytes` makes too — including
+    /// the byte-count multiply that `new` does not have to do, because a
+    /// caller probing an absurd context must get an error rather than a
+    /// wrapped product that looks affordable.
+    #[test]
+    fn projected_bytes_rejects_exactly_what_new_rejects() {
+        for (l, h, d, c) in [
+            (0, 4, 128, 8),
+            (48, 0, 128, 8),
+            (48, 4, 0, 8),
+            (48, 4, 128, 0),
+            (usize::MAX, usize::MAX, 2, 2),
+            (48, 4, 128, usize::MAX),
+        ] {
+            assert!(
+                KvCache::projected_bytes(l, h, d, c).is_err(),
+                "geometry {l}x{h}x{d} at capacity {c} must not project a number"
+            );
+        }
+        // Sized, but past what `usize` can hold once the two planes and the
+        // 2-byte element are counted: `new` would wrap where this reports.
+        assert!(matches!(
+            KvCache::projected_bytes(1, 1, 1, usize::MAX / 2).unwrap_err(),
             KvError::InvalidDims { .. }
         ));
     }

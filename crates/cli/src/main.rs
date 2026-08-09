@@ -16,7 +16,9 @@
 //! [`RuntimeArgs`] — the expert-cache byte budget, the compute thread
 //! count, and the integrity policy — and the prefill dials in
 //! [`PrefillArgs`], which choose between the chunked layer-major sweep and
-//! the token-major path it replaced.
+//! the token-major path it replaced. Those three and `serve` — every command
+//! that builds a [`ForwardState`] — also take [`ContextArgs`], which sizes
+//! the KV cache and everything accounted against it.
 //!
 //! # Trusted and untrusted prompts
 //!
@@ -39,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand};
+use ramvamp_core::format::load_manifest;
 use ramvamp_core::generate::{
     GenerateParams, GenerateStats, StopReason, TracePhase, generate, generate_from, generate_traced,
 };
@@ -53,7 +56,7 @@ mod repl;
 mod tui;
 
 use repl::{
-    CONTEXT_CAP, PhaseStats, ReplInput, Transcript, TurnCodec, TurnPlan, parse_repl_input,
+    DEFAULT_CONTEXT, PhaseStats, ReplInput, Transcript, TurnCodec, TurnPlan, parse_repl_input,
     plan_turn, print_repl_help, turn_seed,
 };
 
@@ -165,6 +168,113 @@ impl RuntimeArgs {
             pin: true,
         }
     }
+}
+
+/// The context dial, shared by every command that builds a [`ForwardState`].
+///
+/// One `Option`, for the same reason both of [`PrefillArgs`]' are: unset means
+/// "whatever else has a say", and the thing with a say here is
+/// `RAMVAMP_CONTEXT`. A clap `default_value = "4096"` would be
+/// indistinguishable from the user typing `--context 4096` and would silently
+/// beat the variable on every run.
+#[derive(Args, Debug, Clone, Copy)]
+struct ContextArgs {
+    /// Context window in tokens. The KV cache is sized at this, and a prompt
+    /// plus the tokens reserved for its reply must fit inside it. Costs
+    /// resident memory in proportion, so it is the dial that trades
+    /// conversation length against the byte budget. Refused above what the
+    /// model was trained for (the manifest's `arch.context_length`), since
+    /// positions past that generate garbage rather than failing. Unset: 4096,
+    /// or `RAMVAMP_CONTEXT` when it is set.
+    #[arg(
+        long,
+        value_name = "TOKENS",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+    )]
+    context: Option<usize>,
+}
+
+impl ContextArgs {
+    /// The window this run asks for, before the model has a say: `--context`,
+    /// else `RAMVAMP_CONTEXT`, else [`DEFAULT_CONTEXT`].
+    fn configured(self) -> usize {
+        self.against(context_from_env())
+    }
+
+    /// [`configured`](Self::configured) with the environment's answer handed
+    /// in, so the precedence rule is a pure function rather than a claim about
+    /// a process-global variable that another test may be setting.
+    fn against(self, from_env: Option<usize>) -> usize {
+        self.context.or(from_env).unwrap_or(DEFAULT_CONTEXT)
+    }
+
+    /// [`configured`](Self::configured), refused when the checkpoint in
+    /// `model_dir` was never trained that far.
+    ///
+    /// The manifest is read here rather than taken off the loaded [`Model`]
+    /// because a mistyped `--context` should cost a JSON parse, not the tens
+    /// of seconds (minutes, with hashes) it takes to load 30B of weights. The
+    /// file has to exist and parse for the install to be usable at all, so
+    /// this adds no failure the load would not have hit anyway.
+    fn resolve(self, model_dir: &Path) -> anyhow::Result<usize> {
+        let context = self.configured();
+        let manifest = load_manifest(model_dir)
+            .with_context(|| format!("reading the manifest of {}", model_dir.display()))?;
+        check_trained_context(context, manifest.arch.context_length)?;
+        Ok(context)
+    }
+}
+
+/// `RAMVAMP_CONTEXT`, when it is set to a usable window.
+fn context_from_env() -> Option<usize> {
+    parse_context_var(std::env::var("RAMVAMP_CONTEXT").ok())
+}
+
+/// The parsing half of [`context_from_env`], and the whole of the precedence
+/// rule that is worth testing: `None` in, `None` out.
+///
+/// An unusable value is ignored rather than fatal, matching what
+/// `ForwardState` already does with `RAMVAMP_PREFILL_CHUNK`: an environment a
+/// shell profile set years ago must not be able to stop the binary from
+/// starting. It is not ignored *silently* — a variable that was meant to
+/// widen the window and did nothing is exactly the failure a user would
+/// otherwise attribute to the model.
+fn parse_context_var(raw: Option<String>) -> Option<usize> {
+    let raw = raw?;
+    match raw.trim().parse::<usize>() {
+        Ok(tokens) if tokens > 0 => Some(tokens),
+        _ => {
+            // stderr, with the rest of this binary's chrome. Unreachable on
+            // the default path, where the variable is not set at all.
+            eprintln!(
+                "warning: ignoring unusable RAMVAMP_CONTEXT={raw:?}; using --context or 4096"
+            );
+            None
+        }
+    }
+}
+
+/// Refuse a context window past the one the checkpoint was trained on.
+///
+/// `arch.context_length` is the trained window. Nothing downstream enforces
+/// it — the KV cache, the RoPE tables and the attention kernels will all
+/// happily run past it — so a `--context` above it does not fail, it produces
+/// fluent nonsense from the first position the model never saw in training.
+/// That is the failure mode worth a flat refusal.
+///
+/// `trained == 0` is left alone: the manifest validator rejects it and
+/// `Model::load` is about to say so far more precisely than a context check
+/// could.
+fn check_trained_context(context: usize, trained: u64) -> anyhow::Result<()> {
+    if trained > 0 && context as u64 > trained {
+        bail!(
+            "--context {context} exceeds the {trained} tokens this model was trained for; \
+             positions past {trained} were never trained, so the reply would be nonsense \
+             rather than an error. Ask for {trained} or fewer (RAMVAMP_CONTEXT sets the \
+             same dial)."
+        );
+    }
+    Ok(())
 }
 
 /// The prefill dials, shared by every command that consumes a prompt.
@@ -405,6 +515,9 @@ struct GenerateArgs {
     trace_experts: Option<PathBuf>,
 
     #[command(flatten)]
+    context: ContextArgs,
+
+    #[command(flatten)]
     prefill: PrefillArgs,
 
     #[command(flatten)]
@@ -466,6 +579,9 @@ struct ChatArgs {
     /// as it always has.
     #[arg(long)]
     tui: bool,
+
+    #[command(flatten)]
+    context: ContextArgs,
 
     #[command(flatten)]
     prefill: PrefillArgs,
@@ -537,6 +653,9 @@ struct ServeArgs {
     keepalive_secs: u64,
 
     #[command(flatten)]
+    context: ContextArgs,
+
+    #[command(flatten)]
     prefill: PrefillArgs,
 
     #[command(flatten)]
@@ -561,6 +680,9 @@ struct LogitsArgs {
     /// (all prefill) to a binary trace file.
     #[arg(long, value_name = "FILE")]
     trace_experts: Option<PathBuf>,
+
+    #[command(flatten)]
+    context: ContextArgs,
 
     #[command(flatten)]
     prefill: PrefillArgs,
@@ -1057,13 +1179,14 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
     let max_new = args.max_new;
     let trace_experts = args.trace_experts.as_deref();
     let tokenizer = load_tokenizer(model_dir)?;
+    let context = args.context.resolve(model_dir)?;
     let (_, prompt_ids) = encode_input(&tokenizer, args.prompt, args.messages_file)?;
     if prompt_ids.is_empty() {
         bail!("prompt encodes to zero tokens");
     }
-    if prompt_ids.len() + max_new > CONTEXT_CAP {
+    if prompt_ids.len() + max_new > context {
         bail!(
-            "prompt ({}) + max-new ({max_new}) exceeds the v0 context cap of {CONTEXT_CAP}",
+            "prompt ({}) + max-new ({max_new}) exceeds the context cap of {context}",
             prompt_ids.len()
         );
     }
@@ -1071,7 +1194,7 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
     let load_start = Instant::now();
     let model = Model::load(model_dir, args.runtime.load_options())
         .with_context(|| format!("loading model from {}", model_dir.display()))?;
-    let mut state = ForwardState::with_config(&model, CONTEXT_CAP, args.runtime.runtime_config())?;
+    let mut state = ForwardState::with_config(&model, context, args.runtime.runtime_config())?;
     args.prefill.apply(&mut state)?;
     eprintln!(
         "model loaded in {:.2}s ({} prompt tokens); {} compute shards, {} expert \
@@ -1787,6 +1910,7 @@ fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
 
     let model_dir = args.model.as_path();
     let tokenizer = load_tokenizer(model_dir)?;
+    let context = args.context.resolve(model_dir)?;
     let sanitizer = tokenizer.content_sanitizer();
 
     let mut seed: Vec<ChatMessage> = Vec::new();
@@ -1813,10 +1937,10 @@ fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
         .with_context(|| format!("loading model from {}", model_dir.display()))?;
     // Built once for the whole session: every turn continues this cache
     // rather than rebuilding the slot pool, the ring and the compute pool.
-    let mut state = ForwardState::with_config(&model, CONTEXT_CAP, args.runtime.runtime_config())?;
+    let mut state = ForwardState::with_config(&model, context, args.runtime.runtime_config())?;
     args.prefill.apply(&mut state)?;
     eprintln!(
-        "model loaded in {:.2}s; context cap {CONTEXT_CAP}, --max-new {} reserved per turn; \
+        "model loaded in {:.2}s; context cap {context}, --max-new {} reserved per turn; \
          {} compute shards, {} expert slots/layer from a {} budget, {} reads",
         load_start.elapsed().as_secs_f64(),
         args.max_new,
@@ -1911,6 +2035,7 @@ fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
             history.len(),
             &message,
             params.max_new,
+            context,
         )?;
         let (new_ids, used, room) = match plan {
             TurnPlan::Ready {
@@ -1941,7 +2066,7 @@ fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
         if interrupted {
             eprintln!("interrupted after {} bytes; kept as the reply", reply.len());
         }
-        eprintln!("context: {used} used, {room} free of {CONTEXT_CAP}");
+        eprintln!("context: {used} used, {room} free of {context}");
     }
 
     if turn > 0 {
@@ -1980,15 +2105,16 @@ fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     });
 
     let tokenizer = load_tokenizer(model_dir)?;
+    let context = args.context.resolve(model_dir)?;
     let load_start = Instant::now();
     let model = Model::load(model_dir, args.runtime.load_options())
         .with_context(|| format!("loading model from {}", model_dir.display()))?;
     // Built once for the process: every request continues this cache, rewound
     // to whatever prefix it shares with the one before it.
-    let mut state = ForwardState::with_config(&model, CONTEXT_CAP, args.runtime.runtime_config())?;
+    let mut state = ForwardState::with_config(&model, context, args.runtime.runtime_config())?;
     args.prefill.apply(&mut state)?;
     eprintln!(
-        "model loaded in {:.2}s; context cap {CONTEXT_CAP}, --max-new {} reserved per request; \
+        "model loaded in {:.2}s; context cap {context}, --max-new {} reserved per request; \
          {} compute shards, {} expert slots/layer from a {} budget, {} reads",
         load_start.elapsed().as_secs_f64(),
         args.max_new,
@@ -2021,7 +2147,7 @@ fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         tokenizer,
         ramvamp_server::EngineConfig {
             model_id: served_model_name.clone(),
-            context_limit: CONTEXT_CAP,
+            context_limit: context,
             default_max_new: args.max_new,
             params,
         },
@@ -2029,7 +2155,10 @@ fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let config = ramvamp_server::ServeConfig {
         port: args.port,
         keepalive: Duration::from_secs(args.keepalive_secs.max(1)),
-        ..ramvamp_server::ServeConfig::default()
+        // The body a client may send scales with the window it may fill; see
+        // `max_body_bytes_for_context`. At the default 4K this is the 1 MiB
+        // the server has always allowed.
+        max_body_bytes: ramvamp_server::max_body_bytes_for_context(context),
     };
     eprintln!(
         "serving {served_model_name} on http://127.0.0.1:{}{}  (Ctrl-C to stop)",
@@ -2046,20 +2175,21 @@ fn run_logits(args: LogitsArgs) -> anyhow::Result<()> {
     let prompt = args.prompt.as_str();
     let trace_experts = args.trace_experts.as_deref();
     let tokenizer = load_tokenizer(model_dir)?;
+    let context = args.context.resolve(model_dir)?;
     let ids = tokenizer.encode(prompt)?;
     if ids.is_empty() {
         bail!("prompt encodes to zero tokens");
     }
-    if ids.len() > CONTEXT_CAP {
+    if ids.len() > context {
         bail!(
-            "prompt ({}) exceeds the v0 context cap of {CONTEXT_CAP}",
+            "prompt ({}) exceeds the context cap of {context}",
             ids.len()
         );
     }
 
     let model = Model::load(model_dir, args.runtime.load_options())
         .with_context(|| format!("loading model from {}", model_dir.display()))?;
-    let mut state = ForwardState::with_config(&model, CONTEXT_CAP, args.runtime.runtime_config())?;
+    let mut state = ForwardState::with_config(&model, context, args.runtime.runtime_config())?;
     args.prefill.apply(&mut state)?;
 
     let arch = model.arch();

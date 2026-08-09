@@ -76,11 +76,52 @@ impl Default for ServeConfig {
         ServeConfig {
             port: 8080,
             keepalive: Duration::from_secs(10),
-            // Generous against a 4K context (whose whole prompt is on the
-            // order of 16 KB of text) and small against a 3 GB budget.
-            max_body_bytes: 1 << 20,
+            // Derived from the default 4K context, which is what it has always
+            // worked out to: 1 MiB. `ramvamp serve` overrides this from the
+            // window it actually resolved `--context` to.
+            max_body_bytes: max_body_bytes_for_context(DEFAULT_CONTEXT),
         }
     }
+}
+
+/// The context window [`ServeConfig::default`] sizes itself against.
+///
+/// The CLI owns the real default and passes the resolved window in; this is
+/// only what a library caller who sets nothing gets, and it is the same 4096.
+pub const DEFAULT_CONTEXT: usize = 4096;
+
+/// Request-body bytes allowed per token of context.
+///
+/// A prompt runs about 4 bytes of text per token, so 256 is sixty-four times
+/// the text a completely full window can hold — headroom for JSON escaping,
+/// for the `tools` array, and for the whitespace a pretty-printing client
+/// sends. It is also small against a 3 GB budget at any window that budget can
+/// host: a 32K context allows 8 MiB.
+pub const BODY_BYTES_PER_CONTEXT_TOKEN: usize = 256;
+
+/// Floor under [`max_body_bytes_for_context`].
+///
+/// The JSON envelope — role names, tool-call ids, the `model` string, the
+/// framing — does not shrink with the context, so a deliberately tiny window
+/// must not produce a cap that a well-formed request cannot fit inside.
+pub const MIN_BODY_BYTES: usize = 64 << 10;
+
+/// The request-body cap for a server configured with a `context`-token window.
+///
+/// This used to be a flat 1 MiB, justified by "a 4K context's whole prompt is
+/// on the order of 16 KB of text". That reasoning does not survive `--context`
+/// being a dial: an agent client that sends tool schemas against a 16K window
+/// writes a request that approaches the old constant, and would have been
+/// answered with a 413 for asking for exactly what the server was configured
+/// to allow. Deriving it means the cap moves with the window instead.
+///
+/// Saturating, and floored at [`MIN_BODY_BYTES`], so no window produces a cap
+/// that wraps or one too small to hold an envelope.
+#[must_use]
+pub fn max_body_bytes_for_context(context: usize) -> usize {
+    context
+        .saturating_mul(BODY_BYTES_PER_CONTEXT_TOKEN)
+        .max(MIN_BODY_BYTES)
 }
 
 /// Why the server could not run. Per-request failures are [`ServerError`]s and

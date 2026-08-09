@@ -1282,8 +1282,9 @@ impl ExpertStream {
             strides.push(layer.stride);
         }
 
+        let n_experts: Vec<u32> = layers.iter().map(|layer| layer.n_experts).collect();
         let slots_per_layer =
-            slots_for_budget(cache_bytes, &strides, &layers, manifest.arch.top_k)?;
+            slots_for_budget(cache_bytes, &strides, &n_experts, manifest.arch.top_k)?;
         let slots = SlotTable::new(slots_per_layer, &strides)?;
         let mut caches = Vec::with_capacity(layers.len());
         for layer in &layers {
@@ -3148,18 +3149,14 @@ fn completion_capacity(slots_per_layer: u32) -> usize {
     (2 * RING_ENTRIES as usize).max(2 * slots_per_layer as usize)
 }
 
-/// Slots per layer bought by a total byte budget.
+/// Bytes one slot per layer costs across the whole model.
 ///
-/// The pool charges each layer the page-aligned pitch of its own stride, so a
-/// slot costs the sum of those across all layers. Clamped to what a layer can
-/// use (its expert count) and to [`MAX_SLOTS`], and floored at `top_k`, which
-/// is the smallest number of slots any step of this model can be served from.
-fn slots_for_budget(
-    cache_bytes: u64,
-    strides: &[u64],
-    layers: &[LayerState],
-    top_k: u32,
-) -> Result<u32, IoError> {
+/// [`SlotPool`] charges each layer the page-aligned pitch of its own stride
+/// and carves `slots_per_layer` of them, so its whole slab is exactly this
+/// times the slot count. Both the sizing in [`slots_for_budget`] and the
+/// prediction in [`Footprint::project`](crate::io::Footprint::project) go
+/// through here rather than re-deriving the pitch rule.
+pub(super) fn bytes_per_slot(strides: &[u64]) -> Result<u128, IoError> {
     if strides.is_empty() {
         return Err(SlotError::NoLayers.into());
     }
@@ -3177,6 +3174,25 @@ fn slots_for_budget(
     if per_slot == 0 {
         return Err(SlotError::ZeroStride { layer: 0 }.into());
     }
+    Ok(per_slot)
+}
+
+/// Slots per layer bought by a total byte budget.
+///
+/// The pool charges each layer the page-aligned pitch of its own stride, so a
+/// slot costs the sum of those across all layers. Clamped to what a layer can
+/// use (its expert count) and to [`MAX_SLOTS`], and floored at `top_k`, which
+/// is the smallest number of slots any step of this model can be served from.
+///
+/// `n_experts` is one entry per layer, parallel to `strides`; an empty one is
+/// treated as "no clamp", the same as a layer count of zero would be.
+pub(super) fn slots_for_budget(
+    cache_bytes: u64,
+    strides: &[u64],
+    n_experts: &[u32],
+    top_k: u32,
+) -> Result<u32, IoError> {
+    let per_slot = bytes_per_slot(strides)?;
     let slots = u32::try_from(u128::from(cache_bytes) / per_slot).unwrap_or(u32::MAX);
     if slots == 0 {
         tracing::error!(
@@ -3187,9 +3203,9 @@ fn slots_for_budget(
         );
         return Err(SlotError::ZeroSlotsPerLayer.into());
     }
-    let usable = layers
+    let usable = n_experts
         .iter()
-        .map(|layer| layer.n_experts)
+        .copied()
         .min()
         .unwrap_or(MAX_SLOTS)
         .clamp(1, MAX_SLOTS);

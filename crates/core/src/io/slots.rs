@@ -108,12 +108,19 @@
 //! decode loop never allocates.
 
 use std::alloc::{Layout, alloc, dealloc};
+use std::fmt;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::slice;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use thiserror::Error;
+
+use crate::format::{COMMON_FILE, ExpertsLayout, FormatError, Manifest};
+use crate::kv::KvCache;
+
+use super::error::IoError;
+use super::stream::{bytes_per_slot, slots_for_budget};
 
 /// Required alignment of every slot base address, in bytes.
 ///
@@ -856,6 +863,18 @@ impl Drop for SlotGuard<'_> {
 /// with no error path at all — a geometry so large that the allocation
 /// succeeds under overcommit and the pre-fault pass then gets the process
 /// killed, which reports nothing to anyone.
+///
+/// **[`Footprint::project`] does not make this redundant, and deleting it
+/// would reopen a hole.** The two checks answer different questions at
+/// different times. This one is exact, runs at the last moment before the
+/// pages are touched, and guards *every* path into [`SlotPool::new`] —
+/// including callers that never went near a [`ForwardState`][fs], such as the
+/// repacker's tools and the tests. The footprint check is an estimate of the
+/// whole process, runs far earlier, and guards exactly one caller. A narrow,
+/// certain check late plus a broad, approximate check early is the intended
+/// arrangement; neither one covers the other's case.
+///
+/// [fs]: crate::model::ForwardState
 fn check_resident_budget(requested: u128, limit: Option<u64>) -> Result<(), SlotError> {
     let Some(limit) = limit else {
         return Ok(());
@@ -866,6 +885,226 @@ fn check_resident_budget(requested: u128, limit: Option<u64>) -> Result<(), Slot
         return Err(SlotError::ExceedsMemoryBudget { requested, limit });
     }
     Ok(())
+}
+
+/// One mebibyte.
+const MIB: u128 = 1 << 20;
+
+/// Anonymous runtime memory the process holds outside the three sized
+/// tenants: activations and scratch, the tokenizer, thread stacks, allocator
+/// arenas. **115.1 MiB, measured and provisional (EXP-012).**
+///
+/// Provisional in the experiment log's sense: EXP-012 sampled peak `anon`
+/// from inside the cgroup on a live decode run whose context length, token
+/// count and page-cache state were not recorded, so it fails rule 2 and
+/// `docs/architecture.md` carries it as a floor for this tenant rather than a
+/// ceiling. It is the one term of [`Footprint`] that is not arithmetic, and
+/// it is why the whole projection is an estimate rather than a bound.
+///
+/// Two known residuals, of opposite sign, neither of which is corrected for
+/// here — see [`Footprint::project`] for why:
+///
+/// - the fixed-tenant sum this constant belongs to **over**predicts the
+///   measured cgroup peak by about 27 MiB once the KV cache's lazy faulting
+///   is accounted for (EXP-023);
+/// - EXP-018 records a separate, unexplained 99-105 MiB residual in the other
+///   direction.
+///
+/// Exact arithmetic has since added 435 KiB to this tenant (387 KiB of
+/// per-shard attention scratch in phase 7, 48 KiB of fused expert scratch in
+/// phase 9), which is inside the noise of a figure that is provisional to
+/// the nearest tens of MiB and is deliberately not folded in.
+pub const RUNTIME_ANON_BYTES: u64 = (1151 * 1024 * 1024) / 10;
+
+/// Why a footprint could not be projected.
+///
+/// Both variants are failures to *compute* the estimate, not verdicts on it:
+/// the configuration was rejected by the same arithmetic that construction
+/// would have rejected it with, only earlier.
+#[derive(Debug, Error)]
+pub enum FootprintError {
+    /// The KV geometry is degenerate or overflows `usize`. Exactly what
+    /// [`KvCache::new`] would have said.
+    #[error(transparent)]
+    Kv(#[from] crate::kv::KvError),
+
+    /// The expert budget could not be divided into slots on this layout, or
+    /// the install's metadata is incomplete. Exactly what
+    /// [`ExpertStream::new`](super::ExpertStream::new) would have said.
+    #[error(transparent)]
+    Io(#[from] IoError),
+}
+
+/// Projected resident bytes of a whole runtime configuration, by tenant.
+///
+/// The breakdown, not just the sum, because the only reason to compute this
+/// is to tell an operator which dial to move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Footprint {
+    /// The mmap'd `common.bin`: embeddings, lm_head, attention, routers,
+    /// norms. Charged to the cgroup as `file`, and resident in practice
+    /// because every token touches it.
+    pub common: u64,
+    /// The expert slot slab, allocated and pre-faulted whole by
+    /// [`SlotPool::new`].
+    pub experts: u64,
+    /// The FP16 KV cache at [`Footprint::context_cap`] positions.
+    pub kv: u64,
+    /// [`RUNTIME_ANON_BYTES`]: everything else the process holds.
+    pub runtime: u64,
+    /// Positions the KV term was sized for. Carried so the message can name
+    /// the dial rather than only the byte count it produced.
+    pub context_cap: usize,
+}
+
+impl Footprint {
+    /// Project what a configuration will hold resident, before anything is
+    /// allocated.
+    ///
+    /// Three of the four terms are arithmetic on numbers the install already
+    /// declares, and each is computed by the code that will later do the
+    /// allocating rather than by a restatement of it: `common` is the
+    /// manifest's verified size for `common.bin` (checked byte-for-byte
+    /// against the file in
+    /// [`verify_named_file`](super::verify_named_file) before it is mapped),
+    /// `experts` is [`slots_for_budget`]'s slot count times
+    /// [`bytes_per_slot`], and `kv` is [`KvCache::projected_bytes`]. The
+    /// fourth, [`RUNTIME_ANON_BYTES`], is measured and provisional.
+    ///
+    /// **This is an estimate, and it is deliberately not corrected.** Two
+    /// residuals are on record, in opposite directions: the fixed-tenant sum
+    /// overpredicts the measured cgroup peak by roughly 27 MiB (EXP-023,
+    /// unattributed, though the KV cache's lazy faulting explains about 6.7
+    /// MiB of the 33.4 MiB total), while EXP-018 records an unexplained
+    /// 99-105 MiB residual the other way. A fudge factor tuned to either
+    /// would be a guess dressed as a measurement, and would make the next
+    /// person rediscover both. So the sum stays honest arithmetic on the
+    /// numbers above, and the caller should refuse only what it says is
+    /// impossible — never what it says is merely tight.
+    ///
+    /// Ordering note: the KV cache is `alloc_zeroed` at full capacity and
+    /// faulted lazily, so at run time it is charged to the cgroup as it is
+    /// written, not when it is allocated. That is precisely why this has to
+    /// be asked *before* [`KvCache::new`]: the allocation cannot report the
+    /// problem, and the pages that would are faulted in the middle of a
+    /// prefill.
+    ///
+    /// # Errors
+    ///
+    /// [`FootprintError::Kv`] when the KV geometry is degenerate or its byte
+    /// count overflows; [`FootprintError::Io`] when the manifest has no
+    /// `common.bin` entry, the layout has no layers or a zero stride, or the
+    /// expert budget buys fewer slots per layer than the model routes
+    /// experts per step.
+    pub fn project(
+        manifest: &Manifest,
+        layout: &ExpertsLayout,
+        cache_bytes: u64,
+        context_cap: usize,
+    ) -> Result<Self, FootprintError> {
+        // `Manifest::validate` already requires this entry, and
+        // `verify_named_file` has already proved it equal to the file on
+        // disk, so a `Model` can never take this branch. It is here because
+        // the signature takes a `Manifest` rather than a loaded model, and
+        // this crate does not `unwrap` on metadata.
+        let common = manifest
+            .files
+            .get(COMMON_FILE)
+            .ok_or_else(|| IoError::from(FormatError::MissingFileEntry(COMMON_FILE.to_owned())))?
+            .size;
+
+        let strides: Vec<u64> = layout.layers.iter().map(|layer| layer.stride).collect();
+        let n_experts: Vec<u32> = layout.layers.iter().map(|layer| layer.n_experts).collect();
+        let per_slot = bytes_per_slot(&strides)?;
+        let slots = slots_for_budget(cache_bytes, &strides, &n_experts, manifest.arch.top_k)?;
+        // `SlotPool::new` lays out `slots_per_layer` slots at each layer's
+        // page-aligned pitch, so its whole slab is this product — the same
+        // number `ExpertStream::cache_bytes` reports afterwards.
+        let experts =
+            u64::try_from(per_slot * u128::from(slots)).map_err(|_| IoError::TooLarge {
+                what: "expert slot pool bytes",
+                value: cache_bytes,
+            })?;
+
+        let arch = &manifest.arch;
+        let kv = KvCache::projected_bytes(
+            arch.n_layers as usize,
+            arch.n_kv_heads as usize,
+            arch.head_dim as usize,
+            context_cap,
+        )?;
+
+        Ok(Self {
+            common,
+            experts,
+            kv,
+            runtime: RUNTIME_ANON_BYTES,
+            context_cap,
+        })
+    }
+
+    /// Projected resident bytes across every tenant.
+    ///
+    /// In 128-bit so the sum of four `u64`s cannot be the thing that wraps.
+    pub fn total(&self) -> u128 {
+        u128::from(self.common)
+            + u128::from(self.experts)
+            + u128::from(self.kv)
+            + u128::from(self.runtime)
+    }
+
+    /// Whether this configuration is arithmetically possible under `limit`.
+    ///
+    /// Strictly `>` rather than `>=`: a sum that exactly meets the ceiling is
+    /// what the arithmetic says fits, and given the residuals documented on
+    /// [`RUNTIME_ANON_BYTES`] this check has no business being stricter than
+    /// its own inputs.
+    pub fn fits_within(&self, limit: u64) -> bool {
+        self.total() <= u128::from(limit)
+    }
+}
+
+impl fmt::Display for Footprint {
+    /// `about 4,113 MiB (common 1,023 + experts 1,439 + KV 1,536 at 16384
+    /// tokens + runtime 115)` — every term named, so the reader can see which
+    /// one is theirs to change.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "about {} MiB (common {} + experts {} + KV {} at {} tokens + runtime {})",
+            mib(self.total()),
+            mib(u128::from(self.common)),
+            mib(u128::from(self.experts)),
+            mib(u128::from(self.kv)),
+            self.context_cap,
+            mib(u128::from(self.runtime)),
+        )
+    }
+}
+
+/// `bytes` as whole mebibytes, rounded to nearest, grouped with `,` — the way
+/// `docs/architecture.md` writes every figure in the memory contract
+/// (`1,023.34 MiB`, `3,072 MiB`).
+pub(crate) fn mib(bytes: u128) -> String {
+    let whole = (bytes + MIB / 2) / MIB;
+    let digits = whole.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.char_indices() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// Bytes this process could hold resident at most, or `None` when the kernel
+/// will not say — the ceiling [`Footprint`] is judged against.
+///
+/// The public face of the same probe [`SlotPool::new`] uses for its own
+/// narrower check, so the two cannot disagree about what the limit is.
+pub fn resident_ceiling() -> Option<u64> {
+    resident_limit()
 }
 
 /// Bytes this process could hold resident at most, or `None` when the kernel
@@ -1629,6 +1868,344 @@ mod tests {
             Ok(())
         );
         assert!(23 * per_slot * 100 / u128::from(CGROUP_3G) >= 97);
+    }
+
+    // -----------------------------------------------------------------------
+    // The projected footprint
+    // -----------------------------------------------------------------------
+
+    /// The 3 GB benchmark cgroup every published number comes from.
+    const CGROUP_3G: u64 = 3 << 30;
+
+    /// `models/qwen3.rvmp/common.bin`, exactly — 1,023.34 MiB, the "Common
+    /// core" row of the memory contract in `docs/architecture.md`.
+    const V0_COMMON_BYTES: u64 = 1_073_051_648;
+
+    /// One slot across all 48 layers at the audited strides: `24 *
+    /// 3,059,712 + 24 * 2,654,208`, both already page multiples.
+    const V0_PER_SLOT: u64 = 24 * (REAL_STRIDES[0] + REAL_STRIDES[1]);
+
+    /// The audited Qwen3-30B-A3B install, in the only terms a footprint
+    /// reads: the verified `common.bin` size, the attention geometry, the
+    /// router width, and the two real per-layer blob strides.
+    ///
+    /// Declared rather than installed. The predictor's whole point is that it
+    /// runs on metadata before anything is opened, so a test of it can hand
+    /// it metadata; building a 16 GiB install to check arithmetic would test
+    /// the fixture builder instead.
+    fn v0_install() -> (Manifest, ExpertsLayout) {
+        use crate::format::{FileEntry, LayerLayout, QuantInfo, RVMP_VERSION, SourceInfo};
+        use std::collections::BTreeMap;
+
+        let mut arch = crate::io::testutil::fixture_arch();
+        arch.n_layers = 48;
+        arch.n_experts = 128;
+        arch.top_k = 8;
+        arch.n_heads = 32;
+        arch.n_kv_heads = 4;
+        arch.head_dim = 128;
+
+        let manifest = Manifest {
+            rvmp_version: RVMP_VERSION,
+            model_id: "qwen3-30b-a3b-instruct-2507".to_owned(),
+            source: SourceInfo {
+                hf_repo: "test/qwen3".to_owned(),
+                revision: "0".repeat(40),
+                file: "qwen3-Q4_K_M.gguf".to_owned(),
+                sha256: "0".repeat(64),
+            },
+            arch,
+            quant: QuantInfo {
+                scheme: "gguf".to_owned(),
+                tensor_types: BTreeMap::new(),
+            },
+            common_tensors: BTreeMap::new(),
+            files: BTreeMap::from([(
+                COMMON_FILE.to_owned(),
+                FileEntry {
+                    size: V0_COMMON_BYTES,
+                    sha256: "0".repeat(64),
+                },
+            )]),
+        };
+
+        let layout = ExpertsLayout {
+            layers: (0..48)
+                .map(|layer| LayerLayout {
+                    file: crate::format::layer_file_name(layer),
+                    // 24 Q6_K-down layers pack the wider blob; the other 24
+                    // are pure Q4_K.
+                    stride: REAL_STRIDES[usize::from(layer >= 24)],
+                    n_experts: 128,
+                    projections: Vec::new(),
+                })
+                .collect(),
+        };
+        (manifest, layout)
+    }
+
+    /// **The published claim.** 11 slots per layer at a 4,096-token context
+    /// under `memory.max=3G` is the configuration every number in
+    /// `docs/architecture.md` was measured at. A predictor that refuses it is
+    /// wrong about the runtime, not the other way around — so this pins every
+    /// tenant against the memory contract's table, byte for byte, and then
+    /// pins the verdict.
+    #[test]
+    fn the_shipped_default_fits_the_published_three_gigabyte_budget() {
+        let (manifest, layout) = v0_install();
+        let projected =
+            Footprint::project(&manifest, &layout, crate::model::DEFAULT_CACHE_BYTES, 4096)
+                .expect("the shipped dials project");
+
+        // Row by row against docs/architecture.md's memory contract.
+        assert_eq!(projected.common, V0_COMMON_BYTES, "common core row");
+        assert_eq!(V0_PER_SLOT, 137_134_080);
+        assert_eq!(projected.experts, 11 * V0_PER_SLOT, "expert slot pool row");
+        assert_eq!(projected.experts, 1_508_474_880);
+        assert_eq!(projected.kv, 384 << 20, "KV cache row at 4K");
+        assert_eq!(projected.runtime, RUNTIME_ANON_BYTES, "anonymous row");
+        assert_eq!(projected.context_cap, 4096);
+
+        // 2,961.03 MiB, the table's provisional subtotal.
+        assert_eq!(mib(projected.total()), "2,961");
+        assert!(
+            projected.fits_within(CGROUP_3G),
+            "the shipped default must be accepted: {projected}"
+        );
+
+        // And it clears the ceiling by the 111.0 MiB the table claims, not by
+        // a hair — if this moves, the prediction has drifted from the doc.
+        let spare = u128::from(CGROUP_3G) - projected.total();
+        assert_eq!(mib(spare), "111");
+    }
+
+    /// The KV term is the dial that is about to become configurable, so it is
+    /// pinned at the rate the memory contract quotes: 96 KiB a token on the
+    /// v0 geometry (48 layers x 4 kv heads x 128 head_dim x 2 planes x 2 B),
+    /// and linear in the cap.
+    #[test]
+    fn the_kv_term_is_ninety_six_kibibytes_a_token_on_the_v0_geometry() {
+        let (manifest, layout) = v0_install();
+        for cap in [1usize, 512, 4096, 16_384, 131_072] {
+            let projected =
+                Footprint::project(&manifest, &layout, crate::model::DEFAULT_CACHE_BYTES, cap)
+                    .expect("a sane cap projects");
+            assert_eq!(
+                projected.kv,
+                cap as u64 * 96 * 1024,
+                "kv term at a {cap}-token cap"
+            );
+            assert_eq!(projected.context_cap, cap);
+            // Only the KV term moves with the context.
+            assert_eq!(projected.common, V0_COMMON_BYTES);
+            assert_eq!(projected.experts, 11 * V0_PER_SLOT);
+            assert_eq!(projected.runtime, RUNTIME_ANON_BYTES);
+        }
+        // 4K is 384 MiB and 16K is 1,536 MiB, the two figures the docs quote.
+        assert_eq!(4096u64 * 96 * 1024, 384 << 20);
+        assert_eq!(16_384u64 * 96 * 1024, 1536 << 20);
+    }
+
+    /// The expert term is not a restatement of the pool's sizing rule; it is
+    /// the pool's sizing rule. Built small enough to allocate for real, so
+    /// the claim is checked against the slab rather than against a comment.
+    #[test]
+    fn the_expert_term_is_the_slab_the_pool_would_actually_allocate() {
+        use crate::format::{FileEntry, LayerLayout, QuantInfo, RVMP_VERSION, SourceInfo};
+        use std::collections::BTreeMap;
+
+        // A deliberately unaligned stride in the middle: the pool charges its
+        // page-aligned pitch, and a prediction that used the raw stride would
+        // come up short here and nowhere else.
+        let strides = [8192u64, 100, 4096];
+        let per_slot = 8192 + 4096 + 4096;
+
+        let mut arch = crate::io::testutil::fixture_arch();
+        arch.n_layers = 3;
+        arch.n_experts = 8;
+        arch.top_k = 2;
+        let manifest = Manifest {
+            rvmp_version: RVMP_VERSION,
+            model_id: "tiny".to_owned(),
+            source: SourceInfo {
+                hf_repo: "test/tiny".to_owned(),
+                revision: "0".repeat(40),
+                file: "tiny.gguf".to_owned(),
+                sha256: "0".repeat(64),
+            },
+            arch,
+            quant: QuantInfo {
+                scheme: "gguf".to_owned(),
+                tensor_types: BTreeMap::new(),
+            },
+            common_tensors: BTreeMap::new(),
+            files: BTreeMap::from([(
+                COMMON_FILE.to_owned(),
+                FileEntry {
+                    size: 4096,
+                    sha256: "0".repeat(64),
+                },
+            )]),
+        };
+        let layout = ExpertsLayout {
+            layers: strides
+                .iter()
+                .enumerate()
+                .map(|(layer, &stride)| LayerLayout {
+                    file: crate::format::layer_file_name(layer as u32),
+                    stride,
+                    n_experts: 8,
+                    projections: Vec::new(),
+                })
+                .collect(),
+        };
+
+        // A budget that buys 3 slots exactly, and one that buys 3 with change
+        // left over: the pool rounds down, so both must predict the same slab.
+        for budget in [3 * per_slot, 3 * per_slot + per_slot - 1] {
+            let projected = Footprint::project(&manifest, &layout, budget, 16).unwrap();
+            let pool = SlotPool::new(3, &strides).unwrap();
+            assert_eq!(
+                projected.experts,
+                pool.total_bytes() as u64,
+                "predicted slab for a {budget}-byte budget"
+            );
+            assert_eq!(projected.experts, 3 * per_slot);
+        }
+    }
+
+    /// A context cap the arithmetic cannot even represent must come back as
+    /// the typed error [`KvCache::new`] would have raised, never as a wrapped
+    /// product that looks affordable.
+    #[test]
+    fn a_context_cap_near_usize_max_is_an_error_not_an_overflow() {
+        let (manifest, layout) = v0_install();
+        // The v0 row is 512 elements wide, so anything past `usize::MAX / 512`
+        // overflows the plane; `usize::MAX` overflows it by the widest margin
+        // the type allows.
+        for cap in [usize::MAX, usize::MAX / 2, usize::MAX / 512 + 1] {
+            let err =
+                Footprint::project(&manifest, &layout, crate::model::DEFAULT_CACHE_BYTES, cap)
+                    .expect_err("a {cap}-token context cannot be sized");
+            assert!(
+                matches!(
+                    err,
+                    FootprintError::Kv(crate::kv::KvError::InvalidDims { .. })
+                ),
+                "cap {cap} gave {err}"
+            );
+        }
+        // And a zero cap is still the degenerate-geometry error, not a
+        // zero-byte cache that silently projects as affordable.
+        let err = Footprint::project(&manifest, &layout, crate::model::DEFAULT_CACHE_BYTES, 0)
+            .expect_err("a zero context cannot be sized");
+        assert!(
+            matches!(
+                err,
+                FootprintError::Kv(crate::kv::KvError::InvalidDims { .. })
+            ),
+            "{err}"
+        );
+    }
+
+    /// The verdict, at the boundary. Exactly meeting the ceiling is what the
+    /// arithmetic calls a fit; one byte past it is not. Nothing here is
+    /// allowed to be conservative on top of that — see `RUNTIME_ANON_BYTES`
+    /// for the two residuals a fudge factor would be guessing at.
+    #[test]
+    fn the_verdict_is_the_arithmetic_and_nothing_more() {
+        let footprint = Footprint {
+            common: 1000,
+            experts: 1000,
+            kv: 1000,
+            runtime: 1000,
+            context_cap: 8,
+        };
+        assert_eq!(footprint.total(), 4000);
+        assert!(footprint.fits_within(4001));
+        assert!(footprint.fits_within(4000), "an exact fit is a fit");
+        assert!(!footprint.fits_within(3999));
+
+        // The sum is 128-bit, so four maximal tenants report rather than wrap.
+        let huge = Footprint {
+            common: u64::MAX,
+            experts: u64::MAX,
+            kv: u64::MAX,
+            runtime: u64::MAX,
+            context_cap: usize::MAX,
+        };
+        assert_eq!(huge.total(), 4 * u128::from(u64::MAX));
+        assert!(!huge.fits_within(u64::MAX));
+    }
+
+    /// The breakdown reads the way the memory contract is written, because
+    /// its only job is telling an operator which dial is theirs to move.
+    #[test]
+    fn the_breakdown_names_every_tenant_in_the_contract_s_units() {
+        let (manifest, layout) = v0_install();
+        let projected = Footprint::project(
+            &manifest,
+            &layout,
+            crate::model::DEFAULT_CACHE_BYTES,
+            16_384,
+        )
+        .unwrap();
+        assert_eq!(
+            projected.to_string(),
+            "about 4,113 MiB (common 1,023 + experts 1,439 + KV 1,536 \
+             at 16384 tokens + runtime 115)"
+        );
+    }
+
+    #[test]
+    fn mib_rounds_to_nearest_and_groups_by_threes() {
+        assert_eq!(mib(0), "0");
+        assert_eq!(mib(MIB / 2 - 1), "0");
+        assert_eq!(mib(MIB / 2), "1", "rounds to nearest, not down");
+        assert_eq!(mib(MIB), "1");
+        assert_eq!(mib(u128::from(V0_COMMON_BYTES)), "1,023");
+        assert_eq!(mib(u128::from(11 * V0_PER_SLOT)), "1,439");
+        assert_eq!(mib(u128::from(RUNTIME_ANON_BYTES)), "115");
+        assert_eq!(mib(u128::from(CGROUP_3G)), "3,072");
+        assert_eq!(mib(1 << 40), "1,048,576");
+    }
+
+    /// The provisional row, pinned so a silent edit to a measured-and-caveated
+    /// constant cannot pass review as a rounding tidy-up.
+    #[test]
+    fn the_anonymous_runtime_row_is_exp_012_s_measurement() {
+        assert_eq!(RUNTIME_ANON_BYTES, 120_691_097);
+        assert_eq!(mib(u128::from(RUNTIME_ANON_BYTES)), "115");
+        // 115.1 MiB to the precision the figure is quoted at.
+        let hundredths = u128::from(RUNTIME_ANON_BYTES) * 100 / MIB;
+        assert_eq!(hundredths, 11_509);
+    }
+
+    /// A manifest without a `common.bin` entry is metadata this crate does
+    /// not trust, so it reports rather than indexes.
+    #[test]
+    fn a_manifest_missing_its_common_entry_reports_rather_than_panics() {
+        let (mut manifest, layout) = v0_install();
+        manifest.files.clear();
+        let err = Footprint::project(&manifest, &layout, crate::model::DEFAULT_CACHE_BYTES, 4096)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FootprintError::Io(IoError::Format(
+                    crate::format::FormatError::MissingFileEntry(ref name)
+                )) if name == COMMON_FILE
+            ),
+            "{err}"
+        );
+    }
+
+    /// [`resident_ceiling`] and the pool's own probe must be the same number,
+    /// or the broad check and the narrow one are judging against different
+    /// ceilings.
+    #[test]
+    fn the_public_ceiling_is_the_pool_s_own_probe() {
+        assert_eq!(resident_ceiling(), resident_limit());
     }
 
     #[test]

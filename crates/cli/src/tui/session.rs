@@ -66,8 +66,7 @@ use ramvamp_core::tokenizer::{ChatMessage, Role, RvmpTokenizer};
 
 use super::{Harness, Phase, Prefilling, Ribbon, Status, UiEvent};
 use crate::repl::{
-    CONTEXT_CAP, REPL_HELP, ReplInput, Transcript, TurnCodec, TurnPlan, parse_repl_input,
-    plan_turn, turn_seed,
+    REPL_HELP, ReplInput, Transcript, TurnCodec, TurnPlan, parse_repl_input, plan_turn, turn_seed,
 };
 use crate::{ChatAbort, ChatArgs, human_bytes, hush_control_flow_panics, load_tokenizer};
 
@@ -262,6 +261,12 @@ pub fn run_chat_tui(args: ChatArgs) -> anyhow::Result<()> {
     // terminal is restored, and only then is the backtrace printed.
     hush_control_flow_panics();
 
+    // Read before `args` is moved into the worker. This is the *configured*
+    // window, not the resolved one: the manifest refusal belongs to the worker,
+    // which owns the model directory, and it arrives here as an `Output::Failed`
+    // that ends the session anyway.
+    let context_cap = args.context.configured();
+
     let (commands, from_ui) = mpsc::channel::<Command>();
     let (to_ui, outputs) = mpsc::channel::<Output>();
     let interrupt = Arc::new(AtomicBool::new(false));
@@ -274,7 +279,7 @@ pub fn run_chat_tui(args: ChatArgs) -> anyhow::Result<()> {
             .context("spawning the chat worker")?
     };
 
-    let ended = drive(&mut harness, &commands, &outputs, &interrupt);
+    let ended = drive(&mut harness, &commands, &outputs, &interrupt, context_cap);
 
     // The terminal comes back before anything else is said, whichever way the
     // session ended — including a `drive` that failed mid-draw.
@@ -368,18 +373,29 @@ struct Screen {
     meter: Meter,
     /// What the model is called, once the worker has loaded one.
     model: Option<String>,
+    /// The context window this run resolved `--context` to, which is the
+    /// denominator of the panel's `ctx used/cap`.
+    ///
+    /// Resolved by the UI thread from the same [`ContextArgs`] the worker
+    /// reads, before `args` is moved across the channel — not sent back by the
+    /// worker, because the panel has to be able to draw a denominator during
+    /// the tens of seconds the model is still loading.
+    ///
+    /// [`ContextArgs`]: crate::ContextArgs
+    context_cap: usize,
     detail: Option<String>,
     /// A draw is worth doing.
     dirty: bool,
 }
 
 impl Screen {
-    fn loading() -> Self {
+    fn loading(context_cap: usize) -> Self {
         Self {
             snapshot: Snapshot::idle(0),
             phase_started: Instant::now(),
             meter: Meter::default(),
             model: None,
+            context_cap,
             detail: Some("loading the model...".to_owned()),
             dirty: true,
         }
@@ -430,7 +446,7 @@ impl Screen {
             chunk: self.snapshot.chunk,
             tokens: self.snapshot.tokens,
             elapsed: self.phase_started.elapsed(),
-            context: (self.snapshot.context, CONTEXT_CAP),
+            context: (self.snapshot.context, self.context_cap),
             hit_rate: self.snapshot.hit_rate,
             read_bytes: self.snapshot.read_bytes,
             rate: self.meter.rate(),
@@ -472,8 +488,9 @@ fn drive(
     commands: &Sender<Command>,
     outputs: &Receiver<Output>,
     interrupt: &AtomicBool,
+    context_cap: usize,
 ) -> anyhow::Result<Ended> {
-    let mut screen = Screen::loading();
+    let mut screen = Screen::loading(context_cap);
     let (palette, glyphs) = harness.marks();
     let mut ribbon = Ribbon::new(palette, glyphs);
     let mut failure: Option<String> = None;
@@ -685,6 +702,9 @@ fn worker_session(
 ) -> anyhow::Result<()> {
     let model_dir = args.model.as_path();
     let tokenizer = load_tokenizer(model_dir)?;
+    // The same dial the UI thread read, plus the manifest's veto. A refusal
+    // here reaches the user as `Output::Failed`.
+    let context = args.context.resolve(model_dir)?;
     let sanitizer = tokenizer.content_sanitizer();
 
     let mut seed: Vec<ChatMessage> = Vec::new();
@@ -718,7 +738,7 @@ fn worker_session(
         .with_context(|| format!("loading model from {}", model_dir.display()))?;
     // Built once for the whole session: every turn continues this cache rather
     // than rebuilding the slot pool, the ring and the compute pool.
-    let mut state = ForwardState::with_config(&model, CONTEXT_CAP, args.runtime.runtime_config())?;
+    let mut state = ForwardState::with_config(&model, context, args.runtime.runtime_config())?;
     args.prefill.apply(&mut state)?;
 
     let mut params = GenerateParams::from_defaults(tokenizer.sampling_defaults());
@@ -736,7 +756,7 @@ fn worker_session(
     let base_seed = args.seed.unwrap_or(params.seed);
 
     let banner = format!(
-        "model loaded in {:.2}s; context cap {CONTEXT_CAP}, --max-new {} reserved per turn; \
+        "model loaded in {:.2}s; context cap {context}, --max-new {} reserved per turn; \
          {} compute shards, {} expert slots/layer from a {} budget, {} reads",
         load_start.elapsed().as_secs_f64(),
         args.max_new,
@@ -842,6 +862,7 @@ fn worker_session(
                     history.len(),
                     &message,
                     params.max_new,
+                    context,
                 )?;
                 let new_ids = match plan {
                     TurnPlan::Ready { new_ids, .. } => new_ids,
@@ -1046,6 +1067,7 @@ fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repl::DEFAULT_CONTEXT;
 
     fn stats(hits: u64, misses: u64, pending: u64) -> StreamStats {
         StreamStats {
@@ -1199,13 +1221,27 @@ mod tests {
         }
     }
 
+    /// The panel's `ctx used/cap` denominator is the window this run was
+    /// configured with, not a compiled-in 4096 — and it is right from the
+    /// first frame, while the model is still loading, which is why the UI
+    /// thread resolves it instead of waiting for the worker to say.
+    #[test]
+    fn the_panel_counts_against_the_configured_window() {
+        let mut screen = Screen::loading(16_384);
+        assert_eq!(screen.status().context, (0, 16_384));
+        screen.observe(Snapshot::idle(9000));
+        assert_eq!(screen.status().context, (9000, 16_384));
+        // A window the default would have called overfull is merely half used.
+        assert!(screen.status().context.0 > DEFAULT_CONTEXT);
+    }
+
     /// The panel's clock belongs to the UI, and a phase change restarts it —
     /// otherwise decode's rate would be computed over prefill's minutes.
     #[test]
     fn the_phase_clock_restarts_when_the_phase_does() {
-        let mut screen = Screen::loading();
+        let mut screen = Screen::loading(DEFAULT_CONTEXT);
         assert_eq!(screen.status().phase, Phase::Idle);
-        assert_eq!(screen.status().context, (0, CONTEXT_CAP));
+        assert_eq!(screen.status().context, (0, DEFAULT_CONTEXT));
 
         let prefill_at = Instant::now();
         screen.observe_at(prefilling(512), prefill_at);
@@ -1223,7 +1259,7 @@ mod tests {
                 total: Some(3961)
             })
         );
-        assert_eq!(status.context, (1024, CONTEXT_CAP));
+        assert_eq!(status.context, (1024, DEFAULT_CONTEXT));
 
         // Decode restarts it, or its rate would be computed over prefill's
         // minutes.
@@ -1259,7 +1295,7 @@ mod tests {
         let steady = |step: usize| {
             start + Duration::from_secs(64) + Duration::from_secs_f64(step as f64 * 32.0 / 11.0)
         };
-        let mut screen = Screen::loading();
+        let mut screen = Screen::loading(DEFAULT_CONTEXT);
         screen.observe_at(prefilling(0), start);
         screen.observe_at(prefilling(128), start + Duration::from_secs(64));
         let slow = screen.status().rate.expect("two samples is a rate");
@@ -1348,7 +1384,7 @@ mod tests {
     /// turn it has already submitted is warming up.
     #[test]
     fn a_submitted_turn_is_not_idle_before_the_first_progress_event() {
-        let mut screen = Screen::loading();
+        let mut screen = Screen::loading(DEFAULT_CONTEXT);
         screen.observe(Snapshot {
             phase: Phase::Prefill,
             ..Snapshot::idle(0)
@@ -1360,6 +1396,6 @@ mod tests {
 
         screen.observe(Snapshot::idle(4096));
         assert_eq!(screen.status().phase, Phase::Idle);
-        assert_eq!(screen.status().context, (4096, CONTEXT_CAP));
+        assert_eq!(screen.status().context, (4096, DEFAULT_CONTEXT));
     }
 }

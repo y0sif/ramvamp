@@ -99,7 +99,8 @@ use std::time::{Duration, Instant};
 
 use crate::format::ArchInfo;
 use crate::io::{
-    ExpertStream, IoError, StreamMode, StreamPhase, StreamStats, SweepError, SweepPlan,
+    ExpertStream, Footprint, FootprintError, IoError, StreamMode, StreamPhase, StreamStats,
+    SweepError, SweepPlan, mib, resident_ceiling,
 };
 use crate::kernels::KernelError;
 use crate::kernels::attention::{
@@ -301,6 +302,33 @@ pub enum ForwardError {
     #[error(transparent)]
     Sweep(#[from] SweepError),
 
+    /// The requested dials add up to more memory than this process may hold
+    /// resident, so the run would be OOM-killed part-way through rather than
+    /// fail.
+    ///
+    /// Raised at the top of [`ForwardState::with_config`], before the KV
+    /// cache is allocated and before the expert slab is faulted, because
+    /// neither of those allocations can report the problem: the KV cache is
+    /// `alloc_zeroed` and faults lazily, and the slab faults under overcommit.
+    /// The message names every tenant and the ceiling because its only job is
+    /// telling the operator which dial to move.
+    ///
+    /// The verdict is an estimate — see [`Footprint::project`] for the two
+    /// residuals on record — so it refuses only configurations the arithmetic
+    /// says are impossible, never ones it says are merely tight.
+    #[error(
+        "this configuration needs {footprint} but only {} MiB are available; \
+         reduce --context or --cache-bytes",
+        mib(u128::from(*limit))
+    )]
+    ConfigTooLarge {
+        /// The projected per-tenant breakdown.
+        footprint: Footprint,
+        /// Tightest resident limit found: a cgroup v2 `memory.max` on this
+        /// process's path, else `MemTotal`.
+        limit: u64,
+    },
+
     /// The expert slot slab cannot host a prefill chunk beside the sweep
     /// ring, even narrowed to a single row with one window in flight.
     #[error(
@@ -371,6 +399,22 @@ pub enum ForwardError {
         /// Rows the chunk actually holds.
         rows: usize,
     },
+}
+
+impl From<FootprintError> for ForwardError {
+    /// Unwrap rather than nest.
+    ///
+    /// The footprint check is a *rehearsal* of two constructions that happen
+    /// a few lines later, so every way it can fail is a way one of them could
+    /// have failed. Surfacing those as the variants they already had keeps
+    /// the earlier check from changing which error a caller matches on — it
+    /// only changes when the error arrives, which is the entire point.
+    fn from(error: FootprintError) -> Self {
+        match error {
+            FootprintError::Kv(error) => Self::Kv(error),
+            FootprintError::Io(error) => Self::Io(error),
+        }
+    }
 }
 
 /// The architecture dimensions a [`ForwardState`]'s buffers were sized from.
@@ -623,6 +667,8 @@ impl ForwardState {
     /// [`ForwardError::UnsupportedDim`] when an architecture dimension is
     /// not a whole number of activation blocks;
     /// [`ForwardError::InvalidTopK`] on a nonsensical router config;
+    /// [`ForwardError::ConfigTooLarge`] when the dials project past this
+    /// process's resident-memory ceiling;
     /// [`ForwardError::Kv`] when the KV geometry is rejected;
     /// [`ForwardError::Io`] when the expert streamer cannot open the
     /// install or size its slot pool.
@@ -640,6 +686,52 @@ impl ForwardState {
         context_cap: usize,
         config: RuntimeConfig,
     ) -> Result<Self, ForwardError> {
+        // First, before any of the four tenants exists. Two of them cannot
+        // report their own failure: `KvCache::new` below is `alloc_zeroed` at
+        // full capacity, which succeeds instantly at any size and faults its
+        // pages during prefill, and the expert slab faults under overcommit.
+        // Left to themselves the pair produce an OOM kill mid-prefill with no
+        // typed error and no message, which is why the whole configuration is
+        // priced here rather than checked a tenant at a time.
+        //
+        // `SlotPool::new` still runs its own narrower check later; see
+        // `io::slots::check_resident_budget` for why both exist.
+        let footprint = Footprint::project(
+            model.manifest(),
+            model.layout(),
+            config.cache_bytes,
+            context_cap,
+        )?;
+        // Probed once: it reads `/proc/meminfo` and walks every cgroup
+        // ancestor, and the log line below wants the same answer the check
+        // used rather than a second one.
+        let ceiling = resident_ceiling();
+        if let Some(limit) = ceiling
+            && !footprint.fits_within(limit)
+        {
+            tracing::error!(
+                common = footprint.common,
+                experts = footprint.experts,
+                kv = footprint.kv,
+                runtime = footprint.runtime,
+                context_cap,
+                total = %footprint.total(),
+                limit,
+                "configuration does not fit this process's memory limit"
+            );
+            return Err(ForwardError::ConfigTooLarge { footprint, limit });
+        }
+        tracing::debug!(
+            common = footprint.common,
+            experts = footprint.experts,
+            kv = footprint.kv,
+            runtime = footprint.runtime,
+            context_cap,
+            total = %footprint.total(),
+            limit = ?ceiling,
+            "projected resident footprint"
+        );
+
         let arch = model.arch();
         let hidden = arch.hidden as usize;
         let q_dim = arch.n_heads as usize * arch.head_dim as usize;
@@ -4064,6 +4156,120 @@ mod tests {
         assert_eq!(config.cache_bytes, 1_509_949_440);
         assert_eq!(config.threads, None);
         assert!(config.pin);
+    }
+
+    // -----------------------------------------------------------------------
+    // The memory-footprint gate
+    // -----------------------------------------------------------------------
+
+    /// The message is the whole feature: it exists to tell an operator which
+    /// dial to move, so it has to name every tenant, the context it sized the
+    /// KV cache for, the total, and the ceiling.
+    ///
+    /// The numbers are the real ones: the audited `common.bin`, the shipped
+    /// 11-slot pool, a 16K context, EXP-012's anonymous row, and the 3 GB
+    /// benchmark cgroup — the exact configuration a user gets the moment
+    /// context becomes a dial and they reach for a bigger one.
+    #[test]
+    fn an_impossible_configuration_names_every_term_and_the_ceiling() {
+        let footprint = Footprint {
+            common: 1_073_051_648,
+            experts: 11 * 24 * (3_059_712 + 2_654_208),
+            kv: 16_384 * 96 * 1024,
+            runtime: crate::io::RUNTIME_ANON_BYTES,
+            context_cap: 16_384,
+        };
+        let err = ForwardError::ConfigTooLarge {
+            footprint,
+            limit: 3 << 30,
+        };
+        assert_eq!(
+            err.to_string(),
+            "this configuration needs about 4,113 MiB (common 1,023 + experts 1,439 + \
+             KV 1,536 at 16384 tokens + runtime 115) but only 3,072 MiB are available; \
+             reduce --context or --cache-bytes"
+        );
+    }
+
+    /// **The refusal has to land before anything is allocated.**
+    ///
+    /// `KvCache::new` is `vec![0; total]`, which is `alloc_zeroed`: under
+    /// Linux overcommit it succeeds instantly at any size and the pages are
+    /// faulted later, in the middle of prefill, where running out of them is
+    /// an OOM kill with no typed error and no message. So this asks for a
+    /// context whose KV cache alone is a petabyte on the fixture geometry. If
+    /// the check ran after the allocation, this test would not fail — the
+    /// test process would die.
+    ///
+    /// Skipped, not failed, on a host that will not report a memory limit:
+    /// with no ceiling there is nothing to be over, and the arithmetic is
+    /// covered without a probe in `io::slots`.
+    #[test]
+    fn an_enormous_context_is_refused_before_the_kv_cache_is_allocated() {
+        let (_fx, model) = load_fixture("fwd-footprint-refusal");
+        if resident_ceiling().is_none() {
+            return;
+        }
+        // 2 layers x 2 kv heads x 64 head_dim x 2 planes x 2 B = 1 KiB a
+        // token, so this is 2^50 B of KV cache.
+        let err = ForwardState::with_config(&model, 1 << 40, RuntimeConfig::testing())
+            .expect_err("a petabyte of KV cache cannot be accepted");
+        let ForwardError::ConfigTooLarge { footprint, limit } = err else {
+            panic!("expected ConfigTooLarge, got {err}");
+        };
+        assert_eq!(footprint.context_cap, 1 << 40);
+        assert_eq!(footprint.kv, 1 << 50);
+        assert!(footprint.total() > u128::from(limit));
+        // The message still names the dial that is at fault.
+        let rendered = ForwardError::ConfigTooLarge { footprint, limit }.to_string();
+        assert!(rendered.contains("at 1099511627776 tokens"), "{rendered}");
+        assert!(rendered.contains("reduce --context"), "{rendered}");
+    }
+
+    /// The tiny fixture at a sane context is nowhere near any real ceiling,
+    /// so the gate must be invisible to it. This is the regression that
+    /// catches a predictor whose units or sign are wrong: it would refuse
+    /// everything, starting here.
+    #[test]
+    fn the_gate_does_not_refuse_a_configuration_that_fits() {
+        let (_fx, model) = load_fixture("fwd-footprint-accepts");
+        for context_cap in [1usize, 8, 128, 4096] {
+            ForwardState::with_config(&model, context_cap, RuntimeConfig::testing())
+                .unwrap_or_else(|e| panic!("a {context_cap}-token context must be accepted: {e}"));
+        }
+    }
+
+    /// The footprint check rehearses two constructions that run a few lines
+    /// later, so its failures must arrive as the variants they already had.
+    /// A budget too small to seat one expert per routed slot is
+    /// `ForwardError::Io`, exactly as it was when `ExpertStream::new` was the
+    /// first thing to notice.
+    #[test]
+    fn a_rehearsed_failure_keeps_the_variant_it_always_had() {
+        let (_fx, model) = load_fixture("fwd-footprint-variant");
+        let err = ForwardState::with_config(
+            &model,
+            8,
+            RuntimeConfig {
+                cache_bytes: 1,
+                ..RuntimeConfig::testing()
+            },
+        )
+        .expect_err("a one-byte expert budget buys nothing");
+        assert!(
+            matches!(
+                err,
+                ForwardError::Io(IoError::Slots(crate::io::SlotError::ZeroSlotsPerLayer))
+            ),
+            "{err}"
+        );
+
+        let err = ForwardState::with_config(&model, 0, RuntimeConfig::testing())
+            .expect_err("a zero context is not a cache");
+        assert!(
+            matches!(err, ForwardError::Kv(KvError::InvalidDims { .. })),
+            "{err}"
+        );
     }
 
     /// The default budget must clear 11 slots/layer on the audited Qwen3
