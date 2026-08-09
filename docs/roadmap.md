@@ -67,9 +67,9 @@ remaining experiment in the project.
 | Decode throughput | **settled per drive**, 2026-08-08 |
 | **Gate 5: perplexity** | **OPEN**: reference banked in phase 4 (llama.cpp PPL 6.3810 +/- 0.16588, wiki.test.raw `-c 512 --chunks 40`); **the ramvamp side has never been run** |
 | **Shipping surface** | **SETTLED 2026-08-08: `ramvamp-server`.** The TUI ships as a development affordance only |
-| Tool calling | **done**, 2026-08-08. Renderer byte-identical to 20 transformers fixtures; calls extracted non-streaming. **Streaming tool calls are not done** |
+| Tool calling | **done**, 2026-08-09, streaming and buffered. Renderer byte-identical to 20 transformers fixtures; both paths share one parser and one id minter. Verified against OpenCode driving real tool calls |
 | Configurable context and profiles | **done**, 2026-08-09. `--context`, a JSON profile file, `--no-config`, and a `plan` subcommand that prices a configuration in 4 ms. An impossible one is refused before allocation instead of OOM-killed mid-prefill |
-| Server usable by an agent client | **OPEN**: OpenCode's baseline request measures 8,842 tokens. A profile can now ask for 16K, but not inside 3 GB, so it needs a larger budget on the box that runs it |
+| Server usable by an agent client | **done**, 2026-08-09. OpenCode drives the server with working tool calls on a 32K profile, projected 5,649 MiB. Not inside 3 GB: the agent profile needs a larger budget on the box that runs it, which is what profiles exist to express |
 
 Everything except gate 5 and a shipping surface is finished. v0 is not blocked
 on runtime work.
@@ -176,6 +176,16 @@ being re-derived.
 - Why workers are slower per row than the submitter. Six cores buy 1.43x
   post-fusion, 11.00 GB/s aggregate. Most interesting, most likely to eat a
   phase for nothing: timebox it.
+- **Prefill rate against prompt length.** Every estimate in this file uses
+  EXP-023's cold ctx-512 figure of 11.25 tok/s, and an uncontrolled
+  observation on 2026-08-09 put a ~32K OpenCode conversation at roughly 23
+  minutes, about **2x faster** than that basis predicts. Either the estimate's
+  basis is wrong for long prompts or prefix caching was doing more of the work
+  than assumed, and the two have very different consequences for what the
+  agent profile is worth recommending. Cheap to settle: the cold sweep already
+  walks five rungs, and this is one more column of what it already records.
+  Until it is settled, no prefill-time claim about a large context belongs in
+  a published number.
 - A second drive. Turns the published band into a curve and tests the project's
   central claim that the design scales with the device.
 
