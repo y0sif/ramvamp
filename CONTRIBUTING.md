@@ -265,6 +265,32 @@ The description says:
 Commits use imperative mood with a `feat:` / `fix:` / `chore:` / `docs:` /
 `perf:` prefix. Branch off `main`, named `feat/...`.
 
+## Releases
+
+For maintainers. Publishing to crates.io is done by hand, not by CI, because
+crates.io has no undo: a version can be yanked but never republished under the
+same number, so a half-finished automated run is unrecoverable.
+
+1. Bump `version` in the root `Cargo.toml`, run the gate, commit.
+2. Tag `vX.Y.Z` and push the tag. The release workflow refuses a tag whose
+   version does not match the workspace, then builds and attaches the Linux
+   x86_64 tarball.
+3. Publish in dependency order, waiting for the sparse index between each.
+   crates.io acknowledges a publish before the index serves it, so a
+   back-to-back run fails when the next crate cannot resolve the one just
+   uploaded.
+
+```bash
+cargo publish -p ramvamp-core
+# wait for the index, then
+cargo publish -p ramvamp-repack
+cargo publish -p ramvamp-server
+cargo publish -p ramvamp
+```
+
+`ramvamp-repack` is a leaf and nothing resolves it, so only `ramvamp-core` and
+`ramvamp-server` have to be in the index before the crate after them.
+
 ## Licensing
 
 Contributions are dual licensed MIT OR Apache-2.0, matching the project.

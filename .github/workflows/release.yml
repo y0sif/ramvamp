@@ -5,8 +5,12 @@ on:
     tags:
       - "v*"
 
+# This workflow builds and releases the tarball. It does not publish to
+# crates.io: that is done by hand with `cargo publish` after a release is cut,
+# because crates.io has no undo and a version can be yanked but never
+# republished under the same number. See CONTRIBUTING.md for the order.
+#
 # Scoped per job rather than workflow-wide: only `release` writes anything.
-# `build` and `publish` run with the default read-only token.
 permissions:
   contents: read
 
@@ -16,12 +20,11 @@ env:
 jobs:
   # Refuse a tag that does not match the version it claims to release.
   #
-  # Without this, tagging v0.1.1 without bumping Cargo.toml builds a tarball,
-  # cuts a GitHub Release for v0.1.1, and then silently no-ops every publish,
-  # because `cargo publish` on an already-uploaded 0.1.0 is treated as success.
-  # The whole run goes green having published nothing. That is exactly the
-  # half-finished-but-green outcome the approval gate below exists to prevent,
-  # so it is caught here, before anything is built.
+  # Without this, tagging v0.1.1 without bumping Cargo.toml cuts a GitHub
+  # Release labelled v0.1.1 containing binaries that report 0.1.0, and the run
+  # goes green. It also strands the manual `cargo publish` that follows, since
+  # the crate version would not match the tag anyone downloaded. Caught here,
+  # before anything is built.
   guard:
     name: Tag matches version
     runs-on: ubuntu-latest
@@ -111,114 +114,3 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
-
-  publish:
-    name: Publish to crates.io
-    needs: [guard, release]
-    runs-on: ubuntu-latest
-    # Runs after the GitHub release, so the tag is fully built and published
-    # before the one step that cannot be taken back. crates.io has no undo: a
-    # version can be yanked but never republished under the same number.
-    #
-    # The `guard` job is what protects that: it refuses a tag whose version
-    # does not match the workspace, which is the mistake that would otherwise
-    # produce a green run that published nothing.
-    #
-    # Needs only the `CARGO_REGISTRY_TOKEN` repository secret. If you would
-    # rather publish by hand, delete this job; the tarball release above stands
-    # on its own.
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      # Deliberately no `Swatinem/rust-cache` here. This is the one job holding
-      # CARGO_REGISTRY_TOKEN, and the cache is writable by any same-repo branch
-      # push, so restoring it into this job widens what a compromised branch can
-      # reach. A publish-only job has little to gain from it anyway.
-
-      # Publish order is forced by the dependency graph:
-      #
-      #   ramvamp-core
-      #     -> ramvamp-repack (leaf)
-      #     -> ramvamp-server
-      #          -> ramvamp
-      #
-      # `ramvamp` depends on core and server. `ramvamp-repack` is a leaf: it is
-      # published because it ships a binary, and nothing resolves it, so its
-      # index entry is not waited on.
-      #
-      # It has to be serialized, and each step has to wait for the sparse index
-      # to catch up. crates.io acknowledges a publish before the index serves
-      # it, so a back-to-back run fails when the next crate tries to resolve
-      # the one just uploaded and gets told it does not exist.
-      #
-      # `wait_for_index` polls the same sparse index cargo resolves against,
-      # which is the thing that lags. `publish` is idempotent enough to retry:
-      # a rerun after a successful upload gets "already uploaded", which is
-      # treated as success so a flaky network cannot strand the sequence.
-      - name: Publish crates in dependency order
-        run: |
-          set -euo pipefail
-
-          index_path() {
-            local name="$1"
-            case ${#name} in
-              1) printf '1/%s' "$name" ;;
-              2) printf '2/%s' "$name" ;;
-              3) printf '3/%s/%s' "${name:0:1}" "$name" ;;
-              *) printf '%s/%s/%s' "${name:0:2}" "${name:2:2}" "$name" ;;
-            esac
-          }
-
-          wait_for_index() {
-            local name="$1" version="$2"
-            local url="https://index.crates.io/$(index_path "$name")"
-            echo "waiting for $name $version to appear in the sparse index"
-            for attempt in $(seq 1 60); do
-              if curl -sSf "$url" 2>/dev/null \
-                | jq -e --arg v "$version" 'select(.vers == $v)' >/dev/null; then
-                echo "  $name $version is in the index (attempt $attempt)"
-                return 0
-              fi
-              sleep 10
-            done
-            echo "::error::$name $version never appeared in the sparse index"
-            return 1
-          }
-
-          publish() {
-            local name="$1"
-            for attempt in 1 2 3 4 5; do
-              echo "publishing $name (attempt $attempt)"
-              if output=$(cargo publish -p "$name" 2>&1); then
-                echo "$output"
-                return 0
-              fi
-              echo "$output"
-              if grep -qi 'already uploaded\|already exists' <<<"$output"; then
-                echo "  $name is already on crates.io, continuing"
-                return 0
-              fi
-              echo "  publish failed, retrying in 30s"
-              sleep 30
-            done
-            echo "::error::failed to publish $name"
-            return 1
-          }
-
-          version="${{ needs.guard.outputs.version }}"
-          echo "publishing workspace version $version"
-
-          publish ramvamp-core
-          wait_for_index ramvamp-core "$version"
-
-          # Leaf. Nothing resolves it, so no index wait.
-          publish ramvamp-repack
-
-          publish ramvamp-server
-          wait_for_index ramvamp-server "$version"
-
-          publish ramvamp
