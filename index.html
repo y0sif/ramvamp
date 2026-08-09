@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ramvamp - run 26-30B MoE models in about 3 GB of RAM, no GPU</title>
+  <meta name="description" content="CPU-first Rust runtime that streams Mixture-of-Experts weights from NVMe with io_uring and O_DIRECT. Qwen3-30B-A3B in about 3 GB of RAM on an ordinary Linux x86_64 machine.">
+  <meta name="keywords" content="llm, inference, mixture of experts, moe, nvme, io_uring, rust, cpu, quantization">
+  <meta name="author" content="y0sif">
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="ramvamp - run 26-30B MoE models in about 3 GB of RAM, no GPU">
+  <meta property="og:description" content="A Rust runtime that streams experts from NVMe instead of holding them hostage in memory. 30B parameters, about 3 GB of RAM, CPU only.">
+  <meta property="og:url" content="https://y0sif.github.io/ramvamp/">
+  <meta property="og:site_name" content="ramvamp">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="ramvamp - run 26-30B MoE models in about 3 GB of RAM, no GPU">
+  <meta name="twitter:description" content="Streams Mixture-of-Experts weights from NVMe with io_uring and O_DIRECT. CPU-first, Linux-first, open source.">
+
+  <!-- JSON-LD: SoftwareApplication -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "ramvamp",
+    "description": "CPU-first local LLM inference runtime for fine-grained Mixture-of-Experts models, written in Rust. Runs a 30B-parameter quantized model on an ordinary Linux x86_64 machine with an NVMe SSD, no GPU, by streaming routed experts from disk with io_uring and O_DIRECT instead of loading the full checkpoint into memory.",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "Linux",
+    "processorRequirements": "x86_64",
+    "storageRequirements": "17.35 GiB for the installed model, on an NVMe SSD",
+    "memoryRequirements": "About 3 GB",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "license": "https://opensource.org/licenses/MIT",
+    "url": "https://y0sif.github.io/ramvamp/",
+    "downloadUrl": "https://github.com/y0sif/ramvamp/releases",
+    "softwareVersion": "0.1.0",
+    "author": {
+      "@type": "Person",
+      "name": "y0sif",
+      "url": "https://github.com/y0sif"
+    },
+    "codeRepository": "https://github.com/y0sif/ramvamp",
+    "programmingLanguage": "Rust"
+  }
+  </script>
+
+  <!-- JSON-LD: FAQPage -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "How does a 30B model fit in 3 GB of RAM?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "It does not fit, and it is never asked to. In a fine-grained Mixture-of-Experts model most of the weights are routed experts, and only 8 of 128 per layer are needed for any given token. ramvamp keeps the always-needed common weights memory-mapped, about 1,023 MiB, and leaves the experts on disk in a page-aligned packed format, reading the ones the router asks for with io_uring and O_DIRECT through a small per-layer LFU cache. Measured peak resident memory is 2,497 to 2,929 MiB inside a 3,072 MiB ceiling."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "How fast is ramvamp?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "About 2 tokens per second of decode on the reference machine, which is an Intel Core Ultra 9 185H with a Micron 2400 DRAM-less QLC NVMe: 1.46 to 2.19 tok/s across context 64 to 3,961. Prefill is 11.25 tok/s at context 512. Decode is I/O-bound, so the number belongs to the drive as much as to the code, and no figure is published without naming its drive."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Do I need a GPU?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "No. ramvamp is CPU-first. The fast kernels are AVX2 plus FMA, with F16C for attention, detected at runtime, and there is a scalar fallback for CPUs without them."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Do I need an NVMe SSD?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "For the published numbers, yes. Decode reads up to about 1.1 GB of expert weights per token, so the drive is the throughput. ramvamp runs on SATA or a spinning disk and will be far slower than anything documented here."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "What do I have to download?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "The runtime is a 6 MB tarball. The model is separate and much larger: Qwen3-30B-A3B Q4_K_M is a 17.35 GiB download, streamed straight into the packed layout by ramvamp-repack install, so it needs 17.35 GiB free rather than twice that. The installer never starts that download for you."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Which platforms does ramvamp support?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Linux on x86_64, and only that, deliberately. io_uring is a Linux kernel interface and the expert streamer is built on it; the fast kernels are AVX2 plus F16C, which is x86_64. The installer refuses anything else rather than shipping a binary that would run only on fallback paths no published figure describes."
+        }
+      }
+    ]
+  }
+  </script>
+
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --accent-hover: #79c0ff;
+      --green: #3fb950;
+      --amber: #d29922;
+      --copy-bg: #1f2937;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--accent-hover); text-decoration: underline; }
+
+    code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+
+    .container {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* Hero */
+    .hero {
+      text-align: center;
+      padding: 80px 0 48px;
+    }
+
+    .hero pre {
+      font-size: 13px;
+      line-height: 1.3;
+      color: var(--accent);
+      margin: 0 auto 24px;
+      display: block;
+      width: fit-content;
+      max-width: 100%;
+      overflow-x: auto;
+      text-align: left;
+    }
+
+    .hero h1 {
+      font-size: 2.4rem;
+      font-weight: 700;
+      margin-bottom: 16px;
+    }
+
+    .hero p {
+      font-size: 1.2rem;
+      color: var(--text-muted);
+      max-width: 640px;
+      margin: 0 auto 32px;
+    }
+
+    .badges {
+      display: flex;
+      gap: 8px;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-bottom: 32px;
+    }
+
+    .badges img { height: 22px; }
+
+    /* Install box */
+    .install {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 32px;
+      margin-bottom: 64px;
+    }
+
+    .install h2 {
+      font-size: 1.1rem;
+      margin-bottom: 16px;
+      text-align: center;
+    }
+
+    .install h3 {
+      font-size: 0.95rem;
+      color: var(--text-muted);
+      font-weight: 600;
+      margin: 24px 0 10px;
+    }
+
+    .install-cmd {
+      display: flex;
+      align-items: center;
+      background: var(--copy-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 16px;
+      font-size: 0.95rem;
+      margin-bottom: 12px;
+    }
+
+    .install-cmd code {
+      flex: 1;
+      color: var(--green);
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+
+    .install-cmd button {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text-muted);
+      padding: 4px 10px;
+      cursor: pointer;
+      font-size: 0.8rem;
+      margin-left: 12px;
+      white-space: nowrap;
+      transition: all 0.15s;
+    }
+
+    .install-cmd button:hover {
+      color: var(--text);
+      border-color: var(--text-muted);
+    }
+
+    .note {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    .note strong { color: var(--amber); }
+
+    .install-methods {
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      margin-top: 20px;
+    }
+
+    .install-methods a { margin: 0 6px; }
+
+    /* Sections */
+    section { margin-bottom: 64px; }
+
+    section h2 {
+      font-size: 1.5rem;
+      margin-bottom: 24px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    section > p { margin-bottom: 20px; }
+
+    /* Features grid */
+    .features {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 20px;
+    }
+
+    .feature {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 24px;
+    }
+
+    .feature h3 {
+      font-size: 1.05rem;
+      margin-bottom: 8px;
+    }
+
+    .feature p {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    /* Tables */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+
+    th, td {
+      padding: 10px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+
+    th {
+      font-weight: 600;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    td.num { color: var(--green); font-weight: 600; }
+
+    .caption {
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      margin-top: 14px;
+    }
+
+    /* FAQ */
+    .faq-item { margin-bottom: 24px; }
+
+    .faq-item h3 {
+      font-size: 1rem;
+      margin-bottom: 6px;
+    }
+
+    .faq-item p {
+      color: var(--text-muted);
+      font-size: 0.95rem;
+    }
+
+    /* Footer */
+    footer {
+      text-align: center;
+      padding: 48px 0;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      border-top: 1px solid var(--border);
+    }
+
+    /* Responsive */
+    @media (max-width: 600px) {
+      .hero { padding: 48px 0 32px; }
+      .hero pre { font-size: 8px; }
+      .hero h1 { font-size: 1.8rem; }
+      .hero p { font-size: 1rem; }
+      .install { padding: 20px; }
+      .install-cmd { font-size: 0.8rem; }
+      table { font-size: 0.8rem; }
+      th, td { padding: 8px 10px; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Hero -->
+  <div class="hero">
+    <pre>
+ ||    _ __ __ _ _ __ _____   ____ _ _ __ ___  _ __     ||
+ ||   | '__/ _` | '_ ` _ \ \ / / _` | '_ ` _ \| '_ \    ||
+ ||:  | | | (_| | | | | | \ V / (_| | | | | | | |_) |  :||
+ ||   |_|  \__,_|_| |_| |_|\_/ \__,_|_| |_| |_| .__/    ||
+ ||                                           |_|       ||</pre>
+    <h1>Run 26-30B MoE models in about 3 GB of RAM</h1>
+    <p>A Rust runtime that streams Mixture-of-Experts weights from NVMe instead of holding them hostage in memory. CPU only, no GPU, on an ordinary Linux x86_64 machine.</p>
+    <div class="badges">
+      <a href="https://github.com/y0sif/ramvamp/actions/workflows/ci.yml"><img src="https://github.com/y0sif/ramvamp/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+      <a href="https://github.com/y0sif/ramvamp#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0"></a>
+      <a href="https://github.com/y0sif/ramvamp/releases/latest"><img src="https://img.shields.io/github/v/release/y0sif/ramvamp" alt="Latest release"></a>
+    </div>
+  </div>
+
+  <div class="container">
+
+    <!-- Install -->
+    <div class="install">
+      <h2>Install the runtime</h2>
+      <div class="install-cmd">
+        <code>curl -sSL https://y0sif.github.io/ramvamp/install.sh | bash</code>
+        <button onclick="copyCmd(this)">Copy</button>
+      </div>
+      <p class="note">
+        Linux x86_64 only. Puts <code>ramvamp</code> and <code>ramvamp-repack</code> in
+        <code>/usr/local/bin</code>. Re-run it later to upgrade. On any other platform it
+        refuses and installs nothing, because io_uring is a Linux interface and the fast
+        kernels are AVX2 plus F16C.
+      </p>
+
+      <h3>Then install a model</h3>
+      <div class="install-cmd">
+        <code>ramvamp-repack install --output ~/models/qwen3-30b-a3b.rvmp</code>
+        <button onclick="copyCmd(this)">Copy</button>
+      </div>
+      <p class="note">
+        This is a <strong>17.35 GiB download</strong>, so the installer will not start it for
+        you. It streams the source GGUF straight into the packed layout, so it needs 17.35 GiB
+        free and not twice that. Put the path on an NVMe SSD.
+      </p>
+
+      <h3>Then run it</h3>
+      <div class="install-cmd">
+        <code>ramvamp chat --model ~/models/qwen3-30b-a3b.rvmp --tui</code>
+        <button onclick="copyCmd(this)">Copy</button>
+      </div>
+      <p class="note">
+        Or <code>ramvamp serve</code> for an OpenAI-compatible endpoint on loopback, with
+        streaming SSE and tool calls.
+      </p>
+
+      <p class="install-methods">
+        Also available as a
+        <a href="https://github.com/y0sif/ramvamp/releases/latest">prebuilt tarball</a> /
+        <a href="https://github.com/y0sif/ramvamp/blob/main/docs/install.md">from source</a>
+      </p>
+    </div>
+
+    <!-- What it measures -->
+    <section>
+      <h2>Measured, not projected</h2>
+      <p class="note">
+        Qwen3-30B-A3B Q4_K_M, cold page cache, inside a <code>memory.max=3G</code> cgroup with
+        <code>memory.swap.max=0</code>, on the reference machine: Intel Core Ultra 9 185H, CPU
+        only, Micron 2400 DRAM-less QLC NVMe.
+      </p>
+      <div style="overflow-x: auto;">
+        <table>
+          <tbody>
+            <tr>
+              <td>Decode</td>
+              <td class="num">about 2 tok/s</td>
+              <td>1.46 to 2.19 across context 64 to 3,961, on this DRAM-less QLC drive</td>
+            </tr>
+            <tr>
+              <td>Prefill</td>
+              <td class="num">11.25 tok/s</td>
+              <td>at context 512</td>
+            </tr>
+            <tr>
+              <td>Peak RAM</td>
+              <td class="num">2,497 to 2,929 MiB</td>
+              <td>of a 3,072 MiB ceiling</td>
+            </tr>
+            <tr>
+              <td>Model on disk</td>
+              <td class="num">17.35 GiB</td>
+              <td>about a 6x memory saving over loading it</td>
+            </tr>
+            <tr>
+              <td>Fidelity</td>
+              <td class="num">1.04e-2 mean KL</td>
+              <td>full-vocab, against llama.cpp on identical weights, top-1 agreement 8/8</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="caption">
+        Two tokens per second is the honest headline, and it is I/O-bound: decode reads up to
+        about 1.1 GB of expert weights per token, so the number belongs to the drive as much as
+        to the code. No figure is published here without naming the drive it came from. Full
+        table and conditions:
+        <a href="https://github.com/y0sif/ramvamp/blob/main/docs/benchmarks.md">docs/benchmarks.md</a>.
+      </p>
+    </section>
+
+    <!-- How it works -->
+    <section>
+      <h2>How it works</h2>
+      <div class="features">
+        <div class="feature">
+          <h3>Experts live on disk</h3>
+          <p>In a fine-grained MoE model the routed experts are most of the weights, and a token needs 8 of the 128 in each layer. They stay in a page-aligned packed format on NVMe and are fetched only when the router asks.</p>
+        </div>
+        <div class="feature">
+          <h3>Explicit reads, never mmap</h3>
+          <p>Expert reads go through io_uring with O_DIRECT, batched per layer. That bypasses the page cache, so expert traffic costs the memory budget nothing. Demand paging is the alternative, and <a href="https://github.com/drumih/turbo-fieldfare">TurboFieldfare</a> measured mmap 3.54x slower per cold expert read.</p>
+        </div>
+        <div class="feature">
+          <h3>Common weights are mmap'd</h3>
+          <p>Embeddings, attention, routers, norms and the lm_head are about 1,023 MiB, touched on every token, and the page cache keeps them resident.</p>
+        </div>
+        <div class="feature">
+          <h3>A small LFU cache</h3>
+          <p>Eleven slots per layer out of 128 experts at the default budget, absorbing 53 to 59 percent of requests. Hits dispatch immediately and hide the latency of the misses behind compute.</p>
+        </div>
+        <div class="feature">
+          <h3>Install repacks, it does not convert</h3>
+          <p>The GGUF is streamed into the packed layout in one pass. Quantized bytes are copied unchanged, nothing is requantized, and no shard is ever materialized in heap memory.</p>
+        </div>
+        <div class="feature">
+          <h3>CPU-first kernels</h3>
+          <p>AVX2 and FMA, with F16C for attention, detected at runtime, on a pinned compute pool that respects CPU topology. There is a scalar fallback, and it is slower.</p>
+        </div>
+        <div class="feature">
+          <h3>An OpenAI-compatible server</h3>
+          <p><code>ramvamp serve</code> speaks <code>/v1/chat/completions</code> on loopback with streaming SSE, tool calls, and KV prefix reuse across requests. It rejects fields it cannot honour exactly rather than accepting them quietly.</p>
+        </div>
+        <div class="feature">
+          <h3>A context dial you can price</h3>
+          <p><code>ramvamp plan</code> costs a configuration before loading anything, and refuses an impossible one. Named profiles make a 32K setup a thing you can write down instead of rediscover.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Requirements -->
+    <section>
+      <h2>What it needs</h2>
+      <div style="overflow-x: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Component</th>
+              <th>Requirement</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>OS</td><td>Linux, x86_64. Nothing else, on purpose: io_uring and AVX2 are the design</td></tr>
+            <tr><td>Kernel</td><td>5.1 or newer for io_uring. Older kernels fall back to pread, which works and is slower</td></tr>
+            <tr><td>CPU</td><td>Any x86_64. AVX2, FMA and F16C are detected at runtime, with a scalar fallback</td></tr>
+            <tr><td>RAM</td><td>About 3 GB for the default 4,096-token context. Larger contexts cost more and <code>plan</code> will tell you how much</td></tr>
+            <tr><td>Disk</td><td>17.35 GiB free on an NVMe SSD. It runs on slower storage, well below these figures</td></tr>
+            <tr><td>GPU</td><td>None</td></tr>
+            <tr><td>Rust</td><td>1.88 or newer, and only if you build from source. The prebuilt binary needs no toolchain</td></tr>
+            <tr><td>Model</td><td>Qwen3-30B-A3B is the v0 model. The repacker accepts <code>qwen3moe</code> GGUFs and refuses anything else by name</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- FAQ -->
+    <section>
+      <h2>FAQ</h2>
+
+      <div class="faq-item">
+        <h3>How does a 30B model fit in 3 GB of RAM?</h3>
+        <p>It does not fit, and it is never asked to. Only 8 of 128 experts per layer are needed for a given token, so the common weights stay memory-mapped at about 1,023 MiB and the experts stay on disk, read on demand through a small per-layer cache. Measured peak resident memory is 2,497 to 2,929 MiB inside a 3,072 MiB ceiling.</p>
+      </div>
+
+      <div class="faq-item">
+        <h3>How fast is it, honestly?</h3>
+        <p>About 2 tokens per second of decode on the reference machine, 1.46 to 2.19 across context 64 to 3,961, on a Micron 2400 DRAM-less QLC NVMe. Prefill is 11.25 tok/s at context 512. That is the number, and a faster drive is the thing most likely to move it.</p>
+      </div>
+
+      <div class="faq-item">
+        <h3>Do I need a GPU?</h3>
+        <p>No. ramvamp is CPU-first and there is no GPU path. The kernels are AVX2 plus FMA, with F16C for attention, detected at runtime.</p>
+      </div>
+
+      <div class="faq-item">
+        <h3>Do I need an NVMe SSD?</h3>
+        <p>For these numbers, yes. Decode reads up to about 1.1 GB of expert weights per token, so the drive is the throughput. It will run on SATA or a spinning disk and be far slower than anything documented here.</p>
+      </div>
+
+      <div class="faq-item">
+        <h3>What do I actually have to download?</h3>
+        <p>The runtime is a 6 MB tarball. The model is separate and is a 17.35 GiB download, streamed straight into the packed layout so it needs 17.35 GiB free rather than twice that. The installer prints the command and stops; starting a 17 GiB fetch is your decision, not a script's.</p>
+      </div>
+
+      <div class="faq-item">
+        <h3>Why Linux x86_64 only?</h3>
+        <p>io_uring is a Linux kernel interface and the expert streamer is built on it. The fast kernels are AVX2 plus F16C, which is x86_64. Everywhere else the code compiles and runs on fallback paths that no published figure describes, so the installer refuses rather than implying otherwise. Cross-platform builds wait for an I/O path worth measuring there.</p>
+      </div>
+
+      <div class="faq-item">
+        <h3>Is it finished?</h3>
+        <p>No. This is v0, and it runs: coherent generation on CPU inside a 3 GB cgroup with a cold page cache, validated against llama.cpp on identical weights. The plan of record, including what is not done, is <a href="https://github.com/y0sif/ramvamp/blob/main/docs/roadmap.md">docs/roadmap.md</a>.</p>
+      </div>
+    </section>
+
+    <!-- Docs -->
+    <section>
+      <h2>Documentation</h2>
+      <div style="overflow-x: auto;">
+        <table>
+          <tbody>
+            <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/install.md">install.md</a></td><td>Requirements, the three I/O modes, and every repacker subcommand</td></tr>
+            <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/benchmarks.md">benchmarks.md</a></td><td>Every published number, with its conditions and its drive</td></tr>
+            <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/architecture.md">architecture.md</a></td><td>The packed format, the streamer, the cache, the kernels</td></tr>
+            <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/landscape.md">landscape.md</a></td><td>Why explicit reads beat mmap, and why there is no cross-layer prefetch</td></tr>
+            <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/server.md">server.md</a></td><td>The OpenAI-compatible surface, its routes and its refusals</td></tr>
+            <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/configuration.md">configuration.md</a></td><td>Profiles, the context dial, and the precedence chain</td></tr>
+            <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/roadmap.md">roadmap.md</a></td><td>The plan of record: what is done and what is open</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </div>
+
+  <footer>
+    <p>
+      <a href="https://github.com/y0sif/ramvamp">GitHub</a> &middot;
+      <a href="https://github.com/y0sif/ramvamp/releases">Releases</a> &middot;
+      <a href="https://github.com/y0sif/ramvamp/blob/main/docs/roadmap.md">Roadmap</a> &middot;
+      MIT OR Apache-2.0
+    </p>
+    <p style="margin-top: 8px;">
+      Model weights are not included and remain governed by their own terms.
+    </p>
+  </footer>
+
+  <script>
+    function copyCmd(btn) {
+      const code = btn.parentElement.querySelector('code').textContent;
+      navigator.clipboard.writeText(code).then(() => {
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+      });
+    }
+  </script>
+
+</body>
+</html>
