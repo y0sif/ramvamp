@@ -249,6 +249,19 @@ exact count depends on its blob stride and has not been computed.
 | Runtime anonymous memory | 115.1 MiB (**provisional**, EXP-012) + 387 KiB (phase 7) + 48 KiB (phase 9) | activations and scratch, tokenizer, thread stacks, allocator arenas; peak `anon` sampled from inside the cgroup on a live decode run whose context length, token count and page-cache state were not recorded: it fails rule 2, so it is a floor for this tenant, not a ceiling. See Open risk below. The 387 KiB is decode's per-shard attention scratch, `min(n_kv_heads, shards)` carves of 132,096 B for 528,384 B total against the one 132,096 B carve that preceded it (EXP-020). The 48 KiB is phase 9's fused expert fan-out, which sizes the FFN scratch for a whole routed window instead of for one expert at a time: `gate_up` goes `2 x 8 x 768 x 4 B` = **49,152 B** against 6,144 B (**+43,008**) and `acts_q8k_moe` goes `8 x (768 / 256)` = 24 `BlockQ8K` of 292 B = **7,008 B** against 876 B (**+6,132**), so **+49,140 B = 47.99 KiB**. Both are `Vec`s in `ForwardState::with_config`, allocated once at construction and shared by all 48 layers; nothing is per token and nothing is per layer. Total added since EXP-012 sampled the row: 396,288 + 49,140 = **445,428 B (435 KiB)**. All of it is exact arithmetic on top of a provisional figure, so it does not make the row less provisional |
 | Subtotal | **2,961.0 MiB** (**provisional**) | 111.0 MiB headroom under `memory.max=3G` (3,072 MiB), also provisional: both cells inherit the provenance of the anon row above, and neither may be published until that row is re-measured. **Correction (EXP-023):** measured cold at 3,961 prompt tokens plus 64 generated, the cgroup peaks at **2,929.3 MiB**, so this row overpredicts by 31.7 MiB. The prediction is not edited, because the overshoot is not yet attributed; see the Correction under the slot table below |
 
+**This table is now executable.** `Footprint::project` (`crates/core/src/io/slots.rs`)
+computes the same four tenants at runtime and `ForwardState::with_config` refuses a
+configuration that does not fit before anything is allocated, so an impossible
+`--context` or `--cache-bytes` is a typed error naming every term rather than an
+OOM kill partway through prefill. It was an OOM kill until 2026-08-09: the slot
+check ran *after* `KvCache::new`, and the KV allocation is `alloc_zeroed` and
+therefore lazily faulted, so it always appeared to succeed however large it was.
+A test pins the projection to this table tenant by tenant, so the two cannot
+drift apart without failing the build. The projection inherits every caveat
+above, including the provisional anon row and the 31.7 MiB overprediction, and
+it deliberately carries no safety margin: it refuses only what the arithmetic
+says is impossible.
+
 **The prefill sweep is not a fifth row.** Its streaming ring is a
 sub-allocation of the expert slot pool above, borrowed while the pool is
 idle rather than allocated (see "The prefill arena"), so it moves no cell in

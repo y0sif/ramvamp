@@ -20,8 +20,15 @@ use ramvamp_core::io::StreamStats;
 use ramvamp_core::model::{ForwardState, StreamPhase};
 use ramvamp_core::tokenizer::{ChatMessage, ContentSanitizer, Role, RvmpTokenizer};
 
-/// v0 scope cap: single sequence, 4K context (`docs/architecture.md`).
-pub(crate) const CONTEXT_CAP: usize = 4096;
+/// The context window a run gets when nothing configures one: the v0 scope
+/// cap of a single sequence at 4K (`docs/architecture.md`).
+///
+/// A *default*, not a constant the code may assume: everything below takes
+/// the cap it is working against as an argument, because `--context` (and the
+/// profile system that will set it) makes the window a runtime value. This is
+/// only what `main.rs` falls back to when neither the flag nor
+/// `RAMVAMP_CONTEXT` has anything to say.
+pub(crate) const DEFAULT_CONTEXT: usize = 4096;
 
 /// Every phase's streaming counters as of one instant, so a *span* of a run
 /// can be reported out of a state that outlives it.
@@ -256,18 +263,25 @@ impl TurnCodec {
     }
 }
 
-/// Context accounting for one turn.
+/// Context accounting for one turn, against the `context_cap` this run was
+/// configured with.
 ///
 /// `Ok(room)` is how many positions are still free once `prompt_tokens` are
 /// prefilled and `max_new` is reserved for the reply; `Err(total)` is what
-/// the turn would have needed when that does not fit [`CONTEXT_CAP`].
+/// the turn would have needed when that does not fit `context_cap`.
 ///
 /// `max_new` is *reserved*, not merely hoped for: the KV cache is sized at
-/// [`CONTEXT_CAP`] and a reply that reached the end of it would fail
-/// mid-token, so a turn that could overrun is refused before it starts.
-pub(crate) fn context_room(prompt_tokens: usize, max_new: usize) -> Result<usize, usize> {
+/// `context_cap` and a reply that reached the end of it would fail mid-token,
+/// so a turn that could overrun is refused before it starts. The cap is
+/// passed in rather than read from a constant because it is whatever
+/// `--context` resolved to, and the caller is the only thing that knows.
+pub(crate) fn context_room(
+    prompt_tokens: usize,
+    max_new: usize,
+    context_cap: usize,
+) -> Result<usize, usize> {
     match prompt_tokens.checked_add(max_new) {
-        Some(total) if total <= CONTEXT_CAP => Ok(CONTEXT_CAP - total),
+        Some(total) if total <= context_cap => Ok(context_cap - total),
         Some(total) => Err(total),
         // Only reachable from absurd arguments; report it as "does not fit"
         // rather than wrapping into a number that says it does.
@@ -311,12 +325,17 @@ pub(crate) enum TurnPlan {
 
 /// Everything a turn does before the model is involved: append the user
 /// message, work out which ids the cache has not seen, and decide whether the
-/// result plus `max_new` fits [`CONTEXT_CAP`].
+/// result plus `max_new` fits `context_cap`.
 ///
 /// `history_len` is how many ids the conversation already stands at — zero
 /// at startup and after `/reset`, when the whole transcript has to be
 /// rendered, and the running id history otherwise, when only the new turn
 /// does (see [`TurnCodec`]).
+///
+/// `context_cap` is what the run resolved `--context` to, and it is the same
+/// number the KV cache was sized at; passing it means the refusal message
+/// quotes the window the user actually configured rather than a compiled-in
+/// 4096.
 ///
 /// On refusal the appended message is rolled back, so a transcript that
 /// has hit the cap is left in exactly the state `/save` should write. This
@@ -329,6 +348,7 @@ pub(crate) fn plan_turn(
     history_len: usize,
     message: &str,
     max_new: usize,
+    context_cap: usize,
 ) -> anyhow::Result<TurnPlan> {
     transcript.push(tokenizer.content_sanitizer(), Role::User, message);
     let new_ids = if history_len == 0 {
@@ -344,7 +364,7 @@ pub(crate) fn plan_turn(
         codec.continue_with(tokenizer, &user)?
     };
     let used = history_len + new_ids.len();
-    match context_room(used, max_new) {
+    match context_room(used, max_new, context_cap) {
         Ok(room) => Ok(TurnPlan::Ready {
             new_ids,
             used,
@@ -353,7 +373,7 @@ pub(crate) fn plan_turn(
         Err(total) => {
             transcript.pop();
             Ok(TurnPlan::Refused(format!(
-                "context: this turn needs {total} of {CONTEXT_CAP} tokens ({used} for the \
+                "context: this turn needs {total} of {context_cap} tokens ({used} for the \
                  conversation + {max_new} reserved for the reply). Nothing was sent and \
                  your message was not added. Use /save <path> to keep this conversation, \
                  then /reset to start a new one — or restart with a smaller --max-new.",
@@ -529,81 +549,111 @@ pub(crate) mod tests {
         assert_eq!(transcript.live_turns(), 0);
     }
 
-    /// `--max-new` is reserved, not hoped for: the KV cache is sized at
-    /// `CONTEXT_CAP` and a reply that ran into the end of it would fail
+    /// Every cap the context arithmetic is asked about in these tests: the
+    /// one a run gets by default, one far below it, and one far above — the
+    /// whole point of `--context` being that the second and third are as real
+    /// as the first.
+    const CAPS: [usize; 3] = [DEFAULT_CONTEXT, 512, 40_960];
+
+    /// `--max-new` is reserved, not hoped for: the KV cache is sized at the
+    /// configured context and a reply that ran into the end of it would fail
     /// mid-token, so a turn that could overrun is refused before it starts.
+    ///
+    /// Stated against every cap, because the cap is an argument now: an
+    /// arithmetic that quietly kept using 4096 would still pass at the
+    /// default and refuse nothing at 512.
     #[test]
     fn a_turn_that_could_overrun_the_context_is_refused_whole() {
-        assert_eq!(context_room(0, 0), Ok(CONTEXT_CAP));
-        assert_eq!(context_room(100, 128), Ok(CONTEXT_CAP - 228));
-        // Exactly full is allowed; one more is not.
-        assert_eq!(context_room(CONTEXT_CAP - 128, 128), Ok(0));
-        assert_eq!(context_room(CONTEXT_CAP - 127, 128), Err(CONTEXT_CAP + 1));
-        assert_eq!(context_room(CONTEXT_CAP + 1, 0), Err(CONTEXT_CAP + 1));
-        // Absurd arguments report "does not fit" rather than wrapping into
-        // a total that says they do.
-        assert_eq!(context_room(usize::MAX, 1), Err(usize::MAX));
+        for cap in CAPS {
+            assert_eq!(context_room(0, 0, cap), Ok(cap), "cap {cap}");
+            assert_eq!(context_room(100, 128, cap), Ok(cap - 228), "cap {cap}");
+            // Exactly full is allowed; one more is not.
+            assert_eq!(context_room(cap - 128, 128, cap), Ok(0), "cap {cap}");
+            assert_eq!(context_room(cap - 127, 128, cap), Err(cap + 1), "cap {cap}");
+            assert_eq!(context_room(cap + 1, 0, cap), Err(cap + 1), "cap {cap}");
+            // Absurd arguments report "does not fit" rather than wrapping into
+            // a total that says they do.
+            assert_eq!(
+                context_room(usize::MAX, 1, cap),
+                Err(usize::MAX),
+                "cap {cap}"
+            );
+        }
     }
 
     /// The context policy, end to end: a turn that does not fit is refused
     /// whole and the transcript is left byte-identical, so nothing older is
     /// lost and the user's next move (`/save`, `/reset`) still has the
     /// complete conversation to work with.
+    ///
+    /// Run against every cap, so "does not fit" means "does not fit the
+    /// window this run was configured with" rather than a compiled-in one.
     #[test]
     fn a_refused_turn_leaves_the_transcript_exactly_as_it_was() {
-        let tokenizer = fixture_tokenizer();
-        let codec = TurnCodec::new(tokenizer).unwrap();
-        let sanitizer = tokenizer.content_sanitizer();
-        let mut transcript = Transcript::new(vec![ChatMessage::system("Be nice.")]);
-        transcript.push(sanitizer, Role::User, "an earlier question");
-        transcript.push(sanitizer, Role::Assistant, "an earlier answer");
-        let before = transcript.messages().to_vec();
+        for cap in CAPS {
+            let tokenizer = fixture_tokenizer();
+            let codec = TurnCodec::new(tokenizer).unwrap();
+            let sanitizer = tokenizer.content_sanitizer();
+            let mut transcript = Transcript::new(vec![ChatMessage::system("Be nice.")]);
+            transcript.push(sanitizer, Role::User, "an earlier question");
+            transcript.push(sanitizer, Role::Assistant, "an earlier answer");
+            let before = transcript.messages().to_vec();
 
-        // Fits, and on a cold cache the new ids are the whole conversation
-        // plus the generation prompt.
-        let TurnPlan::Ready {
-            new_ids,
-            used,
-            room,
-        } = plan_turn(tokenizer, &codec, &mut transcript, 0, "and another", 128).unwrap()
-        else {
-            panic!("a short turn should fit");
-        };
-        assert_eq!(transcript.messages().len(), before.len() + 1);
-        assert_eq!(
-            transcript.messages().last(),
-            Some(&ChatMessage::user("and another"))
-        );
-        assert_eq!(used, new_ids.len());
-        assert_eq!(used + 128 + room, CONTEXT_CAP);
-        assert_eq!(
-            new_ids,
-            tokenizer
-                .encode_chat_sanitized(transcript.messages(), true)
-                .unwrap(),
-        );
-        transcript.pop();
-        assert_eq!(transcript.messages(), before);
+            // Fits, and on a cold cache the new ids are the whole conversation
+            // plus the generation prompt.
+            let TurnPlan::Ready {
+                new_ids,
+                used,
+                room,
+            } = plan_turn(
+                tokenizer,
+                &codec,
+                &mut transcript,
+                0,
+                "and another",
+                128,
+                cap,
+            )
+            .unwrap()
+            else {
+                panic!("a short turn should fit cap {cap}");
+            };
+            assert_eq!(transcript.messages().len(), before.len() + 1);
+            assert_eq!(
+                transcript.messages().last(),
+                Some(&ChatMessage::user("and another"))
+            );
+            assert_eq!(used, new_ids.len());
+            assert_eq!(used + 128 + room, cap);
+            assert_eq!(
+                new_ids,
+                tokenizer
+                    .encode_chat_sanitized(transcript.messages(), true)
+                    .unwrap(),
+            );
+            transcript.pop();
+            assert_eq!(transcript.messages(), before);
 
-        // Does not fit, because `--max-new` alone eats the window.
-        let TurnPlan::Refused(reason) = plan_turn(
-            tokenizer,
-            &codec,
-            &mut transcript,
-            0,
-            "one more",
-            CONTEXT_CAP,
-        )
-        .unwrap() else {
-            panic!("reserving the whole window should refuse every turn");
-        };
-        assert!(reason.contains("Nothing was sent"), "{reason}");
-        assert!(reason.contains("/reset"), "{reason}");
-        assert_eq!(
-            transcript.messages(),
-            before,
-            "a refused turn must not store the message or drop anything older"
-        );
+            // Does not fit, because `--max-new` alone eats the window.
+            let TurnPlan::Refused(reason) =
+                plan_turn(tokenizer, &codec, &mut transcript, 0, "one more", cap, cap).unwrap()
+            else {
+                panic!("reserving the whole window should refuse every turn");
+            };
+            assert!(reason.contains("Nothing was sent"), "{reason}");
+            assert!(reason.contains("/reset"), "{reason}");
+            // The window it quotes is the one it was given, which is the one
+            // the KV cache was actually sized at.
+            assert!(
+                reason.contains(&format!("of {cap} tokens")),
+                "cap {cap}: {reason}"
+            );
+            assert_eq!(
+                transcript.messages(),
+                before,
+                "a refused turn must not store the message or drop anything older"
+            );
+        }
     }
 
     /// A fixed seed makes every `generate` call replay the same random
@@ -707,9 +757,16 @@ pub(crate) mod tests {
         let mut transcript = Transcript::new(vec![ChatMessage::system("Be nice.")]);
 
         // Turn 0, cold: the whole transcript.
-        let TurnPlan::Ready { new_ids: cold, .. } =
-            plan_turn(tokenizer, &codec, &mut transcript, 0, "hi", 128).unwrap()
-        else {
+        let TurnPlan::Ready { new_ids: cold, .. } = plan_turn(
+            tokenizer,
+            &codec,
+            &mut transcript,
+            0,
+            "hi",
+            128,
+            DEFAULT_CONTEXT,
+        )
+        .unwrap() else {
             panic!("a short turn should fit");
         };
         assert_eq!(
@@ -734,6 +791,7 @@ pub(crate) mod tests {
             history_len,
             "again",
             128,
+            DEFAULT_CONTEXT,
         )
         .unwrap()
         else {
@@ -756,7 +814,41 @@ pub(crate) mod tests {
         );
         // The accounting is over the conversation, not over the delta.
         assert_eq!(used, history_len + warm.len());
-        assert_eq!(used + 128 + room, CONTEXT_CAP);
+        assert_eq!(used + 128 + room, DEFAULT_CONTEXT);
+    }
+
+    /// A turn that fits 4096 but not 512 is admitted by one run and refused
+    /// by the other, from the same transcript — which is the whole of what
+    /// making the window a runtime value buys.
+    #[test]
+    fn the_same_turn_is_admitted_or_refused_by_the_configured_window() {
+        let tokenizer = fixture_tokenizer();
+        let codec = TurnCodec::new(tokenizer).unwrap();
+
+        let mut roomy = Transcript::new(Vec::new());
+        let TurnPlan::Ready { used, .. } = plan_turn(
+            tokenizer,
+            &codec,
+            &mut roomy,
+            0,
+            "hi",
+            1024,
+            DEFAULT_CONTEXT,
+        )
+        .unwrap() else {
+            panic!("1024 reserved tokens fit a 4096 window");
+        };
+        assert!(used + 1024 <= DEFAULT_CONTEXT);
+
+        let mut cramped = Transcript::new(Vec::new());
+        let TurnPlan::Refused(reason) =
+            plan_turn(tokenizer, &codec, &mut cramped, 0, "hi", 1024, 512).unwrap()
+        else {
+            panic!("1024 reserved tokens cannot fit a 512 window");
+        };
+        assert!(reason.contains("of 512 tokens"), "{reason}");
+        assert!(!reason.contains("4096"), "{reason}");
+        assert_eq!(cramped.messages(), [], "a refused turn stores nothing");
     }
 
     /// `generate_from`'s feeding rule, which the REPL's bookkeeping rests on:

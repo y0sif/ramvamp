@@ -109,8 +109,15 @@ pub trait TokenSink {
     fn prefill(&mut self, positions_done: usize, positions_total: usize)
     -> Result<(), StreamError>;
 
-    /// One token's worth of newly-decoded text.
-    fn token(&mut self, text: &str) -> Result<(), StreamError>;
+    /// One token: the id the model sampled, and the text it decoded to.
+    ///
+    /// The id is carried because `<tool_call>` and `</tool_call>` are single
+    /// added tokens and the decoder does not skip them, so a sink that has the
+    /// id can recognise a call block by an integer compare. The alternative —
+    /// scanning the decoded text — would have to be done at a layer that sees
+    /// only a stream of fragments, where a marker can be split across two of
+    /// them; an id cannot be split. See [`crate::toolcall::CallStream`].
+    fn token(&mut self, id: u32, text: &str) -> Result<(), StreamError>;
 }
 
 /// A sink that discards everything, for the non-streaming path.
@@ -125,7 +132,7 @@ impl TokenSink for NullSink {
         Ok(())
     }
 
-    fn token(&mut self, _: &str) -> Result<(), StreamError> {
+    fn token(&mut self, _: u32, _: &str) -> Result<(), StreamError> {
         Ok(())
     }
 }
@@ -458,7 +465,7 @@ impl Engine for ModelEngine {
                 live.reply.push_str(text);
                 live.spoken.push(id);
                 if live.abort.is_none()
-                    && let Err(e) = live.sink.token(text)
+                    && let Err(e) = live.sink.token(id, text)
                 {
                     live.abort = Some(e);
                 }

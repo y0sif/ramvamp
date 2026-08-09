@@ -186,11 +186,39 @@ impl ChatCompletion {
     }
 }
 
+/// One entry of a streaming `tool_calls` delta.
+///
+/// OpenAI fragments this shape across many deltas — it streams `arguments` as
+/// the model generates them, so a client is handed a name, then argument text
+/// in pieces, and reassembles them by `index`. This server has the whole block
+/// buffered before it recognises it as a call at all (see
+/// [`crate::toolcall::CallStream`]), so every field is filled on the one delta
+/// the call produces. A client that assembles fragments handles a complete
+/// entry as the trivial case of the same rule.
+///
+/// `index` is therefore the one field that is not decoration: it is how a
+/// client knows which call an entry belongs to, and two calls in one turn are
+/// indistinguishable without it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallDelta {
+    /// Position in this response's `tool_calls`.
+    pub index: u32,
+    /// The call id, matched by the `tool` message's `tool_call_id`. Minted by
+    /// [`crate::toolcall::wire_call`], the same function the buffered path
+    /// uses, so both paths name the same call identically.
+    pub id: String,
+    /// Always `function`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Name and arguments, complete.
+    pub function: crate::request::FunctionCall,
+}
+
 /// The incremental half of a streaming choice.
 ///
 /// Every field is optional and every absent field is omitted, which is what
-/// makes the three chunk shapes distinguishable on the wire: `{"role":...,
-/// "content":""}`, `{"content":"..."}`, and `{}`.
+/// makes the four chunk shapes distinguishable on the wire: `{"role":...,
+/// "content":""}`, `{"content":"..."}`, `{"tool_calls":[...]}`, and `{}`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delta {
     /// Sent once, on the first chunk.
@@ -199,9 +227,10 @@ pub struct Delta {
     /// A slice of the reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// Tool-call fragments. Never produced by this lane.
+    /// Calls the model asked for, one entry per call. Omitted rather than
+    /// empty: a client branches on the key being present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<serde_json::Value>>,
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 /// One choice of a streaming chunk.
@@ -242,13 +271,15 @@ pub struct ChatCompletionChunk {
 ///
 /// 1. [`role`](Self::role) — `delta: {"role":"assistant","content":""}`
 /// 2. [`content`](Self::content) — `delta: {"content":"..."}`, repeated
-/// 3. [`usage`](Self::usage) — `choices: []` plus `usage`, only when
+/// 3. [`tool_call`](Self::tool_call) — `delta: {"tool_calls":[...]}`, once per
+///    call the model asked for, interleaved with the content
+/// 4. [`usage`](Self::usage) — `choices: []` plus `usage`, only when
 ///    `stream_options.include_usage` was set, and immediately *before* the
 ///    sentinel rather than after: a client stops reading at `[DONE]`, so usage
 ///    emitted after it is usage nobody receives
-/// 4. [`finish`](Self::finish) — `delta: {}` plus `finish_reason`
+/// 5. [`finish`](Self::finish) — `delta: {}` plus `finish_reason`
 ///
-/// The order on the wire is 1, 2*, 4, 3?, then `data: [DONE]`.
+/// The order on the wire is 1, (2|3)*, 5, 4?, then `data: [DONE]`.
 #[derive(Debug, Clone)]
 pub struct ChunkBuilder {
     id: String,
@@ -311,6 +342,37 @@ impl ChunkBuilder {
                     role: None,
                     content: Some(text.into()),
                     tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            None,
+        )
+    }
+
+    /// One call, complete, in a single delta.
+    ///
+    /// `content` is absent rather than `""`: a client concatenating
+    /// `delta.content` would otherwise append an empty string for a chunk that
+    /// carries no text at all, and a client switching on which key is present
+    /// would see two answers to that question in one delta.
+    ///
+    /// `index` saturates rather than wrapping. A turn with four billion calls
+    /// in it is not a case worth modelling, and reporting call `u32::MAX` twice
+    /// is a visible fault where wrapping to `0` would silently overwrite the
+    /// first call in the client's table.
+    pub fn tool_call(&self, index: usize, call: crate::request::ToolCall) -> ChatCompletionChunk {
+        self.chunk(
+            vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    role: None,
+                    content: None,
+                    tool_calls: Some(vec![ToolCallDelta {
+                        index: u32::try_from(index).unwrap_or(u32::MAX),
+                        id: call.id,
+                        kind: call.kind,
+                        function: call.function,
+                    }]),
                 },
                 finish_reason: None,
             }],
@@ -503,6 +565,45 @@ mod tests {
         }
     }
 
+    /// The tool-call delta, pinned field by field. This is the shape an agent
+    /// client switches on, and `index` is the field it cannot do without.
+    #[test]
+    fn a_tool_call_delta_carries_one_complete_call_with_its_index() {
+        let builder = ChunkBuilder::new("chatcmpl-x", 42, "m");
+        let call = crate::request::ToolCall {
+            id: "call_x_0".to_owned(),
+            kind: "function".to_owned(),
+            function: crate::request::FunctionCall {
+                name: "glob".to_owned(),
+                arguments: r#"{"pattern": "*/.rs"}"#.to_owned(),
+            },
+        };
+        let value = json(&builder.tool_call(0, call.clone()));
+
+        assert_eq!(value["object"], "chat.completion.chunk");
+        let delta = &value["choices"][0]["delta"];
+        assert_eq!(delta["tool_calls"][0]["index"], 0);
+        assert_eq!(delta["tool_calls"][0]["id"], "call_x_0");
+        assert_eq!(delta["tool_calls"][0]["type"], "function");
+        assert_eq!(delta["tool_calls"][0]["function"]["name"], "glob");
+        // `arguments` is a JSON *string*, byte for byte what the model wrote.
+        assert_eq!(
+            delta["tool_calls"][0]["function"]["arguments"],
+            r#"{"pattern": "*/.rs"}"#
+        );
+        assert!(
+            delta.get("content").is_none(),
+            "a call delta carries no content key: {delta}"
+        );
+        assert!(delta.get("role").is_none(), "{delta}");
+        assert!(value["choices"][0]["finish_reason"].is_null());
+
+        // A second call in the same turn is index 1, which is the only thing
+        // telling a client the two apart.
+        let second = json(&builder.tool_call(1, call));
+        assert_eq!(second["choices"][0]["delta"]["tool_calls"][0]["index"], 1);
+    }
+
     /// `finish_reason` must be an explicit `null`, not an absent key.
     #[test]
     fn non_final_chunks_serialize_a_null_finish_reason() {
@@ -519,6 +620,17 @@ mod tests {
         for chunk in [
             builder.role(),
             builder.content("text"),
+            builder.tool_call(
+                0,
+                crate::request::ToolCall {
+                    id: "call_id_0".to_owned(),
+                    kind: "function".to_owned(),
+                    function: crate::request::FunctionCall {
+                        name: "read".to_owned(),
+                        arguments: "{}".to_owned(),
+                    },
+                },
+            ),
             builder.finish(FinishReason::Length),
             builder.usage(Usage::new(1, 2)),
         ] {

@@ -74,7 +74,11 @@ use ratatui::crossterm::{QueueableCommand as _, cursor};
 use ratatui::text::{Line, Span};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
-use crate::repl::CONTEXT_CAP;
+// The self-test's fabricated numbers, and only those: it runs before argument
+// parsing and has no `--context` to honour, so the window it draws against is
+// the default one. Everything the real harness shows comes from `session.rs`,
+// which is given the resolved cap.
+use crate::repl::DEFAULT_CONTEXT;
 use glyphs::Glyphs;
 use input::LineEditor;
 use panel::Layout;
@@ -958,7 +962,7 @@ fn fresh_status() -> Status {
     Status {
         phase: Phase::Idle,
         model: Some(FAKE_MODEL.to_owned()),
-        context: (0, CONTEXT_CAP),
+        context: (0, DEFAULT_CONTEXT),
         ..Status::default()
     }
 }
@@ -968,7 +972,7 @@ fn idle_status() -> Status {
     Status {
         phase: Phase::Idle,
         model: Some(FAKE_MODEL.to_owned()),
-        context: (FAKE_PROMPT_POSITIONS + FAKE_DECODE_TOKENS, CONTEXT_CAP),
+        context: (FAKE_PROMPT_POSITIONS + FAKE_DECODE_TOKENS, DEFAULT_CONTEXT),
         hit_rate: Some(fake_hit_rate(FAKE_PROMPT_POSITIONS + FAKE_DECODE_TOKENS)),
         ..Status::default()
     }
@@ -1008,7 +1012,7 @@ fn fake_turn(harness: &mut Harness, ribbon: &mut Ribbon, prompt: &str) -> io::Re
             }),
             chunk: Some((done.div_ceil(FAKE_CHUNK).max(1), chunks)),
             elapsed: Duration::from_secs_f64(done as f64 / FAKE_PREFILL_RATE),
-            context: (done, CONTEXT_CAP),
+            context: (done, DEFAULT_CONTEXT),
             rate: Some(FAKE_PREFILL_RATE),
             eta: Some(Duration::from_secs_f64(remaining)),
             // No byte figure: the runtime reports none between prefill
@@ -1050,7 +1054,7 @@ fn decode_status(tokens: usize) -> Status {
         model: Some(FAKE_MODEL.to_owned()),
         tokens,
         elapsed: Duration::from_secs_f64(tokens as f64 / FAKE_DECODE_RATE),
-        context: (FAKE_PROMPT_POSITIONS + tokens, CONTEXT_CAP),
+        context: (FAKE_PROMPT_POSITIONS + tokens, DEFAULT_CONTEXT),
         hit_rate: Some(fake_hit_rate(FAKE_PROMPT_POSITIONS + tokens)),
         read_bytes: Some(tokens as u64 * FAKE_BYTES_PER_TOKEN),
         rate: (tokens > 0).then_some(FAKE_DECODE_RATE),
@@ -1288,7 +1292,7 @@ mod tests {
             }
         }
         assert_eq!(fresh_status().hit_rate, None);
-        assert_eq!(fresh_status().context, (0, CONTEXT_CAP));
+        assert_eq!(fresh_status().context, (0, DEFAULT_CONTEXT));
         assert!(idle_status().hit_rate.is_some());
         // The prefill look is the one with a bar, so it is the one that has
         // to have a total to draw it against.

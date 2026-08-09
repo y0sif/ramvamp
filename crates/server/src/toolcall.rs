@@ -68,6 +68,25 @@
 //! An unterminated `<tool_call>` is content for the same reason: it is what a
 //! reply that ran out of `max_tokens` mid-block looks like, and no call can be
 //! honestly claimed from half a block.
+//!
+//! # Streaming, where the whole reply is not in hand
+//!
+//! [`extract`] needs the finished text. A stream does not have it: the decision
+//! to send a token as content has to be made before the token after it exists,
+//! and once a `<` has gone out as content it cannot be recalled. Scanning the
+//! text as it accumulates would also mean handling a marker split across two
+//! deltas, since nothing about a byte stream promises `</tool_call>` arrives
+//! whole.
+//!
+//! It does arrive whole, and that is the mechanism [`CallStream`] is built on.
+//! Both markers are *added tokens* in the Qwen3 tokenizer —
+//! [`OPEN_TAG_ID`] and [`CLOSE_TAG_ID`] — so each is a single id, and the
+//! decoder does not skip them. Detection is therefore an integer compare
+//! against the id the model sampled, made at the one layer that still has the
+//! id, and a marker cannot be split because a token cannot be. What is left is
+//! bookkeeping: buffer between the two ids, hand the body to the same
+//! [`parse_block`] the buffered path uses, and give the call the same id
+//! [`wire_call`] would have given it there.
 
 use crate::request::{FunctionCall, ToolCall};
 use crate::response::COMPLETION_ID_PREFIX;
@@ -77,6 +96,18 @@ pub const OPEN_TAG: &str = "<tool_call>";
 
 /// The marker that closes one.
 pub const CLOSE_TAG: &str = "</tool_call>";
+
+/// The single token id [`OPEN_TAG`] encodes to.
+///
+/// An `added_tokens` entry of the Qwen3 tokenizer, `special: false`, so the
+/// streaming decoder emits it as one token carrying the literal text. Pinned as
+/// a constant rather than looked up because the streaming sink has no
+/// tokenizer: it sees ids and text, and this crate is meant to be testable
+/// without an install on disk.
+pub const OPEN_TAG_ID: u32 = 151_657;
+
+/// The single token id [`CLOSE_TAG`] encodes to. See [`OPEN_TAG_ID`].
+pub const CLOSE_TAG_ID: u32 = 151_658;
 
 /// The `type` of every call: OpenAI has defined exactly one.
 pub const CALL_KIND: &str = "function";
@@ -186,20 +217,157 @@ pub fn call_id(completion_id: &str, index: usize) -> String {
     format!("{CALL_ID_PREFIX}{suffix}_{index}")
 }
 
+/// Give one parsed call its wire shape and its id, at `index`.
+///
+/// The single place a [`ParsedCall`] becomes a [`ToolCall`], which is what
+/// makes the buffered and streaming paths agree by construction rather than by
+/// two implementations that happen to match today: the buffered path indexes a
+/// finished list, the streaming one counts calls as they close, and both arrive
+/// here.
+pub fn wire_call(completion_id: &str, index: usize, call: &ParsedCall) -> ToolCall {
+    ToolCall {
+        id: call_id(completion_id, index),
+        kind: CALL_KIND.to_owned(),
+        function: FunctionCall {
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        },
+    }
+}
+
 /// Give the parsed calls their wire shape and their ids.
 pub fn wire_calls(completion_id: &str, calls: &[ParsedCall]) -> Vec<ToolCall> {
     calls
         .iter()
         .enumerate()
-        .map(|(index, call)| ToolCall {
-            id: call_id(completion_id, index),
-            kind: CALL_KIND.to_owned(),
-            function: FunctionCall {
-                name: call.name.clone(),
-                arguments: call.arguments.clone(),
-            },
-        })
+        .map(|(index, call)| wire_call(completion_id, index, call))
         .collect()
+}
+
+/// What the sink should do with the token it just fed to a [`CallStream`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// Send nothing: the token is inside a block that has not closed.
+    Nothing,
+    /// Send this as a content delta. Not always the token's own text — a block
+    /// that closed without naming a function comes back here whole, markers
+    /// included, exactly as the buffered path keeps it.
+    Content(String),
+    /// A block closed and named a function.
+    Call {
+        /// Its position in this response's `tool_calls`, which is the `index`
+        /// the delta must carry: it is how a client knows which call a
+        /// fragment belongs to.
+        index: usize,
+        /// The call.
+        call: ParsedCall,
+    },
+}
+
+/// [`extract`]'s rules, applied one token at a time.
+///
+/// Fed every generated token in order, it answers what to put on the wire for
+/// it. The outcome matches what [`extract`] would have produced from the
+/// concatenated reply, with one unavoidable difference: [`extract`] trims the
+/// prose that framed a removed block, and a stream has already sent that
+/// whitespace by the time the block it framed appears.
+///
+/// Pure and clock-free like the rest of the module, so the state machine is
+/// pinned by unit tests rather than by a live model.
+///
+/// The other difference is [`find_close`]'s string awareness, which has no
+/// streaming equivalent and does not need one. A `</tool_call>` written *inside*
+/// an argument string reaches [`extract`] as twelve characters of a JSON
+/// literal; it reaches here as [`CLOSE_TAG_ID`], the id the model chose to
+/// sample, and an id is not text. Closing there is the honest reading of what
+/// the model emitted, and it is also the only reading available: the fallback
+/// that makes the buffered scan safe — search the *rest of the reply* — is a
+/// rest that does not exist yet.
+#[derive(Debug, Clone)]
+pub struct CallStream {
+    /// Whether calls are recovered at all.
+    ///
+    /// False for a request that declared no tools, and then every token is
+    /// content. The model only writes these markers because the tools branch of
+    /// the template told it to, so without tools they are ordinary text a user
+    /// asked for — and swallowing them would delete the answer. The same gate
+    /// the buffered path applies, for the same reason.
+    enabled: bool,
+    /// The body of the block currently open, markers excluded, or `None`
+    /// outside one.
+    open: Option<String>,
+    /// Calls emitted so far, which is both the next `index` and the answer to
+    /// "was this turn a tool call".
+    emitted: usize,
+}
+
+impl CallStream {
+    /// A stream that recovers calls, or one that passes everything through.
+    pub fn new(enabled: bool) -> Self {
+        CallStream {
+            enabled,
+            open: None,
+            emitted: 0,
+        }
+    }
+
+    /// How many calls have been emitted.
+    ///
+    /// Non-zero is what makes `finish_reason` `tool_calls`: the model stopped
+    /// because it wanted a tool, whatever token ended the reply.
+    pub fn emitted(&self) -> usize {
+        self.emitted
+    }
+
+    /// Feed one generated token and its id.
+    pub fn push(&mut self, id: u32, text: &str) -> Step {
+        if !self.enabled {
+            return Step::Content(text.to_owned());
+        }
+        match id {
+            // A second opener inside an open block is body text, matching
+            // `extract`, which looks for the terminator and not for another
+            // opener.
+            OPEN_TAG_ID if self.open.is_none() => {
+                self.open = Some(String::new());
+                Step::Nothing
+            }
+            // A terminator with nothing open closes nothing; it is the stray
+            // marker case, and it is content.
+            CLOSE_TAG_ID if self.open.is_some() => self.close(),
+            _ => match &mut self.open {
+                Some(body) => {
+                    body.push_str(text);
+                    Step::Nothing
+                }
+                None => Step::Content(text.to_owned()),
+            },
+        }
+    }
+
+    /// Generation ended: give back the text of a block that never closed.
+    ///
+    /// Half a block is not a call — it is what a reply that ran out of
+    /// `max_tokens` mid-block looks like — but it *is* text the model wrote,
+    /// and nothing the model wrote is dropped. Idempotent.
+    pub fn flush(&mut self) -> Option<String> {
+        self.open.take().map(|body| format!("{OPEN_TAG}{body}"))
+    }
+
+    /// Resolve the block that just closed.
+    fn close(&mut self) -> Step {
+        let body = self.open.take().unwrap_or_default();
+        match parse_block(&body) {
+            Some(call) => {
+                let index = self.emitted;
+                self.emitted += 1;
+                Step::Call { index, call }
+            }
+            // No recoverable name, so it was never a call: the block survives
+            // as text, markers and all.
+            None => Step::Content(format!("{OPEN_TAG}{body}{CLOSE_TAG}")),
+        }
+    }
 }
 
 /// Find the `</tool_call>` that closes the block whose body starts at `from`.
@@ -628,6 +796,208 @@ mod tests {
         assert_eq!(wire_calls("chatcmpl-18f3a0001", &calls), wire);
         // An id without the usual prefix still yields a usable one.
         assert_eq!(call_id("x", 3), "call_x_3");
+    }
+
+    // ---- the streaming half ----
+
+    /// The id of an ordinary token. Any value that is not a marker will do:
+    /// the state machine only ever compares against the two markers.
+    const TEXT: u32 = 7;
+
+    /// Feed a token sequence through a [`CallStream`] and collect what it would
+    /// have put on the wire: the concatenated content and the calls with their
+    /// indices, including whatever the final flush produced.
+    fn drive(enabled: bool, tokens: &[(u32, &str)]) -> (String, Vec<(usize, ParsedCall)>) {
+        let mut stream = CallStream::new(enabled);
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        for (id, text) in tokens {
+            match stream.push(*id, text) {
+                Step::Nothing => {}
+                Step::Content(text) => content.push_str(&text),
+                Step::Call { index, call } => calls.push((index, call)),
+            }
+        }
+        if let Some(rest) = stream.flush() {
+            content.push_str(&rest);
+        }
+        // Flushing twice must not duplicate the tail.
+        assert_eq!(stream.flush(), None, "flush is not idempotent");
+        assert_eq!(stream.emitted(), calls.len());
+        (content, calls)
+    }
+
+    /// The markers as the tokens they actually are, around one body token.
+    fn streamed(body: &str) -> Vec<(u32, &str)> {
+        vec![
+            (OPEN_TAG_ID, OPEN_TAG),
+            (TEXT, body),
+            (CLOSE_TAG_ID, CLOSE_TAG),
+        ]
+    }
+
+    /// The property the streaming path exists to preserve: the same reply, one
+    /// token at a time, recovers the same call the buffered path recovers.
+    #[test]
+    fn a_streamed_block_recovers_what_the_buffered_path_recovers() {
+        let body = "\n{\"name\": \"glob\", \"arguments\": {\"pattern\": \"*/.rs\"}}\n";
+        let (content, calls) = drive(true, &streamed(body));
+        assert_eq!(content, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, 0);
+        assert_eq!(
+            calls[0].1,
+            extract(&format!("{OPEN_TAG}{body}{CLOSE_TAG}")).calls[0]
+        );
+        assert_eq!(calls[0].1.name, "glob");
+        assert_eq!(calls[0].1.arguments, r#"{"pattern": "*/.rs"}"#);
+    }
+
+    /// A body arrives as many tokens, because a body is many tokens. Only the
+    /// markers are single ids.
+    #[test]
+    fn a_body_split_across_tokens_is_reassembled_whole() {
+        let mut tokens = vec![(OPEN_TAG_ID, OPEN_TAG)];
+        for piece in [
+            "\n{\"na",
+            "me\": \"re",
+            "ad\", \"argu",
+            "ments\": {\"path\": \"a\"}}\n",
+        ] {
+            tokens.push((TEXT, piece));
+        }
+        tokens.push((CLOSE_TAG_ID, CLOSE_TAG));
+        let (content, calls) = drive(true, &tokens);
+        assert_eq!(content, "");
+        assert_eq!(calls[0].1.name, "read");
+        assert_eq!(calls[0].1.arguments, r#"{"path": "a"}"#);
+    }
+
+    #[test]
+    fn prose_before_between_and_after_streams_as_content() {
+        let mut tokens = vec![(TEXT, "I will "), (TEXT, "read both.\n")];
+        tokens.extend(streamed(r#"{"name": "read", "arguments": {"path": "a"}}"#));
+        tokens.push((TEXT, "\nand the other\n"));
+        tokens.extend(streamed(r#"{"name": "read", "arguments": {"path": "b"}}"#));
+        tokens.push((TEXT, "\nDone."));
+
+        let (content, calls) = drive(true, &tokens);
+        assert_eq!(content, "I will read both.\n\nand the other\n\nDone.");
+        assert_eq!(calls.len(), 2);
+        // The index is how a client tells two calls apart, so it counts.
+        assert_eq!(calls[0].0, 0);
+        assert_eq!(calls[1].0, 1);
+        assert_eq!(calls[0].1.arguments, r#"{"path": "a"}"#);
+        assert_eq!(calls[1].1.arguments, r#"{"path": "b"}"#);
+    }
+
+    /// What a reply that hit `max_tokens` mid-block looks like: no call, and
+    /// not one byte of what the model wrote is lost.
+    #[test]
+    fn an_unterminated_streamed_block_flushes_as_content() {
+        let tokens = [
+            (TEXT, "Reading it.\n"),
+            (OPEN_TAG_ID, OPEN_TAG),
+            (TEXT, "\n{\"name\": \"read\", \"argum"),
+        ];
+        let (content, calls) = drive(true, &tokens);
+        assert!(calls.is_empty());
+        assert_eq!(
+            content,
+            "Reading it.\n<tool_call>\n{\"name\": \"read\", \"argum"
+        );
+    }
+
+    /// Without tools the markers are ordinary text: the request never enabled
+    /// calling, so swallowing them would delete the user's answer.
+    #[test]
+    fn a_streamed_block_without_tools_is_ordinary_text() {
+        let body = r#"{"name": "read", "arguments": {}}"#;
+        let (content, calls) = drive(false, &streamed(body));
+        assert!(calls.is_empty());
+        assert_eq!(content, format!("{OPEN_TAG}{body}{CLOSE_TAG}"));
+    }
+
+    /// A closed block that names no function was never a call, and the whole
+    /// block — markers included — reaches the client as text.
+    #[test]
+    fn a_streamed_block_with_no_recoverable_name_is_content_markers_and_all() {
+        for body in ["{\"arguments\": {}}", "{\"name\": \"\"}", "words", ""] {
+            let (content, calls) = drive(true, &streamed(body));
+            assert!(calls.is_empty(), "{body:?} became a call");
+            assert_eq!(content, format!("{OPEN_TAG}{body}{CLOSE_TAG}"));
+        }
+    }
+
+    #[test]
+    fn a_stray_streamed_terminator_is_content() {
+        let tokens = [
+            (TEXT, "the tag is "),
+            (CLOSE_TAG_ID, CLOSE_TAG),
+            (TEXT, ", as shown"),
+        ];
+        let (content, calls) = drive(true, &tokens);
+        assert!(calls.is_empty());
+        assert_eq!(content, "the tag is </tool_call>, as shown");
+    }
+
+    /// A second opener inside an open block is body text, exactly as the
+    /// buffered scan treats it.
+    #[test]
+    fn a_nested_opener_is_body_text() {
+        let tokens = [
+            (OPEN_TAG_ID, OPEN_TAG),
+            (TEXT, "{\"name\": \"echo\", \"arguments\": {\"t\": \""),
+            (OPEN_TAG_ID, OPEN_TAG),
+            (TEXT, "\"}}"),
+            (CLOSE_TAG_ID, CLOSE_TAG),
+        ];
+        let (content, calls) = drive(true, &tokens);
+        assert_eq!(content, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1.arguments, "{\"t\": \"<tool_call>\"}");
+    }
+
+    /// Models get this JSON wrong routinely. The call still goes out, with
+    /// whatever the `arguments` span held.
+    #[test]
+    fn malformed_json_in_a_streamed_block_still_yields_a_call() {
+        let (content, calls) = drive(
+            true,
+            &streamed(r#"{"name": "read", "arguments": {"p": 1,}}"#),
+        );
+        assert_eq!(content, "");
+        assert_eq!(calls[0].1.name, "read");
+        assert_eq!(calls[0].1.arguments, r#"{"p": 1,}"#);
+    }
+
+    /// The streaming and buffered paths mint the same ids for the same
+    /// completion, because there is one function that mints them.
+    #[test]
+    fn streamed_call_ids_match_the_buffered_paths() {
+        let body = r#"{"name": "read", "arguments": {}}"#;
+        let mut tokens = streamed(body);
+        tokens.extend(streamed(body));
+        let (_, calls) = drive(true, &tokens);
+
+        let parsed: Vec<ParsedCall> = calls.iter().map(|(_, call)| call.clone()).collect();
+        let buffered = wire_calls("chatcmpl-18f3a0001", &parsed);
+        let streamed: Vec<ToolCall> = calls
+            .iter()
+            .map(|(index, call)| wire_call("chatcmpl-18f3a0001", *index, call))
+            .collect();
+        assert_eq!(streamed, buffered);
+        assert_eq!(streamed[0].id, "call_18f3a0001_0");
+        assert_eq!(streamed[1].id, "call_18f3a0001_1");
+    }
+
+    /// The two constants are the mechanism. If they ever drift from the
+    /// tokenizer's `added_tokens`, streaming silently emits raw markup again.
+    #[test]
+    fn the_marker_ids_are_the_qwen3_added_tokens() {
+        assert_eq!(OPEN_TAG_ID, 151_657);
+        assert_eq!(CLOSE_TAG_ID, 151_658);
+        assert_ne!(OPEN_TAG_ID, CLOSE_TAG_ID);
     }
 
     /// The extracted call, re-rendered on the next turn, is the text the model

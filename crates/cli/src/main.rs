@@ -8,6 +8,8 @@
 //! - `logits`: raw-encode a prompt, run one forward pass, and print the
 //!   top-N next-token logits as JSON — the llama.cpp comparison hook
 //!   consumed by `scripts/compare_llamacpp.py`.
+//! - `plan`: resolve the dials, say where each one came from, and price
+//!   them against this machine's memory limit — without loading the model.
 //!
 //! Both `generate` and `logits` can dump the router's per-layer expert
 //! selection with `--trace-experts <PATH>`; see [`TraceWriter`] for the
@@ -16,7 +18,15 @@
 //! [`RuntimeArgs`] — the expert-cache byte budget, the compute thread
 //! count, and the integrity policy — and the prefill dials in
 //! [`PrefillArgs`], which choose between the chunked layer-major sweep and
-//! the token-major path it replaced.
+//! the token-major path it replaced. Those three and `serve` — every command
+//! that builds a [`ForwardState`] — also take [`ContextArgs`], which sizes
+//! the KV cache and everything accounted against it.
+//!
+//! Every one of those dials can also come from a **named profile** in
+//! `~/.config/ramvamp/config.json`, picked with `--profile`. The whole
+//! precedence chain — built-in default, then the profile, then the
+//! environment, then the flag — lives in [`config`], and `plan` is how you
+//! see which layer won.
 //!
 //! # Trusted and untrusted prompts
 //!
@@ -39,22 +49,25 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand};
+use ramvamp_core::format::{load_layout, load_manifest};
 use ramvamp_core::generate::{
     GenerateParams, GenerateStats, StopReason, TracePhase, generate, generate_from, generate_traced,
 };
-use ramvamp_core::io::StreamStats;
+use ramvamp_core::io::{StreamStats, resident_ceiling};
 use ramvamp_core::model::{
-    ForwardState, LoadOptions, Model, PrefillConfig, PrefillMode, PrefillTiming, RuntimeConfig,
-    StreamPhase, prefill_prompt,
+    ForwardError, ForwardState, LoadOptions, Model, PrefillMode, PrefillTiming, StreamPhase,
+    prefill_prompt,
 };
 use ramvamp_core::tokenizer::{ChatMessage, Role, RvmpTokenizer};
 
+mod config;
 mod repl;
 mod tui;
 
+use config::{Dials, ProfileArgs, plan_lines, resolve_dials};
 use repl::{
-    CONTEXT_CAP, PhaseStats, ReplInput, Transcript, TurnCodec, TurnPlan, parse_repl_input,
-    plan_turn, print_repl_help, turn_seed,
+    PhaseStats, ReplInput, Transcript, TurnCodec, TurnPlan, parse_repl_input, plan_turn,
+    print_repl_help, turn_seed,
 };
 
 // The model can be driven from a thread that is not the one that built it.
@@ -109,13 +122,21 @@ struct RuntimeArgs {
     /// budget, not a slot count: 1440M buys 11 slots/layer on
     /// Qwen3-30B-A3B, and a model with a different layer count or expert
     /// size gets a different number of slots out of the same budget.
+    /// Unset: 1440M, or the profile's `cache_bytes`.
+    //
+    // `Option` rather than a clap `default_value`, for the reason
+    // [`ContextArgs`] spells out: a default here is indistinguishable from the
+    // user typing `--cache-bytes 1440M`, and would silently beat a profile on
+    // every run. The default itself is unchanged — it is
+    // [`ramvamp_core::model::DEFAULT_CACHE_BYTES`], which is exactly what
+    // `1440M` parses to, and `a_bare_command_line_resolves_to_the_published_
+    // defaults` pins that.
     #[arg(
         long,
         value_name = "BYTES",
-        default_value = "1440M",
         value_parser = parse_bytes,
     )]
-    cache_bytes: u64,
+    cache_bytes: Option<u64>,
 
     /// Compute threads, counting the decode thread itself. Defaults to the
     /// runtime's own CPU topology detection: one thread per physical
@@ -150,30 +171,113 @@ struct RuntimeArgs {
 
 impl RuntimeArgs {
     /// The load-time integrity policy these flags describe.
+    ///
+    /// Not a profile dial: `--skip-hashes` and `--verify-layer-hashes` are
+    /// per-invocation decisions about what to check, not a configuration worth
+    /// naming, and a config file that could turn integrity checking off is a
+    /// config file worth not having.
     fn load_options(&self) -> LoadOptions {
         LoadOptions {
             skip_hashes: self.skip_hashes,
             verify_layer_hashes: self.verify_layer_hashes,
         }
     }
+}
 
-    /// The decode-time runtime dials these flags describe.
-    fn runtime_config(&self) -> RuntimeConfig {
-        RuntimeConfig {
-            cache_bytes: self.cache_bytes,
-            threads: self.threads,
-            pin: true,
+/// The context dial, shared by every command that builds a [`ForwardState`].
+///
+/// One `Option`, for the same reason both of [`PrefillArgs`]' are: unset means
+/// "whatever else has a say", and the things with a say here are
+/// `RAMVAMP_CONTEXT` and the selected profile. A clap `default_value = "4096"`
+/// would be indistinguishable from the user typing `--context 4096` and would
+/// silently beat both on every run. See [`config`] for the whole chain.
+#[derive(Args, Debug, Clone, Copy)]
+struct ContextArgs {
+    /// Context window in tokens. The KV cache is sized at this, and a prompt
+    /// plus the tokens reserved for its reply must fit inside it. Costs
+    /// resident memory in proportion, so it is the dial that trades
+    /// conversation length against the byte budget. Refused above what the
+    /// model was trained for (the manifest's `arch.context_length`), since
+    /// positions past that generate garbage rather than failing. Unset: 4096,
+    /// or `RAMVAMP_CONTEXT`, or the profile's `context`.
+    #[arg(
+        long,
+        value_name = "TOKENS",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+    )]
+    context: Option<usize>,
+}
+
+/// The resolved context window, refused when the checkpoint in `model_dir` was
+/// never trained that far.
+///
+/// The manifest is read here rather than taken off the loaded [`Model`]
+/// because a mistyped `--context` should cost a JSON parse, not the tens of
+/// seconds (minutes, with hashes) it takes to load 30B of weights. The file has
+/// to exist and parse for the install to be usable at all, so this adds no
+/// failure the load would not have hit anyway.
+fn checked_context(dials: &Dials, model_dir: &Path) -> anyhow::Result<usize> {
+    let context = dials.context.value;
+    let manifest = load_manifest(model_dir)
+        .with_context(|| format!("reading the manifest of {}", model_dir.display()))?;
+    check_trained_context(context, manifest.arch.context_length)?;
+    Ok(context)
+}
+
+/// The parsing half of `RAMVAMP_CONTEXT`, and the whole of the precedence rule
+/// that is worth testing: `None` in, `None` out.
+///
+/// An unusable value is ignored rather than fatal, matching what
+/// `ForwardState` already does with `RAMVAMP_PREFILL_CHUNK`: an environment a
+/// shell profile set years ago must not be able to stop the binary from
+/// starting. It is not ignored *silently* — a variable that was meant to
+/// widen the window and did nothing is exactly the failure a user would
+/// otherwise attribute to the model.
+fn parse_context_var(raw: Option<String>) -> Option<usize> {
+    let raw = raw?;
+    match raw.trim().parse::<usize>() {
+        Ok(tokens) if tokens > 0 => Some(tokens),
+        _ => {
+            // stderr, with the rest of this binary's chrome. Unreachable on
+            // the default path, where the variable is not set at all.
+            eprintln!(
+                "warning: ignoring unusable RAMVAMP_CONTEXT={raw:?}; using --context or 4096"
+            );
+            None
         }
     }
 }
 
+/// Refuse a context window past the one the checkpoint was trained on.
+///
+/// `arch.context_length` is the trained window. Nothing downstream enforces
+/// it — the KV cache, the RoPE tables and the attention kernels will all
+/// happily run past it — so a `--context` above it does not fail, it produces
+/// fluent nonsense from the first position the model never saw in training.
+/// That is the failure mode worth a flat refusal.
+///
+/// `trained == 0` is left alone: the manifest validator rejects it and
+/// `Model::load` is about to say so far more precisely than a context check
+/// could.
+fn check_trained_context(context: usize, trained: u64) -> anyhow::Result<()> {
+    if trained > 0 && context as u64 > trained {
+        bail!(
+            "--context {context} exceeds the {trained} tokens this model was trained for; \
+             positions past {trained} were never trained, so the reply would be nonsense \
+             rather than an error. Ask for {trained} or fewer (RAMVAMP_CONTEXT sets the \
+             same dial)."
+        );
+    }
+    Ok(())
+}
+
 /// The prefill dials, shared by every command that consumes a prompt.
 ///
-/// Both flags are `Option`, and that is the point: unset means "whatever the
-/// runtime already decided", which is the core default *or* the
-/// `RAMVAMP_PREFILL` / `RAMVAMP_PREFILL_CHUNK` environment override that
-/// [`ForwardState`] seeds itself from. A clap `default_value` here would
-/// silently beat those variables on every run.
+/// Both flags are `Option`, and that is the point: unset means "whatever else
+/// has a say", which is the core default, the `RAMVAMP_PREFILL` /
+/// `RAMVAMP_PREFILL_CHUNK` environment override that [`ForwardState`] seeds
+/// itself from, or the selected profile. A clap `default_value` here would
+/// silently beat both on every run.
 #[derive(Args, Debug, Clone, Copy)]
 struct PrefillArgs {
     /// Prefill path. `sweep` is the chunked layer-major pass: one sweep over
@@ -197,27 +301,6 @@ struct PrefillArgs {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
     )]
     prefill_chunk: Option<usize>,
-}
-
-impl PrefillArgs {
-    /// `base` with every dial the user actually typed applied on top.
-    fn merge(self, base: PrefillConfig) -> PrefillConfig {
-        let mut config = base;
-        if let Some(mode) = self.prefill {
-            config.mode = mode;
-        }
-        if let Some(chunk) = self.prefill_chunk {
-            config.chunk = chunk;
-        }
-        config
-    }
-
-    /// Apply these dials to a freshly built state.
-    fn apply(self, state: &mut ForwardState) -> anyhow::Result<()> {
-        let config = self.merge(state.prefill_config());
-        state.set_prefill_config(config)?;
-        Ok(())
-    }
 }
 
 /// Parse `--prefill`. Accepts exactly the spellings `RAMVAMP_PREFILL` does,
@@ -331,6 +414,11 @@ enum Command {
     /// Print the top-N next-token logits for a raw prompt as JSON (the
     /// llama.cpp logit-comparison hook).
     Logits(LogitsArgs),
+
+    /// Resolve the runtime dials and print them with their projected memory
+    /// footprint, without loading the model. Answers "will this fit here"
+    /// in well under a second.
+    Plan(PlanArgs),
 }
 
 #[derive(Args)]
@@ -405,6 +493,12 @@ struct GenerateArgs {
     trace_experts: Option<PathBuf>,
 
     #[command(flatten)]
+    profile: ProfileArgs,
+
+    #[command(flatten)]
+    context: ContextArgs,
+
+    #[command(flatten)]
     prefill: PrefillArgs,
 
     #[command(flatten)]
@@ -466,6 +560,12 @@ struct ChatArgs {
     /// as it always has.
     #[arg(long)]
     tui: bool,
+
+    #[command(flatten)]
+    profile: ProfileArgs,
+
+    #[command(flatten)]
+    context: ContextArgs,
 
     #[command(flatten)]
     prefill: PrefillArgs,
@@ -537,6 +637,12 @@ struct ServeArgs {
     keepalive_secs: u64,
 
     #[command(flatten)]
+    profile: ProfileArgs,
+
+    #[command(flatten)]
+    context: ContextArgs,
+
+    #[command(flatten)]
     prefill: PrefillArgs,
 
     #[command(flatten)]
@@ -561,6 +667,45 @@ struct LogitsArgs {
     /// (all prefill) to a binary trace file.
     #[arg(long, value_name = "FILE")]
     trace_experts: Option<PathBuf>,
+
+    #[command(flatten)]
+    profile: ProfileArgs,
+
+    #[command(flatten)]
+    context: ContextArgs,
+
+    #[command(flatten)]
+    prefill: PrefillArgs,
+
+    #[command(flatten)]
+    runtime: RuntimeArgs,
+}
+
+/// `plan`: the dials, where each one came from, and what they would cost.
+///
+/// A subcommand rather than a flag on `generate`, for two reasons. `generate`
+/// requires one of `--prompt`/`--messages-file` and this needs neither — the
+/// question is about the configuration, not about a prompt. And a `generate
+/// --dry-run` would have to promise not to load the model from inside the one
+/// function whose job is loading it; a separate command cannot accidentally
+/// grow that path.
+///
+/// It flattens [`RuntimeArgs`] whole, integrity flags included, so a `generate`
+/// command line answers for itself with the verb changed. `--skip-hashes` and
+/// `--verify-layer-hashes` are accepted and do nothing here: nothing is hashed
+/// because nothing is opened but the two metadata files.
+#[derive(Args)]
+struct PlanArgs {
+    /// Installed model directory (the .rvmp dir). Only `manifest.json` and
+    /// `experts/layout.json` are read — a few hundred KiB, not 17 GiB.
+    #[arg(long, value_name = "DIR")]
+    model: PathBuf,
+
+    #[command(flatten)]
+    profile: ProfileArgs,
+
+    #[command(flatten)]
+    context: ContextArgs,
 
     #[command(flatten)]
     prefill: PrefillArgs,
@@ -589,7 +734,47 @@ fn main() -> anyhow::Result<()> {
         Command::Chat(args) => run_chat(*args),
         Command::Serve(args) => run_serve(*args),
         Command::Logits(args) => run_logits(args),
+        Command::Plan(args) => run_plan(args),
     }
+}
+
+/// Resolve the dials, project the footprint, and print both. Loads no model.
+///
+/// The projection is [`ramvamp_core::io::Footprint::project`]'s — the same
+/// call `ForwardState::with_config` prices itself with, over the same inputs —
+/// and the refusal at the end is literally the runtime's own
+/// [`ForwardError::ConfigTooLarge`], so this command cannot answer a question
+/// the run would answer differently.
+///
+/// The report goes to stdout because it is this command's product. A
+/// configuration that does not fit is also a nonzero exit, so a script can ask
+/// the question without parsing the answer.
+fn run_plan(args: PlanArgs) -> anyhow::Result<()> {
+    let model_dir = args.model.as_path();
+    let dials = resolve_dials(&args.profile, args.context, args.prefill, &args.runtime)?;
+
+    // Both files are read at load anyway (`Model::load` reads the manifest,
+    // then the layout, and cross-checks them) and both are small. Nothing else
+    // is opened: no `common.bin` map, no expert file, no hash.
+    let manifest = load_manifest(model_dir)
+        .with_context(|| format!("reading the manifest of {}", model_dir.display()))?;
+    manifest.validate()?;
+    check_trained_context(dials.context.value, manifest.arch.context_length)?;
+    let layout = load_layout(model_dir)
+        .with_context(|| format!("reading the expert layout of {}", model_dir.display()))?;
+    layout.validate_against(&manifest)?;
+
+    let footprint = dials.project(&manifest, &layout)?;
+    let ceiling = resident_ceiling();
+    for line in plan_lines(&dials, model_dir, &footprint, ceiling) {
+        println!("{line}");
+    }
+    if let Some(limit) = ceiling
+        && !footprint.fits_within(limit)
+    {
+        return Err(ForwardError::ConfigTooLarge { footprint, limit }.into());
+    }
+    Ok(())
 }
 
 /// Encode the input, print what the model would actually see, and check
@@ -1057,13 +1242,15 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
     let max_new = args.max_new;
     let trace_experts = args.trace_experts.as_deref();
     let tokenizer = load_tokenizer(model_dir)?;
+    let dials = resolve_dials(&args.profile, args.context, args.prefill, &args.runtime)?;
+    let context = checked_context(&dials, model_dir)?;
     let (_, prompt_ids) = encode_input(&tokenizer, args.prompt, args.messages_file)?;
     if prompt_ids.is_empty() {
         bail!("prompt encodes to zero tokens");
     }
-    if prompt_ids.len() + max_new > CONTEXT_CAP {
+    if prompt_ids.len() + max_new > context {
         bail!(
-            "prompt ({}) + max-new ({max_new}) exceeds the v0 context cap of {CONTEXT_CAP}",
+            "prompt ({}) + max-new ({max_new}) exceeds the context cap of {context}",
             prompt_ids.len()
         );
     }
@@ -1071,8 +1258,8 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
     let load_start = Instant::now();
     let model = Model::load(model_dir, args.runtime.load_options())
         .with_context(|| format!("loading model from {}", model_dir.display()))?;
-    let mut state = ForwardState::with_config(&model, CONTEXT_CAP, args.runtime.runtime_config())?;
-    args.prefill.apply(&mut state)?;
+    let mut state = ForwardState::with_config(&model, context, dials.runtime_config())?;
+    dials.apply_prefill(&mut state)?;
     eprintln!(
         "model loaded in {:.2}s ({} prompt tokens); {} compute shards, {} expert \
          slots/layer from a {} budget, {} reads",
@@ -1781,12 +1968,17 @@ fn chat_turn(
 /// machinery, because `scripts/cold_bench.py` and the phase 8/9 sweeps parse
 /// what it writes.
 fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
+    // Before the branch, so both front ends resolve the same dials from the
+    // same three layers exactly once — and so a bad `--profile` is refused
+    // before a terminal is taken over.
+    let dials = resolve_dials(&args.profile, args.context, args.prefill, &args.runtime)?;
     if args.tui {
-        return tui::run_chat_tui(args);
+        return tui::run_chat_tui(args, dials);
     }
 
     let model_dir = args.model.as_path();
     let tokenizer = load_tokenizer(model_dir)?;
+    let context = checked_context(&dials, model_dir)?;
     let sanitizer = tokenizer.content_sanitizer();
 
     let mut seed: Vec<ChatMessage> = Vec::new();
@@ -1813,10 +2005,10 @@ fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
         .with_context(|| format!("loading model from {}", model_dir.display()))?;
     // Built once for the whole session: every turn continues this cache
     // rather than rebuilding the slot pool, the ring and the compute pool.
-    let mut state = ForwardState::with_config(&model, CONTEXT_CAP, args.runtime.runtime_config())?;
-    args.prefill.apply(&mut state)?;
+    let mut state = ForwardState::with_config(&model, context, dials.runtime_config())?;
+    dials.apply_prefill(&mut state)?;
     eprintln!(
-        "model loaded in {:.2}s; context cap {CONTEXT_CAP}, --max-new {} reserved per turn; \
+        "model loaded in {:.2}s; context cap {context}, --max-new {} reserved per turn; \
          {} compute shards, {} expert slots/layer from a {} budget, {} reads",
         load_start.elapsed().as_secs_f64(),
         args.max_new,
@@ -1911,6 +2103,7 @@ fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
             history.len(),
             &message,
             params.max_new,
+            context,
         )?;
         let (new_ids, used, room) = match plan {
             TurnPlan::Ready {
@@ -1941,7 +2134,7 @@ fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
         if interrupted {
             eprintln!("interrupted after {} bytes; kept as the reply", reply.len());
         }
-        eprintln!("context: {used} used, {room} free of {CONTEXT_CAP}");
+        eprintln!("context: {used} used, {room} free of {context}");
     }
 
     if turn > 0 {
@@ -1980,15 +2173,17 @@ fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     });
 
     let tokenizer = load_tokenizer(model_dir)?;
+    let dials = resolve_dials(&args.profile, args.context, args.prefill, &args.runtime)?;
+    let context = checked_context(&dials, model_dir)?;
     let load_start = Instant::now();
     let model = Model::load(model_dir, args.runtime.load_options())
         .with_context(|| format!("loading model from {}", model_dir.display()))?;
     // Built once for the process: every request continues this cache, rewound
     // to whatever prefix it shares with the one before it.
-    let mut state = ForwardState::with_config(&model, CONTEXT_CAP, args.runtime.runtime_config())?;
-    args.prefill.apply(&mut state)?;
+    let mut state = ForwardState::with_config(&model, context, dials.runtime_config())?;
+    dials.apply_prefill(&mut state)?;
     eprintln!(
-        "model loaded in {:.2}s; context cap {CONTEXT_CAP}, --max-new {} reserved per request; \
+        "model loaded in {:.2}s; context cap {context}, --max-new {} reserved per request; \
          {} compute shards, {} expert slots/layer from a {} budget, {} reads",
         load_start.elapsed().as_secs_f64(),
         args.max_new,
@@ -2021,7 +2216,7 @@ fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         tokenizer,
         ramvamp_server::EngineConfig {
             model_id: served_model_name.clone(),
-            context_limit: CONTEXT_CAP,
+            context_limit: context,
             default_max_new: args.max_new,
             params,
         },
@@ -2029,7 +2224,10 @@ fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let config = ramvamp_server::ServeConfig {
         port: args.port,
         keepalive: Duration::from_secs(args.keepalive_secs.max(1)),
-        ..ramvamp_server::ServeConfig::default()
+        // The body a client may send scales with the window it may fill; see
+        // `max_body_bytes_for_context`. At the default 4K this is the 1 MiB
+        // the server has always allowed.
+        max_body_bytes: ramvamp_server::max_body_bytes_for_context(context),
     };
     eprintln!(
         "serving {served_model_name} on http://127.0.0.1:{}{}  (Ctrl-C to stop)",
@@ -2046,21 +2244,23 @@ fn run_logits(args: LogitsArgs) -> anyhow::Result<()> {
     let prompt = args.prompt.as_str();
     let trace_experts = args.trace_experts.as_deref();
     let tokenizer = load_tokenizer(model_dir)?;
+    let dials = resolve_dials(&args.profile, args.context, args.prefill, &args.runtime)?;
+    let context = checked_context(&dials, model_dir)?;
     let ids = tokenizer.encode(prompt)?;
     if ids.is_empty() {
         bail!("prompt encodes to zero tokens");
     }
-    if ids.len() > CONTEXT_CAP {
+    if ids.len() > context {
         bail!(
-            "prompt ({}) exceeds the v0 context cap of {CONTEXT_CAP}",
+            "prompt ({}) exceeds the context cap of {context}",
             ids.len()
         );
     }
 
     let model = Model::load(model_dir, args.runtime.load_options())
         .with_context(|| format!("loading model from {}", model_dir.display()))?;
-    let mut state = ForwardState::with_config(&model, CONTEXT_CAP, args.runtime.runtime_config())?;
-    args.prefill.apply(&mut state)?;
+    let mut state = ForwardState::with_config(&model, context, dials.runtime_config())?;
+    dials.apply_prefill(&mut state)?;
 
     let arch = model.arch();
     let mut recorder = trace_experts
@@ -2735,7 +2935,7 @@ mod tests {
         assert_eq!(args.top_k, Some(20));
         assert_eq!(args.top_p, Some(0.8));
         assert_eq!(args.seed, Some(7));
-        assert_eq!(args.runtime.cache_bytes, 512 * 1024 * 1024);
+        assert_eq!(args.runtime.cache_bytes, Some(512 * 1024 * 1024));
         assert_eq!(args.runtime.threads, Some(4));
         assert!(args.runtime.skip_hashes);
         assert!(args.runtime.verify_layer_hashes);
@@ -3084,44 +3284,220 @@ mod tests {
         assert!(parse(&["--prefill", "sweep"]).is_ok());
     }
 
-    /// An unset flag must leave the runtime's own decision alone, because
-    /// that decision includes the `RAMVAMP_PREFILL*` environment overrides.
-    /// A clap `default_value` would have silently beaten them on every run.
+    /// An unset flag must leave every other layer alone, because those layers
+    /// are the `RAMVAMP_PREFILL*` environment overrides and the selected
+    /// profile. A clap `default_value` would have silently beaten both on
+    /// every run.
+    ///
+    /// This is [`Flags::from_args`] wired to [`Dials::resolve`], which is the
+    /// join the pure precedence test in [`config`] cannot see: a `from_args`
+    /// that read `prefill_chunk` into `prefill` would satisfy every test over
+    /// there and none of these.
     #[test]
-    fn unset_prefill_dials_change_nothing() {
+    fn unset_dials_leave_every_other_layer_alone() {
+        use ramvamp_core::model::PrefillConfig;
+
+        use crate::config::{Env, Flags, Selection, Source};
+
         let Ok(Cli {
             command: Command::Logits(args),
         }) = Cli::try_parse_from(["ramvamp", "logits", "--model", "/m", "--prompt", "hi"])
         else {
-            panic!("logits without the prefill flags should parse");
+            panic!("logits without the runtime flags should parse");
         };
-        assert_eq!(args.prefill.prefill, None);
-        assert_eq!(args.prefill.prefill_chunk, None);
+        // Nothing typed: every dial is `None`, which is what gives the layers
+        // below a say at all.
+        let unset = Flags::from_args(args.context, args.prefill, &args.runtime);
+        assert_eq!(unset, Flags::default());
 
-        // Whatever the state came with survives untouched ...
+        // ... so an environment that sets the three dials it has variables for
+        // wins them.
+        let env = Env {
+            context: Some(2048),
+            prefill: Some(PrefillMode::TokenMajor),
+            prefill_chunk: Some(77),
+        };
+        let dials = Dials::resolve(Selection::default(), &unset, &env);
+        assert_eq!(dials.context.value, 2048);
+        assert_eq!(dials.prefill.value, PrefillMode::TokenMajor);
+        assert_eq!(dials.prefill_chunk.value, 77);
+        for source in [
+            dials.context.source,
+            dials.prefill.source,
+            dials.prefill_chunk.source,
+        ] {
+            assert_eq!(source, Source::Env);
+        }
+
+        // Applying them touches the two dials this chain owns and nothing
+        // else: the sweep's own sub-dials come off the state untouched.
         let base = PrefillConfig {
-            mode: PrefillMode::TokenMajor,
-            chunk: 77,
+            experts_per_window: 7,
+            windows_in_flight: 3,
             ..PrefillConfig::default()
         };
-        assert_eq!(args.prefill.merge(base), base);
-        // ... and each flag overrides exactly its own dial.
-        let mode_only = PrefillArgs {
-            prefill: Some(PrefillMode::Sweep),
-            prefill_chunk: None,
-        };
         assert_eq!(
-            mode_only.merge(base),
+            dials.prefill_config(base),
             PrefillConfig {
-                mode: PrefillMode::Sweep,
+                mode: PrefillMode::TokenMajor,
+                chunk: 77,
                 ..base
             }
         );
-        let chunk_only = PrefillArgs {
-            prefill: None,
-            prefill_chunk: Some(256),
+
+        // And each flag overrides exactly its own dial, leaving the rest to
+        // the environment.
+        let Ok(Cli {
+            command: Command::Logits(args),
+        }) = Cli::try_parse_from([
+            "ramvamp",
+            "logits",
+            "--model",
+            "/m",
+            "--prompt",
+            "hi",
+            "--prefill",
+            "sweep",
+        ])
+        else {
+            panic!("logits --prefill sweep should parse");
         };
-        assert_eq!(chunk_only.merge(base), PrefillConfig { chunk: 256, ..base });
+        let flags = Flags::from_args(args.context, args.prefill, &args.runtime);
+        let dials = Dials::resolve(Selection::default(), &flags, &env);
+        assert_eq!(dials.prefill.value, PrefillMode::Sweep);
+        assert_eq!(dials.prefill.source, Source::Flag);
+        assert_eq!(dials.prefill_chunk.value, 77);
+        assert_eq!(dials.prefill_chunk.source, Source::Env);
+    }
+
+    // -----------------------------------------------------------------
+    // profiles
+    // -----------------------------------------------------------------
+
+    /// The two profile flags are on every command that builds a
+    /// [`ForwardState`], and on `plan`. They are deliberately *not* on
+    /// `tokenize`, which reads no dial.
+    #[test]
+    fn the_profile_flags_are_on_every_command_that_reads_a_dial() {
+        let with = |command: &str, extra: &[&str]| {
+            let mut argv = vec!["ramvamp", command, "--model", "/m"];
+            argv.extend_from_slice(extra);
+            argv.extend_from_slice(&["--profile", "agent", "--config", "/c.json"]);
+            Cli::try_parse_from(argv)
+        };
+        let profile = |parsed: Result<Cli, clap::Error>| match parsed.map(|cli| cli.command) {
+            Ok(Command::Generate(args)) => args.profile.clone(),
+            Ok(Command::Chat(args)) => args.profile.clone(),
+            Ok(Command::Serve(args)) => args.profile.clone(),
+            Ok(Command::Logits(args)) => args.profile,
+            Ok(Command::Plan(args)) => args.profile,
+            other => panic!("unexpected parse: {:?}", other.map(|_| "tokenize").err()),
+        };
+        for args in [
+            profile(with("generate", &["--prompt", "hi"])),
+            profile(with("chat", &[])),
+            profile(with("serve", &[])),
+            profile(with("logits", &["--prompt", "hi"])),
+            profile(with("plan", &[])),
+        ] {
+            assert_eq!(args.profile.as_deref(), Some("agent"));
+            assert_eq!(args.config, Some(PathBuf::from("/c.json")));
+        }
+        // `tokenize` runs no model and resolves no dial, so a profile there
+        // would be a flag that does nothing.
+        assert!(
+            Cli::try_parse_from(["ramvamp", "tokenize", "--model", "/m", "--prompt", "hi"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ramvamp",
+                "tokenize",
+                "--model",
+                "/m",
+                "--prompt",
+                "hi",
+                "--profile",
+                "agent",
+            ])
+            .is_err()
+        );
+    }
+
+    /// `plan` needs a model directory and nothing else, and takes the same
+    /// dials as the command it is answering for — so a `generate` line answers
+    /// for itself with the verb changed.
+    #[test]
+    fn plan_needs_only_a_model_and_takes_the_same_dials() {
+        assert!(Cli::try_parse_from(["ramvamp", "plan"]).is_err());
+        let Ok(Cli {
+            command: Command::Plan(args),
+        }) = Cli::try_parse_from([
+            "ramvamp",
+            "plan",
+            "--model",
+            "/m.rvmp",
+            "--context",
+            "16384",
+            "--cache-bytes",
+            "512M",
+            "--threads",
+            "4",
+            "--prefill",
+            "token-major",
+            "--prefill-chunk",
+            "256",
+            "--skip-hashes",
+        ])
+        else {
+            panic!("plan with every dial should parse");
+        };
+        assert_eq!(args.model, PathBuf::from("/m.rvmp"));
+        assert_eq!(args.context.context, Some(16_384));
+        assert_eq!(args.runtime.cache_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(args.runtime.threads, Some(4));
+        assert_eq!(args.prefill.prefill, Some(PrefillMode::TokenMajor));
+        assert_eq!(args.prefill.prefill_chunk, Some(256));
+        // Accepted, and documented to do nothing: `plan` hashes nothing
+        // because it opens nothing but the two metadata files.
+        assert!(args.runtime.skip_hashes);
+    }
+
+    /// The default path is the whole promise of this feature: with no config
+    /// file, no profile and no environment, every dial resolves to exactly
+    /// what it resolved to before profiles existed.
+    #[test]
+    fn a_bare_command_line_resolves_to_the_published_defaults() {
+        use ramvamp_core::model::{DEFAULT_CACHE_BYTES, PrefillConfig, RuntimeConfig};
+
+        use crate::config::{Env, Flags, Selection};
+
+        let Ok(Cli {
+            command: Command::Generate(args),
+        }) = Cli::try_parse_from([
+            "ramvamp",
+            "generate",
+            "--model",
+            "/m",
+            "--prompt",
+            "The capital of France is",
+        ])
+        else {
+            panic!("the default generate line should parse");
+        };
+        let flags = Flags::from_args(args.context, args.prefill, &args.runtime);
+        let dials = Dials::resolve(Selection::default(), &flags, &Env::default());
+
+        assert_eq!(dials.context.value, repl::DEFAULT_CONTEXT);
+        assert_eq!(dials.cache_bytes.value, DEFAULT_CACHE_BYTES);
+        assert_eq!(dials.cache_bytes.value, parse_bytes("1440M").unwrap());
+        // What the removed clap defaults used to produce, term for term.
+        assert_eq!(dials.runtime_config(), RuntimeConfig::default());
+        assert_eq!(
+            dials.prefill_config(PrefillConfig::default()),
+            PrefillConfig::default()
+        );
+        assert!(!args.runtime.skip_hashes);
+        assert!(!args.runtime.verify_layer_hashes);
     }
 
     // -----------------------------------------------------------------

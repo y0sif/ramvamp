@@ -18,7 +18,11 @@
 //!   the *sanitizing* encoder because the input is untrusted.
 //! * [`toolcall`] — the return leg: recovering `tool_calls` from the
 //!   `<tool_call>` text the model writes, preserving the argument bytes so the
-//!   client's echo of them re-renders into the block the model emitted.
+//!   client's echo of them re-renders into the block the model emitted. Twice
+//!   over, because a stream cannot wait for the whole reply: [`extract`] for
+//!   the buffered path and [`CallStream`] for the streaming one, the latter
+//!   keyed off the marker *token ids* so a boundary cannot fall between two
+//!   deltas.
 //! * [`error`] — one typed error per refusal, each knowing its status, body and
 //!   headers.
 //!
@@ -68,7 +72,10 @@ pub use engine::{
     common_prefix, hush_stream_aborts,
 };
 pub use error::{ErrorDetail, ErrorResponse, RETRY_HEADERS, ServerError};
-pub use http::{ServeConfig, ServeError, serve, serve_with};
+pub use http::{
+    BODY_BYTES_PER_CONTEXT_TOKEN, MIN_BODY_BYTES, ServeConfig, ServeError,
+    max_body_bytes_for_context, serve, serve_with,
+};
 pub use prompt::{Prompt, check_context};
 pub use request::{
     ChatCompletionRequest, Content, ContentPart, Message, MessageRole, StreamOptions,
@@ -76,10 +83,12 @@ pub use request::{
 };
 pub use response::{
     ChatCompletion, ChatCompletionChunk, ChunkBuilder, Delta, FinishReason, Health, ModelList,
-    ResponseMessage, Usage,
+    ResponseMessage, ToolCallDelta, Usage,
 };
 pub use sse::{DONE_SENTINEL, sse_data, sse_done, sse_event};
-pub use toolcall::{Extracted, ParsedCall, call_id, extract, wire_calls};
+pub use toolcall::{
+    CallStream, Extracted, ParsedCall, Step, call_id, extract, wire_call, wire_calls,
+};
 
 #[cfg(test)]
 mod tests {
