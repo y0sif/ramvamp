@@ -1,11 +1,4 @@
-```
- ||    _ __ __ _ _ __ _____   ____ _ _ __ ___  _ __     ||
- ||   | '__/ _` | '_ ` _ \ \ / / _` | '_ ` _ \| '_ \    ||
- ||:  | | | (_| | | | | | \ V / (_| | | | | | | |_) |  :||
- ||   |_|  \__,_|_| |_| |_|\_/ \__,_|_| |_| |_| .__/    ||
- ||                                           |_|       ||
-
-```
+<h1 align="center">ramvamp</h1>
 
 <p align="center">
   <a href="https://github.com/y0sif/ramvamp/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/y0sif/ramvamp/actions/workflows/ci.yml/badge.svg"></a> <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a> <img alt="Rust 1.88 or newer" src="https://img.shields.io/badge/rust-1.88%2B-orange.svg">
