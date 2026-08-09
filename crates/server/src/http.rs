@@ -45,6 +45,7 @@ use crate::response::{
     ResponseMessage,
 };
 use crate::sse::{sse_data, sse_done, sse_event};
+use crate::toolcall::{CallStream, Step, wire_call};
 use crate::wire::{KEEPALIVE, StreamState};
 
 /// `POST` this to generate.
@@ -267,8 +268,9 @@ fn chat_completions(engine: &mut dyn Engine, mut request: Request, config: &Serv
             Ok(completion) => {
                 // The whole reply is in hand, so the `<tool_call>` blocks in it
                 // can be turned into calls before anything is sent. The
-                // streaming path cannot do this, having already sent the text,
-                // which is why only this half is wired up.
+                // streaming path reaches the same outcome by a different route
+                // — [`CallStream`], driven by the marker token ids — because it
+                // has to decide per token, without the text that follows.
                 //
                 // Gated on the request having declared tools. Without that, a
                 // conversation *about* tool calls ("show me what a tool call
@@ -346,6 +348,10 @@ pub fn stream_into<W: Write + Send + 'static>(
         state: Arc::clone(&state),
         builder: builder.clone(),
         keepalive,
+        // The same gate the buffered path applies: without declared tools the
+        // markers are ordinary text a user asked about, and swallowing them
+        // deletes their answer.
+        calls: CallStream::new(!request.tools().is_empty()),
     };
     let include_usage = request.include_usage();
     let outcome = engine.run(plan, &mut sink);
@@ -356,10 +362,22 @@ pub fn stream_into<W: Write + Send + 'static>(
             tracing::debug!("client left mid-reply; the stream is abandoned unterminated");
         }
         Ok(completion) => {
-            let _ = emit(
-                &state,
-                &sse_or_empty(&builder.finish(completion.finish_reason)),
-            );
+            // A block the token budget cut in half is not a call, but it is
+            // text the model wrote, and it has been held back until now.
+            if let Some(unterminated) = sink.calls.flush() {
+                let _ = emit(&state, &sse_or_empty(&builder.content(unterminated)));
+            }
+            // A recovered call overrides the stop reason: the model stopped
+            // because it wanted a tool, whatever token ended it. Nothing
+            // recovered leaves the reason alone, so a block cut off by the
+            // budget still reports `length` — the same rule as the buffered
+            // path, reached from a counter instead of from a list.
+            let finish_reason = if sink.calls.emitted() > 0 {
+                FinishReason::ToolCalls
+            } else {
+                completion.finish_reason
+            };
+            let _ = emit(&state, &sse_or_empty(&builder.finish(finish_reason)));
             // Usage goes immediately *before* the sentinel: a client stops
             // reading at `[DONE]`, so usage after it is usage nobody gets.
             if include_usage {
@@ -385,6 +403,9 @@ struct SseSink<W: Write> {
     state: Arc<Mutex<StreamState<W>>>,
     builder: ChunkBuilder,
     keepalive: Duration,
+    /// Recovers `<tool_call>` blocks as they arrive, so an agent client gets
+    /// structure rather than the markup it would have to parse itself.
+    calls: CallStream,
 }
 
 impl<W: Write> TokenSink for SseSink<W> {
@@ -406,14 +427,25 @@ impl<W: Write> TokenSink for SseSink<W> {
         Ok(())
     }
 
-    fn token(&mut self, text: &str) -> Result<(), StreamError> {
-        // A token whose bytes are still an incomplete UTF-8 character decodes
-        // to nothing; sending an empty delta would be a chunk that says
-        // nothing, and the next token carries the character anyway.
-        if text.is_empty() {
-            return Ok(());
-        }
-        let event = sse_or_empty(&self.builder.content(text));
+    fn token(&mut self, id: u32, text: &str) -> Result<(), StreamError> {
+        // The id, not the text, decides: `<tool_call>` and `</tool_call>` are
+        // single added tokens, so the block boundaries are an integer compare
+        // and cannot be split across two deltas.
+        let event = match self.calls.push(id, text) {
+            // Inside a block. Nothing goes out until it closes, which is what
+            // keeps the raw markup off the wire.
+            Step::Nothing => return Ok(()),
+            // A token whose bytes are still an incomplete UTF-8 character
+            // decodes to nothing; sending an empty delta would be a chunk that
+            // says nothing, and the next token carries the character anyway.
+            Step::Content(text) if text.is_empty() => return Ok(()),
+            Step::Content(text) => sse_or_empty(&self.builder.content(text)),
+            Step::Call { index, call } => {
+                tracing::debug!(index, name = %call.name, "recovered a streamed tool call");
+                let wire = wire_call(self.builder.id(), index, &call);
+                sse_or_empty(&self.builder.tool_call(index, wire))
+            }
+        };
         lock(&self.state).emit(&event)
     }
 }
@@ -629,7 +661,10 @@ mod tests {
     struct StubEngine {
         prefill_steps: usize,
         prefill_delay: Duration,
-        tokens: Vec<String>,
+        /// Each token as (id, text), because the streaming tool-call lane keys
+        /// off the id and a source that could only produce text could not
+        /// exercise it.
+        tokens: Vec<(u32, String)>,
         token_delay: Duration,
         /// Why the stub says it stopped. The tool-call lane overrides this, so
         /// what it overrides has to be settable.
@@ -639,12 +674,22 @@ mod tests {
         produced: Arc<AtomicUsize>,
     }
 
+    /// The id of an ordinary token: anything that is not a marker.
+    const TEXT_ID: u32 = 7;
+
     impl StubEngine {
         fn new(tokens: &[&str]) -> Self {
+            StubEngine::with_ids(&tokens.iter().map(|t| (TEXT_ID, *t)).collect::<Vec<_>>())
+        }
+
+        fn with_ids(tokens: &[(u32, &str)]) -> Self {
             StubEngine {
                 prefill_steps: 0,
                 prefill_delay: Duration::ZERO,
-                tokens: tokens.iter().map(|t| (*t).to_owned()).collect(),
+                tokens: tokens
+                    .iter()
+                    .map(|(id, text)| (*id, (*text).to_owned()))
+                    .collect(),
                 token_delay: Duration::ZERO,
                 finish_reason: FinishReason::Stop,
                 produced: Arc::new(AtomicUsize::new(0)),
@@ -687,11 +732,11 @@ mod tests {
                     return Ok(aborted(text, plan.prompt_tokens, 0));
                 }
             }
-            for (index, token) in self.tokens.clone().iter().enumerate() {
+            for (index, (id, token)) in self.tokens.clone().iter().enumerate() {
                 std::thread::sleep(self.token_delay);
                 self.produced.store(index + 1, Ordering::Relaxed);
                 text.push_str(token);
-                if sink.token(token).is_err() {
+                if sink.token(*id, token).is_err() {
                     return Ok(aborted(text, plan.prompt_tokens, index + 1));
                 }
             }
@@ -789,18 +834,95 @@ mod tests {
         ChatCompletionRequest::from_json(&body).expect("valid body")
     }
 
+    /// The same body with a `glob` tool declared, which is the gate the
+    /// streaming tool-call lane is behind.
+    fn request_with_tools() -> ChatCompletionRequest {
+        ChatCompletionRequest::from_json(
+            r#"{"model":"stub-model","messages":[{"role":"user","content":"list the rust files"}],
+                "stream":true,
+                "tools":[{"type":"function","function":{"name":"glob","parameters":{}}}]}"#,
+        )
+        .expect("valid body")
+    }
+
     fn run_stream(engine: &mut StubEngine, recorder: Recorder, keepalive: Duration) {
-        let request = request(true);
-        let plan = engine.prepare(&request).expect("a plan");
+        run_stream_for(engine, &request(true), recorder, keepalive);
+    }
+
+    fn run_stream_for(
+        engine: &mut StubEngine,
+        request: &ChatCompletionRequest,
+        recorder: Recorder,
+        keepalive: Duration,
+    ) {
+        let plan = engine.prepare(request).expect("a plan");
         stream_into(
             engine,
-            &request,
+            request,
             plan,
             recorder,
             "chatcmpl-test",
             1_700_000_000,
             keepalive,
         );
+    }
+
+    /// The `data:` payloads of a recorded stream, parsed, with the sentinel
+    /// dropped. What a client actually gets.
+    fn chunks(body: &str) -> Vec<serde_json::Value> {
+        body.split("data: ")
+            .skip(1)
+            .map(|event| event.split("\n\n").next().unwrap_or_default())
+            .filter(|payload| *payload != crate::sse::DONE_SENTINEL)
+            .map(|payload| {
+                serde_json::from_str(payload)
+                    .unwrap_or_else(|e| panic!("a chunk payload: {e}\n{payload}"))
+            })
+            .collect()
+    }
+
+    /// The `tool_calls` entries of a recorded stream, flattened, in order.
+    fn streamed_calls(body: &str) -> Vec<serde_json::Value> {
+        chunks(body)
+            .into_iter()
+            .filter_map(|chunk| {
+                chunk["choices"][0]["delta"]["tool_calls"]
+                    .as_array()
+                    .cloned()
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// The content deltas of a recorded stream, concatenated.
+    fn streamed_text(body: &str) -> String {
+        chunks(body)
+            .iter()
+            .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+            .collect()
+    }
+
+    /// The reason the stream ended, from its finish chunk.
+    fn streamed_finish(body: &str) -> String {
+        chunks(body)
+            .iter()
+            .find_map(|chunk| {
+                chunk["choices"][0]["finish_reason"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .expect("a finish chunk")
+    }
+
+    /// The block a model writes when it wants `glob`, as the tokens it writes
+    /// it in: the markers are single added tokens, the body is not.
+    fn glob_call_tokens() -> Vec<(u32, &'static str)> {
+        vec![
+            (crate::toolcall::OPEN_TAG_ID, "<tool_call>"),
+            (TEXT_ID, "\n{\"name\": \"glob\", "),
+            (TEXT_ID, "\"arguments\": {\"pattern\": \"*/.rs\"}}\n"),
+            (crate::toolcall::CLOSE_TAG_ID, "</tool_call>"),
+        ]
     }
 
     /// The assertion a buffered implementation cannot pass: the content
@@ -1276,22 +1398,237 @@ mod tests {
         );
     }
 
-    /// Wave 4's boundary, asserted rather than assumed: the streaming path
-    /// still sends the model's text exactly as it comes, blocks included.
+    // ---- streaming tool calls ----
+
+    /// The bug this lane exists to fix, in one assertion: OpenCode streams by
+    /// default, and every agentic turn used to render the raw block as
+    /// assistant prose. Now it is structure, and the markup is gone.
     #[test]
-    fn the_streaming_path_still_emits_the_raw_block() {
-        let mut engine = StubEngine::new(&["<tool_call>", "{\"name\": \"read\"}", "</tool_call>"]);
+    fn a_streamed_call_becomes_a_tool_calls_delta_and_no_raw_markup() {
+        let mut engine = StubEngine::with_ids(&glob_call_tokens());
+        let recorder = Recorder::new();
+        run_stream_for(
+            &mut engine,
+            &request_with_tools(),
+            recorder.clone(),
+            Duration::from_secs(60),
+        );
+
+        let body = recorder.body();
+        assert!(
+            !body.contains("tool_call>"),
+            "the raw markup is still on the wire: {body}"
+        );
+
+        let calls = streamed_calls(&body);
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "glob");
+        assert_eq!(
+            calls[0]["function"]["arguments"], r#"{"pattern": "*/.rs"}"#,
+            "the model's argument bytes reach the client unaltered"
+        );
+        // The stop reason is overridden: the model stopped to call a tool.
+        assert_eq!(streamed_finish(&body), "tool_calls");
+        assert_eq!(streamed_text(&body), "", "the block left no prose behind");
+        assert!(body.contains("[DONE]"), "{body}");
+        assert!(body.ends_with(TERMINATOR), "{body}");
+    }
+
+    /// Prose is still prose. Only the blocks are withheld, and only for as long
+    /// as they are open.
+    #[test]
+    fn prose_before_between_and_after_streamed_calls_is_still_content() {
+        let mut tokens = vec![(TEXT_ID, "Let me "), (TEXT_ID, "look.\n")];
+        tokens.extend(glob_call_tokens());
+        tokens.push((TEXT_ID, "\nand the tests\n"));
+        tokens.extend(glob_call_tokens());
+        tokens.push((TEXT_ID, "\nThen I will compare."));
+
+        let mut engine = StubEngine::with_ids(&tokens);
+        let recorder = Recorder::new();
+        run_stream_for(
+            &mut engine,
+            &request_with_tools(),
+            recorder.clone(),
+            Duration::from_secs(60),
+        );
+
+        let body = recorder.body();
+        assert_eq!(
+            streamed_text(&body),
+            "Let me look.\n\nand the tests\n\nThen I will compare."
+        );
+        assert!(!body.contains("tool_call>"), "{body}");
+    }
+
+    /// Two calls in one turn are told apart by `index` and by nothing else.
+    #[test]
+    fn two_streamed_calls_get_indices_zero_and_one() {
+        let mut tokens = glob_call_tokens();
+        tokens.extend(glob_call_tokens());
+        let mut engine = StubEngine::with_ids(&tokens);
+        let recorder = Recorder::new();
+        run_stream_for(
+            &mut engine,
+            &request_with_tools(),
+            recorder.clone(),
+            Duration::from_secs(60),
+        );
+
+        let body = recorder.body();
+        let calls = streamed_calls(&body);
+        assert_eq!(calls.len(), 2, "{body}");
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[1]["index"], 1);
+        assert_ne!(calls[0]["id"], calls[1]["id"]);
+        assert_eq!(streamed_finish(&body), "tool_calls");
+        // Each call is complete in one delta, so a client never has to
+        // reassemble a half-written `arguments` string.
+        for call in &calls {
+            assert_eq!(call["function"]["arguments"], r#"{"pattern": "*/.rs"}"#);
+        }
+    }
+
+    /// A block the token budget cut in half is not a call. It is text, it is
+    /// flushed, and the reason the generation actually ended stands.
+    #[test]
+    fn an_unterminated_streamed_block_flushes_as_content_and_keeps_length() {
+        let mut engine = StubEngine::with_ids(&[
+            (TEXT_ID, "Reading it.\n"),
+            (crate::toolcall::OPEN_TAG_ID, "<tool_call>"),
+            (TEXT_ID, "\n{\"name\": \"glob\", \"argum"),
+        ]);
+        engine.finish_reason = FinishReason::Length;
+        let recorder = Recorder::new();
+        run_stream_for(
+            &mut engine,
+            &request_with_tools(),
+            recorder.clone(),
+            Duration::from_secs(60),
+        );
+
+        let body = recorder.body();
+        assert!(streamed_calls(&body).is_empty(), "{body}");
+        assert_eq!(streamed_finish(&body), "length");
+        assert_eq!(
+            streamed_text(&body),
+            "Reading it.\n<tool_call>\n{\"name\": \"glob\", \"argum",
+            "half a block is text, and text is not dropped"
+        );
+    }
+
+    /// A request that declared no tools gets the block back as text. The model
+    /// only writes these markers because the template's tools branch asked for
+    /// them, so without tools they are an answer, not a call.
+    #[test]
+    fn a_streamed_block_without_tools_stays_ordinary_text() {
+        let mut engine = StubEngine::with_ids(&glob_call_tokens());
         let recorder = Recorder::new();
         run_stream(&mut engine, recorder.clone(), Duration::from_secs(60));
 
         let body = recorder.body();
-        assert!(body.contains(r#""content":"<tool_call>""#), "{body}");
-        assert!(body.contains(r#""content":"</tool_call>""#), "{body}");
-        assert!(body.contains(r#""finish_reason":"stop""#), "{body}");
         assert!(
-            !body.contains(r#""tool_calls""#),
-            "streaming tool calls are wave 4: {body}"
+            streamed_calls(&body).is_empty(),
+            "a request without tools got tool_calls back: {body}"
         );
+        assert_eq!(streamed_finish(&body), "stop");
+        assert_eq!(
+            streamed_text(&body),
+            "<tool_call>\n{\"name\": \"glob\", \"arguments\": {\"pattern\": \"*/.rs\"}}\n</tool_call>",
+            "byte for byte, markers and all"
+        );
+    }
+
+    /// Models get this JSON wrong routinely, and a dropped turn would be the
+    /// cost. The call goes out with whatever the `arguments` span held.
+    #[test]
+    fn malformed_json_in_a_streamed_block_still_yields_a_call() {
+        let mut engine = StubEngine::with_ids(&[
+            (crate::toolcall::OPEN_TAG_ID, "<tool_call>"),
+            (
+                TEXT_ID,
+                "\n{\"name\": \"glob\", \"arguments\": {\"pattern\": \"*\",}}\n",
+            ),
+            (crate::toolcall::CLOSE_TAG_ID, "</tool_call>"),
+        ]);
+        let recorder = Recorder::new();
+        run_stream_for(
+            &mut engine,
+            &request_with_tools(),
+            recorder.clone(),
+            Duration::from_secs(60),
+        );
+
+        let body = recorder.body();
+        let calls = streamed_calls(&body);
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0]["function"]["name"], "glob");
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"pattern": "*",}"#);
+        assert_eq!(streamed_finish(&body), "tool_calls");
+    }
+
+    /// The two paths name the same call identically, so a client that retries a
+    /// turn without `stream` gets ids it can still match against its table.
+    #[test]
+    fn streamed_call_ids_match_the_buffered_paths_for_the_same_completion() {
+        const ID: &str = "chatcmpl-18f3a0001";
+        let mut engine = StubEngine::with_ids(&glob_call_tokens());
+        let recorder = Recorder::new();
+        let request = request_with_tools();
+        let plan = engine.prepare(&request).expect("a plan");
+        stream_into(
+            &mut engine,
+            &request,
+            plan,
+            recorder.clone(),
+            ID,
+            1_700_000_000,
+            Duration::from_secs(60),
+        );
+
+        let body = recorder.body();
+        let streamed = streamed_calls(&body);
+        // What the buffered path would have produced from the same reply.
+        let reply: String = glob_call_tokens().iter().map(|(_, text)| *text).collect();
+        let buffered = crate::toolcall::wire_calls(ID, &crate::toolcall::extract(&reply).calls);
+        assert_eq!(buffered.len(), 1);
+        assert_eq!(streamed[0]["id"], buffered[0].id);
+        assert_eq!(streamed[0]["id"], "call_18f3a0001_0");
+    }
+
+    /// The framing rules do not change because a delta carries a call: one
+    /// event per chunk, hex length of the payload only.
+    #[test]
+    fn a_tool_call_delta_is_framed_like_every_other_event() {
+        let mut engine = StubEngine::with_ids(&glob_call_tokens());
+        let recorder = Recorder::new();
+        run_stream_for(
+            &mut engine,
+            &request_with_tools(),
+            recorder.clone(),
+            Duration::from_secs(60),
+        );
+
+        let body = recorder.body();
+        let mut rest = body.strip_prefix(SSE_HEAD).expect("head first");
+        let mut events = 0usize;
+        loop {
+            let (head, tail) = rest.split_once("\r\n").expect("a chunk header");
+            let len = usize::from_str_radix(head, 16).expect("hex length");
+            if len == 0 {
+                assert_eq!(tail, "\r\n", "the terminator ends the body");
+                break;
+            }
+            assert_eq!(&tail[len..len + 2], "\r\n", "chunk not CRLF-terminated");
+            let payload = &tail[..len];
+            assert_eq!(payload.matches("\n\n").count(), 1, "{payload:?}");
+            events += 1;
+            rest = &tail[len + 2..];
+        }
+        // role, the call, finish, [DONE].
+        assert_eq!(events, 4, "{body}");
     }
 
     /// The array-form `content` every SDK sends, end to end. A server that
