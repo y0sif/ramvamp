@@ -47,9 +47,9 @@ jobs:
       matrix:
         include:
           - name: default (io-uring)
-            flags: ""
+            flags: "--workspace"
           - name: no-default-features (pread fallback)
-            flags: "--no-default-features"
+            flags: "-p ramvamp-core --no-default-features"
     steps:
       - uses: actions/checkout@v4
 
@@ -59,8 +59,15 @@ jobs:
 
       # `ramvamp-core`'s `io-uring` feature is on by default. The portable
       # pread path exists so the runtime builds where io_uring does not, so it
-      # has to be built and tested on its own, not just inherited from a
-      # default-features run that never compiles it.
+      # has to be built and tested on its own.
+      #
+      # The `-p ramvamp-core` is load-bearing, not tidiness. `--no-default-features`
+      # at the workspace root does NOT disable the feature: repack, server and cli
+      # all depend on core with default features, and cargo's feature unification
+      # turns `io-uring` back on for the whole graph. That leg then passes as a
+      # green duplicate of the default one and the pread path is never compiled.
+      # Confirm with `cargo tree --workspace --no-default-features -i io-uring`,
+      # which still resolves the crate.
       - name: Build
         run: cargo build --all-targets ${{ matrix.flags }}
 
@@ -86,7 +93,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build on MSRV
-        run: cargo build --all-targets
+        run: cargo build --all-targets --workspace
 
+      # `-p ramvamp-core` for the same reason as the features job above: at the
+      # workspace root, feature unification re-enables `io-uring` and this leg
+      # silently becomes a copy of the one before it.
       - name: Build on MSRV (pread fallback)
-        run: cargo build --all-targets --no-default-features
+        run: cargo build --all-targets -p ramvamp-core --no-default-features

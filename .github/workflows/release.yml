@@ -5,14 +5,46 @@ on:
     tags:
       - "v*"
 
+# Scoped per job rather than workflow-wide: only `release` writes anything.
+# `build` and `publish` run with the default read-only token.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Refuse a tag that does not match the version it claims to release.
+  #
+  # Without this, tagging v0.1.1 without bumping Cargo.toml builds a tarball,
+  # cuts a GitHub Release for v0.1.1, and then silently no-ops every publish,
+  # because `cargo publish` on an already-uploaded 0.1.0 is treated as success.
+  # The whole run goes green having published nothing. That is exactly the
+  # half-finished-but-green outcome the approval gate below exists to prevent,
+  # so it is caught here, before anything is built.
+  guard:
+    name: Tag matches version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: check
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "ramvamp-core") | .version')
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "releasing $version"
+
   build:
+    needs: guard
     name: Build — ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -64,6 +96,8 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -80,7 +114,7 @@ jobs:
 
   publish:
     name: Publish to crates.io
-    needs: release
+    needs: [guard, release]
     runs-on: ubuntu-latest
     # Manual approval gate rather than `continue-on-error`.
     #
@@ -102,13 +136,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      # Deliberately no `Swatinem/rust-cache` here. This is the one job holding
+      # CARGO_REGISTRY_TOKEN, and the cache is writable by any same-repo branch
+      # push, so restoring it into this job widens what a compromised branch can
+      # reach. A publish-only job has little to gain from it anyway.
 
       # Publish order is forced by the dependency graph:
       #
       #   ramvamp-core
-      #     -> ramvamp-repack, ramvamp-server
-      #        -> ramvamp
+      #     -> ramvamp-repack (leaf)
+      #     -> ramvamp-server
+      #          -> ramvamp
+      #
+      # `ramvamp` depends on core and server. `ramvamp-repack` is a leaf: it is
+      # published because it ships a binary, and nothing resolves it, so its
+      # index entry is not waited on.
       #
       # It has to be serialized, and each step has to wait for the sparse index
       # to catch up. crates.io acknowledges a publish before the index serves
@@ -169,15 +211,14 @@ jobs:
             return 1
           }
 
-          version=$(cargo metadata --format-version 1 --no-deps \
-            | jq -r '.packages[] | select(.name == "ramvamp-core") | .version')
+          version="${{ needs.guard.outputs.version }}"
           echo "publishing workspace version $version"
 
           publish ramvamp-core
           wait_for_index ramvamp-core "$version"
 
+          # Leaf. Nothing resolves it, so no index wait.
           publish ramvamp-repack
-          wait_for_index ramvamp-repack "$version"
 
           publish ramvamp-server
           wait_for_index ramvamp-server "$version"
