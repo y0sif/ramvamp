@@ -38,16 +38,19 @@ NVMe) running Qwen3-30B-A3B Q4_K_M with a cold page cache inside
 
 | | measured |
 | --- | --- |
-| Decode | **about 2 tok/s**: 1.46 to 2.19 over ctx 64-3,961 in one session, 1.43 to 2.16 over the same rungs in another |
+| Decode | **about 2 tok/s**: 1.46 to 2.19 over ctx 64-3,961 (EXP-023), and 1.43 to 2.16 over the same rungs on a later branch (EXP-025) |
 | Prefill | **11.25 tok/s** at ctx 512 |
 | Peak RAM | **2.5-2.9 GiB** of a 3.0 GiB ceiling |
 | Model on disk | 17.35 GiB, a **~6x** memory saving |
 | Fidelity | mean full-vocab KL **1.04e-2** vs llama.cpp, top-1 agreement 8/8 |
 
-Those are two separate sessions and deliberately not merged into one curve:
-re-running the *byte-identical* binary a day later read 3.1% slower at ctx 512
-and 8.9% slower at 3,961. On a DRAM-less QLC part, a decode figure describes
-its session as well as its device.
+Those two ladders come from different binaries in different sessions, and are
+deliberately not drawn as one curve. The drift is measured rather than assumed:
+the later session also re-ran EXP-023's *byte-identical* binary at two rungs and
+read **1.85 tok/s against 1.91** at ctx 512, and **1.33 against 1.46** at 3,961.
+That is 3.1% and 8.9% slower a day later, on the same machine, with no code
+change. On a DRAM-less QLC part a decode figure describes its session as well as
+its device, which is why no single number appears here without one.
 
 **Throughput is stated per drive on purpose.** Decode is I/O-bound: expert
 reads are 44.4% of a decode token at ctx 512 and 33.2% at 3,961, and because

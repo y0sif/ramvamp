@@ -116,19 +116,17 @@ jobs:
     name: Publish to crates.io
     needs: [guard, release]
     runs-on: ubuntu-latest
-    # Manual approval gate rather than `continue-on-error`.
+    # Runs after the GitHub release, so the tag is fully built and published
+    # before the one step that cannot be taken back. crates.io has no undo: a
+    # version can be yanked but never republished under the same number.
     #
-    # crates.io has no undo: a version can be yanked but never republished, so
-    # a half-finished run leaves `ramvamp-core 0.1.0` on the registry with no
-    # way to fix it under the same number. `continue-on-error` would paint that
-    # outcome green. An environment with a required reviewer means the tag is
-    # already built and released before anyone is asked to approve the one step
-    # that cannot be taken back.
+    # The `guard` job is what protects that: it refuses a tag whose version
+    # does not match the workspace, which is the mistake that would otherwise
+    # produce a green run that published nothing.
     #
-    # This needs a repository environment named `crates-io` with a required
-    # reviewer and the `CARGO_REGISTRY_TOKEN` secret. Without the reviewer the
-    # job simply runs, so configure it before the first tag.
-    environment: crates-io
+    # Needs only the `CARGO_REGISTRY_TOKEN` repository secret. If you would
+    # rather publish by hand, delete this job; the tarball release above stands
+    # on its own.
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:

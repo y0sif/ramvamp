@@ -62,9 +62,11 @@ Cause of the recorded 138,407, established and reproduced (EXP-007): a
 benchmark harness indexed its buffer pool with modulo arithmetic, so two
 in-flight O_DIRECT reads could target the same buffer. btrfs verifies the
 checksum after DMA into the user buffer, so one read's verification ran over
-bytes the other had already overwritten. Measured 13-27% spurious `EIO` with
-aliased buffers versus 0 across 4,000 reads with an explicit free list. The
-data on disk was never affected: the model files hash-match `manifest.json`,
+bytes the other had already overwritten. Aliased buffers returned spurious
+`EIO` frequently but not always; the probe's 13-27% spread is across repeats on
+a machine that was not quiet and is not a rate to quote. An explicit free list
+measured 0 `EIO` across 4,000 reads. The data on disk was never affected: the
+model files hash-match `manifest.json`,
 the failing regions re-read clean, and an instrumented run confirmed 6,000
 blocks delivered byte-correct while 256 checksum failures were logged.
 

@@ -82,7 +82,7 @@ What it checks, and why each check exists:
 8. The workload argv is handed to the inner wrapper through a **file**,
    not through `systemd-run`'s command line. systemd expands `${NAME}` and
    unescapes `$$` inside `ExecStart=` arguments, and it does so silently:
-   measured on systemd 261, `A ${HOME} B` arrives as `A /home/y0sif B`,
+   measured on systemd 261, `A ${HOME} B` arrives as `A /home/you B`,
    `A ${UNSET} B` arrives as `A  B`, and `A $$VAR B` arrives as `A $VAR B`.
    (Bare `$VAR`, `%` specifiers, newlines, tabs, quotes and backslashes all
    survive, so short English prompts never tripped it.) At phase-6 prefill

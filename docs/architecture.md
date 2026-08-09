@@ -1580,9 +1580,9 @@ withdrawn.
   arithmetic.
 
   **"in the session EXP-023 measured" is load-bearing, and EXP-025 is why.**
-  EXP-025 re-ran the **byte-identical** EXP-023 binary
-  (sha256 `d36036b6...`) on the **same two prompt files** at the same dial a
-  day later and measured **1.85 tok/s at ctx 512 against EXP-023's 1.91
+  EXP-025 re-ran the **byte-identical** EXP-023 binary on the **same two
+  prompt files** at the same dial a day later and measured **1.85 tok/s at
+  ctx 512 against EXP-023's 1.91
   (0.969x) and 1.33 at ctx 3,961 against 1.46 (0.911x)**, MEASURED cold,
   hygiene PASS on both arms. Same bytes, same workload, 3.1% and 8.9% apart.
   **So 1.46-2.19 tok/s is a fact about one session and not a property of this
@@ -1719,7 +1719,7 @@ withdrawn.
   | Decode, 11 slots/layer, ctx 64 to 3,961 | **1.46 to 2.19 tok/s** (EXP-023) and **1.43 to 2.16** (EXP-025). MEASURED cold. **Two sessions; rule 3 forbids one curve through them and they are quoted separately for that reason.** |
   | Decode, 13 slots/layer, ctx 512 | **2.06 tok/s** MEASURED cold (EXP-023) |
   | Prefill, ctx 512 | **11.25** (EXP-023), **11.07** (EXP-025) MEASURED cold |
-  | `memory.peak` | **2,497 to 2,929 MiB** against the 3,072 MiB ceiling |
+  | `memory.peak` | **2,497 to 2,929 MiB** against the 3,072 MiB ceiling. 2,497.0 is EXP-025's fused arm at ctx 64, 2,929.3 is EXP-023 at ctx 3,961 |
 
   The one-line summary the README carries is **"about 2 tok/s decode on a
   DRAM-less QLC drive"**. That is the honest reading of two ladders that read

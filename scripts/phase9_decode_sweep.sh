@@ -36,12 +36,12 @@
 #   4. The tail prints every stderr block WHOLE. Phase 8's printer found the
 #      first line containing "split" or starting with "experts:", printed
 #      twelve lines and broke. Because `experts:` matches first, the decode
-#      split came out cut off after two of its six rows — see
-#      scratch/phase8/sweep-20260806-165322/SUMMARY.txt lines 587-588, where
-#      the 3,961-token arm's decode split ends one row in, at `attention:`,
-#      and its expert-compute, expert-io, projections, elementwise and other
-#      rows are absent from the artifact EXP-023 was written from. Phase 9 also emits a SECOND block, `decode
-#      gemv split (submitting thread):`, which that printer would have
+#      split came out cut off after two of its six rows: in the phase-8 sweep
+#      artifact the 3,961-token arm's decode split ends one row in, at
+#      `attention:`, and its expert-compute, expert-io, projections,
+#      elementwise and other rows are absent from the summary EXP-023 was
+#      written from. Phase 9 also emits a SECOND block, `decode gemv split
+#      (submitting thread):`, which that printer would have
 #      dropped entirely. The replacement takes each block's extent from
 #      indentation, so it depends on no block's line count.
 #
@@ -935,8 +935,8 @@ say ""
 say "--- estimated wall time (ESTIMATED, not measured) ---"
 say ""
 say "Derived from the phase-8 sweep's own MEASURED step walls, which ran this"
-say "exact seven-arm list on this machine and this drive"
-say "(scratch/phase8/sweep-20260806-165322/exitcodes.tsv):"
+say "exact seven-arm list on this machine and this drive (the sweep behind"
+say "EXP-023):"
 say ""
 say "  measured  ctx   64  branch arm              202 s"
 say "  measured  ctx  512  branch arm              327 s"
@@ -1375,13 +1375,12 @@ def split_blocks(lines):
     Two things were wrong with that and both are why this exists. Because
     `experts:` matches before `decode split (forward_token):`, the twelve
     lines were spent on the experts block and the two split blocks, so the
-    decode split was cut off after two of its six rows -- visible in
-    scratch/phase8/sweep-20260806-165322/SUMMARY.txt, where the 3,961-token
-    arm ends at `attention:` and its expert-compute, expert-io, projections,
-    elementwise and other rows are simply not in the artifact EXP-023 was
-    written from. And it broke after one block, so phase 9's second block,
-    `decode gemv split (submitting thread):`, would never have printed at
-    all.
+    decode split was cut off after two of its six rows -- visible in the
+    phase-8 sweep artifact, where the 3,961-token arm ends at `attention:` and
+    its expert-compute, expert-io, projections, elementwise and other rows are
+    simply not in the summary EXP-023 was written from. And it broke after one
+    block, so phase 9's second block, `decode gemv split (submitting
+    thread):`, would never have printed at all.
 
     Counting to a bigger number would fix today's stderr and break on the
     next block anyone adds. The block boundary is already in the text.

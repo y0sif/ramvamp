@@ -87,7 +87,7 @@ inside `memory.max=3G` with swap off, at the shipped 11 slots per layer:
 | Decode, 13 slots, ctx 512 | **2.06 tok/s** (EXP-023) |
 | Prefill, ctx 512 | **11.25 tok/s** (EXP-023), **11.07** (EXP-025) |
 | Expert cache hit rate, ctx 64 to 3,961 | **53.0% to 59.3%**, no trend in context (EXP-023) |
-| `memory.peak` | **2,497 to 2,929 MiB** of 3,072 |
+| `memory.peak` | **2,497 to 2,929 MiB** of 3,072 (2,497.0 is EXP-025's fused arm at ctx 64, 2,929.3 is EXP-023 at ctx 3,961) |
 | Fidelity | mean full-vocab KL **1.04e-2** against llama.cpp, top-1 agreement 8/8 (EXP-004) |
 | Model on disk | 17.35 GiB, about a 6x memory saving |
 
@@ -123,7 +123,7 @@ experiment in the project.
 | Shipping surface: `ramvamp-server` | **done**. Loopback OpenAI-compatible HTTP on 127.0.0.1: `/v1/chat/completions` streaming and buffered, `/v1/models`, `/health`, one request at a time, KV cache reused across requests |
 | Tool calling | **done**. Streaming and buffered, parsed from Qwen's native `<tool_call>` tokens; both paths share one parser and one id minter. The renderer is byte-identical to 20 committed transformers fixtures. Verified against OpenCode driving real tool calls |
 | Configurable context and profiles | **done**. `--context`, `RAMVAMP_CONTEXT`, a JSON profile file, `--no-config`, and a `plan` subcommand that resolves the dials and projects the memory footprint without loading the model. A configuration that cannot fit is refused before allocation instead of OOM-killed part way through prefill |
-| Usable by an agent client | **done**. OpenCode drives the server with working tool calls on a 32K-context profile. That profile does **not** fit in 3 GB: it projects roughly 5.6 GiB, which is what profiles exist to express. The 3 GB contract is a property of the 4K default, not of the runtime |
+| Usable by an agent client | **done**. OpenCode drives the server with working tool calls on a 32K-context profile. That profile does **not** fit in 3 GB: it projects roughly 5,649 MiB, about 5.5 GiB, which is what profiles exist to express. The 3 GB contract is a property of the 4K default, not of the runtime |
 | **Gate 5: perplexity** | **open**, and it is the only open v0 gate |
 
 Four claims above have no numbered experiment behind them, which is worth
@@ -138,16 +138,20 @@ row that overpredicted the one measured 4K point by 31.7 MiB.
 
 ### Gate 5 is a good task and it is unclaimed
 
-The llama.cpp side is banked and reproducible: **PPL 6.3810 +/- 0.16588**,
-`llama-perplexity` b10217, `wiki.test.raw`, `-c 512 --chunks 40`, with the
-corpus and the log in `models/llamacpp-ref/` (EXP-004). **The ramvamp side has
-never been run.**
+The llama.cpp side is banked: **PPL 6.3810 +/- 0.16588** (EXP-004). The
+reference is `llama-perplexity` from llama.cpp b10217, run on the WikiText-2
+raw test split (`wiki.test.raw`) at `-c 512 --chunks 40`, against the same
+Qwen3-30B-A3B Q4_K_M GGUF the runtime installs from. The corpus and the
+per-chunk log are kept outside the repository, and nothing about them is
+private: build llama.cpp at b10217, fetch `wiki.test.raw` from the
+wikitext-2-raw-v1 archive, and re-run that command on your own GGUF to
+regenerate the reference locally. **The ramvamp side has never been run.**
 
 The work is to compute perplexity over the same corpus with the same chunking
 on the same GGUF bytes and compare. It is self-contained. It needs an
 installed model, but it is a correctness measurement, which rule 2 exempts, so
-it does not need the benchmark cgroup or a quiet machine, and the reference it
-is scored against already exists. The other gates are the pattern to follow,
+it does not need the benchmark cgroup or a quiet machine, and the reference is
+one llama.cpp command away. The other gates are the pattern to follow,
 including their shared exit-code convention: `scripts/bitident.py`,
 `scripts/kl_vs_reference.py` and `scripts/greedy_regression.py`.
 

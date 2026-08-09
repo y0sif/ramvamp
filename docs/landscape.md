@@ -68,9 +68,12 @@ implementation of this technique:
    as written: lower is better, so those numbers say LFU *lost*. Which policy
    is which cannot be recovered from our notes, so the pair is **withdrawn**
    pending a re-read of their log. The LFU-versus-LRU question is settled on
-   our own traces anyway: EXP-005 measures ghost-history LFU at 44.8% against
-   LRU's 42.6% at 10 slots/layer, and finds that per-slot LFU without ghost
-   history is worth -1.7 to 0.0 points against LRU. **Our traces also do not
+   our own traces anyway: EXP-005's simulator, replaying recorded routing
+   traces rather than measuring the runtime, gives ghost-history LFU 44.8%
+   against LRU's 42.6% at 10 slots/layer, and finds that per-slot LFU without
+   ghost history is worth -1.7 to 0.0 points against LRU. Both are simulated
+   rates, quotable for the ranking and not as the runtime's hit rate. **Our
+   traces also do not
    reproduce their 66.6% absolute level**: EXP-005 gives 58.1% at 16 slots on
    Qwen3-30B-A3B, 8.5 points low, but that is not a like-for-like comparison
    either, because 58.1% is the simulator's sequential lower bound and the
@@ -154,9 +157,6 @@ citations check out against the repository, so both survive.
   "blocks until all 4 complete (single wait vs 4 thread joins)". This one is
   a structural claim rather than a number, so the citation rule has nothing
   to attach to it.
-
-`docs/architecture.md` still says the flash-moe citation needs a source link.
-It does not any more; that URL is the answer.
 
 ## Known trade-offs to state honestly
 

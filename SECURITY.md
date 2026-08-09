@@ -12,13 +12,12 @@ Include what you did, what happened, and what you expected instead. A file or
 a script that reproduces it is worth more than a description. If the bug is in
 parsing, attach the input that triggers it.
 
-There is no bounty. Expect a first reply within a week. This is a pre-v0
-project maintained by one person, so a fix can take considerably longer than
-the reply.
+There is no bounty. Expect a first reply within a week. This is a v0 project
+maintained by one person, so a fix can take considerably longer than the reply.
 
 ## Supported versions
 
-ramvamp is pre-v0. Only `main` is supported and there are no backports.
+ramvamp is at v0. Only `main` is supported and there are no backports.
 
 ## Deployment posture
 

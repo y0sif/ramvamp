@@ -118,8 +118,11 @@ number is from last week, you do not have a before number.
 
 The project's central claim is that throughput scales with the device. It has
 only ever been measured on one drive: a Micron 2400, DRAM-less QLC, measured
-cold and in-cgroup at 1.54 to 2.37 GB/s. Decode is I/O-bound, so that drive is
-in every published decode figure.
+cold and in-cgroup at 1.54 to 2.37 GB/s across the whole probe matrix, whose
+top end comes from large sequential reads the runtime never issues. At decode's
+own geometry, one expert blob at a time in random order, the same drive
+sustains about 1.6 GB/s, and that is the figure to quote when reasoning about
+decode. Decode is I/O-bound, so that drive is in every published decode figure.
 
 A mainstream TLC Gen4 part should do materially better. Nobody has measured
 it, and this project does not publish numbers it has not measured. One report
@@ -185,8 +188,10 @@ Attach the summary JSON. It already carries the argv, the prompt hash, the
 child's stderr and every counter, so a rule correction can be re-applied
 without another cold run.
 
-**5. Check the generated text.** Decoding is greedy by default, so the output
-is deterministic for a given prompt and model and any run reproduces it:
+**5. Check the generated text.** Decoding samples by default (the v0 pin's
+temperature 0.7, top-p 0.8, top-k 20), so pass `--greedy` as below; that makes
+the output deterministic for a given prompt and model, and any run reproduces
+it:
 
 ```bash
 target/release/ramvamp generate --model models/qwen3.rvmp \

@@ -4251,7 +4251,8 @@ mod tests {
         // poison the arena. So every guard `take_arena` had still passed, and
         // the next sweep issued a 23 MiB O_DIRECT read into pages an abandoned
         // decode read was still writing: two O_DIRECT reads aliased onto one
-        // buffer, which EXP-007 measured as 13-27% spurious btrfs EIO.
+        // buffer, which EXP-007 measured as spurious btrfs EIO, frequently
+        // and not always (its 13-27% is not a rate to quote).
         let fx = build_install("stream-arena-over-retired");
         let mut stream = open(&fx, 4);
         let stride0 = fx.layout.layers[0].stride as usize;
