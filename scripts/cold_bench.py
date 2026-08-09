@@ -1021,6 +1021,13 @@ def main() -> int:
         "--prompt", args.prompt,
         "--max-new", str(args.max_new),
         "--skip-hashes",
+        # A config file in the operator's home would otherwise set dials that
+        # no summary records and no experiment entry mentions, so the same
+        # command would measure different things on two machines. This removes
+        # that layer; env vars and the explicit flags below still apply, and
+        # the `model loaded in ...` line still names the budget and slot count
+        # the run actually got.
+        "--no-config",
     ]
     # Appended only when asked for. An always-present `--cache-bytes 1440M`
     # would be the same value ramvamp defaults to, but it would change the

@@ -65,6 +65,7 @@ use ramvamp_core::model::{ForwardState, Model, StreamPhase};
 use ramvamp_core::tokenizer::{ChatMessage, Role, RvmpTokenizer};
 
 use super::{Harness, Phase, Prefilling, Ribbon, Status, UiEvent};
+use crate::config::Dials;
 use crate::repl::{
     REPL_HELP, ReplInput, Transcript, TurnCodec, TurnPlan, parse_repl_input, plan_turn, turn_seed,
 };
@@ -252,7 +253,7 @@ fn hit_rate(stats: &StreamStats) -> Option<f32> {
 /// what keeps the harness out of `scripts/cold_bench.py` and the sweep
 /// scripts: they parse the timing lines the line REPL writes to stderr, and
 /// this path writes none of them anywhere.
-pub fn run_chat_tui(args: ChatArgs) -> anyhow::Result<()> {
+pub fn run_chat_tui(args: ChatArgs, dials: Dials) -> anyhow::Result<()> {
     let mut harness = Harness::enter()
         .context("chat --tui needs an interactive terminal; drop --tui for the line REPL")?;
     // *After* `Harness::enter`, so the hush hook wraps the terminal-restoring
@@ -261,11 +262,11 @@ pub fn run_chat_tui(args: ChatArgs) -> anyhow::Result<()> {
     // terminal is restored, and only then is the backtrace printed.
     hush_control_flow_panics();
 
-    // Read before `args` is moved into the worker. This is the *configured*
-    // window, not the resolved one: the manifest refusal belongs to the worker,
-    // which owns the model directory, and it arrives here as an `Output::Failed`
-    // that ends the session anyway.
-    let context_cap = args.context.configured();
+    // Read before `dials` is moved into the worker. This is the *configured*
+    // window, not the one the manifest has vetted: the trained-context refusal
+    // belongs to the worker, which owns the model directory, and it arrives
+    // here as an `Output::Failed` that ends the session anyway.
+    let context_cap = dials.context.value;
 
     let (commands, from_ui) = mpsc::channel::<Command>();
     let (to_ui, outputs) = mpsc::channel::<Output>();
@@ -275,7 +276,7 @@ pub fn run_chat_tui(args: ChatArgs) -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("ramvamp-chat".to_owned())
             .stack_size(WORKER_STACK)
-            .spawn(move || worker_main(args, &from_ui, &to_ui, &interrupt))
+            .spawn(move || worker_main(args, &dials, &from_ui, &to_ui, &interrupt))
             .context("spawning the chat worker")?
     };
 
@@ -678,11 +679,12 @@ fn tell(outputs: &Sender<Output>, output: Output) -> bool {
 
 fn worker_main(
     args: ChatArgs,
+    dials: &Dials,
     commands: &Receiver<Command>,
     outputs: &Sender<Output>,
     interrupt: &AtomicBool,
 ) {
-    if let Err(error) = worker_session(args, commands, outputs, interrupt) {
+    if let Err(error) = worker_session(args, dials, commands, outputs, interrupt) {
         // The UI may already be gone, in which case there is nobody to tell
         // and nothing to do about it.
         let _ = outputs.send(Output::Failed(format!("{error:#}")));
@@ -696,6 +698,7 @@ fn worker_main(
 /// cannot drift into describing different runtimes.
 fn worker_session(
     args: ChatArgs,
+    dials: &Dials,
     commands: &Receiver<Command>,
     outputs: &Sender<Output>,
     interrupt: &AtomicBool,
@@ -704,7 +707,7 @@ fn worker_session(
     let tokenizer = load_tokenizer(model_dir)?;
     // The same dial the UI thread read, plus the manifest's veto. A refusal
     // here reaches the user as `Output::Failed`.
-    let context = args.context.resolve(model_dir)?;
+    let context = crate::checked_context(dials, model_dir)?;
     let sanitizer = tokenizer.content_sanitizer();
 
     let mut seed: Vec<ChatMessage> = Vec::new();
@@ -738,8 +741,8 @@ fn worker_session(
         .with_context(|| format!("loading model from {}", model_dir.display()))?;
     // Built once for the whole session: every turn continues this cache rather
     // than rebuilding the slot pool, the ring and the compute pool.
-    let mut state = ForwardState::with_config(&model, context, args.runtime.runtime_config())?;
-    args.prefill.apply(&mut state)?;
+    let mut state = ForwardState::with_config(&model, context, dials.runtime_config())?;
+    dials.apply_prefill(&mut state)?;
 
     let mut params = GenerateParams::from_defaults(tokenizer.sampling_defaults());
     params.max_new = args.max_new;

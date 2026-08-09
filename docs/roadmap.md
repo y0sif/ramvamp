@@ -67,6 +67,9 @@ remaining experiment in the project.
 | Decode throughput | **settled per drive**, 2026-08-08 |
 | **Gate 5: perplexity** | **OPEN**: reference banked in phase 4 (llama.cpp PPL 6.3810 +/- 0.16588, wiki.test.raw `-c 512 --chunks 40`); **the ramvamp side has never been run** |
 | **Shipping surface** | **SETTLED 2026-08-08: `ramvamp-server`.** The TUI ships as a development affordance only |
+| Tool calling | **done**, 2026-08-08. Renderer byte-identical to 20 transformers fixtures; calls extracted non-streaming. **Streaming tool calls are not done** |
+| Configurable context and profiles | **done**, 2026-08-09. `--context`, a JSON profile file, `--no-config`, and a `plan` subcommand that prices a configuration in 4 ms. An impossible one is refused before allocation instead of OOM-killed mid-prefill |
+| Server usable by an agent client | **OPEN**: OpenCode's baseline request measures 8,842 tokens. A profile can now ask for 16K, but not inside 3 GB, so it needs a larger budget on the box that runs it |
 
 Everything except gate 5 and a shipping surface is finished. v0 is not blocked
 on runtime work.
