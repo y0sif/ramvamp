@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/repack", "crates/server", "crates/cli"]
+members = [
+    "crates/core",
+    "crates/repack",
+    "crates/server",
+    "crates/cli",
+    "crates/vulkan-spike",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -54,6 +60,11 @@ ureq = { version = "3", features = ["rustls"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# Vulkan, used only by the throwaway `crates/vulkan-spike`. Declared here with
+# the rest so the version is pinned in one place; nothing that ships depends
+# on it.
+ash = "0.38"
 
 [profile.release]
 lto = "thin"

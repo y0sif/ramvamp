@@ -45,6 +45,9 @@ Pre-push: all four must pass.
 - `crates/server` (`ramvamp-server`): OpenAI-compatible HTTP surface, library
   only. The binary that serves it is `ramvamp serve`.
 - `crates/cli` (`ramvamp`): user-facing binary.
+- `crates/vulkan-spike` (`ramvamp-vulkan-spike`): a throwaway measurement
+  spike, not a shipping crate. `publish = false`, nothing depends on it, and
+  it is deleted once the GPU-backend question is settled (EXP-026).
 
 ## Hard rules
 

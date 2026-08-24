@@ -202,6 +202,59 @@ is an additional configuration and never a substitute for the CPU path.** The
 kernel trait exists for exactly this, and the CPU path stays the reference
 that correctness is measured against.
 
+A throwaway spike (`crates/vulkan-spike`, EXP-026) took the one kernel worth
+porting first: the Q4_K x Q8_K batched GEMV that dominates prefill. What it
+established:
+
+- **The Q4_K arithmetic ports -- Q4_K, and only Q4_K.** A Vulkan compute
+  shader reproducing the reference dot's structure agrees with the CPU
+  kernel on a real expert slab to a max absolute error of 1.490e-6 and
+  9.519e-5 max relative over the outputs above 0.1% of scale, with 3,390 of
+  24,576 outputs bit-identical. A dequantize-then-multiply shader was never
+  the plan and is not what was measured. **This does not generalize to the
+  expert FFN as a whole**, and the reason is structural rather than a
+  matter of writing more shader: the weight buffer is declared `uint w[]`
+  and every weight read indexes it in 4-byte units, so the packed block
+  size has to be a whole number of uints. Q4_K's 144 B is. **Q6_K's 210 B
+  is not**, and `ffn_down_exps` is Q6_K on 24 of 48 layers, so the `down`
+  projection on half the layers needs a byte-granular read path before any
+  of this applies to it. The spike enforces the limit rather than stating
+  it (`gpu::check_shader_format` refuses any other format, with a test that
+  pins Q6_K's 210 B as the case that breaks the indexing). So what ports
+  today is `gate` and `up`, and the second expert dot kernel is unported
+  work that a GPU backend would have to cost in.
+- **The hardware has what the kernel needs.** On the reference machine's Arc
+  iGPU the 4x8-bit packed integer dot product is hardware-accelerated in all
+  three signednesses, and the heap is unified, so buffers are mapped and
+  written in place with no staging copy.
+
+What it did **not** establish: whether the iGPU is faster. Every run was taken
+on a throttled box (`no_turbo=1`, `max_perf_pct=60`), so the spike prints its
+verdict INVALID, exits non-zero, and computes no ratio anywhere in its output:
+not per round, not per arm, not in the verdict line. Every millisecond and
+GFLOP/s figure such a run does print is stamped `[INVALID]` on its own line,
+because the unit of quotation is the line and not the run. The clock gate that
+decides this compares each pinned CPU's `scaling_max_freq` against its
+`cpuinfo_max_freq` as well as reading `no_turbo`, `max_perf_pct` and the
+governor, so a profile that pins the ceiling underneath those three does not
+pass it. Two things have to be settled before any ratio means anything. The measurement has to be taken
+unthrottled on a quiet machine, and the CPU kernel's own asymmetry has to be
+decided: the shader hoists each weight row's dequant setup across all 32
+activations and `vec_dot_q4_k_q8_k` redoes it on every pass, which a prototype
+put at 1.15-1.18x, so that much of any gap is a CPU-kernel question and not a
+hardware one. That 1.15-1.18x is a **warm diagnostic** under rule 2, not a
+publishable figure: 0.482-0.495 ms against production's 0.551-0.568 ms, taken
+on the same throttled box (`no_turbo=1`, `max_perf_pct=60`, governor
+`powersave`), warm, uncgrouped, and before the harness had convergence
+gating, so the sample was never shown to be a steady state. That prototype
+was also never checked for bit-identity against production, so the figure is
+not a verified same-math A/B, and its expansion is scalar where production's
+inner loop is AVX2 -- which makes 1.15-1.18x a floor on the asymmetry rather
+than a measurement of it. It is preserved on branch
+`perf/q4k-row-hoist-prototype` under the standing rule below, and it is not a
+merge candidate. **Nothing here justifies a GPU backend yet, and nothing here
+rules one out.**
+
 ### 3. Bring your own model
 
 This is closer than it sounds, which is worth saying precisely, because it is
@@ -355,6 +408,16 @@ rather than default to measuring more.
 | The `attn_q` + `attn_v` fusion | **settled**: dropped, its bucket did not separate at either rung. The expert-phase fusion stays |
 | Reopen progressive miss execution | **open** |
 | Move the slot dial to 12 or 13 | **held**, needs a 13-slot arm at 4K context |
+| Hoist the Q4_K per-row dequant setup out of `vec_dot_q4_k_q8_k`'s activation loop | **open**: a prototype puts it at 1.15-1.18x on the batched GEMV, and it is the CPU-side half of any GPU-vs-CPU ratio (EXP-026). That figure is a **warm diagnostic** under rule 2 and not publishable: 0.482-0.495 ms against 0.551-0.568 ms, throttled box, warm, uncgrouped, no convergence gating, bit-identity to production never checked when it was taken, and a scalar expansion, so it is a floor rather than a measurement. The prototype is preserved on branch `perf/q4k-row-hoist-prototype`, where the reconstruction is bit-identical to production on the shapes tested; production is untouched on purpose |
+
+The same standing rule keeps the Q4_K row-hoist prototype on branch
+`perf/q4k-row-hoist-prototype` rather than in a description of itself. It is
+a preserved prototype and not a merge candidate: its only figure is the warm
+diagnostic in the table above, there is no cold in-cgroup measurement of the
+trade it makes (`in_dim` bytes of per-row scratch against the packed row
+production keeps in L1), and `main` carries none of it. The reconstruction on
+that branch is bit-identical to `gemv_q8_k_batched` on the shapes it tests,
+which satisfies rule 4 but is not by itself a reason to merge.
 
 The TUI (`chat --tui`) is kept rather than deleted, under the standing rule
 that measured-and-set-aside work is preserved. It is genuinely useful as an

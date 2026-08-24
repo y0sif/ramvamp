@@ -1,0 +1,16 @@
+[package]
+name = "ramvamp-vulkan-spike"
+description = "Throwaway spike: Q4_K x Q8_K batched GEMV on the iGPU vs the pinned CPU pool."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+# Never published: this is a measurement harness, not a crate anybody depends
+# on. `repository`/`homepage`/`readme` are left off for the same reason.
+publish = false
+
+[dependencies]
+ramvamp-core = { workspace = true }
+anyhow = { workspace = true }
+ash = { workspace = true }

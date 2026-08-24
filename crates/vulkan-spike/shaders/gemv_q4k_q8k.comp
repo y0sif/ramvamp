@@ -1,0 +1,198 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+
+// Batched Q4_K x Q8_K GEMV, the shape that dominates ramvamp's prefill:
+// one expert's packed weight matrix (out_dim rows of in_dim weights) against
+// n_acts quantized activation rows.
+//
+// This reproduces the structure of `kernels::quants::dot::vec_dot_q4_k_q8_k`,
+// not a naive dequantize-then-multiply:
+//
+//   * weights stay PACKED in memory and are expanded to int8 in ggml's
+//     nibble order only into workgroup-shared memory, once per weight row,
+//     amortized over all n_acts activation rows;
+//   * products accumulate in INTEGERS per 32-weight sub-block via the
+//     hardware 4x8-bit packed dot product (DP4a);
+//   * the 6-bit sub-block scale is applied while still in integers;
+//   * the k-quant mins are folded in through the activation's bsums, one
+//     multiply per 16-element group, never touching qs again;
+//   * floats appear only once per super-block, as
+//     `d*y.d*sumi - dmin*y.d*sumi_mins`, summed over super-blocks in
+//     ascending order exactly as the scalar reference does.
+//
+// One workgroup owns one weight row. Invocation `tid` owns the
+// (activation `a`, super-block `b`) pair with `b = tid / n_acts` and
+// `a = tid % n_acts`, so a subgroup of 32 lanes shares one `b`: every
+// shared-memory weight read is a broadcast, and every activation read is
+// 32 consecutive uints (the host packs activations activation-minor for
+// exactly this reason).
+
+layout(local_size_x = 256) in;
+
+// Format constants (ggml k-quants; QK_K = 256).
+//
+// THIS SHADER IS Q4_K-ONLY, and not just because the arithmetic below is
+// q4_K's. The weight buffer is declared `uint w[]` and every weight read
+// (`w[base]`, `w[rowbase + ...]`, `unpackHalf2x16(w[base])`) indexes it in
+// 4-byte units, so the whole read pattern assumes the packed block size is a
+// whole number of uints. Q4_K's 144 B is (144 = 36 * 4). **Q6_K's 210 B is
+// not**, and `ffn_down_exps` is Q6_K on 24 of 48 layers (see
+// `docs/architecture.md`), so half the expert FFN cannot reuse this indexing
+// at all: block `b` of a Q6_K row starts at byte `210 * b`, which is only
+// 2-byte aligned on odd `b`, and both the d/dmin f16 pair and the qs run
+// would straddle uint boundaries. Porting the other half needs a
+// byte-granular path (a `uint8_t` buffer under `GL_EXT_shader_8bit_storage`,
+// or explicit two-uint shift-and-merge reads), not a wider index. The host
+// enforces this: `gpu::check_shader_format` refuses any format whose
+// `block_bytes()` is not a multiple of 4.
+const uint SUBBLOCKS = 8;   // 32-weight sub-blocks per super-block
+const uint BSUM_GROUPS = 16; // 16-element bsum groups per super-block
+const uint UINTS_PER_BLOCK = 36; // 144 packed Q4_K bytes; see the note above
+const uint QS_UINT_OFF = 4;      // qs starts at byte 16
+const uint AUX_UINTS_PER_BLOCK = 64; // 256 int8 weights
+
+// Spike-scoped caps, asserted on the host.
+const uint MAX_BLOCKS = 8;
+const uint MAX_ACTS = 32;
+
+layout(std430, binding = 0) readonly buffer Weights { uint w[]; };
+// Activation qs, packed 4x int8 per uint, indexed [b][j][k][a].
+layout(std430, binding = 1) readonly buffer ActQs { uint aq[]; };
+// Per-(super-block, activation-row) f32 scale, indexed [b][a]. Q8_K
+// quantizes per 256 weights, so a row does not have one scale.
+layout(std430, binding = 2) readonly buffer ActD { float ad[]; };
+// Activation bsums, indexed [b][g][a].
+layout(std430, binding = 3) readonly buffer ActBsums { int ab[]; };
+// out[row * n_acts + a], matching `gemv_q8_k_batched`'s [weight_row][act].
+layout(std430, binding = 4) writeonly buffer Out { float o[]; };
+
+layout(push_constant) uniform Push {
+    // Rows in the weight matrix. Read, and bounds-checked below: a workgroup
+    // whose `gl_WorkGroupID.x` is past the end returns before it touches
+    // `w[]` or `o[]`, so an over-dispatch cannot read or write out of bounds.
+    // The whole workgroup takes the same branch (the ID is workgroup-uniform),
+    // so the `barrier()`s further down stay in uniform control flow.
+    uint n_rows;
+    uint n_acts;
+    uint n_blocks;
+} pc;
+
+shared uint sh_aux[MAX_BLOCKS * AUX_UINTS_PER_BLOCK];
+shared int sh_sc[MAX_BLOCKS * SUBBLOCKS];
+shared int sh_min[MAX_BLOCKS * SUBBLOCKS];
+shared float sh_d[MAX_BLOCKS];
+shared float sh_dmin[MAX_BLOCKS];
+shared float sh_part[MAX_BLOCKS * MAX_ACTS];
+
+// ggml's get_scale_min_k4 over the 12-byte packed (scale, min) field.
+void scale_min_k4(uint j, uint s0, uint s1, uint s2, out uint sc, out uint m) {
+    uint packed[3] = uint[3](s0, s1, s2);
+    // Byte `i` of the 12-byte field, little-endian within each uint.
+    uint b_j = (packed[j >> 2] >> (8u * (j & 3u))) & 0xFFu;
+    uint jp4 = j + 4u;
+    uint b_jp4 = (packed[jp4 >> 2] >> (8u * (jp4 & 3u))) & 0xFFu;
+    if (j < 4u) {
+        sc = b_j & 63u;
+        m = b_jp4 & 63u;
+    } else {
+        uint jm4 = j - 4u;
+        uint b_jm4 = (packed[jm4 >> 2] >> (8u * (jm4 & 3u))) & 0xFFu;
+        sc = (b_jp4 & 0xFu) | ((b_jm4 >> 6u) << 4u);
+        m = (b_jp4 >> 4u) | ((b_j >> 6u) << 4u);
+    }
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    // Workgroup-uniform, so every invocation of this group returns together
+    // and no `barrier()` below is reached in divergent control flow.
+    if (row >= pc.n_rows) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint n_acts = pc.n_acts;
+    uint n_blocks = pc.n_blocks;
+    uint rowbase = row * n_blocks * UINTS_PER_BLOCK;
+
+    // --- expand the packed row to int8 in ggml order, into shared memory ---
+    // Per super-block, `qs` is 32 uints; within each 64-weight span, byte `l`
+    // holds weight `l` in its low nibble and weight `l + 32` in its high
+    // nibble -- so one packed uint yields two aux uints with a mask and a
+    // shift, no per-nibble work.
+    if (tid < n_blocks * 32u) {
+        uint b = tid >> 5u;
+        uint k32 = tid & 31u;
+        uint qw = w[rowbase + b * UINTS_PER_BLOCK + QS_UINT_OFF + k32];
+        uint span = k32 >> 3u;
+        uint k = k32 & 7u;
+        uint dst = b * AUX_UINTS_PER_BLOCK + span * 16u + k;
+        sh_aux[dst] = qw & 0x0F0F0F0Fu;
+        sh_aux[dst + 8u] = (qw >> 4u) & 0x0F0F0F0Fu;
+    }
+
+    // --- unpack d/dmin and the eight 6-bit (scale, min) pairs ---
+    if (tid < n_blocks) {
+        uint base = rowbase + tid * UINTS_PER_BLOCK;
+        vec2 dd = unpackHalf2x16(w[base]); // d in the low half, dmin in the high half
+        sh_d[tid] = dd.x;
+        sh_dmin[tid] = dd.y;
+        uint s0 = w[base + 1u];
+        uint s1 = w[base + 2u];
+        uint s2 = w[base + 3u];
+        for (uint j = 0u; j < SUBBLOCKS; ++j) {
+            uint sc;
+            uint m;
+            scale_min_k4(j, s0, s1, s2, sc, m);
+            sh_sc[tid * SUBBLOCKS + j] = int(sc);
+            sh_min[tid * SUBBLOCKS + j] = int(m);
+        }
+    }
+
+    barrier();
+
+    uint pairs = n_acts * n_blocks;
+    if (tid < pairs) {
+        uint b = tid / n_acts;
+        uint a = tid - b * n_acts;
+
+        // Scaled integer dot over the super-block's eight 32-weight
+        // sub-blocks: eight DP4a per sub-block, then the 6-bit scale, all
+        // in int32. Nothing here can overflow: |sc| <= 63, |aux| <= 15,
+        // |qs| <= 127, so |sumi| <= 8 * 63 * 32 * 15 * 127 ~ 3.1e7.
+        int sumi = 0;
+        uint auxbase = b * AUX_UINTS_PER_BLOCK;
+        uint qbase = b * SUBBLOCKS * 8u * n_acts + a;
+        for (uint j = 0u; j < SUBBLOCKS; ++j) {
+            int s = 0;
+            uint ab_ = auxbase + j * 8u;
+            uint qb = qbase + j * 8u * n_acts;
+            for (uint k = 0u; k < 8u; ++k) {
+                s += dotPacked4x8EXT(int(sh_aux[ab_ + k]), int(aq[qb + k * n_acts]));
+            }
+            sumi += sh_sc[b * SUBBLOCKS + j] * s;
+        }
+
+        // Min correction from the activation bsums: bsums are per-16 sums,
+        // mins are per-32, so each min multiplies two adjacent bsums.
+        int sumi_mins = 0;
+        uint bbase = b * BSUM_GROUPS * n_acts + a;
+        for (uint g = 0u; g < BSUM_GROUPS; ++g) {
+            sumi_mins += ab[bbase + g * n_acts] * sh_min[b * SUBBLOCKS + (g >> 1u)];
+        }
+
+        float yd = ad[b * n_acts + a];
+        sh_part[tid] = (sh_d[b] * yd) * float(sumi) - (sh_dmin[b] * yd) * float(sumi_mins);
+    }
+
+    barrier();
+
+    // Sum the super-block contributions in ascending order, one lane per
+    // activation row, so the float accumulation order matches the reference.
+    if (tid < n_acts) {
+        float sum = 0.0;
+        for (uint b = 0u; b < n_blocks; ++b) {
+            sum += sh_part[b * n_acts + tid];
+        }
+        o[row * n_acts + tid] = sum;
+    }
+}
