@@ -14,6 +14,11 @@ pub mod backend;
 mod error;
 pub mod gemv;
 
+// PRESERVED PROTOTYPE, branch `perf/q4k-row-hoist-prototype` only. Nothing
+// in the runtime calls it; it exists so the 1.15-1.18x warm diagnostic in
+// EXP-026 has code behind it. Not a merge candidate. See its module docs.
+pub mod q4k_row_hoist;
+
 pub mod quants;
 
 pub mod primitives;
