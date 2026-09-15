@@ -76,6 +76,53 @@ const NOTE: &str = "note: ";
 /// putting it back from pushing the tail over the cap again.
 const TAIL_CAP: usize = TRANSCRIPT_CAP - MODEL.len();
 
+/// The least [`TranscriptRing::trim`] will leave behind for the sake of a tidy
+/// start.
+///
+/// Dropping the line a cut lands in is what keeps the tail beginning at the
+/// start of a line, and while turns are ordinary that costs a few bytes out of
+/// a budget measured in kilobytes. Against a line that is itself a large
+/// fraction of the budget — an 8 KiB prompt submitted as one turn, a reply that
+/// streamed six kilobytes without a newline — it costs most of the ring:
+/// everything before that line has already gone to make room for it, so
+/// dropping it too leaves an agent reading a conversation one short turn long.
+/// Past half the budget the tidy start is not worth what it discards, and the
+/// cut goes inside the line instead, re-marked with its speaker.
+const KEEP_AT_LEAST: usize = TAIL_CAP / 2;
+
+/// Bytes of the draft the `input` node publishes.
+///
+/// A bound on the copy that goes on the wire and on nothing else. The editor's
+/// buffer is the human's, and what they have typed is not this module's to
+/// shorten.
+///
+/// It is the snapshot that needs the bound. The value is whatever has been
+/// typed or pasted, and about 256 unsubmitted `type_text` calls — or one paste
+/// from somebody with a 70,000-token context to fill — put the line over
+/// taria's 1 MiB `MAX_LINE_BYTES`. That failure is silent and total: an
+/// oversized line is not an error the agent is told about, it is a connection
+/// the bridge treats as broken, and because the app republishes the same
+/// oversized tree when the bridge reconnects, the agent goes on reading the
+/// last tree that fit with nothing anywhere saying why.
+///
+/// Eight kibibytes beside the 6 KiB transcript and a tree that is otherwise
+/// under a kilobyte puts the whole snapshot near 15 KiB. Even if every byte of
+/// it needed a six-byte `\uXXXX` escape in the JSON, that is ~90 KiB — an order
+/// of magnitude inside the limit, which is the margin a bound nobody will
+/// revisit ought to have. It is also two whole 4,096-character `type_text`
+/// payloads, so an agent reads its own typing back in full well past the point
+/// where a prompt has become a paste.
+const DRAFT_CAP: usize = 8 * 1024;
+
+/// What [`draft_value`] cuts the draft to: [`DRAFT_CAP`] less the room the
+/// elision marker needs.
+///
+/// Held back before the cut, the same trick [`TAIL_CAP`] plays for the speaker
+/// mark: saying that the draft was cut must not be the thing that pushes it
+/// back over the cap. Sixty-four bytes is the marker's fixed text and a decimal
+/// count that cannot reach twenty digits.
+const DRAFT_TAIL_CAP: usize = DRAFT_CAP - 64;
+
 /// Between two facts in a node value. Fixed rather than taken from
 /// [`Glyphs`](super::glyphs::Glyphs): what the terminal can draw has no
 /// bearing on what an agent can read.
@@ -165,12 +212,27 @@ impl TranscriptRing {
     /// the cut ran into is therefore put back in front of what is left, and
     /// [`TAIL_CAP`] is the room held back for it.
     ///
-    /// A single line longer than the whole budget — a reply that has streamed
-    /// six kilobytes without a newline — has no line boundary to cut at, so it
-    /// is cut on a character boundary instead; slicing a `char` in half would
-    /// produce a `String` that is not UTF-8, which is the one thing `drain`
-    /// will panic on. That tail is re-marked too: a fragment of a word is
-    /// still a fragment of somebody's word.
+    /// # What the whole-line cut is not allowed to do
+    ///
+    /// Drop the last line, and drop a line worth more than the tail it leaves.
+    ///
+    /// Every turn ends on a newline, so a turn longer than the whole budget —
+    /// an 8 KiB paste, two `type_text` payloads submitted as one line, a reply
+    /// that streamed six kilobytes — puts a line boundary right at the *end*
+    /// of the text. Cutting there is not that turn trimmed, it is the entire
+    /// conversation gone because one turn was too long, and the ring comes
+    /// back empty. Stopping one line short of it leaves a line that cannot fit
+    /// whatever the front gives up, which is what sends the cut into the line
+    /// itself; [`KEEP_AT_LEAST`] is the same judgement one line earlier, for a
+    /// line that would leave a sliver rather than nothing.
+    ///
+    /// A cut inside a line is a cut on a character boundary: slicing a `char`
+    /// in half would produce a `String` that is not UTF-8, which is the one
+    /// thing `drain` will panic on. That tail is re-marked like any other — a
+    /// fragment of a word is still a fragment of somebody's word — and that is
+    /// also what keeps an *open* model turn attributed, since the mark that
+    /// opened it can be cut away while the chunks still streaming in go on
+    /// appending to what is left.
     fn trim(&mut self) {
         if self.text.len() <= TAIL_CAP {
             return;
@@ -187,13 +249,44 @@ impl TranscriptRing {
             let Some(at) = rest.find('\n') else {
                 break;
             };
-            cut += at + 1;
+            let next = cut + at + 1;
+            // Both ways a whole-line cut is the wrong cut, and both of them are
+            // one oversized turn: a boundary at the end of the text is the ring
+            // handing back nothing at all, and a remainder under
+            // `KEEP_AT_LEAST` is it handing back a sliver. Either way the line
+            // the cut is standing in is worth more than a tidy start, so it is
+            // cut into below instead of dropped.
+            if next >= self.text.len() || self.text.len() - next < KEEP_AT_LEAST {
+                break;
+            }
+            cut = next;
         }
         if self.text.len() - cut > TAIL_CAP {
+            // The line the cut is standing in, which is where its mark is if it
+            // has one: every exit from the loop above leaves `cut` at the start
+            // of a line.
+            let line = cut;
+            // `want` is a whole `TAIL_CAP` back from the end and a character is
+            // at most four bytes, so the boundary found is always well short of
+            // the end: this cannot empty the ring, and it cannot fail to find
+            // one — `unwrap_or` keeps the line cut rather than inventing an
+            // index, because a total function is worth more here than a byte of
+            // the cap.
             let want = self.text.len() - TAIL_CAP;
-            cut = (want..=self.text.len())
+            cut = (want..self.text.len())
                 .find(|at| self.text.is_char_boundary(*at))
-                .unwrap_or(self.text.len());
+                .unwrap_or(cut);
+            // A cut a few bytes into the line lands inside the mark itself, and
+            // half a mark is worse than none: `vamp: ` survives at the front,
+            // reads as part of what was said, and then the re-mark below puts a
+            // whole `ramvamp: ` in front of it. The mark goes whole or not at
+            // all. Moving the cut forward only ever keeps less, so the cap is
+            // still held.
+            if let Some(mark) = turn_mark(&self.text[line..])
+                && cut < line + mark.len()
+            {
+                cut = line + mark.len();
+            }
         }
         self.text.drain(..cut);
         if let Some(mark) = owner
@@ -319,10 +412,15 @@ pub(crate) fn build_nodes(
 /// really is there, and the human's Ctrl-C still works — but it advertises
 /// nothing once the session is winding down, because nothing it could
 /// advertise would be applied.
+///
+/// The value is the draft as [`draft_value`] bounds it. The editor itself is
+/// never bounded: `plan` decides on the whole buffer, `handle_key` edits the
+/// whole buffer, and the panel draws the whole buffer. Only the copy that goes
+/// on the wire has a size the wire cares about.
 fn input_node(editor: &LineEditor, live: bool) -> Node {
     let node = Node::new("input", Role::TextInput)
         .label("Ask ramvamp anything")
-        .value(editor.text())
+        .value(draft_value(editor.text()))
         .focused(true);
     if !live {
         return node;
@@ -339,6 +437,32 @@ fn input_node(editor: &LineEditor, live: bool) -> Node {
         node = node.action(Action::Activate);
     }
     node
+}
+
+/// The draft as an agent reads it: the tail, and a word about what is missing.
+///
+/// The tail rather than the head because that is where the cursor is and what
+/// the person is typing now; the head of a long paste is the part they have
+/// already stopped looking at.
+///
+/// Marked rather than quietly cut, because a value that is a fragment of the
+/// draft while presenting itself as the draft is the tree saying something
+/// untrue — the one thing it is never allowed to do. An agent that read a
+/// silently cut draft and sent it straight back through `set_value` would
+/// replace the human's prompt with a shortened copy of it and report success.
+fn draft_value(text: &str) -> String {
+    if text.len() <= DRAFT_CAP {
+        return text.to_owned();
+    }
+    let want = text.len() - DRAFT_TAIL_CAP;
+    // On a character boundary, for the reason `TranscriptRing::trim` cuts on
+    // one: a slice through the middle of a `char` panics. `want` is a whole
+    // `DRAFT_TAIL_CAP` back from the end and a character is at most four bytes,
+    // so the boundary is always found, and always well short of the end.
+    let at = (want..text.len())
+        .find(|at| text.is_char_boundary(*at))
+        .unwrap_or(text.len());
+    format!("[{at} earlier bytes elided] {}", &text[at..])
 }
 
 /// What the phase is, in the agent's words rather than the panel's: the panel
@@ -1251,8 +1375,26 @@ mod tests {
         assert!(ring.text().ends_with('\n'));
     }
 
-    /// Nothing the worker or the user can produce may upset the ring: an
-    /// empty chunk, a turn that is only newlines, a cap-sized single push.
+    /// One of the ring's three entry points.
+    type Push = fn(&mut TranscriptRing, &str);
+
+    /// The three voices and the mark each one leaves, so a property of the ring
+    /// can be asserted of all of them rather than of whichever one a test
+    /// happened to pick.
+    const PUSHES: [(&str, Push); 3] = [
+        (YOU, TranscriptRing::push_user),
+        (MODEL, TranscriptRing::push_model),
+        (NOTE, TranscriptRing::push_system),
+    ];
+
+    /// Nothing the worker or the user can produce may upset the ring: an empty
+    /// chunk, a turn that is only newlines, a single push twice the size of the
+    /// whole budget.
+    ///
+    /// The cap is the weakest thing this could assert, and asserting only the
+    /// cap is how a ring that answered the last of those with an empty string
+    /// passed: `""` is under every cap there is. So each case says what has to
+    /// *survive*.
     #[test]
     fn the_ring_survives_degenerate_turns() {
         let mut ring = TranscriptRing::default();
@@ -1263,12 +1405,192 @@ mod tests {
         assert_eq!(ring.text(), "you: \nnote: \n");
 
         let mut ring = TranscriptRing::default();
-        ring.push_user(&"z".repeat(TRANSCRIPT_CAP * 2));
-        assert!(ring.text().len() <= TRANSCRIPT_CAP);
-
-        let mut ring = TranscriptRing::default();
         ring.push_user("\n\n\n");
         assert_eq!(ring.text(), "you: \n");
+
+        // One turn twice the size of the budget, in each voice. It has to come
+        // back as a tail of itself: non-empty, inside the cap, marked, ending
+        // where the turn ended, and filling the budget rather than a sliver of
+        // it — five things the old `len() <= TRANSCRIPT_CAP` could not tell
+        // apart from the empty string it was actually getting.
+        for (mark, push) in PUSHES {
+            let mut ring = TranscriptRing::default();
+            ring.push_user("the turn before it");
+            push(&mut ring, &"z".repeat(TRANSCRIPT_CAP * 2));
+            let text = ring.text();
+            assert!(!text.is_empty(), "{mark:?} emptied the ring");
+            assert!(
+                text.len() <= TRANSCRIPT_CAP,
+                "{mark:?}: {} bytes",
+                text.len()
+            );
+            assert!(text.starts_with(mark), "{mark:?}: {:?}", first_line(text));
+            assert!(text.trim_end_matches('\n').ends_with('z'), "{mark:?}");
+            assert!(text.len() >= TAIL_CAP, "{mark:?}: {} bytes", text.len());
+        }
+    }
+
+    /// The blocker this replaced a vacuous test for. Two 4,096-character
+    /// `type_text` calls — each inside taria's own per-call limit — are one
+    /// 8,192-byte turn when the agent submits them, and somebody pasting a long
+    /// prompt into a model that advertises a 70,000-token context is the same
+    /// push. Both used to publish an *empty* conversation: every turn ends on a
+    /// newline, so the whole-line cut ran off the end of the oversized one,
+    /// took everything before it along, and left the character cut nothing to
+    /// do.
+    #[test]
+    fn an_oversized_turn_keeps_its_tail_instead_of_emptying_the_ring() {
+        let mut ring = TranscriptRing::default();
+        ring.push_user("what does the repacker do?");
+        ring.push_model("It copies the quantized bytes unchanged.");
+        ring.push_user(&format!("{}{}", "a".repeat(4096), "b".repeat(4096)));
+
+        let text = ring.text();
+        assert!(!text.is_empty(), "the ring emptied itself");
+        assert!(text.len() <= TRANSCRIPT_CAP, "{} bytes", text.len());
+        // Marked, with the speaker of the turn the tail belongs to.
+        assert!(text.starts_with(YOU), "{:?}", first_line(text));
+        // The tail of the prompt and not its head: the second `type_text` is
+        // there whole, and what went is the oldest end of the first.
+        assert!(text.ends_with(&format!("{}\n", "b".repeat(4096))));
+        assert!(text.contains('a'), "the cut overshot the older half");
+        // Filled rather than fragmentary: the ring gave up what the cap asked
+        // for and not a turn more.
+        assert!(text.len() >= TAIL_CAP, "{} bytes", text.len());
+        // What came before is gone because an 8 KiB turn leaves no room for it,
+        // which is the only reason a ring may drop anything.
+        assert!(!text.contains("repacker"));
+    }
+
+    /// A trim landing inside an *open* model turn has to leave the ring able to
+    /// say whose words these are. The `ramvamp:` that opened the reply can be
+    /// cut away like anything else, and everything after it is still the model
+    /// speaking: hand that back unmarked and every chunk streamed in afterwards
+    /// appends to a line with nobody's name on it, until the next `you:` makes
+    /// the model's words read as the user's. The output of that bug was
+    /// `"and then some more text\nyou: ok\n"` — a reply attributed to nobody
+    /// and a turn boundary that never happened.
+    ///
+    /// It is out of reach through `on_token`, which posts one token at a time.
+    /// That is an accident of the caller, not a property of the ring, so the
+    /// ring is asserted on its own.
+    #[test]
+    fn a_reply_stays_attributed_when_the_trim_lands_inside_it() {
+        let mut ring = TranscriptRing::default();
+        ring.push_user("why is prefill slow?");
+        // One chunk past the whole budget, so the trim cuts inside the reply
+        // and takes the mark that opened it.
+        ring.push_model(&"e".repeat(TRANSCRIPT_CAP * 2));
+        assert!(
+            ring.text().starts_with(MODEL),
+            "{:?}",
+            first_line(ring.text())
+        );
+        // The turn is still open, so what streams in next continues it rather
+        // than opening a second `ramvamp:`.
+        ring.push_model(" and then some more text");
+        ring.push_user("ok");
+
+        let text = ring.text();
+        assert!(text.len() <= TRANSCRIPT_CAP, "{} bytes", text.len());
+        assert!(text.starts_with(MODEL), "{:?}", first_line(text));
+        assert!(
+            text.ends_with(" and then some more text\nyou: ok\n"),
+            "{:?}",
+            text.lines().next_back().unwrap_or_default()
+        );
+        // Two turns, and no third invented by the trim.
+        assert_eq!(text.matches(MODEL).count(), 1);
+        assert_eq!(text.matches(YOU).count(), 1);
+    }
+
+    /// Half a speaker mark is worse than none. A cut a few bytes into the line
+    /// lands inside `ramvamp: ` itself; leaving the rest of it at the front
+    /// puts `vamp: ` into the conversation as something the model said, and
+    /// then the re-mark puts a whole `ramvamp: ` in front of that. The mark
+    /// goes whole or not at all.
+    ///
+    /// Found by sweeping the sizes either side of the cut rather than by
+    /// reading the code: the cut is only inside the mark for a handful of
+    /// lengths, and no example test was standing on one of them.
+    #[test]
+    fn a_cut_inside_the_speaker_mark_takes_the_whole_mark() {
+        for (mark, push) in PUSHES {
+            for slack in 0..16 {
+                let mut ring = TranscriptRing::default();
+                ring.push_user("q");
+                push(&mut ring, &"e".repeat(TAIL_CAP - mark.len() + slack));
+                let text = ring.text();
+                assert!(
+                    text.len() <= TRANSCRIPT_CAP,
+                    "{mark:?} slack {slack}: {} bytes",
+                    text.len()
+                );
+                let tail = text
+                    .strip_prefix(mark)
+                    .unwrap_or_else(|| panic!("{mark:?} slack {slack}: {:?}", first_line(text)));
+                assert!(
+                    tail.chars().all(|c| c == 'e' || c == '\n'),
+                    "{mark:?} slack {slack}: a fragment of the mark survived: {:?}",
+                    first_line(text)
+                );
+            }
+        }
+    }
+
+    /// The ring's three invariants, over every shape of turn that can reach it:
+    /// it is never empty while anything has been pushed, it is never over the
+    /// cap, and it always opens on a speaker mark. Sizes either side of the cap
+    /// and the tail budget, every voice, interleaved with ordinary turns, and
+    /// multi-byte characters straddling the cut.
+    ///
+    /// A sweep rather than three more examples because the failure this is
+    /// guarding against was a *shape* — a turn whose last byte is a newline —
+    /// that every example test happened to miss.
+    #[test]
+    fn the_ring_holds_its_invariants_under_every_shape_of_turn() {
+        let mut worst = 0;
+        for (mark, push) in PUSHES {
+            for size in [1, 100, 6000, 6143, 6144, 6145, 8192, 20_000] {
+                // A one-byte character, a three-byte one that cannot divide the
+                // cap evenly, and one with a newline in it, so the cut lands
+                // mid-character as often as it lands mid-line.
+                for filler in ["z", "日", "本語\n"] {
+                    let body = filler.repeat(size / filler.len() + 1);
+                    let mut ring = TranscriptRing::default();
+                    for turn in 0..4 {
+                        ring.push_user(&format!("ask {turn}"));
+                        push(&mut ring, &body);
+                        ring.push_model("a short reply");
+                        ring.push_system("[interrupted]");
+                        let text = ring.text();
+                        let at = format!("{mark:?} size {size} filler {filler:?}");
+                        assert!(!text.is_empty(), "{at}: the ring emptied itself");
+                        assert!(text.len() <= TRANSCRIPT_CAP, "{at}: {} bytes", text.len());
+                        assert!(
+                            turn_mark(text).is_some(),
+                            "{at}: opens unattributed: {:?}",
+                            first_line(text)
+                        );
+                        worst = worst.max(text.len());
+                    }
+                }
+            }
+        }
+        println!("worst retained length: {worst} bytes of {TRANSCRIPT_CAP}");
+        assert!(worst <= TRANSCRIPT_CAP);
+    }
+
+    /// The first line, for a failure message that does not print six kilobytes.
+    /// Total, like everything else here: a helper that panics while building a
+    /// panic message hides the assertion that was actually failing.
+    fn first_line(text: &str) -> &str {
+        let line = text.lines().next().unwrap_or_default();
+        let mut end = line.len().min(60);
+        while end > 0 && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        &line[..end]
     }
 
     /// The transcript reaches the agent through the tree, so the node has to
@@ -1283,6 +1605,79 @@ mod tests {
         assert_eq!(transcript.role, Role::Log);
         assert_eq!(transcript.value.as_deref(), Some(ring.text()));
         assert!(transcript.actions.is_empty(), "the transcript is read-only");
+    }
+
+    /// The draft is the other value that grows without anyone deciding it
+    /// should, and it is the one that can stop the tree arriving at all: a
+    /// snapshot line over taria's 1 MiB `MAX_LINE_BYTES` is not an error the
+    /// agent hears about, it is a connection the bridge treats as broken, and
+    /// the app republishes the same oversized tree on the reconnect. About 256
+    /// unsubmitted `type_text` calls get there, and so does one large paste.
+    #[test]
+    fn a_pathological_draft_cannot_push_the_snapshot_past_the_wire_limit() {
+        // A megabyte of draft — 256 `type_text` calls at taria's own per-call
+        // limit, none of them submitted — and a full transcript beside it.
+        let typed = "x".repeat(1024 * 1024);
+        let editor = editor(&typed);
+        let mut ring = TranscriptRing::default();
+        for turn in 0..400 {
+            ring.push_user(&format!("turn {turn} {}", "y".repeat(60)));
+        }
+        let nodes = build_nodes(&decode_status(), &editor, &ring, Liveness::Live);
+
+        let draft = value(&nodes, "input");
+        assert!(draft.len() <= DRAFT_CAP, "{} bytes", draft.len());
+        // The tail, because that is where the cursor is — and said out loud,
+        // because a value that is a fragment of the draft while presenting
+        // itself as the draft tells an agent something untrue.
+        assert!(draft.ends_with("xxx"));
+        assert!(draft.starts_with('['), "{:?}", first_line(draft));
+        assert!(draft.contains("elided"), "{:?}", first_line(draft));
+        // The whole snapshot, serialized the way the layer sends it, with room
+        // to spare inside the line the bridge will read.
+        let wire = serde_json::to_string(&nodes).expect("the tree serializes");
+        assert!(wire.len() < 64 * 1024, "{} bytes on the wire", wire.len());
+        // And the editor still holds every byte the human typed. The cap is on
+        // what is published, never on what they wrote.
+        assert_eq!(editor.text().len(), typed.len());
+    }
+
+    /// A draft that fits is published verbatim, to the byte: an agent reading
+    /// the value back has to see what the editor holds, including the
+    /// whitespace `Activate` is gated on. Multi-byte characters straddling the
+    /// cut are the one way the bound could panic.
+    #[test]
+    fn a_draft_that_fits_is_published_untouched() {
+        for draft in ["", "  hello  ", "日本語", "a\nb"] {
+            let nodes = nodes(&idle_status(), draft);
+            assert_eq!(value(&nodes, "input"), draft, "{draft:?}");
+        }
+        for filler in ["z", "日", "🜁"] {
+            for extra in [0, 1, 2, 3, 64] {
+                let draft = filler.repeat(DRAFT_CAP / filler.len() + extra);
+                let published = draft_value(&draft);
+                assert!(
+                    published.len() <= DRAFT_CAP,
+                    "{filler:?} +{extra}: {} bytes",
+                    published.len()
+                );
+                assert!(
+                    published.ends_with(filler),
+                    "{filler:?} +{extra}: the head survived instead of the tail"
+                );
+                if draft.len() <= DRAFT_CAP {
+                    assert_eq!(published, draft, "{filler:?} +{extra}");
+                    continue;
+                }
+                // Cut, and saying so: what follows the marker is the end of
+                // what was typed, to the byte.
+                let (marker, tail) = published
+                    .split_once("] ")
+                    .unwrap_or_else(|| panic!("{filler:?} +{extra}: cut without saying so"));
+                assert!(marker.starts_with('['), "{filler:?} +{extra}: {marker:?}");
+                assert!(draft.ends_with(tail), "{filler:?} +{extra}");
+            }
+        }
     }
 
     // -- agent input ---------------------------------------------------------

@@ -619,26 +619,38 @@ fn drive(
         }
 
         // Idle is the only state whose row does not change on its own, so it
-        // is the only one that does not get a redraw per pass.
-        let status = screen.status();
-        if screen.dirty || screen.snapshot.phase != Phase::Idle {
-            harness.set_status(status.clone());
-            screen.dirty = false;
-        }
-        // The agent's view of the same instant. Unthrottled, because the
-        // layer skips a tree identical to the last one it published — which
-        // is what the rounding in `agent.rs` is for — so a pass that changed
-        // nothing costs a comparison. Built only when there is a layer to
-        // publish it to: `publish` returns immediately on an inert layer, but
-        // the tree is ~8 nodes and a copy of the transcript tail, and a user
-        // with no agent should not pay for one 25 times a second.
-        if layer.is_enabled() {
-            layer.publish(agent::build_nodes(
-                &status,
-                harness.editor(),
-                &screen.transcript,
-                Liveness::Live,
-            ));
+        // is the only one that does not get a redraw per pass. The tree is
+        // built only when there is a layer to publish it to: `publish` returns
+        // immediately on an inert layer, but the tree is ~8 nodes and a copy of
+        // the transcript tail, and a user with no agent should not pay for one
+        // 25 times a second.
+        //
+        // The two of them describe one instant, so the `Status` behind them is
+        // built once — and on a pass that wants neither, which idle with no
+        // bridge attached is every pass, not at all. It used to be built and
+        // then cloned whatever the pass was doing, which is four `String`
+        // clones a pass for two readers that were often both absent.
+        let redraw = screen.dirty || screen.snapshot.phase != Phase::Idle;
+        if redraw || layer.is_enabled() {
+            let status = screen.status();
+            // The agent's view goes out first only so that the panel's can take
+            // the `Status` by value rather than a copy of it; nothing observes
+            // the order, and both are the same instant either way. Unthrottled,
+            // because the layer skips a tree identical to the last one it
+            // published — which is what the rounding in `agent.rs` is for — so
+            // a pass that changed nothing costs a comparison.
+            if layer.is_enabled() {
+                layer.publish(agent::build_nodes(
+                    &status,
+                    harness.editor(),
+                    &screen.transcript,
+                    Liveness::Live,
+                ));
+            }
+            if redraw {
+                harness.set_status(status);
+                screen.dirty = false;
+            }
         }
 
         // Agent input is drained either side of the blocking poll: once before
@@ -677,6 +689,11 @@ fn drive(
     screen.say("stopping; Ctrl-C again to leave without waiting");
     screen.dirty = true;
     let mut join = true;
+    // Before the first pass rather than after the first quiet one: from here on
+    // every input is acked `Ignored` where it stands, and a `Live` tree left
+    // standing over that window goes on advertising four actions the drain now
+    // refuses.
+    publish_wind_down(harness, layer, &screen, &screen.status());
     loop {
         // Acked, deliberately not applied. An input that arrives now cannot be
         // honoured — the tree has stopped advertising anything and the session
@@ -707,20 +724,10 @@ fn drive(
             Err(TryRecvError::Disconnected) => break,
             Err(TryRecvError::Empty) => {
                 let status = screen.status();
-                harness.set_status(status.clone());
                 // Winding down is a state an agent can be watching, so the
-                // tree must not go stale while it happens — and it must not
-                // lie either. Nothing here is applied, so `WindingDown` strips
-                // every action set and the tree advertises nothing, which is
-                // the same answer the drain above gives.
-                if layer.is_enabled() {
-                    layer.publish(agent::build_nodes(
-                        &status,
-                        harness.editor(),
-                        &screen.transcript,
-                        Liveness::WindingDown,
-                    ));
-                }
+                // tree must not go stale while it happens.
+                publish_wind_down(harness, layer, &screen, &status);
+                harness.set_status(status);
                 // A prefill in flight cannot be cut short (see the module
                 // docs), so a user who does not want to wait it out says so
                 // again and the thread is left to the process exit.
@@ -735,6 +742,29 @@ fn drive(
         }
     }
     Ok(Ended { failure, join })
+}
+
+/// Publish the wind-down tree: every value the live one carries, and nothing to
+/// act on.
+///
+/// Both places the wind-down loop can leave a tree behind go through here. It
+/// must not go stale, because an agent watching a session end still has to be
+/// able to read it — and it must not lie either: nothing in that loop is
+/// applied, so `WindingDown` strips every action set and the tree advertises
+/// nothing, which is the same answer the drain gives. A `Live` tree left
+/// standing while the worker streams its last tokens, or while a channel that
+/// was already `Disconnected` breaks the loop on its first pass, would be
+/// offering `focus`, `set_value`, `activate` and a way out for as long as that
+/// window lasts. The verdict would stay honest; the tree would not.
+fn publish_wind_down(harness: &Harness, layer: &mut TariaLayer, screen: &Screen, status: &Status) {
+    if layer.is_enabled() {
+        layer.publish(agent::build_nodes(
+            status,
+            harness.editor(),
+            &screen.transcript,
+            Liveness::WindingDown,
+        ));
+    }
 }
 
 /// Hand every agent input that has arrived to the harness, and collect the

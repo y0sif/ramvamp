@@ -36,11 +36,23 @@ clap = { workspace = true }
 # dependency (see the root Cargo.toml), and the alternatives (ctrlc,
 # signal-hook) would be.
 libc = { workspace = true }
-# `tui` draws the pinned status panel. Default features are off on purpose:
-# the only backend we want is crossterm, and `scrolling-regions` is
-# deliberately *not* enabled because it only changes `Terminal::insert_before`,
-# which this crate never calls. crossterm itself is not listed here — it comes
-# in through ratatui and is used via the `ratatui::crossterm` re-export, so the
-# tree cannot end up with two versions of it.
+# `tui` draws the pinned status panel. This line asks for crossterm and nothing
+# else, but it is no longer the only line asking: `taria-ratatui 0.2.0` declares
+# `ratatui = "0.30.2"` with its defaults on, cargo unions features across the
+# graph, and so `all-widgets`, `layout-cache`, `macros` and `underline-color`
+# compile into this binary whatever is written here. Three of those are compile
+# time and code size; `underline-color` is not, because it makes the crossterm
+# backend append a `SetUnderlineColor(Reset)` to the reset sequence it writes at
+# the end of every draw — the bytes this binary puts on the terminal changed
+# when it adopted taria. The fix belongs upstream rather than in a workaround
+# here: `taria-ratatui` now asks for `default-features = false, features =
+# ["crossterm"]` itself (committed there, due in its next release), at which
+# point this line is the only one speaking again.
+# `scrolling-regions` is the one thing still off, which is the original concern
+# intact: it is in nobody's default set, and it only changes
+# `Terminal::insert_before`, which this crate never calls. crossterm itself is
+# not listed here — it comes in through ratatui and is used via the
+# `ratatui::crossterm` re-export, so the tree cannot end up with two versions of
+# it.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 taria-ratatui = "0.2"
