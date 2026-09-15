@@ -316,6 +316,14 @@ pub fn run_chat_tui(args: ChatArgs, dials: Dials) -> anyhow::Result<()> {
     // off and stderr is the user's again. Nothing in `drive` may report any of
     // this, because in raw mode a bare newline does not return to column 0.
     report_agent_layer(&layer);
+    // And then the socket goes, before the join below can hold it open for the
+    // rest of a prefill. From here the tree is frozen whatever happens — the
+    // loop that published it has ended and nothing is draining what an agent
+    // sends — so a layer left bound is a socket that accepts a call, answers
+    // nothing, and leaves the agent to wait out its own timeout on a session
+    // that is over. Dropping it closes the connection instead, which is a
+    // thing the bridge can report and an agent can act on.
+    drop(layer);
     match ended {
         Ok(Ended { failure, join }) => {
             if join {
