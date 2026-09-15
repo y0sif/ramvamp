@@ -39,3 +39,4 @@ libc = { workspace = true }
 # in through ratatui and is used via the `ratatui::crossterm` re-export, so the
 # tree cannot end up with two versions of it.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+taria-ratatui = "0.2"

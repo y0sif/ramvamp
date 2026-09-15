@@ -539,13 +539,13 @@ fn hit_text(hit: f32) -> String {
 ///
 /// Truncated rather than rounded on purpose: a bar that has not reached the
 /// end must not be able to say 100%.
-fn percent(done: u64, total: u64) -> Option<u64> {
+pub(crate) fn percent(done: u64, total: u64) -> Option<u64> {
     (total > 0).then(|| done.min(total) * 100 / total)
 }
 
 /// `1m 33s`. Zero-padded seconds, so a live clock never changes width and
 /// never reflows the row it sits in.
-fn clock(elapsed: std::time::Duration) -> String {
+pub(crate) fn clock(elapsed: std::time::Duration) -> String {
     let seconds = elapsed.as_secs();
     format!("{}m {:02}s", seconds / 60, seconds % 60)
 }

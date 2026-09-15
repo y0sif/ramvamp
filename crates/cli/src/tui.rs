@@ -49,7 +49,14 @@
 //! [`session`] is the other half — it owns the model on a worker thread and
 //! feeds this one by message. That split is forced rather than stylistic; see
 //! its module docs.
+//!
+//! [`agent`] is the machine-facing side of the same panel: the semantic tree
+//! taria publishes, and the decision of what an agent input means. What it
+//! returns is a [`Plan`] — a key press or a paste — which
+//! [`Harness::apply_agent_input`] runs through the handlers the keyboard
+//! already goes through, so an agent can reach no state a keyboard cannot.
 
+mod agent;
 mod glyphs;
 mod input;
 mod panel;
@@ -73,12 +80,15 @@ use ratatui::crossterm::tty::IsTty as _;
 use ratatui::crossterm::{QueueableCommand as _, cursor};
 use ratatui::text::{Line, Span};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use taria_ratatui::InputStatus;
+use taria_ratatui::taria::AgentInput;
 
 // The self-test's fabricated numbers, and only those: it runs before argument
 // parsing and has no `--context` to honour, so the window it draws against is
 // the default one. Everything the real harness shows comes from `session.rs`,
 // which is given the resolved cap.
 use crate::repl::DEFAULT_CONTEXT;
+use agent::Plan;
 use glyphs::Glyphs;
 use input::LineEditor;
 use panel::Layout;
@@ -310,6 +320,16 @@ impl Harness {
         (self.palette, self.glyphs)
     }
 
+    /// The line the user is part way through typing.
+    ///
+    /// Read-only, and it exists for one caller: [`agent::build_nodes`] has to
+    /// publish the draft as the value of the input node, and the editor is
+    /// the harness's rather than the session's. Nothing may write through
+    /// this — what the user typed is the keyboard's to change.
+    pub(crate) fn editor(&self) -> &LineEditor {
+        &self.editor
+    }
+
     /// Write model output, user turns, banners — anything that belongs in
     /// the scrollback — into the scroll region.
     ///
@@ -384,6 +404,69 @@ impl Harness {
         // whatever the tick and the settle window have to say about it.
         self.draw()?;
         Ok(out)
+    }
+
+    /// Apply one agent input, and say what it earned.
+    ///
+    /// Two steps, and the split is the point: [`agent::plan`] decides — purely,
+    /// out of the phase and the draft, and unit-tested against the very tree
+    /// that advertised the action — and this executes the [`Plan`] it returned
+    /// through the handlers a keyboard already uses. Nothing here decides
+    /// anything, so there is no second copy of the routing table to drift.
+    ///
+    /// The [`UiEvent`]s come back in a `Vec` because one input can be several
+    /// keystrokes: `type_text("a\nb\n")` is two turns, and dropping either
+    /// would lose one.
+    pub(crate) fn apply_agent_input(&mut self, input: &AgentInput) -> (InputStatus, Vec<UiEvent>) {
+        let (plan, status) = agent::plan(input, self.status.phase, self.editor.text());
+        let mut events = Vec::new();
+        self.run_plan(plan, &mut events);
+        (status, events)
+    }
+
+    /// Run a decided [`Plan`], collecting whatever the key handler produced.
+    fn run_plan(&mut self, plan: Plan, events: &mut Vec<UiEvent>) {
+        match plan {
+            Plan::Key(code, modifiers) => events.extend(self.feed_key(code, modifiers)),
+            Plan::Paste(text) => self.feed_paste(&text),
+            Plan::PasteThenSubmit(text) => {
+                self.feed_paste(&text);
+                events.extend(self.feed_key(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            Plan::Submit => events.extend(self.feed_key(KeyCode::Enter, KeyModifiers::NONE)),
+            Plan::Nothing => {}
+            // One level deep in practice, and this is the only place that
+            // matters: a plan is a list of keystrokes, not a tree of them.
+            Plan::Sequence(steps) => {
+                for step in steps {
+                    self.run_plan(step, events);
+                }
+            }
+        }
+    }
+
+    /// Feed one key press through the app's own key handler.
+    ///
+    /// Private, and deliberately: an agent input reaches it only through
+    /// [`Harness::apply_agent_input`], so there is nowhere in the session that
+    /// can synthesize a keystroke without a decided plan and the ack that goes
+    /// with it.
+    ///
+    /// The draw mirrors [`Harness::poll`] — what the input did echoes now
+    /// rather than at the next tick — and its error is swallowed for the
+    /// reason [`Harness::set_status`] swallows one: the caller polls the
+    /// terminal every pass anyway, and that is where a failure surfaces.
+    fn feed_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<UiEvent> {
+        let out = self.handle_key(code, modifiers);
+        let _ = self.draw();
+        out
+    }
+
+    /// Insert text through the bracketed-paste path, exactly as
+    /// [`Event::Paste`] does.
+    fn feed_paste(&mut self, text: &str) {
+        self.editor.insert_paste(text);
+        let _ = self.draw();
     }
 
     /// Give the terminal back, for a clean error exit or a `Drop`.
