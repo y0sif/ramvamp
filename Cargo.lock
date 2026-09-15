@@ -1452,6 +1452,7 @@ dependencies = [
  "ratatui",
  "serde_json",
  "taria-ratatui",
+ "tracing",
  "tracing-subscriber",
 ]
 

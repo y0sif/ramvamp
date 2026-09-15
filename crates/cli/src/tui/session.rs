@@ -73,8 +73,9 @@ use ramvamp_core::generate::{GenerateParams, GenerateProgress, generate_from_wit
 use ramvamp_core::io::StreamStats;
 use ramvamp_core::model::{ForwardState, Model, StreamPhase};
 use ramvamp_core::tokenizer::{ChatMessage, Role, RvmpTokenizer};
-use taria_ratatui::TariaLayer;
+use taria_ratatui::{InputStatus, TariaLayer};
 
+use super::agent::Liveness;
 use super::{Harness, Phase, Prefilling, Ribbon, Status, UiEvent, agent};
 use crate::config::Dials;
 use crate::repl::{
@@ -342,8 +343,16 @@ pub fn run_chat_tui(args: ChatArgs, dials: Dials) -> anyhow::Result<()> {
 /// normal case: a layer that bound and served without losing anything has
 /// nothing to add to the end of a chat session.
 fn report_agent_layer(layer: &TariaLayer) {
+    // Not on stderr. Nobody asked for the agent socket, and the ordinary way
+    // to fail to bind it is to already be running `chat --tui` in another
+    // window — comparing two models side by side is a thing people do, and the
+    // second one greeting them with an error about a feature they never asked
+    // for is worse than silence. `RUST_LOG=ramvamp=debug` has it for whoever
+    // was actually looking for the socket. The counters below stay on stderr:
+    // they only fire when they are non-zero, which means an agent really was
+    // connected and really did lose something.
     if let Some(error) = layer.bind_error() {
-        eprintln!("the agent socket did not come up ({error}); the session ran without it");
+        tracing::debug!(%error, "the agent socket did not come up; running without it");
     }
     let dropped = layer.dropped_inputs();
     if dropped > 0 {
@@ -619,20 +628,29 @@ fn drive(
         // The agent's view of the same instant. Unthrottled, because the
         // layer skips a tree identical to the last one it published — which
         // is what the rounding in `agent.rs` is for — so a pass that changed
-        // nothing costs a comparison.
-        layer.publish(agent::build_nodes(
-            &status,
-            harness.editor(),
-            &screen.transcript,
-        ));
+        // nothing costs a comparison. Built only when there is a layer to
+        // publish it to: `publish` returns immediately on an inert layer, but
+        // the tree is ~8 nodes and a copy of the transcript tail, and a user
+        // with no agent should not pay for one 25 times a second.
+        if layer.is_enabled() {
+            layer.publish(agent::build_nodes(
+                &status,
+                harness.editor(),
+                &screen.transcript,
+                Liveness::Live,
+            ));
+        }
 
         // Agent input is drained either side of the blocking poll: once before
         // it, so what arrived during the last pass is applied without waiting
         // out another POLL, and once after, so an input that landed while the
         // loop was parked is applied in the same pass as the keystroke that
-        // woke it. Both drains apply their input where they stand, so this
-        // order is also the order the harness saw them in; only the events
-        // they produced are held back, to keep the one set of arms below.
+        // woke it. Both drains apply their input where they stand, so the
+        // harness sees them in the order the drains ran — which is not the
+        // order they arrived in: an agent input that landed during the poll is
+        // applied after the keystroke that woke it, even if it got there
+        // first. Only the events they produced are held back, to keep the one
+        // set of arms below.
         let mut events: Vec<UiEvent> = Vec::new();
         pump_agent(harness, layer, &mut events);
         events.extend(harness.poll(POLL)?);
@@ -660,6 +678,17 @@ fn drive(
     screen.dirty = true;
     let mut join = true;
     loop {
+        // Acked, deliberately not applied. An input that arrives now cannot be
+        // honoured — the tree has stopped advertising anything and the session
+        // is already leaving — but it must still be answered, or it sits there
+        // until the agent's own timeout, which is as long as the in-flight
+        // prefill this loop is waiting out. Applying one would be worse than
+        // useless: an agent could press Ctrl-C into the poll below, set
+        // `join = false` and abandon the worker thread the user is waiting on.
+        // Drained on every pass rather than only when the worker goes quiet,
+        // because a reply still streaming out is exactly when an agent is
+        // likely to be acting.
+        layer.drain_acking(|_| InputStatus::Ignored);
         match outputs.try_recv() {
             Ok(output) => {
                 // A fatal error raised on the way out still gets reported, but
@@ -680,12 +709,18 @@ fn drive(
                 let status = screen.status();
                 harness.set_status(status.clone());
                 // Winding down is a state an agent can be watching, so the
-                // tree must not go stale while it happens.
-                layer.publish(agent::build_nodes(
-                    &status,
-                    harness.editor(),
-                    &screen.transcript,
-                ));
+                // tree must not go stale while it happens — and it must not
+                // lie either. Nothing here is applied, so `WindingDown` strips
+                // every action set and the tree advertises nothing, which is
+                // the same answer the drain above gives.
+                if layer.is_enabled() {
+                    layer.publish(agent::build_nodes(
+                        &status,
+                        harness.editor(),
+                        &screen.transcript,
+                        Liveness::WindingDown,
+                    ));
+                }
                 // A prefill in flight cannot be cut short (see the module
                 // docs), so a user who does not want to wait it out says so
                 // again and the thread is left to the process exit.

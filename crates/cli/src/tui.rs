@@ -414,9 +414,11 @@ impl Harness {
     /// through the handlers a keyboard already uses. Nothing here decides
     /// anything, so there is no second copy of the routing table to drift.
     ///
-    /// The [`UiEvent`]s come back in a `Vec` because one input can be several
-    /// keystrokes: `type_text("a\nb\n")` is two turns, and dropping either
-    /// would lose one.
+    /// The [`UiEvent`]s come back in a `Vec` because one input can be more
+    /// than one keystroke — a `set_value` is a clear and then a paste — and
+    /// dropping what any of them produced would lose it. It is a short `Vec`
+    /// by construction: `agent::MAX_PLAN_STEPS` bounds the steps one input
+    /// can expand into, and at most one of them submits.
     pub(crate) fn apply_agent_input(&mut self, input: &AgentInput) -> (InputStatus, Vec<UiEvent>) {
         let (plan, status) = agent::plan(input, self.status.phase, self.editor.text());
         let mut events = Vec::new();
@@ -435,8 +437,9 @@ impl Harness {
             }
             Plan::Submit => events.extend(self.feed_key(KeyCode::Enter, KeyModifiers::NONE)),
             Plan::Nothing => {}
-            // One level deep in practice, and this is the only place that
-            // matters: a plan is a list of keystrokes, not a tree of them.
+            // One level deep in practice and bounded in length by
+            // `agent::MAX_PLAN_STEPS`, which is what keeps this recursion a
+            // short list of keystrokes rather than a tree of them.
             Plan::Sequence(steps) => {
                 for step in steps {
                     self.run_plan(step, events);

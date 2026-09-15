@@ -25,6 +25,10 @@ ramvamp-core = { workspace = true }
 ramvamp-server = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+# `tracing` beside the subscriber this binary already installs: the TUI's
+# agent layer reports a failure to bind its socket at debug level rather
+# than on stderr, because nobody running `chat --tui` asked for that socket.
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 # `chat` installs a SIGINT handler so Ctrl-C stops a reply instead of the

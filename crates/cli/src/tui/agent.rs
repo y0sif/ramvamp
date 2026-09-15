@@ -68,6 +68,14 @@ const YOU: &str = "you: ";
 const MODEL: &str = "ramvamp: ";
 const NOTE: &str = "note: ";
 
+/// What [`TranscriptRing::trim`] actually trims to.
+///
+/// The longest speaker mark, held back from [`TRANSCRIPT_CAP`] rather than
+/// spent after the cut: a trim that lands inside a turn puts that turn's mark
+/// back in front of what is left, and reserving the room first is what stops
+/// putting it back from pushing the tail over the cap again.
+const TAIL_CAP: usize = TRANSCRIPT_CAP - MODEL.len();
+
 /// Between two facts in a node value. Fixed rather than taken from
 /// [`Glyphs`](super::glyphs::Glyphs): what the terminal can draw has no
 /// bearing on what an agent can read.
@@ -146,34 +154,90 @@ impl TranscriptRing {
         }
     }
 
-    /// Drop the front until the tail fits.
+    /// Drop the front until the tail fits, and keep what is left attributed.
     ///
-    /// Whole lines first, so the tail starts where a turn does rather than in
-    /// the middle of a word. A single line longer than the whole budget — a
-    /// reply that has streamed six kilobytes without a newline — has no line
-    /// boundary to cut at, so it is cut on a character boundary instead;
-    /// slicing a `char` in half would produce a `String` that is not UTF-8,
-    /// which is the one thing `drain` will panic on.
+    /// Whole lines first, so the tail starts at the start of a line rather
+    /// than in the middle of a word. Starting at a line is not the same as
+    /// starting at a *turn*, which is what an agent needs: a reply with
+    /// newlines in it is stored as one marked line and however many unmarked
+    /// continuations, so a cut landing inside one used to leave the tail
+    /// opening on a paragraph with nobody's name on it. The mark of the turn
+    /// the cut ran into is therefore put back in front of what is left, and
+    /// [`TAIL_CAP`] is the room held back for it.
+    ///
+    /// A single line longer than the whole budget — a reply that has streamed
+    /// six kilobytes without a newline — has no line boundary to cut at, so it
+    /// is cut on a character boundary instead; slicing a `char` in half would
+    /// produce a `String` that is not UTF-8, which is the one thing `drain`
+    /// will panic on. That tail is re-marked too: a fragment of a word is
+    /// still a fragment of somebody's word.
     fn trim(&mut self) {
-        while self.text.len() > TRANSCRIPT_CAP {
-            let Some(at) = self.text.find('\n') else {
+        if self.text.len() <= TAIL_CAP {
+            return;
+        }
+        // The speaker of the last turn the cut ran into, so what survives it
+        // can be marked with the same name.
+        let mut owner: Option<&'static str> = None;
+        let mut cut = 0;
+        while self.text.len() - cut > TAIL_CAP {
+            let rest = &self.text[cut..];
+            if let Some(mark) = turn_mark(rest) {
+                owner = Some(mark);
+            }
+            let Some(at) = rest.find('\n') else {
                 break;
             };
-            self.text.drain(..=at);
+            cut += at + 1;
         }
-        if self.text.len() > TRANSCRIPT_CAP {
-            let want = self.text.len() - TRANSCRIPT_CAP;
-            let cut = (want..=self.text.len())
+        if self.text.len() - cut > TAIL_CAP {
+            let want = self.text.len() - TAIL_CAP;
+            cut = (want..=self.text.len())
                 .find(|at| self.text.is_char_boundary(*at))
                 .unwrap_or(self.text.len());
-            self.text.drain(..cut);
+        }
+        self.text.drain(..cut);
+        if let Some(mark) = owner
+            && !self.text.is_empty()
+            && turn_mark(&self.text).is_none()
+        {
+            self.text.insert_str(0, mark);
         }
     }
+}
+
+/// The speaker a line opens, if it opens one.
+///
+/// What tells a turn's first line from its continuations, and so the one
+/// thing [`TranscriptRing::trim`] needs to know to hand back a tail that says
+/// who is talking.
+fn turn_mark(line: &str) -> Option<&'static str> {
+    [YOU, MODEL, NOTE]
+        .into_iter()
+        .find(|mark| line.starts_with(mark))
 }
 
 // ---------------------------------------------------------------------------
 // the tree
 // ---------------------------------------------------------------------------
+
+/// Whether the session is still acting on what the tree advertises.
+///
+/// The wind-down loop keeps publishing, because a tree that freezes while the
+/// worker is asked to stop leaves an agent reading a session that ended
+/// minutes ago. What it no longer does is *apply* anything: every input it
+/// drains is acked `Ignored` on the spot, so nothing waits out the bridge's
+/// window, and an agent cannot reach the session's own exit path from there.
+/// A tree that went on advertising `focus`, `set_value`, `activate` and the
+/// way out through that window would be advertising four actions that cannot
+/// work — the one thing the tree is never allowed to do — so it advertises
+/// none of them instead, and the tree and the verdict agree again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    /// The UI loop is reading input and acting on it.
+    Live,
+    /// Leaving: the tree still reports, and offers nothing.
+    WindingDown,
+}
 
 /// The semantic tree for one instant of the session.
 ///
@@ -189,8 +253,10 @@ pub(crate) fn build_nodes(
     status: &Status,
     editor: &LineEditor,
     transcript: &TranscriptRing,
+    liveness: Liveness,
 ) -> Vec<Node> {
     let running = status.phase != Phase::Idle;
+    let live = liveness == Liveness::Live;
     let mut nodes = vec![
         // `Log` rather than `Text`: the value is a rolling tail, so what an
         // agent reads is a suffix of the conversation and not the whole of
@@ -229,34 +295,42 @@ pub(crate) fn build_nodes(
                 .value(detail),
         );
     }
-    nodes.push(input_node(editor));
+    nodes.push(input_node(editor, live));
     // Exactly one advertised way out, whatever the phase: stop a turn that is
     // running, leave when there is nothing to stop. That is the same rule the
     // keyboard follows — Ctrl-C interrupts while busy and exits while idle —
     // so the tree and the key handler cannot disagree about what is possible.
-    nodes.push(if running {
-        Node::new("stop", Role::Button)
-            .label("stop")
-            .action(Action::Activate)
+    // Winding down there is no way out to offer: the loop is already leaving
+    // and the input it drains on the way is acked `Ignored`.
+    let out = if running { "stop" } else { "quit" };
+    let out = Node::new(out, Role::Button).label(out);
+    nodes.push(if live {
+        out.action(Action::Activate)
     } else {
-        Node::new("quit", Role::Button)
-            .label("quit")
-            .action(Action::Activate)
+        out
     });
     nodes
 }
 
 /// The input line: always the focused node, because the panel's keyboard has
 /// nowhere else to be.
-fn input_node(editor: &LineEditor) -> Node {
-    let mut node = Node::new("input", Role::TextInput)
+///
+/// Focused whether or not the session is still taking input — the keyboard
+/// really is there, and the human's Ctrl-C still works — but it advertises
+/// nothing once the session is winding down, because nothing it could
+/// advertise would be applied.
+fn input_node(editor: &LineEditor, live: bool) -> Node {
+    let node = Node::new("input", Role::TextInput)
         .label("Ask ramvamp anything")
         .value(editor.text())
-        .focused(true)
-        // `Focus` is what an agent acts on to aim `type_text` at a surface,
-        // so it is advertised even though this app has only the one: without
-        // it the tree never says where typed text lands.
-        .actions([Action::Focus, Action::SetValue]);
+        .focused(true);
+    if !live {
+        return node;
+    }
+    // `Focus` is what an agent acts on to aim `type_text` at a surface, so it
+    // is advertised even though this app has only the one: without it the tree
+    // never says where typed text lands.
+    let mut node = node.actions([Action::Focus, Action::SetValue]);
     // `Activate` only when the draft would actually submit. Enter on a blank
     // buffer reprompts and disturbs nothing (see `Harness::handle_key`), and
     // the condition here is that handler's own, whitespace included, so the
@@ -367,19 +441,21 @@ fn stats_value(status: &Status) -> String {
 /// is a thing a reviewer can see in the enum rather than a thing they have to
 /// find by reading every arm of [`plan`].
 ///
-/// [`Sequence`](Self::Sequence) is composition, not a sixth capability. Two
-/// inputs need more than one keyboard action to carry out — a `set_value`
-/// (clear the line, then paste) and typed text with a newline in it (a paste
-/// and an Enter per line) — and a sequence of keystrokes is still only
-/// keystrokes. It never nests more than one level deep, because nothing
-/// builds it but the two sites below.
+/// [`Sequence`](Self::Sequence) is composition, not a sixth capability. One
+/// input needs more than one keyboard action to carry out — a `set_value`,
+/// which is the line cleared and then pasted over — and a sequence of
+/// keystrokes is still only keystrokes. It never nests more than one level
+/// deep, and [`MAX_PLAN_STEPS`] bounds its length: a step here can be an
+/// Enter, an Enter is a model turn, and an input whose step count grows with
+/// its own length is an input that can queue more work than anyone can
+/// interrupt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Plan {
     /// Feed through the key handler, exactly as crossterm would deliver it.
     Key(KeyCode, KeyModifiers),
     /// Insert through the bracketed-paste path, verbatim.
     Paste(String),
-    /// A paste and then Enter: one typed line, submitted.
+    /// A paste and then Enter: the typed text, submitted as one turn.
     PasteThenSubmit(String),
     /// Enter through the key handler.
     Submit,
@@ -390,6 +466,17 @@ pub(crate) enum Plan {
     /// Several of the above, in order.
     Sequence(Vec<Plan>),
 }
+
+/// The most steps one agent input may expand into.
+///
+/// Defence in depth rather than a limit anything reaches: the one site that
+/// builds a sequence builds two steps. What the cap stops is a future routing
+/// change reintroducing an expansion that scales with the input — the shape of
+/// the bug in which a single 4 KiB `type_text`, well inside the bridge's own
+/// sanctioned limit, became two thousand `Submit`s on an unbounded channel and
+/// two thousand queued model turns, run back to back without the keyboard
+/// being read in between.
+const MAX_PLAN_STEPS: usize = 4;
 
 /// Decide what an agent input does, without doing any of it.
 ///
@@ -433,7 +520,7 @@ pub(crate) fn plan(input: &AgentInput, phase: Phase, draft: &str) -> (Plan, Inpu
             // asked for.
             None => (Plan::Nothing, InputStatus::Ignored),
         },
-        AgentInput::Text { text, .. } => plan_text(text),
+        AgentInput::Text { text, .. } => plan_text(text, draft),
         // The layer answers this variant itself and never hands it over. It is
         // named here only so the lint above can still see the wildcard.
         AgentInput::Unknown => (Plan::Nothing, InputStatus::Ignored),
@@ -524,53 +611,78 @@ fn plan_act(
 /// normalise — a stray control character in an agent's text would be inserted
 /// into the buffer as itself, where the paste path drops it.
 ///
-/// # Where this deliberately differs from a human paste
+/// # One `type_text` is at most one turn
 ///
-/// A *human* paste keeps its newlines: `insert_paste` normalises them to LF
-/// and the whole paste submits as one turn, which is the fix recorded in
-/// `input.rs` for a pasted paragraph arriving one turn per line. Agent text
-/// does the opposite, and follows taria's convention instead — `'\n'` is
-/// Enter. `type_text("hi\n")` submits one turn and `type_text("a\nb\n")`
-/// submits two.
+/// Only a *trailing* newline submits. Interior newlines stay in the buffer as
+/// themselves, so `type_text("a\nb\n")` pastes `a\nb` and submits it as a
+/// single turn — exactly what a person pasting that text and pressing Enter
+/// gets — and `type_text("a\nb")` pastes it and leaves it sitting there.
 ///
-/// The two rules disagree because the two senders were told different things.
-/// A person pastes a paragraph they can see, into a field they can see, and
-/// expects it to stay one message. An agent is told by the bridge's own tool
-/// description that a newline in `type_text` arrives as Enter and submits, so
-/// a newline it sends is a newline it meant as Enter; honouring the human rule
-/// there would leave it waiting for a reply to a turn that was never
-/// submitted. Text with no newline in it behaves identically on both paths,
-/// which is the overwhelming majority of both.
+/// This is not a retreat from taria's `'\n'`-is-Enter convention, it is the
+/// case the convention carves out. `AgentInput::Text` documents the lowering
+/// as "a convention for adapters and not a rule this crate can enforce: an app
+/// whose typing surface is not made of key events reads the characters itself
+/// and decides there what a newline or a tab means". This app's typing surface
+/// is a `String`, not a stream of key events, and it decided for its human
+/// users already: `insert_paste` keeps newlines so a pasted paragraph is one
+/// turn, which is the fix recorded in `input.rs` and pinned by
+/// `a_multi_line_paste_is_one_turn` there. Agent text now gets the same
+/// answer, so `type_text`, `set_value` and a human paste all keep interior
+/// newlines literal, and there is no asymmetry left between them.
 ///
-/// Everything else is the paste path's: CRLF and bare CR become LF (so they
-/// submit like LF), a tab becomes a space, and other C0 controls are dropped.
-/// Text that is nothing but those is `Ignored` — there is no keystroke left in
-/// it to deliver.
-fn plan_text(text: &str) -> (Plan, InputStatus) {
+/// The alternative was measured and is the reason this changed. An Enter per
+/// newline made `type_text` of `"a\n"` repeated 2,048 times — 4,096
+/// characters, inside the limit the bridge itself sanctions — into 2,048
+/// `Submit`s, 2,048 `Command::Submit`s on an unbounded channel, and days of
+/// queued prefill and decode that the session ran through without reading the
+/// keyboard in between. No key press can produce more than one turn, so no
+/// agent input may either; that property is worth more than a newline
+/// convention this app was never obliged to follow.
+///
+/// # What is delivered and what is not
+///
+/// Everything else is the paste path's: CRLF and bare CR become LF (so a
+/// trailing one submits like LF), a tab becomes a space, and other C0 controls
+/// are dropped. Text that is nothing but those is `Ignored` — there is no
+/// keystroke left in it to deliver — and so is text whose only effect would be
+/// an Enter on a buffer that is blank once the text is in it, because
+/// `handle_key` clears such a buffer, reprompts and starts no turn. That is
+/// the very condition `input`'s `Activate` is gated on, on purpose: the same
+/// non-effect has to earn the same verdict whichever of the two ways an agent
+/// asks for it.
+fn plan_text(text: &str, draft: &str) -> (Plan, InputStatus) {
     let text = normalise_paste(text);
     if text.is_empty() {
         return (Plan::Nothing, InputStatus::Ignored);
     }
-    let lines: Vec<&str> = text.split('\n').collect();
-    let last = lines.len() - 1;
-    let mut steps: Vec<Plan> = Vec::with_capacity(lines.len());
-    for (index, line) in lines.iter().enumerate() {
-        match (index == last, line.is_empty()) {
-            // The tail after the final newline. Nothing to type, and the
-            // Enter before it has already submitted.
-            (true, true) => {}
-            (true, false) => steps.push(Plan::Paste((*line).to_owned())),
-            // A newline with nothing in front of it is just Enter.
-            (false, true) => steps.push(Plan::Submit),
-            (false, false) => steps.push(Plan::PasteThenSubmit((*line).to_owned())),
-        }
+    // The one newline that is Enter, if the text carries it at all. Every
+    // other newline is a character being typed.
+    let Some(typed) = text.strip_suffix('\n') else {
+        return (Plan::Paste(text), InputStatus::Delivered);
+    };
+    // Enter on a whitespace-only buffer reprompts and disturbs nothing, and
+    // the buffer this would submit is the draft with `typed` somewhere in it:
+    // blank exactly when both are. Ignored rather than delivered, so an agent
+    // is not left waiting on a turn that never starts.
+    if draft.trim().is_empty() && typed.trim().is_empty() {
+        return (Plan::Nothing, InputStatus::Ignored);
     }
-    (sequence(steps), InputStatus::Delivered)
+    if typed.is_empty() {
+        return (Plan::Submit, InputStatus::Delivered);
+    }
+    (
+        Plan::PasteThenSubmit(typed.to_owned()),
+        InputStatus::Delivered,
+    )
 }
 
 /// Fold a list of steps into the smallest [`Plan`] that expresses it, so that
 /// a one-step plan has exactly one spelling.
+///
+/// Truncated to [`MAX_PLAN_STEPS`]. Nothing here builds a longer one; the
+/// truncation is what keeps that true of whatever is written next.
 fn sequence(mut steps: Vec<Plan>) -> Plan {
+    steps.truncate(MAX_PLAN_STEPS);
     match steps.len() {
         0 => Plan::Nothing,
         1 => steps.remove(0),
@@ -646,7 +758,21 @@ mod tests {
     }
 
     fn nodes(status: &Status, draft: &str) -> Vec<Node> {
-        build_nodes(status, &editor(draft), &TranscriptRing::default())
+        build_nodes(
+            status,
+            &editor(draft),
+            &TranscriptRing::default(),
+            Liveness::Live,
+        )
+    }
+
+    fn winding_down(status: &Status, draft: &str) -> Vec<Node> {
+        build_nodes(
+            status,
+            &editor(draft),
+            &TranscriptRing::default(),
+            Liveness::WindingDown,
+        )
     }
 
     fn find<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
@@ -752,6 +878,37 @@ mod tests {
             // The other one is absent rather than present and inert.
             let absent = if expected == "quit" { "stop" } else { "quit" };
             assert!(find(&nodes, absent).is_none(), "{name} published {absent}");
+        }
+    }
+
+    /// Winding down, the loop publishes but applies nothing: every input it
+    /// drains is acked `Ignored` where it stands. So the tree must advertise
+    /// nothing at all — an `activate` offered through that window is an
+    /// action that cannot work, and the window is as long as an in-flight
+    /// prefill, which cannot be cut short. The values keep moving, because an
+    /// agent watching a session end still has to be able to read it.
+    #[test]
+    fn the_wind_down_tree_advertises_nothing_anywhere() {
+        for (name, status) in states() {
+            for draft in ["", "   ", "why is prefill slow?"] {
+                let live = nodes(&status, draft);
+                let winding = winding_down(&status, draft);
+                for node in &winding {
+                    assert!(
+                        node.actions.is_empty(),
+                        "{name} with draft {draft:?}: {} still offers {:?}",
+                        node.id.0,
+                        node.actions
+                    );
+                }
+                // Same ids, same roles, same values: only the offers are gone.
+                assert_eq!(ids(&winding), ids(&live), "{name} with draft {draft:?}");
+                for (winding, live) in winding.iter().zip(live.iter()) {
+                    assert_eq!(winding.role, live.role, "{name}");
+                    assert_eq!(winding.value, live.value, "{name}");
+                    assert_eq!(winding.focused, live.focused, "{name}");
+                }
+            }
         }
     }
 
@@ -1024,6 +1181,40 @@ mod tests {
         );
     }
 
+    /// A trim that cuts into a turn takes the line carrying the speaker mark
+    /// with it, so the mark goes back on what is left. Without that, an agent
+    /// reading the tail of a long reply opens on a paragraph with nobody's
+    /// name on it and cannot tell the model's words from its own.
+    #[test]
+    fn a_trimmed_tail_still_says_who_is_speaking() {
+        let mut ring = TranscriptRing::default();
+        ring.push_user("why is prefill slow?");
+        // One reply, many lines, far more than the ring can hold.
+        for line in 0..400 {
+            ring.push_model(&format!("paragraph {line} {}\n", "y".repeat(60)));
+        }
+        assert!(ring.text().len() <= TRANSCRIPT_CAP);
+        let first = ring.text().lines().next().unwrap_or_default();
+        assert!(first.starts_with(MODEL), "{first:?}");
+        // And it is the reply's own continuation that was re-marked, not a
+        // line invented from nowhere.
+        assert!(first.contains("paragraph "), "{first:?}");
+
+        // Every line the ring can hand back opens a turn or continues the one
+        // the tail was re-marked with, whatever it is fed.
+        let mut ring = TranscriptRing::default();
+        for turn in 0..200 {
+            ring.push_user(&format!("ask {turn}"));
+            ring.push_model(&format!("a\nb\nc {turn} {}\n", "z".repeat(80)));
+        }
+        assert!(ring.text().len() <= TRANSCRIPT_CAP);
+        let first = ring.text().lines().next().unwrap_or_default();
+        assert!(
+            turn_mark(first).is_some(),
+            "the tail opens unattributed: {first:?}"
+        );
+    }
+
     /// One reply longer than the whole budget has no line boundary to cut at,
     /// so the fallback cut is on a character boundary. Cutting inside a
     /// character would leave a `String` that is not UTF-8, which is the one
@@ -1041,7 +1232,14 @@ mod tests {
             "{} bytes",
             ring.text().len()
         );
-        assert!(ring.text().chars().all(|c| c == '🜁'));
+        // Re-marked: the cut took the `ramvamp:` that opened the reply with
+        // it, and a tail of unattributed characters is a tail an agent cannot
+        // read.
+        let tail = ring
+            .text()
+            .strip_prefix(MODEL)
+            .unwrap_or_else(|| panic!("the tail lost its speaker: {:?}", ring.text()));
+        assert!(tail.chars().all(|c| c == '🜁'));
         // Three-byte characters in whole lines take the line-boundary path
         // and must survive it just as intact.
         let mut ring = TranscriptRing::default();
@@ -1080,7 +1278,7 @@ mod tests {
         let mut ring = TranscriptRing::default();
         ring.push_user("hello");
         ring.push_model("hi there");
-        let nodes = build_nodes(&idle_status(), &editor(""), &ring);
+        let nodes = build_nodes(&idle_status(), &editor(""), &ring, Liveness::Live);
         let transcript = find(&nodes, "transcript").expect("a transcript node");
         assert_eq!(transcript.role, Role::Log);
         assert_eq!(transcript.value.as_deref(), Some(ring.text()));
@@ -1340,60 +1538,128 @@ mod tests {
         }
     }
 
-    /// The deliberate divergence from this app's human paste path, and the one
-    /// place agent text and a person's paste disagree.
+    /// Only a trailing newline submits, and it submits once.
     ///
-    /// `insert_paste` keeps newlines, so a pasted paragraph is one turn — see
-    /// `a_multi_line_paste_is_one_turn` in `input.rs`. taria's convention for
-    /// typed text is the opposite: `'\n'` is Enter. An agent is told that by
-    /// the bridge's own tool description, so a newline it sends is one it
-    /// meant as Enter, and holding it in the buffer would leave it waiting for
-    /// a reply to a turn nobody submitted. Text with no newline in it — the
-    /// overwhelming majority of both — behaves identically on the two paths.
+    /// The interior ones are characters being typed, which is the answer
+    /// `insert_paste` already gives a human paste — see
+    /// `a_multi_line_paste_is_one_turn` in `input.rs` — and the answer
+    /// `set_value` gives too, so the three ways text reaches this buffer agree
+    /// about what a newline in the middle of it means. taria's
+    /// `'\n'`-is-Enter lowering says in so many words that it is a convention
+    /// for adapters rather than a rule, for an app whose typing surface is
+    /// made of key events; this one's is a `String`.
     #[test]
-    fn typed_text_submits_at_every_newline_where_a_paste_would_keep_it() {
+    fn typed_text_submits_only_on_a_trailing_newline() {
         for (text, expected) in [
             ("hi", Plan::Paste("hi".to_owned())),
             ("hi\n", Plan::PasteThenSubmit("hi".to_owned())),
-            (
-                "a\nb\n",
-                Plan::Sequence(vec![
-                    Plan::PasteThenSubmit("a".to_owned()),
-                    Plan::PasteThenSubmit("b".to_owned()),
-                ]),
-            ),
-            // No trailing newline: the tail is typed and left in the buffer,
-            // exactly where a person typing it would have left it.
-            (
-                "a\nb",
-                Plan::Sequence(vec![
-                    Plan::PasteThenSubmit("a".to_owned()),
-                    Plan::Paste("b".to_owned()),
-                ]),
-            ),
-            // A bare newline is a bare Enter.
+            // The interior newline is typed, not pressed: one paste, one
+            // Enter, one turn — the same turn a person pasting this and
+            // pressing Enter would send.
+            ("a\nb\n", Plan::PasteThenSubmit("a\nb".to_owned())),
+            // No trailing newline: typed and left in the buffer, exactly where
+            // a person typing it would have left it.
+            ("a\nb", Plan::Paste("a\nb".to_owned())),
+            // A bare newline is a bare Enter — on a draft that would submit.
             ("\n", Plan::Submit),
         ] {
+            let draft = if text == "\n" { "hello" } else { "" };
             assert_eq!(
-                plan(&AgentInput::text(text), Phase::Idle, ""),
+                plan(&AgentInput::text(text), Phase::Idle, draft),
                 (expected, InputStatus::Delivered),
                 "{text:?}"
             );
         }
-        // One turn per newline, whatever the phase: text sent while a turn
-        // runs types into the buffer and submits as type-ahead, the same as a
-        // person typing during a reply.
+    }
+
+    /// The blocker this rule exists for: one `type_text` inside the bridge's
+    /// own 4,096-character limit used to expand to one `Submit` per newline,
+    /// and every `Submit` is a full model turn queued on an unbounded channel
+    /// and run without the keyboard being read in between. A keystroke cannot
+    /// produce more than one turn; neither may an agent input.
+    #[test]
+    fn a_text_of_many_newlines_submits_at_most_once() {
+        let submits = |plan: &Plan| {
+            steps(plan)
+                .iter()
+                .filter(|step| matches!(step, Plan::PasteThenSubmit(_) | Plan::Submit))
+                .count()
+        };
+        for text in [
+            "a\n".repeat(2048),
+            "\n".repeat(4096),
+            "a\r\n".repeat(1365),
+            format!("{}\n", "a\n".repeat(2048)),
+        ] {
+            for (name, status) in states() {
+                for draft in ["", "hello"] {
+                    let (plan, _) = plan(&AgentInput::text(&text), status.phase, draft);
+                    assert!(
+                        submits(&plan) <= 1,
+                        "{name} with draft {draft:?}: {} submits from {} characters",
+                        submits(&plan),
+                        text.len()
+                    );
+                    assert!(steps(&plan).len() <= MAX_PLAN_STEPS, "{name}");
+                }
+            }
+        }
+    }
+
+    /// `type_text("\n")` on a blank draft and `act(input, activate)` on the
+    /// same draft are the same non-event: `handle_key` clears the buffer,
+    /// reprompts and starts no turn. Two agent paths to one outcome must not
+    /// return opposite verdicts, or an agent taking the `Delivered` one waits
+    /// out a turn that is never coming.
+    #[test]
+    fn typed_text_and_activate_agree_about_a_draft_that_would_not_submit() {
         for (name, status) in states() {
-            let (plan, _) = plan(&AgentInput::text("a\nb\n"), status.phase, "");
+            for blank in ["", "   ", "\t", " \t "] {
+                let activated = plan(&act("input", Action::Activate), status.phase, blank);
+                assert_eq!(
+                    activated,
+                    (Plan::Nothing, InputStatus::Ignored),
+                    "{name} with draft {blank:?}"
+                );
+                for text in ["\n", "  \n", "\t\n"] {
+                    assert_eq!(
+                        plan(&AgentInput::text(text), status.phase, blank),
+                        activated,
+                        "{name}: {text:?} on draft {blank:?}"
+                    );
+                }
+            }
+            // And with something to submit, both deliver.
             assert_eq!(
-                steps(&plan)
-                    .iter()
-                    .filter(|step| matches!(step, Plan::PasteThenSubmit(_) | Plan::Submit))
-                    .count(),
-                2,
+                plan(&act("input", Action::Activate), status.phase, "hello"),
+                (Plan::Submit, InputStatus::Delivered),
+                "{name}"
+            );
+            assert_eq!(
+                plan(&AgentInput::text("\n"), status.phase, "hello"),
+                (Plan::Submit, InputStatus::Delivered),
+                "{name}"
+            );
+            // Text that is only whitespace but is not submitting is still a
+            // change to the buffer, so it is still delivered.
+            assert_eq!(
+                plan(&AgentInput::text("  "), status.phase, ""),
+                (Plan::Paste("  ".to_owned()), InputStatus::Delivered),
                 "{name}"
             );
         }
+    }
+
+    /// The cap is defence in depth, so it is asserted where it is enforced
+    /// rather than only where it currently binds: nothing builds a long
+    /// sequence today, and this is what makes that still true of whatever is
+    /// written next.
+    #[test]
+    fn a_plan_never_runs_more_steps_than_the_cap() {
+        let long = sequence(vec![Plan::Submit; 1000]);
+        assert_eq!(steps(&long).len(), MAX_PLAN_STEPS);
+        assert_eq!(sequence(Vec::new()), Plan::Nothing);
+        assert_eq!(sequence(vec![Plan::Submit]), Plan::Submit);
     }
 
     /// Everything that is not a newline comes from the paste path, so agent
@@ -1523,6 +1789,14 @@ mod tests {
                             "{name}: a plan nested deeper than one level"
                         );
                     }
+                    // And in a bounded number of steps, however long the input
+                    // was: a step can be an Enter, and an Enter is a model
+                    // turn nobody can take back.
+                    assert!(
+                        steps(&plan).len() <= MAX_PLAN_STEPS,
+                        "{name}: {} steps from {input:?}",
+                        steps(&plan).len()
+                    );
                     if earned == InputStatus::Ignored {
                         assert_eq!(plan, Plan::Nothing, "{name}: {input:?}");
                     }
