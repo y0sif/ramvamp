@@ -703,13 +703,23 @@ fn drive(
     // refuses.
     publish_wind_down(harness, layer, &screen, &screen.status());
     loop {
-        // Acked, deliberately not applied. An input that arrives now cannot be
-        // honoured — the tree has stopped advertising anything and the session
-        // is already leaving — but it must still be answered, or it sits there
-        // until the agent's own timeout, which is as long as the in-flight
-        // prefill this loop is waiting out. Applying one would be worse than
-        // useless: an agent could press Ctrl-C into the poll below, set
-        // `join = false` and abandon the worker thread the user is waiting on.
+        // Answered, deliberately not applied. An input that arrives now cannot
+        // be honoured — the tree has stopped advertising anything and the
+        // session is already leaving — but it must still be answered, or it
+        // sits there until the agent's own timeout, which is as long as the
+        // in-flight prefill this loop is waiting out. Applying one would be
+        // worse than useless: an agent could press Ctrl-C into the poll below,
+        // set `join = false` and abandon the worker thread the user is waiting
+        // on.
+        //
+        // What reaches the agent here is the `Delivered` the layer sends as it
+        // hands each input over. The `Ignored` this returns is a refinement
+        // queued behind it, and on the way out the process frequently exits
+        // before that queue flushes, so an agent acting in this window usually
+        // sees `Delivered` and nothing after it. The property that matters
+        // survives — every input is answered, so nothing waits out a timeout —
+        // and the tree published just above already advertises nothing, which
+        // is the honest half an agent reads before it acts.
         // Drained on every pass rather than only when the worker goes quiet,
         // because a reply still streaming out is exactly when an agent is
         // likely to be acting.

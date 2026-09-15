@@ -644,7 +644,12 @@ fn stats_value(status: &Status) -> String {
     parts.push(format!("ctx {used}/{cap}"));
     // Nothing said yet: `0%` is noise next to `0/4096`, the same judgement
     // the panel's context segment makes.
-    if let Some(share) = percent(used as u64, cap as u64).filter(|_| used > 0) {
+    // Filtered on the rounded share rather than on `used`, because those are
+    // not the same test at this cap. A 70,000-token context is still under one
+    // percent at 350 positions, so gating on `used > 0` let a literal `0%` onto
+    // the wire for most of a short session. The `ctx 20/70000` beside it already
+    // says the same thing with the numbers an agent can actually act on.
+    if let Some(share) = percent(used as u64, cap as u64).filter(|&share| share > 0) {
         parts.push(format!("{share}%"));
     }
     if let Some(hit) = status.hit_rate {
