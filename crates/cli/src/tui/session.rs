@@ -32,6 +32,16 @@
 //! in particular not a second copy of the context accounting, which is the
 //! part that is easy to get subtly wrong.
 //!
+//! # Agent input
+//!
+//! The taria layer is a second source of the same events. An agent input is
+//! decided by [`agent::plan`], executed by
+//! [`Harness::apply_agent_input`](super::Harness::apply_agent_input) through
+//! the key handler and the paste path the keyboard already uses, and whatever
+//! [`UiEvent`] that produces is applied by [`steer`] — the same function the
+//! keyboard's events go through. So there is one implementation of what Submit
+//! and Interrupt mean, and an agent cannot reach a state a keyboard cannot.
+//!
 //! # Interrupt
 //!
 //! Unchanged from the line REPL: `on_token` sees the flag and leaves by
@@ -63,8 +73,10 @@ use ramvamp_core::generate::{GenerateParams, GenerateProgress, generate_from_wit
 use ramvamp_core::io::StreamStats;
 use ramvamp_core::model::{ForwardState, Model, StreamPhase};
 use ramvamp_core::tokenizer::{ChatMessage, Role, RvmpTokenizer};
+use taria_ratatui::{InputStatus, TariaLayer};
 
-use super::{Harness, Phase, Prefilling, Ribbon, Status, UiEvent};
+use super::agent::Liveness;
+use super::{Harness, Phase, Prefilling, Ribbon, Status, UiEvent, agent};
 use crate::config::Dials;
 use crate::repl::{
     REPL_HELP, ReplInput, Transcript, TurnCodec, TurnPlan, parse_repl_input, plan_turn, turn_seed,
@@ -254,6 +266,14 @@ fn hit_rate(stats: &StreamStats) -> Option<f32> {
 /// scripts: they parse the timing lines the line REPL writes to stderr, and
 /// this path writes none of them anywhere.
 pub fn run_chat_tui(args: ChatArgs, dials: Dials) -> anyhow::Result<()> {
+    // Before the harness, and therefore before raw mode and before the DSR
+    // cursor query: binding a socket is the kind of thing that can block on a
+    // filesystem, and doing it while the terminal is half taken over is how a
+    // session ends up wedged. `bind_or_disabled` cannot fail by design — a
+    // layer that could not bind is inert and answers every method — so taria
+    // can never be the reason `chat --tui` does not start. It prints nothing
+    // itself either; reporting is ours to place, after `suspend`.
+    let mut layer = TariaLayer::bind_or_disabled("ramvamp");
     let mut harness = Harness::enter()
         .context("chat --tui needs an interactive terminal; drop --tui for the line REPL")?;
     // *After* `Harness::enter`, so the hush hook wraps the terminal-restoring
@@ -280,11 +300,30 @@ pub fn run_chat_tui(args: ChatArgs, dials: Dials) -> anyhow::Result<()> {
             .context("spawning the chat worker")?
     };
 
-    let ended = drive(&mut harness, &commands, &outputs, &interrupt, context_cap);
+    let ended = drive(
+        &mut harness,
+        &mut layer,
+        &commands,
+        &outputs,
+        &interrupt,
+        context_cap,
+    );
 
     // The terminal comes back before anything else is said, whichever way the
     // session ended — including a `drive` that failed mid-draw.
     let _ = harness.suspend();
+    // And only now is printing safe: the scroll region is reset, raw mode is
+    // off and stderr is the user's again. Nothing in `drive` may report any of
+    // this, because in raw mode a bare newline does not return to column 0.
+    report_agent_layer(&layer);
+    // And then the socket goes, before the join below can hold it open for the
+    // rest of a prefill. From here the tree is frozen whatever happens — the
+    // loop that published it has ended and nothing is draining what an agent
+    // sends — so a layer left bound is a socket that accepts a call, answers
+    // nothing, and leaves the agent to wait out its own timeout on a session
+    // that is over. Dropping it closes the connection instead, which is a
+    // thing the bridge can report and an agent can act on.
+    drop(layer);
     match ended {
         Ok(Ended { failure, join }) => {
             if join {
@@ -301,6 +340,62 @@ pub fn run_chat_tui(args: ChatArgs, dials: Dials) -> anyhow::Result<()> {
             }
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Say what the agent layer could not do, once the terminal is the user's
+/// again.
+///
+/// Every one of these is traffic that went nowhere, and the layer keeps the
+/// counts precisely because it must not print them itself. Silence is the
+/// normal case: a layer that bound and served without losing anything has
+/// nothing to add to the end of a chat session.
+fn report_agent_layer(layer: &TariaLayer) {
+    // Not on stderr. Nobody asked for the agent socket, and the ordinary way
+    // to fail to bind it is to already be running `chat --tui` in another
+    // window — comparing two models side by side is a thing people do, and the
+    // second one greeting them with an error about a feature they never asked
+    // for is worse than silence. `RUST_LOG=ramvamp=debug` has it for whoever
+    // was actually looking for the socket. The counters below stay on stderr:
+    // they only fire when they are non-zero, which means an agent really was
+    // connected and really did lose something.
+    if let Some(error) = layer.bind_error() {
+        tracing::debug!(%error, "the agent socket did not come up; running without it");
+    }
+    let dropped = layer.dropped_inputs();
+    if dropped > 0 {
+        eprintln!("dropped {dropped} agent input(s): the chat loop could not keep up");
+    }
+    let stale = layer.stale_inputs();
+    if stale > 0 {
+        eprintln!(
+            "discarded {stale} agent input(s): the bridge connection they arrived on ended first"
+        );
+    }
+    let unknown = layer.unknown_inputs();
+    if unknown > 0 {
+        eprintln!(
+            "could not read {unknown} agent input(s): the bridge speaks a newer taria than this \
+             build; raise the taria-ratatui dependency"
+        );
+    }
+    let acks = layer.dropped_acks();
+    if acks > 0 {
+        eprintln!(
+            "lost the answer to {acks} agent input(s): the bridge read them slower than the \
+             session answered, so those agent calls timed out instead"
+        );
+    }
+    let cut = layer.truncated_snapshots();
+    if cut > 0 {
+        // Names the depth measured and a node found at it, which is the only
+        // way to find a branch that ran away in a tree generated from data.
+        match layer.last_truncation() {
+            Some(branch) => {
+                eprintln!("published {cut} agent snapshot(s) with a branch cut: {branch}")
+            }
+            None => eprintln!("published {cut} agent snapshot(s) with a branch cut"),
+        }
     }
 }
 
@@ -364,6 +459,13 @@ impl Meter {
 /// a clock.
 struct Screen {
     snapshot: Snapshot,
+    /// The rolling tail of the conversation, for the agent tree.
+    ///
+    /// The human transcript lives in the terminal's scrollback and nowhere
+    /// else (see `tui.rs`), so this is the only copy anything in this process
+    /// can read back. It is a tap, never a replacement: every push here sits
+    /// beside the `ribbon` call that did the writing.
+    transcript: agent::TranscriptRing,
     /// When the current phase started, by the UI's own monotonic clock.
     ///
     /// The worker cannot send a duration from inside a generate call, so this
@@ -393,6 +495,7 @@ impl Screen {
     fn loading(context_cap: usize) -> Self {
         Self {
             snapshot: Snapshot::idle(0),
+            transcript: agent::TranscriptRing::default(),
             phase_started: Instant::now(),
             meter: Meter::default(),
             model: None,
@@ -486,6 +589,7 @@ fn route(line: &str) -> Routed {
 /// The UI loop: drain the worker, refresh the panel, read a keystroke.
 fn drive(
     harness: &mut Harness,
+    layer: &mut TariaLayer,
     commands: &Sender<Command>,
     outputs: &Receiver<Output>,
     interrupt: &AtomicBool,
@@ -496,6 +600,7 @@ fn drive(
     let mut ribbon = Ribbon::new(palette, glyphs);
     let mut failure: Option<String> = None;
     ribbon.system(harness, GREETING)?;
+    screen.transcript.push_system(GREETING);
 
     'session: loop {
         // Everything the worker has said since the last pass. Draining rather
@@ -522,41 +627,65 @@ fn drive(
         }
 
         // Idle is the only state whose row does not change on its own, so it
-        // is the only one that does not get a redraw per pass.
-        if screen.dirty || screen.snapshot.phase != Phase::Idle {
-            harness.set_status(screen.status());
-            screen.dirty = false;
+        // is the only one that does not get a redraw per pass. The tree is
+        // built only when there is a layer to publish it to: `publish` returns
+        // immediately on an inert layer, but the tree is ~8 nodes and a copy of
+        // the transcript tail, and a user with no agent should not pay for one
+        // 25 times a second.
+        //
+        // The two of them describe one instant, so the `Status` behind them is
+        // built once — and on a pass that wants neither, which idle with no
+        // bridge attached is every pass, not at all. It used to be built and
+        // then cloned whatever the pass was doing, which is four `String`
+        // clones a pass for two readers that were often both absent.
+        let redraw = screen.dirty || screen.snapshot.phase != Phase::Idle;
+        if redraw || layer.is_enabled() {
+            let status = screen.status();
+            // The agent's view goes out first only so that the panel's can take
+            // the `Status` by value rather than a copy of it; nothing observes
+            // the order, and both are the same instant either way. Unthrottled,
+            // because the layer skips a tree identical to the last one it
+            // published — which is what the rounding in `agent.rs` is for — so
+            // a pass that changed nothing costs a comparison.
+            if layer.is_enabled() {
+                layer.publish(agent::build_nodes(
+                    &status,
+                    harness.editor(),
+                    &screen.transcript,
+                    Liveness::Live,
+                ));
+            }
+            if redraw {
+                harness.set_status(status);
+                screen.dirty = false;
+            }
         }
 
-        match harness.poll(POLL)? {
-            Some(UiEvent::Submit(line)) => match route(&line) {
-                Routed::Nothing => {}
-                Routed::Local(text) => ribbon.system(harness, &text)?,
-                Routed::Leave => break 'session,
-                Routed::Send(command) => {
-                    if let Command::Submit(message) = &command {
-                        ribbon.user(harness, message)?;
-                        // Before the worker has said a word: from here Esc
-                        // means "stop this", not "leave", and the panel stops
-                        // claiming to be idle during the seconds before the
-                        // first prefill chunk lands.
-                        screen.observe(Snapshot {
-                            phase: Phase::Prefill,
-                            ..Snapshot::idle(screen.snapshot.context)
-                        });
-                        screen.say("prefilling; the stop lands at the first token");
-                    }
-                    if commands.send(command).is_err() {
-                        break 'session;
-                    }
-                }
-            },
-            Some(UiEvent::Interrupt) => {
-                interrupt.store(true, Ordering::SeqCst);
-                screen.say("stopping at the next token...");
+        // Agent input is drained either side of the blocking poll: once before
+        // it, so what arrived during the last pass is applied without waiting
+        // out another POLL, and once after, so an input that landed while the
+        // loop was parked is applied in the same pass as the keystroke that
+        // woke it. Both drains apply their input where they stand, so the
+        // harness sees them in the order the drains ran — which is not the
+        // order they arrived in: an agent input that landed during the poll is
+        // applied after the keystroke that woke it, even if it got there
+        // first. Only the events they produced are held back, to keep the one
+        // set of arms below.
+        let mut events: Vec<UiEvent> = Vec::new();
+        pump_agent(harness, layer, &mut events);
+        events.extend(harness.poll(POLL)?);
+        pump_agent(harness, layer, &mut events);
+        for event in events {
+            if steer(
+                harness,
+                &mut ribbon,
+                &mut screen,
+                commands,
+                interrupt,
+                event,
+            )? {
+                break 'session;
             }
-            Some(UiEvent::Exit) => break 'session,
-            _ => {}
         }
     }
 
@@ -568,7 +697,33 @@ fn drive(
     screen.say("stopping; Ctrl-C again to leave without waiting");
     screen.dirty = true;
     let mut join = true;
+    // Before the first pass rather than after the first quiet one: from here on
+    // every input is acked `Ignored` where it stands, and a `Live` tree left
+    // standing over that window goes on advertising four actions the drain now
+    // refuses.
+    publish_wind_down(harness, layer, &screen, &screen.status());
     loop {
+        // Answered, deliberately not applied. An input that arrives now cannot
+        // be honoured — the tree has stopped advertising anything and the
+        // session is already leaving — but it must still be answered, or it
+        // sits there until the agent's own timeout, which is as long as the
+        // in-flight prefill this loop is waiting out. Applying one would be
+        // worse than useless: an agent could press Ctrl-C into the poll below,
+        // set `join = false` and abandon the worker thread the user is waiting
+        // on.
+        //
+        // What reaches the agent here is the `Delivered` the layer sends as it
+        // hands each input over. The `Ignored` this returns is a refinement
+        // queued behind it, and on the way out the process frequently exits
+        // before that queue flushes, so an agent acting in this window usually
+        // sees `Delivered` and nothing after it. The property that matters
+        // survives — every input is answered, so nothing waits out a timeout —
+        // and the tree published just above already advertises nothing, which
+        // is the honest half an agent reads before it acts.
+        // Drained on every pass rather than only when the worker goes quiet,
+        // because a reply still streaming out is exactly when an agent is
+        // likely to be acting.
+        layer.drain_acking(|_| InputStatus::Ignored);
         match outputs.try_recv() {
             Ok(output) => {
                 // A fatal error raised on the way out still gets reported, but
@@ -586,7 +741,11 @@ fn drive(
             }
             Err(TryRecvError::Disconnected) => break,
             Err(TryRecvError::Empty) => {
-                harness.set_status(screen.status());
+                let status = screen.status();
+                // Winding down is a state an agent can be watching, so the
+                // tree must not go stale while it happens.
+                publish_wind_down(harness, layer, &screen, &status);
+                harness.set_status(status);
                 // A prefill in flight cannot be cut short (see the module
                 // docs), so a user who does not want to wait it out says so
                 // again and the thread is left to the process exit.
@@ -601,6 +760,104 @@ fn drive(
         }
     }
     Ok(Ended { failure, join })
+}
+
+/// Publish the wind-down tree: every value the live one carries, and nothing to
+/// act on.
+///
+/// Both places the wind-down loop can leave a tree behind go through here. It
+/// must not go stale, because an agent watching a session end still has to be
+/// able to read it — and it must not lie either: nothing in that loop is
+/// applied, so `WindingDown` strips every action set and the tree advertises
+/// nothing, which is the same answer the drain gives. A `Live` tree left
+/// standing while the worker streams its last tokens, or while a channel that
+/// was already `Disconnected` breaks the loop on its first pass, would be
+/// offering `focus`, `set_value`, `activate` and a way out for as long as that
+/// window lasts. The verdict would stay honest; the tree would not.
+fn publish_wind_down(harness: &Harness, layer: &mut TariaLayer, screen: &Screen, status: &Status) {
+    if layer.is_enabled() {
+        layer.publish(agent::build_nodes(
+            status,
+            harness.editor(),
+            &screen.transcript,
+            Liveness::WindingDown,
+        ));
+    }
+}
+
+/// Hand every agent input that has arrived to the harness, and collect the
+/// [`UiEvent`]s it produced.
+///
+/// [`drain_acking`](TariaLayer::drain_acking) acks each input as the handler
+/// returns its verdict, so an act this app looked at and deliberately did
+/// nothing with — a node that is gone, an action this phase does not offer, a
+/// `set_value` with nothing to set — reaches the agent as `Ignored` rather
+/// than as a silence it has to time out. The events are collected rather than
+/// applied here because applying one needs the ribbon, the screen and the
+/// command channel, none of which this closure can borrow while the harness is
+/// borrowed; they go through [`steer`] with the keyboard's, which is the whole
+/// point.
+fn pump_agent(harness: &mut Harness, layer: &TariaLayer, events: &mut Vec<UiEvent>) {
+    layer.drain_acking(|input| {
+        let (status, produced) = harness.apply_agent_input(&input);
+        events.extend(produced);
+        status
+    });
+}
+
+/// Apply one [`UiEvent`], whoever produced it, and say whether the session is
+/// over.
+///
+/// The one set of arms both input paths go through. A keystroke and an agent
+/// act arrive here having already been reduced to the same four events by
+/// [`Harness`], so `/reset` typed at the panel and `/reset` submitted by an
+/// agent are not two implementations of the same command — they are one, and
+/// there is no second copy to drift.
+fn steer(
+    harness: &mut Harness,
+    ribbon: &mut Ribbon,
+    screen: &mut Screen,
+    commands: &Sender<Command>,
+    interrupt: &AtomicBool,
+    event: UiEvent,
+) -> io::Result<bool> {
+    match event {
+        UiEvent::Submit(line) => match route(&line) {
+            Routed::Nothing => {}
+            Routed::Local(text) => {
+                ribbon.system(harness, &text)?;
+                screen.transcript.push_system(&text);
+            }
+            Routed::Leave => return Ok(true),
+            Routed::Send(command) => {
+                if let Command::Submit(message) = &command {
+                    ribbon.user(harness, message)?;
+                    screen.transcript.push_user(message);
+                    // Before the worker has said a word: from here Esc means
+                    // "stop this", not "leave", and the panel stops claiming
+                    // to be idle during the seconds before the first prefill
+                    // chunk lands.
+                    screen.observe(Snapshot {
+                        phase: Phase::Prefill,
+                        ..Snapshot::idle(screen.snapshot.context)
+                    });
+                    screen.say("prefilling; the stop lands at the first token");
+                }
+                if commands.send(command).is_err() {
+                    return Ok(true);
+                }
+            }
+        },
+        UiEvent::Interrupt => {
+            interrupt.store(true, Ordering::SeqCst);
+            screen.say("stopping at the next token...");
+        }
+        UiEvent::Exit => return Ok(true),
+        // The harness has already redrawn; nothing here owns anything that a
+        // resize changes.
+        UiEvent::Redraw => {}
+    }
+    Ok(false)
 }
 
 /// Apply one worker message to the screen. Returns whether the session is over.
@@ -622,19 +879,26 @@ fn absorb(
     match output {
         Output::Ready { banner, model } => {
             ribbon.system(harness, &banner)?;
+            screen.transcript.push_system(&banner);
             screen.model = Some(model);
             // The keys the idle row shows are the panel's own; nothing needs
             // to be said over them.
             screen.clear_detail();
         }
-        Output::Token(text) => ribbon.say(harness, &text)?,
+        Output::Token(text) => {
+            ribbon.say(harness, &text)?;
+            screen.transcript.push_model(&text);
+        }
         Output::Progress(snapshot) => {
             // The first event of a phase is where the row stops being told
             // what is about to happen and starts reporting what is.
             screen.clear_detail();
             screen.observe(snapshot);
         }
-        Output::Notice(text) => ribbon.system(harness, &text)?,
+        Output::Notice(text) => {
+            ribbon.system(harness, &text)?;
+            screen.transcript.push_system(&text);
+        }
         Output::TurnDone { context } => {
             ribbon.hush(harness)?;
             screen.observe(Snapshot::idle(context));
@@ -643,6 +907,7 @@ fn absorb(
         }
         Output::Failed(reason) => {
             ribbon.system(harness, &reason)?;
+            screen.transcript.push_system(&reason);
             *failure = Some(reason);
             return Ok(true);
         }

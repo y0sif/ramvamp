@@ -25,6 +25,10 @@ ramvamp-core = { workspace = true }
 ramvamp-server = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+# `tracing` beside the subscriber this binary already installs: the TUI's
+# agent layer reports a failure to bind its socket at debug level rather
+# than on stderr, because nobody running `chat --tui` asked for that socket.
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 # `chat` installs a SIGINT handler so Ctrl-C stops a reply instead of the
@@ -32,10 +36,27 @@ clap = { workspace = true }
 # dependency (see the root Cargo.toml), and the alternatives (ctrlc,
 # signal-hook) would be.
 libc = { workspace = true }
-# `tui` draws the pinned status panel. Default features are off on purpose:
-# the only backend we want is crossterm, and `scrolling-regions` is
-# deliberately *not* enabled because it only changes `Terminal::insert_before`,
-# which this crate never calls. crossterm itself is not listed here — it comes
-# in through ratatui and is used via the `ratatui::crossterm` re-export, so the
+# `tui` draws the pinned status panel. This line asks for crossterm and nothing
+# else, but it is no longer the only line asking: `taria-ratatui 0.2.0` declares
+# `ratatui = "0.30.2"` with its defaults on, cargo unions features across the
+# graph, and so `all-widgets`, `widget-calendar`, `layout-cache` and `macros`
+# compile into this binary whatever is written here, pulling `time` and its
+# dependencies in behind them. That is compile time and code size, and a choice
+# this line made being overridden from outside; it is not behaviour.
+#
+# `underline-color` is on too, and it is worth saying plainly that taria did not
+# turn it on. It sits in `ratatui-crossterm`'s own default set, and that crate
+# arrives through the `crossterm` feature selected right here, so it was on
+# before taria and stays on without it. Measured on a pty, this binary emits the
+# same reset sequence either way. The fix still belongs upstream rather than in
+# a workaround here: `taria-ratatui` now asks for `default-features = false,
+# features = ["crossterm"]` itself (committed there, due in its next release),
+# at which point this line is the only one speaking again.
+#
+# `scrolling-regions` is off, which is the original concern intact: it is in
+# nobody's default set, and it only changes `Terminal::insert_before`, which
+# this crate never calls. crossterm itself is not listed here — it comes in
+# through ratatui and is used via the `ratatui::crossterm` re-export, so the
 # tree cannot end up with two versions of it.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+taria-ratatui = "0.2"
