@@ -360,6 +360,10 @@ The TUI (`chat --tui`) is kept rather than deleted, under the standing rule
 that measured-and-set-aside work is preserved. It is genuinely useful as an
 operator console for watching a cold run's hit rate move. It is not the
 shipping surface, it is not on the v0 path, and it should not accrue features.
+The one recorded exception is the taria integration (`feat/taria`, merged
+2026-09-29): it publishes a semantic tree over a socket so an agent can drive
+the TUI, and routes that input through the same key handler. The author tested
+it by hand and chose to keep it.
 `chat` without `--tui` remains the reference behaviour, and `generate` and
 `logits` keep their exact stdio, because the measurement scripts parse them.
 
