@@ -27,6 +27,12 @@
 //! fact** - `SlotPool::new` and `LayerCache::new` take slot counts today, and
 //! wave 2 is where the configured quantity becomes bytes.
 
+// `chunks_exact_to_as_chunks` is newer than the toolchains some contributors
+// run, hence `unknown_lints`. The flagged loops are hot kernel code, and
+// rewriting them to `as_chunks` is a codegen change that gets measured, not
+// slipped in to quiet a lint.
+#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
+
 pub mod format;
 pub mod generate;
 pub mod io;
