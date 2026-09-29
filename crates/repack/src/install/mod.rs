@@ -672,9 +672,9 @@ fn decode_hex_digest(s: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut out = [0u8; 32];
-    for (i, pair) in s.as_bytes().chunks_exact(2).enumerate() {
-        let hi = (pair[0] as char).to_digit(16)?;
-        let lo = (pair[1] as char).to_digit(16)?;
+    for (i, &[hi, lo]) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let hi = (hi as char).to_digit(16)?;
+        let lo = (lo as char).to_digit(16)?;
         out[i] = (hi * 16 + lo) as u8;
     }
     Some(out)
