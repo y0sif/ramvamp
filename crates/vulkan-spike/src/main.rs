@@ -28,14 +28,15 @@
 //!
 //! What this binary will and will not claim. It gates itself on four
 //! conditions and exits non-zero if any fails: the two arms must agree
-//! numerically inside named tolerances *including* a signed-bias check, each
-//! arm's sampled minimum must stop improving (and must not be drifting
-//! upward) before the sample is called a steady state, the machine's clock
-//! policy must not be capping the CPU arm, and the weights must be a real
-//! expert slab rather than the synthetic fallback. A ratio measured against
-//! a throttled CPU is a fact about the power daemon, a ratio measured before
-//! either arm reaches steady state is a fact about the sample size, and a
-//! ratio measured on invented bytes is a fact about nothing, so none of them
+//! numerically inside named tolerances *including* a signed-bias check,
+//! every arm must hold one steady state across a fixed sample (its per-round
+//! medians must agree across the run's windows and must not spread wide),
+//! the machine's clock policy must not be capping the CPU arm, and the
+//! weights must be a real expert slab rather than the synthetic fallback. A
+//! ratio measured against a throttled CPU is a fact about the power daemon,
+//! a ratio between arms that changed state mid-run is a fact about which
+//! state each arm happened to be in, and a ratio measured on invented bytes
+//! is a fact about nothing, so none of them
 //! is printed as a result. Every one of those reasons lands *in the verdict
 //! sentence*, which also carries the weights' provenance inline, so the one
 //! line most likely to be quoted out of context cannot be quoted without it.
@@ -86,21 +87,23 @@ const WARMUP: usize = 200;
 const REWARM: usize = 20;
 /// Timed iterations per arm per round.
 const BLOCK: usize = 50;
-/// Rounds that always run, before convergence is even tested.
-const MIN_ROUNDS: usize = 3;
-/// Hard cap on rounds. Reaching it without converging is reported, not
-/// hidden. A round is ~70 ms, so 60 rounds is ~4 s of timed work. 20 was
-/// enough at locked throttled clocks (EXP-026 converged in 10 and 13 rounds)
-/// but not with turbo on, where round-to-round jitter in the block minimum
-/// restarts patience far more often.
-const MAX_ROUNDS: usize = 60;
-/// Consecutive rounds that must fail to improve an arm's running minimum
-/// before that minimum counts as converged.
-const PATIENCE: usize = 3;
-/// Relative improvement in the running minimum that still counts as progress.
-/// A round that shaves less than this off the best sample is noise, not a
-/// unit still climbing.
-const MIN_IMPROVEMENT: f64 = 0.005;
+/// Rounds per run, and every one of them runs. The sample size is fixed
+/// before anything is measured: stopping once the numbers look settled is
+/// optional stopping, and the minimum-based rule that did it never stopped at
+/// all with turbo on. A round is ~70 ms, so this is ~4 s of timed work.
+const ROUNDS: usize = 60;
+/// The run is split into this many consecutive windows, and each arm's window
+/// medians must agree. A drift, or a slow episode confined to part of the
+/// run, shows up as windows that disagree.
+const WINDOWS: usize = 3;
+/// How far apart an arm's window medians may be, as `max / min - 1`. Set
+/// well under the effects this spike decides on (15-30%), so instability
+/// inside it cannot flip a verdict.
+const TOL_WINDOW_SPREAD: f64 = 0.05;
+/// How wide an arm's per-round medians may spread, as the interquartile range
+/// over the median. An arm flipping between two states throughout the run has
+/// windows that agree and a wide IQR, and no single typical value to compare.
+const TOL_IQR: f64 = 0.10;
 
 /// Numerics gate: outputs below this fraction of the reference's largest
 /// magnitude are cancellation artefacts and carry a meaningless relative
@@ -297,10 +300,9 @@ fn run() -> Result<bool> {
     // disagreement between rounds rather than as a silent bias toward
     // whichever arm ran first.
     //
-    // Rounds are not a fixed count. Every arm keeps sampling until its
-    // running minimum has stopped improving for [`PATIENCE`] rounds, so the
-    // sample size is set by the slowest arm to settle rather than by a
-    // constant chosen before anything was measured.
+    // Rounds are a fixed count, [`ROUNDS`], and every one of them runs.
+    // Whether the sample describes one steady state is judged afterwards,
+    // per arm, by [`Steadiness`].
     let mut cpu_iter = || {
         let t = Instant::now();
         cpu::gemv_batched_pooled(
@@ -333,10 +335,10 @@ fn run() -> Result<bool> {
     let mut gpu_streamed = Vec::new();
     let mut gpu_device = Vec::new();
     let mut rounds = Vec::new();
-    let mut cpu_conv = Convergence::new(cpu_label);
-    let mut res_conv = Convergence::new("GPU  (weights resident)");
-    let mut str_conv = Convergence::new("GPU  (weights streamed)");
-    for round in 1..=MAX_ROUNDS {
+    let mut cpu_steady = Steadiness::new(cpu_label);
+    let mut res_steady = Steadiness::new("GPU  (weights resident)");
+    let mut str_steady = Steadiness::new("GPU  (weights streamed)");
+    for _ in 0..ROUNDS {
         let mut cpu_round = Vec::with_capacity(BLOCK);
         for _ in 0..REWARM {
             cpu_iter()?;
@@ -364,9 +366,9 @@ fn run() -> Result<bool> {
             str_round.push(host);
         }
 
-        cpu_conv.observe(round, &cpu_round);
-        res_conv.observe(round, &res_round);
-        str_conv.observe(round, &str_round);
+        cpu_steady.observe(&cpu_round);
+        res_steady.observe(&res_round);
+        str_steady.observe(&str_round);
         rounds.push((
             Stats::of(&mut cpu_round.clone()),
             Stats::of(&mut res_round.clone()),
@@ -375,14 +377,6 @@ fn run() -> Result<bool> {
         cpu_times.extend_from_slice(&cpu_round);
         gpu_resident.extend_from_slice(&res_round);
         gpu_streamed.extend_from_slice(&str_round);
-
-        if round >= MIN_ROUNDS
-            && cpu_conv.converged()
-            && res_conv.converged()
-            && str_conv.converged()
-        {
-            break;
-        }
     }
     let mut gpu_out = vec![0f32; out_dim * N_ACTS];
     gemv.read_out(&mut gpu_out)?;
@@ -396,19 +390,18 @@ fn run() -> Result<bool> {
     let gpu_s = Stats::of(&mut gpu_streamed);
     let gpu_d = Stats::of(&mut gpu_device);
 
-    let arms = [&cpu_conv, &res_conv, &str_conv];
-    let converged = arms.iter().all(|c| c.converged());
-    let drifting: Vec<&str> = arms
+    let arms = [&cpu_steady, &res_steady, &str_steady];
+    let unsteady: Vec<String> = arms
         .iter()
-        .filter(|c| c.drifting())
-        .map(|c| c.label)
+        .filter(|a| !a.steady())
+        .map(|a| a.why_unsteady())
         .collect();
 
     // Every reason this run's timings are not a result, computed *here*
     // rather than after the figures it disqualifies have already been
     // printed. The invalidation set is knowable at this point -- numerics,
     // provenance and the clock policy were settled before the loop, and
-    // convergence and drift the moment it ended -- so every line below can
+    // steadiness the moment it ended -- so every line below can
     // carry it. It used to be computed at the very bottom, which is how
     // 10-20 clean unqualified ratio and GFLOP/s lines came to be printed
     // above a verdict that said none of them counted.
@@ -417,8 +410,7 @@ fn run() -> Result<bool> {
         slab.synthetic,
         &slab.provenance,
         &throttles,
-        converged,
-        &drifting,
+        &unsteady,
     );
     // Two spaces when the run is valid, so the layout is unchanged; the
     // marker otherwise. Nothing below prints a timing without it.
@@ -429,27 +421,22 @@ fn run() -> Result<bool> {
     };
 
     println!(
-        "== sampling ({} rounds x {BLOCK} timed runs per arm, {WARMUP} + {REWARM}/round warm-up) ==",
+        "== sampling ({} rounds x {BLOCK} timed runs per arm, {WARMUP} + {REWARM}/round warm-up, no early stop) ==",
         rounds.len()
     );
-    for c in arms {
-        println!("{tag}{}", c.report());
+    for a in arms {
+        println!("{tag}{}", a.report());
     }
-    if !converged {
+    if !unsteady.is_empty() {
         println!(
-            "  !! at least one arm's minimum had not settled when the {MAX_ROUNDS}-round\n  \
-             !! cap was hit. Every figure below is an upper bound on that arm and the\n  \
-             !! ratio is not a stable quantity."
-        );
-    }
-    if !drifting.is_empty() {
-        println!(
-            "  !! {} got monotonically WORSE across rounds. That is drift -- something\n  \
-             !! else started on this box, or the part is thermally derating -- and not a\n  \
-             !! steady state. It is reported separately from staleness on purpose: an\n  \
-             !! arm whose minimum keeps rising also never improves, and counting that\n  \
-             !! toward patience would print CONVERGED over data that shows the opposite.",
-            drifting.join(" and ")
+            "  !! An arm is steady when its per-round medians agree across the run's\n  \
+             !! {WINDOWS} windows to within {:.0}% and their interquartile range is within\n  \
+             !! {:.0}% of their median. Windows that disagree mean the arm changed state\n  \
+             !! part-way through (drift, or a slow episode); a wide IQR means it flipped\n  \
+             !! between states throughout. Either way it has no single typical value,\n  \
+             !! and a ratio against it depends on which state each arm happened to be in.",
+            TOL_WINDOW_SPREAD * 100.0,
+            TOL_IQR * 100.0
         );
     }
     println!();
@@ -516,36 +503,49 @@ fn run() -> Result<bool> {
         report_arm_asymmetry();
     }
 
-    // Two ratios, because they answer different questions. The median-vs-
-    // median one is what this box delivers as it is actually loaded. The
-    // best-vs-best one uses each arm's least-disturbed sample, which is the
-    // closest this machine gets to an uncontended measurement -- and it is
-    // the conservative reading, because the CPU arm is the one that
-    // contention hurts. Both are computed inside the valid branch only: on
-    // an invalid run no ratio is formatted at all.
+    // The verdict compares each arm's typical round, the median of its
+    // per-round medians, because that is the statistic the steadiness gate
+    // vouches for. Best-vs-best minima were the headline before, and the
+    // 2026-10-09 re-runs showed why they cannot be: an arm's best block moved
+    // by 10-20% between rounds while its median held within 3%. The device
+    // timestamps are the dispatch alone, with no submit, fence or transfer, so
+    // their ratio is a ceiling for a backend that batches many experts into
+    // one submit, not a figure any single dispatch reaches. Everything is
+    // computed inside the valid branch only: on an invalid run no ratio is
+    // formatted at all.
     if invalid.is_empty() {
-        let median_ratio = cpu.median / gpu_r.median;
-        let best_ratio = cpu.min / gpu_r.min;
-        let streamed_ratio = cpu.min / gpu_s.min;
-        let verdict = if best_ratio > 1.0 { "FASTER" } else { "SLOWER" };
+        let cpu_t = cpu_steady.typical();
+        let res_t = res_steady.typical();
+        let str_t = str_steady.typical();
+        let resident = cpu_t / res_t;
+        let streamed = cpu_t / str_t;
+        let word = |r: f64| if r > 1.0 { "FASTER" } else { "SLOWER" };
         // The provenance is inside the sentence, not on a line above it: a
         // ratio measured on invented bytes and a ratio measured on a real
         // expert slab are different claims, and the quotable line has to say
         // which one it is.
-        println!(
-            "VERDICT: on {}, iGPU is {best_ratio:.2}x {verdict} than the {}-shard pinned CPU \
-             pool with the weights already resident, and {streamed_ratio:.2}x with the weight \
-             slab streamed, on best-vs-best ({:.3} ms resident / {:.3} ms streamed GPU vs \
-             {:.3} ms CPU); {median_ratio:.2}x resident on median-vs-median ({:.3} ms vs \
-             {:.3} ms).",
+        let mut verdict = format!(
+            "VERDICT: on {}, against the {}-shard pinned CPU pool running the {kernel:?} \
+             kernel at {:.3} ms per pass, the iGPU is {resident:.2}x {} with the weights \
+             resident ({:.3} ms) and {streamed:.2}x {} with the weight slab streamed \
+             ({:.3} ms), comparing each arm's median of {ROUNDS} round medians.",
             slab.provenance,
             pool.shards(),
-            gpu_r.min * 1e3,
-            gpu_s.min * 1e3,
-            cpu.min * 1e3,
-            gpu_r.median * 1e3,
-            cpu.median * 1e3
+            cpu_t * 1e3,
+            word(resident),
+            res_t * 1e3,
+            word(streamed),
+            str_t * 1e3,
         );
+        if gpu_d.median > 0.0 {
+            verdict.push_str(&format!(
+                " Dispatch alone, without submit, fence or transfer, is {:.3} ms ({:.2}x): \
+                 the ceiling for a backend that batches many experts into one submit.",
+                gpu_d.median * 1e3,
+                cpu_t / gpu_d.median
+            ));
+        }
+        println!("{verdict}");
     } else {
         // No ratio, not even one carrying its own invalidation. This is the
         // line a screenshot lands on, and a number in it survives being
@@ -562,7 +562,7 @@ fn run() -> Result<bool> {
         pass_fail(numerics_ok),
         pass_fail(!slab.synthetic),
         pass_fail(throttles.is_empty()),
-        pass_fail(converged && drifting.is_empty())
+        pass_fail(unsteady.is_empty())
     );
     // Every gate now has a reason on `invalid`, so this is the whole exit
     // condition rather than one gate plus a list.
@@ -594,8 +594,7 @@ fn invalidations(
     synthetic: bool,
     provenance: &str,
     throttles: &[String],
-    converged: bool,
-    drifting: &[&str],
+    unsteady: &[String],
 ) -> Vec<String> {
     let mut invalid = Vec::new();
     if !numerics_ok {
@@ -613,130 +612,158 @@ fn invalidations(
     if !throttles.is_empty() {
         invalid.push(format!("CPU throttled ({})", throttles.join(", ")));
     }
-    if !converged {
-        invalid.push(format!(
-            "sampled minimum not converged at the {MAX_ROUNDS}-round cap"
-        ));
-    }
-    if !drifting.is_empty() {
-        invalid.push(format!(
-            "sampled minimum drifting upward, not a steady state ({})",
-            drifting.join(", ")
-        ));
+    if !unsteady.is_empty() {
+        invalid.push(format!("not a steady state: {}", unsteady.join("; ")));
     }
     invalid
 }
 
-/// Tracks one arm's running minimum across rounds, and whether it has settled.
+/// One arm's per-round block medians, and whether they describe one steady
+/// state.
 ///
-/// The question a fixed iteration count cannot answer is whether the unit was
-/// still speeding up while it was being measured. A minimum that keeps
-/// falling round after round says it was.
+/// This replaced a stopping rule on each arm's running minimum: sample until
+/// the minimum stops improving by 0.5% for 3 rounds, and treat a round whose
+/// minimum rose as drift that restarts the count. That rule converged at
+/// locked, throttled clocks, and with turbo on it never did. On the
+/// 2026-10-09 re-runs each arm counted as settled in 1 to 11 of 60 rounds,
+/// never in the same round as the others, because one block's minimum moved
+/// by more than 0.5% from round to round while the arm's median held within
+/// 3%. On this box the minimum is too noisy to gate on.
 ///
-/// A minimum that keeps *rising* is the other failure, and it is not the same
-/// one. The running minimum is monotone by construction, so an arm getting
-/// steadily worse stops improving it -- which, counted naively, looks exactly
-/// like an arm that has settled. A build starting on the box mid-run would
-/// therefore have printed `CONVERGED` over data showing drift. So each
-/// round's own block minimum is compared against the previous round's, and a
-/// round that is materially worse is recorded as drift and *restarts*
-/// patience rather than counting toward it: a round that got worse is
-/// positive evidence against a steady state, not neutral evidence for one.
-struct Convergence {
+/// So the sample size is fixed and the gate reads medians, for the two ways
+/// an arm can lack one typical value: it changed state part-way through, so
+/// its windows disagree, or it flipped between states throughout, so its
+/// interquartile range is wide. The minimum rule's drift check is covered by
+/// the first: a climbing arm's windows disagree.
+struct Steadiness {
     label: &'static str,
-    min: f64,
-    samples: usize,
-    rounds: usize,
-    /// Round in which the minimum last improved by more than
-    /// [`MIN_IMPROVEMENT`].
-    last_improved: usize,
-    stale: usize,
-    /// The previous round's own block minimum, which is what drift is
-    /// measured against. The *running* minimum cannot detect drift: it never
-    /// rises.
-    prev_block_min: Option<f64>,
-    /// Consecutive rounds whose block minimum rose by more than
-    /// [`MIN_IMPROVEMENT`] over the round before.
-    rising: usize,
-    /// The worst run of consecutive rising rounds seen, so a drift that ends
-    /// before the cap is still reported.
-    worst_rising: usize,
+    medians: Vec<f64>,
 }
 
-impl Convergence {
+impl Steadiness {
     fn new(label: &'static str) -> Self {
         Self {
             label,
-            min: f64::INFINITY,
-            samples: 0,
-            rounds: 0,
-            last_improved: 0,
-            stale: 0,
-            prev_block_min: None,
-            rising: 0,
-            worst_rising: 0,
+            medians: Vec::new(),
         }
     }
 
-    fn observe(&mut self, round: usize, block: &[f64]) {
-        let block_min = block.iter().copied().fold(f64::INFINITY, f64::min);
-        self.samples += block.len();
-        self.rounds = round;
-        let improved = block_min < self.min * (1.0 - MIN_IMPROVEMENT);
-        let rose = self
-            .prev_block_min
-            .is_some_and(|prev| block_min > prev * (1.0 + MIN_IMPROVEMENT));
-        if improved {
-            self.last_improved = round;
-            self.stale = 0;
-            self.rising = 0;
-        } else if rose {
-            self.rising += 1;
-            self.worst_rising = self.worst_rising.max(self.rising);
-            // Not `stale += 1`: this round is evidence the arm is moving,
-            // just in the wrong direction.
-            self.stale = 0;
+    /// Record one round's block of timings.
+    fn observe(&mut self, block: &[f64]) {
+        self.medians.push(median(block));
+    }
+
+    /// The arm's figure: the median of its per-round medians.
+    fn typical(&self) -> f64 {
+        median(&self.medians)
+    }
+
+    /// The median of each of [`WINDOWS`] consecutive windows, in order, with
+    /// the last absorbing any remainder. Empty when there are fewer rounds
+    /// than windows.
+    fn window_medians(&self) -> Vec<f64> {
+        let n = self.medians.len();
+        if n < WINDOWS {
+            return Vec::new();
+        }
+        let size = n / WINDOWS;
+        (0..WINDOWS)
+            .map(|w| {
+                let end = if w + 1 == WINDOWS { n } else { (w + 1) * size };
+                median(&self.medians[w * size..end])
+            })
+            .collect()
+    }
+
+    /// `max / min - 1` over the window medians; infinite with no windows.
+    fn window_spread(&self) -> f64 {
+        let w = self.window_medians();
+        if w.is_empty() {
+            return f64::INFINITY;
+        }
+        let hi = w.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let lo = w.iter().copied().fold(f64::INFINITY, f64::min);
+        hi / lo - 1.0
+    }
+
+    /// The interquartile range of the per-round medians over their median;
+    /// infinite with no rounds.
+    fn iqr_ratio(&self) -> f64 {
+        if self.medians.is_empty() {
+            return f64::INFINITY;
+        }
+        (quantile(&self.medians, 0.75) - quantile(&self.medians, 0.25)) / self.typical()
+    }
+
+    fn steady(&self) -> bool {
+        self.window_spread() <= TOL_WINDOW_SPREAD && self.iqr_ratio() <= TOL_IQR
+    }
+
+    /// The gate's evidence: the window medians and how far apart they are,
+    /// and the IQR, each against its limit.
+    fn figures(&self) -> String {
+        let w = self.window_medians();
+        let windows = if w.is_empty() {
+            format!("fewer than {WINDOWS} rounds")
         } else {
-            self.stale += 1;
-            self.rising = 0;
-        }
-        self.prev_block_min = Some(block_min);
-        self.min = self.min.min(block_min);
+            let ms: Vec<String> = w.iter().map(|m| format!("{:.3}", m * 1e3)).collect();
+            format!(
+                "windows {} ms, {:.1}% apart (limit {:.0}%)",
+                ms.join(" / "),
+                self.window_spread() * 100.0,
+                TOL_WINDOW_SPREAD * 100.0
+            )
+        };
+        format!(
+            "{windows}; IQR {:.1}% of median (limit {:.0}%)",
+            self.iqr_ratio() * 100.0,
+            TOL_IQR * 100.0
+        )
     }
 
-    fn converged(&self) -> bool {
-        self.stale >= PATIENCE && !self.drifting()
-    }
-
-    /// Whether this arm's block minimum rose for [`PATIENCE`] rounds running
-    /// at any point in the sample.
-    fn drifting(&self) -> bool {
-        self.worst_rising >= PATIENCE
+    /// Why this arm fails the gate, naming the arm and its numbers, for the
+    /// verdict line.
+    fn why_unsteady(&self) -> String {
+        format!("{} ({})", self.label, self.figures())
     }
 
     fn report(&self) -> String {
-        let label = self.label;
-        let (n, r) = (self.samples, self.rounds);
-        let min = self.min * 1e3;
-        let head = format!("{label:24}: {n} timed samples over {r} rounds, min {min:.3} ms");
-        if self.drifting() {
-            format!(
-                "{head} DRIFTING (block minimum rose for {} consecutive rounds; a rising \
-                 minimum is not a steady state and does not count as patience)",
-                self.worst_rising
-            )
-        } else if self.converged() {
-            format!(
-                "{head} CONVERGED (no better min in the last {} rounds)",
-                self.stale
-            )
-        } else {
-            format!(
-                "{head} NOT CONVERGED (last improved in round {})",
-                self.last_improved
-            )
-        }
+        let verdict = if self.steady() { "STEADY" } else { "UNSTEADY" };
+        format!(
+            "{:24}: {} rounds, median of round medians {:.3} ms | {} | {verdict}",
+            self.label,
+            self.medians.len(),
+            self.typical() * 1e3,
+            self.figures()
+        )
     }
+}
+
+/// The median of `xs`, averaging the middle pair on an even count; NaN when
+/// empty.
+fn median(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return f64::NAN;
+    }
+    let mut s = xs.to_vec();
+    s.sort_by(f64::total_cmp);
+    let n = s.len();
+    if n.is_multiple_of(2) {
+        (s[n / 2 - 1] + s[n / 2]) / 2.0
+    } else {
+        s[n / 2]
+    }
+}
+
+/// The `p` quantile of a non-empty `xs`, interpolating linearly between order
+/// statistics (numpy's default method).
+fn quantile(xs: &[f64], p: f64) -> f64 {
+    let mut s = xs.to_vec();
+    s.sort_by(f64::total_cmp);
+    let k = (s.len() - 1) as f64 * p;
+    let lo = k.floor() as usize;
+    let hi = (lo + 1).min(s.len() - 1);
+    s[lo] + (s[hi] - s[lo]) * (k - lo as f64)
 }
 
 /// State plainly what each GPU timing does and does not contain.
@@ -1184,7 +1211,7 @@ mod tests {
     /// A run with every gate satisfied. The one input shape that lets a ratio
     /// be printed, so every test below is a departure from it.
     fn clean() -> Vec<String> {
-        invalidations(true, false, "REAL slab", &[], true, &[])
+        invalidations(true, false, "REAL slab", &[], &[])
     }
 
     /// The only way a ratio ever reaches stdout.
@@ -1199,7 +1226,7 @@ mod tests {
     /// thing, so their ratio is not a comparison at all.
     #[test]
     fn a_numerics_failure_invalidates_the_verdict() {
-        let v = invalidations(false, false, "REAL slab", &[], true, &[]);
+        let v = invalidations(false, false, "REAL slab", &[], &[]);
         assert_eq!(v.len(), 1, "got {v:?}");
         assert!(
             v[0].contains("did not compute the same thing"),
@@ -1213,8 +1240,9 @@ mod tests {
     #[test]
     fn numerics_is_reported_first() {
         let throttles = ["no_turbo=1".to_owned()];
-        let v = invalidations(false, true, "SYNTHETIC bytes", &throttles, false, &["CPU"]);
-        assert_eq!(v.len(), 5, "every failing gate must contribute: {v:?}");
+        let unsteady = ["CPU (windows apart)".to_owned()];
+        let v = invalidations(false, true, "SYNTHETIC bytes", &throttles, &unsteady);
+        assert_eq!(v.len(), 4, "every failing gate must contribute: {v:?}");
         assert!(v[0].contains("did not compute the same thing"), "{v:?}");
     }
 
@@ -1222,14 +1250,7 @@ mod tests {
     /// expert slab, and the provenance travels with the reason.
     #[test]
     fn synthetic_weights_invalidate_the_verdict() {
-        let v = invalidations(
-            true,
-            true,
-            "SYNTHETIC q4_k bytes (768x2048)",
-            &[],
-            true,
-            &[],
-        );
+        let v = invalidations(true, true, "SYNTHETIC q4_k bytes (768x2048)", &[], &[]);
         assert_eq!(v.len(), 1, "got {v:?}");
         assert!(v[0].contains("SYNTHETIC"), "{}", v[0]);
         assert!(
@@ -1248,145 +1269,175 @@ mod tests {
             "no_turbo=1".to_owned(),
             "scaling_max_freq below cpuinfo_max_freq on cpu0 2.30 of 4.80 GHz".to_owned(),
         ];
-        let v = invalidations(true, false, "REAL slab", &throttles, true, &[]);
+        let v = invalidations(true, false, "REAL slab", &throttles, &[]);
         assert_eq!(v.len(), 1, "got {v:?}");
         assert!(v[0].contains("no_turbo=1"), "{}", v[0]);
         assert!(v[0].contains("scaling_max_freq"), "{}", v[0]);
     }
 
-    /// A minimum still falling at the cap is a fact about the sample size.
+    /// An arm that is not one steady state invalidates the verdict, and the
+    /// reason names the arm and carries its numbers.
     #[test]
-    fn a_sample_that_never_converged_invalidates_the_verdict() {
-        let v = invalidations(true, false, "REAL slab", &[], false, &[]);
+    fn an_unsteady_arm_invalidates_the_verdict() {
+        let a = arm("GPU  (weights streamed)", &PROD_STREAMED);
+        let v = invalidations(true, false, "REAL slab", &[], &[a.why_unsteady()]);
         assert_eq!(v.len(), 1, "got {v:?}");
-        assert!(v[0].contains("not converged"), "{}", v[0]);
-    }
-
-    /// And a minimum rising through the run is not a steady state, whichever
-    /// arm it was.
-    #[test]
-    fn a_drifting_arm_invalidates_the_verdict() {
-        let v = invalidations(
-            true,
-            false,
-            "REAL slab",
-            &[],
-            true,
-            &["GPU  (weights resident)"],
-        );
-        assert_eq!(v.len(), 1, "got {v:?}");
-        assert!(v[0].contains("drifting"), "{}", v[0]);
+        assert!(v[0].contains("not a steady state"), "{}", v[0]);
         assert!(
-            v[0].contains("GPU  (weights resident)"),
+            v[0].contains("GPU  (weights streamed)"),
             "the arm must be named: {}",
+            v[0]
+        );
+        assert!(
+            v[0].contains("windows"),
+            "the evidence must travel: {}",
             v[0]
         );
     }
 
-    /// A minimum that keeps falling is a unit that was still speeding up, and
-    /// the sampler must not call that a steady state.
-    #[test]
-    fn a_falling_minimum_never_converges() {
-        let mut c = Convergence::new("test");
-        let mut best = 1.0;
-        for round in 1..=10 {
-            // Each round beats the last by well over `MIN_IMPROVEMENT`.
-            best *= 0.9;
-            c.observe(round, &[best, best * 1.1]);
-            assert!(!c.converged(), "converged in round {round} while improving");
+    /// An arm fed one-sample blocks, so each round's median is the value.
+    fn arm(label: &'static str, medians: &[f64]) -> Steadiness {
+        let mut a = Steadiness::new(label);
+        for &m in medians {
+            a.observe(&[m]);
         }
-        assert_eq!(c.samples, 20);
+        a
     }
 
-    /// A minimum that stops improving converges after exactly `PATIENCE`
-    /// stale rounds, and noise inside `MIN_IMPROVEMENT` does not reset it.
+    /// Round-to-round noise well inside both tolerances is one steady state.
     #[test]
-    fn a_settled_minimum_converges_after_patience_rounds() {
-        let mut c = Convergence::new("test");
-        c.observe(1, &[1.0]);
-        for round in 2..=(1 + PATIENCE) {
-            // Better by 0.1%, which is under `MIN_IMPROVEMENT` and must not
-            // count as progress.
-            c.observe(round, &[1.0 - 0.001 * (round - 1) as f64]);
-        }
-        assert!(
-            c.converged(),
-            "should have converged after {PATIENCE} rounds"
-        );
-        assert_eq!(c.last_improved, 1);
+    fn noise_inside_tolerance_is_steady() {
+        let m: Vec<f64> = (0..ROUNDS)
+            .map(|r| if r % 2 == 0 { 1.02 } else { 0.98 })
+            .collect();
+        let a = arm("t", &m);
+        assert!(a.steady(), "{}", a.report());
     }
 
-    /// The defect this drift tracking exists for: an arm that gets
-    /// monotonically WORSE never improves its running minimum either, so a
-    /// sampler that only counts non-improvement would call the drift a
-    /// steady state and print CONVERGED.
+    /// A step part-way through is two states, however flat each side is. The
+    /// minimum-based rule called the flat tail after a step converged.
     #[test]
-    fn a_rising_minimum_is_drift_and_never_converges() {
-        let mut c = Convergence::new("test");
-        let mut worst = 1.0;
-        c.observe(1, &[worst]);
-        for round in 2..=10 {
-            // Each round is materially worse than the last, as if a build
-            // had started on the box after round 1.
-            worst *= 1.1;
-            c.observe(round, &[worst]);
-            assert!(
-                !c.converged(),
-                "converged in round {round} on a monotonically degrading arm"
-            );
-        }
-        assert!(
-            c.drifting(),
-            "a monotonically rising minimum must report drift"
-        );
-        assert!(
-            c.report().contains("DRIFTING"),
-            "the report must say so: {}",
-            c.report()
-        );
+    fn a_step_change_is_unsteady() {
+        let m: Vec<f64> = (0..ROUNDS)
+            .map(|r| if r < ROUNDS / 2 { 1.0 } else { 1.2 })
+            .collect();
+        let a = arm("t", &m);
+        assert!(a.window_spread() > TOL_WINDOW_SPREAD, "{}", a.report());
+        assert!(!a.steady());
     }
 
-    /// Drift is reported even when it stops: an arm that degrades for
-    /// `PATIENCE` rounds and then holds still has not delivered a sample of
-    /// one steady state, and the tail must not launder the head.
+    /// A steady climb, as from a part thermally derating, is not a steady
+    /// state: its windows disagree.
     #[test]
-    fn drift_that_ends_is_still_reported() {
-        let mut c = Convergence::new("test");
-        let mut worst = 1.0;
-        c.observe(1, &[worst]);
-        for round in 2..=(1 + PATIENCE) {
-            worst *= 1.1;
-            c.observe(round, &[worst]);
-        }
-        assert!(c.drifting());
-        // Now hold flat for long enough that staleness alone would have
-        // called it converged.
-        for round in (2 + PATIENCE)..=(2 + 3 * PATIENCE) {
-            c.observe(round, &[worst]);
-        }
-        assert!(
-            c.stale >= PATIENCE,
-            "the flat tail must accumulate patience"
-        );
-        assert!(
-            !c.converged(),
-            "a run containing sustained drift is not a converged sample"
-        );
+    fn drift_is_unsteady() {
+        let m: Vec<f64> = (0..ROUNDS).map(|r| 1.0 + 0.005 * r as f64).collect();
+        let a = arm("t", &m);
+        assert!(a.window_spread() > TOL_WINDOW_SPREAD, "{}", a.report());
+        assert!(!a.steady());
     }
 
-    /// Ordinary round-to-round noise inside `MIN_IMPROVEMENT` is not drift,
-    /// or every honest run would be invalidated.
+    /// An arm flipping between two states throughout has windows that agree
+    /// and still no single typical value. The IQR is what catches it.
     #[test]
-    fn noise_is_not_drift() {
-        let mut c = Convergence::new("test");
-        c.observe(1, &[1.0]);
-        for round in 2..=12 {
-            // Alternating +/-0.2%, well inside `MIN_IMPROVEMENT`.
-            let v = if round % 2 == 0 { 1.002 } else { 0.998 };
-            c.observe(round, &[v]);
+    fn flipping_between_two_states_is_unsteady() {
+        let m: Vec<f64> = (0..ROUNDS)
+            .map(|r| if r % 2 == 0 { 1.0 } else { 1.7 })
+            .collect();
+        let a = arm("t", &m);
+        assert!(a.window_spread() <= TOL_WINDOW_SPREAD, "{}", a.report());
+        assert!(a.iqr_ratio() > TOL_IQR, "{}", a.report());
+        assert!(!a.steady());
+    }
+
+    /// Fewer rounds than windows is no evidence of a steady state.
+    #[test]
+    fn too_few_rounds_is_unsteady() {
+        assert!(!arm("t", &[1.0, 1.0]).steady());
+        assert!(!arm("t", &[]).steady());
+    }
+
+    /// The median averages the middle pair; the quantile interpolates.
+    #[test]
+    fn median_and_quantile_match_the_textbook() {
+        assert!((median(&[3.0, 1.0, 2.0]) - 2.0).abs() < 1e-12);
+        assert!((median(&[4.0, 1.0, 3.0, 2.0]) - 2.5).abs() < 1e-12);
+        assert!((quantile(&[1.0, 2.0, 3.0, 4.0, 5.0], 0.25) - 2.0).abs() < 1e-12);
+        assert!((quantile(&[1.0, 2.0, 3.0, 4.0], 0.75) - 3.25).abs() < 1e-12);
+    }
+
+    // Per-round medians in microseconds from the two unthrottled runs of
+    // 2026-10-09: Intel Arc (MTL) iGPU against 6 pinned P-cores, turbo on,
+    // built before the clocks were unlocked. The tolerances were set from the
+    // size of the effects being decided, not fitted to these runs.
+    const PROD_CPU: [f64; 60] = [
+        279.0, 264.0, 276.0, 270.0, 267.0, 267.0, 271.0, 271.0, 271.0, 272.0, 278.0, 267.0, 272.0,
+        267.0, 261.0, 267.0, 273.0, 269.0, 270.0, 271.0, 267.0, 267.0, 270.0, 271.0, 267.0, 269.0,
+        265.0, 267.0, 266.0, 272.0, 273.0, 273.0, 271.0, 272.0, 272.0, 278.0, 449.0, 276.0, 275.0,
+        277.0, 479.0, 282.0, 314.0, 296.0, 276.0, 276.0, 276.0, 281.0, 271.0, 276.0, 279.0, 287.0,
+        285.0, 276.0, 274.0, 278.0, 276.0, 280.0, 285.0, 285.0,
+    ];
+    const PROD_RESIDENT: [f64; 60] = [
+        251.0, 386.0, 314.0, 283.0, 281.0, 274.0, 278.0, 277.0, 278.0, 278.0, 270.0, 258.0, 272.0,
+        269.0, 248.0, 264.0, 279.0, 271.0, 272.0, 272.0, 268.0, 271.0, 270.0, 270.0, 281.0, 274.0,
+        264.0, 275.0, 264.0, 279.0, 275.0, 256.0, 291.0, 279.0, 274.0, 284.0, 278.0, 286.0, 283.0,
+        295.0, 280.0, 313.0, 311.0, 284.0, 304.0, 308.0, 314.0, 297.0, 272.0, 278.0, 277.0, 271.0,
+        272.0, 271.0, 265.0, 273.0, 273.0, 255.0, 270.0, 279.0,
+    ];
+    const PROD_STREAMED: [f64; 60] = [
+        289.0, 324.0, 274.0, 272.0, 299.0, 258.0, 298.0, 292.0, 270.0, 291.0, 276.0, 299.0, 296.0,
+        287.0, 264.0, 293.0, 310.0, 272.0, 288.0, 301.0, 303.0, 267.0, 286.0, 413.0, 433.0, 312.0,
+        405.0, 394.0, 427.0, 420.0, 405.0, 392.0, 413.0, 447.0, 413.0, 429.0, 421.0, 420.0, 412.0,
+        410.0, 407.0, 445.0, 464.0, 436.0, 298.0, 314.0, 292.0, 311.0, 277.0, 270.0, 246.0, 306.0,
+        290.0, 300.0, 283.0, 287.0, 267.0, 270.0, 287.0, 269.0,
+    ];
+    const HOIST_CPU: [f64; 60] = [
+        238.0, 213.0, 234.0, 214.0, 212.0, 210.0, 228.0, 225.0, 231.0, 224.0, 226.0, 213.0, 212.0,
+        390.0, 362.0, 425.0, 494.0, 366.0, 345.0, 388.0, 349.0, 328.0, 374.0, 369.0, 374.0, 331.0,
+        385.0, 384.0, 364.0, 348.0, 352.0, 335.0, 370.0, 335.0, 364.0, 374.0, 366.0, 217.0, 216.0,
+        216.0, 213.0, 213.0, 214.0, 217.0, 215.0, 237.0, 216.0, 215.0, 214.0, 375.0, 222.0, 384.0,
+        431.0, 383.0, 376.0, 372.0, 381.0, 216.0, 394.0, 373.0,
+    ];
+    const HOIST_RESIDENT: [f64; 60] = [
+        269.0, 284.0, 269.0, 280.0, 274.0, 267.0, 271.0, 278.0, 272.0, 270.0, 269.0, 271.0, 275.0,
+        300.0, 301.0, 312.0, 284.0, 249.0, 267.0, 281.0, 278.0, 249.0, 289.0, 269.0, 288.0, 257.0,
+        273.0, 299.0, 263.0, 256.0, 286.0, 256.0, 279.0, 268.0, 265.0, 266.0, 281.0, 267.0, 443.0,
+        461.0, 459.0, 445.0, 385.0, 360.0, 344.0, 315.0, 305.0, 284.0, 285.0, 244.0, 313.0, 286.0,
+        292.0, 299.0, 280.0, 271.0, 287.0, 277.0, 272.0, 293.0,
+    ];
+    const HOIST_STREAMED: [f64; 60] = [
+        247.0, 292.0, 260.0, 274.0, 308.0, 256.0, 292.0, 298.0, 264.0, 278.0, 301.0, 293.0, 353.0,
+        331.0, 270.0, 332.0, 310.0, 323.0, 279.0, 303.0, 275.0, 277.0, 275.0, 273.0, 278.0, 300.0,
+        297.0, 307.0, 416.0, 409.0, 431.0, 417.0, 418.0, 404.0, 426.0, 419.0, 423.0, 420.0, 477.0,
+        465.0, 461.0, 408.0, 349.0, 323.0, 384.0, 345.0, 303.0, 317.0, 301.0, 284.0, 321.0, 323.0,
+        326.0, 327.0, 266.0, 321.0, 289.0, 428.0, 439.0, 425.0,
+    ];
+
+    /// The production-kernel run: the CPU and resident GPU held one state,
+    /// and the streamed GPU had a slow episode in the middle third.
+    #[test]
+    fn the_production_run_is_steady_except_the_streamed_arm() {
+        let cpu = arm("cpu", &PROD_CPU);
+        let res = arm("res", &PROD_RESIDENT);
+        let st = arm("str", &PROD_STREAMED);
+        assert!(cpu.steady(), "{}", cpu.report());
+        assert!(res.steady(), "{}", res.report());
+        assert!(!st.steady(), "{}", st.report());
+        let w = st.window_medians();
+        assert!(w[1] > 1.3 * w[0] && w[1] > 1.3 * w[2], "{w:?}");
+    }
+
+    /// The hoisted run: the CPU flipped between ~0.21 and ~0.36 ms, and both
+    /// GPU arms had their own slow episodes. No arm is one steady state.
+    #[test]
+    fn the_hoisted_run_is_unsteady_on_every_arm() {
+        for (name, m) in [
+            ("cpu", &HOIST_CPU),
+            ("res", &HOIST_RESIDENT),
+            ("str", &HOIST_STREAMED),
+        ] {
+            let a = arm(name, m);
+            assert!(!a.steady(), "{}", a.report());
         }
-        assert!(!c.drifting(), "sub-threshold noise must not read as drift");
-        assert!(c.converged(), "a settled noisy arm must still converge");
     }
 
     /// Alternating-sign reference outputs, so a uniform scale error cannot
