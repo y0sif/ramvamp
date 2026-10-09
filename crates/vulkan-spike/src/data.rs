@@ -168,7 +168,7 @@ pub fn synthetic_gate_slab(in_dim: usize, out_dim: usize) -> GateSlab {
     let row_bytes = in_dim / QK_K * 144;
     let mut rng = Rng::new(0x5EED_0BAD_C0FF_EE01);
     let mut bytes = vec![0u8; out_dim * row_bytes];
-    for block in bytes.chunks_exact_mut(144) {
+    for block in bytes.as_chunks_mut::<144>().0 {
         // Plausible f16 d/dmin (small positive normals) so the affine
         // reconstruction stays in a sane range.
         let d = ramvamp_core::kernels::quants::f32_to_f16(0.01 + rng.unit() * 0.02);

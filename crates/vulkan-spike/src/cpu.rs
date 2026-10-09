@@ -10,6 +10,7 @@ use anyhow::{Result, anyhow};
 use std::sync::Mutex;
 
 use ramvamp_core::kernels::gemv_q8_k_batched;
+use ramvamp_core::kernels::q4k_row_hoist::gemv_q4_k_q8_k_batched_hoisted;
 use ramvamp_core::kernels::quants::{BlockQ8K, QuantFormat};
 use ramvamp_core::threads::ComputePool;
 
@@ -30,11 +31,23 @@ impl SendPtr {
     }
 }
 
+/// Which CPU kernel the arm runs. `Production` is what prefill calls today;
+/// `Hoisted` is the preserved row-hoist prototype from
+/// `perf/q4k-row-hoist-prototype`, which does the per-row dequant setup once
+/// per row instead of once per activation, the way the shader does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CpuKernel {
+    Production,
+    Hoisted,
+}
+
 /// Batched Q4_K x Q8_K GEMV over the whole matrix, sharded across the pool.
 ///
 /// `out` is `[weight_row][activation]`, `out_dim * n_acts` floats, exactly
 /// the layout `gemv_q8_k_batched` writes.
+#[allow(clippy::too_many_arguments)]
 pub fn gemv_batched_pooled(
+    kernel: CpuKernel,
     pool: &mut ComputePool,
     weight: &[u8],
     in_dim: usize,
@@ -58,16 +71,28 @@ pub fn gemv_batched_pooled(
         // `out.len()` (asserted above). `out` is mutably borrowed for the
         // whole call and `run` joins before returning.
         let chunk = unsafe { std::slice::from_raw_parts_mut(base.get().add(start), len) };
-        if let Err(err) = gemv_q8_k_batched(
-            QuantFormat::Q4_K,
-            weight,
-            in_dim,
-            out_dim,
-            acts,
-            n_acts,
-            shard.rows.clone(),
-            chunk,
-        ) {
+        let result = match kernel {
+            CpuKernel::Production => gemv_q8_k_batched(
+                QuantFormat::Q4_K,
+                weight,
+                in_dim,
+                out_dim,
+                acts,
+                n_acts,
+                shard.rows.clone(),
+                chunk,
+            ),
+            CpuKernel::Hoisted => gemv_q4_k_q8_k_batched_hoisted(
+                weight,
+                in_dim,
+                out_dim,
+                acts,
+                n_acts,
+                shard.rows.clone(),
+                chunk,
+            ),
+        };
+        if let Err(err) = result {
             let mut slot = failure.lock().unwrap_or_else(|e| e.into_inner());
             if slot.is_none() {
                 *slot = Some(err.to_string());
@@ -75,7 +100,7 @@ pub fn gemv_batched_pooled(
         }
     });
     match failure.into_inner().unwrap_or_else(|e| e.into_inner()) {
-        Some(err) => Err(anyhow!("gemv_q8_k_batched failed on a shard: {err}")),
+        Some(err) => Err(anyhow!("{kernel:?} CPU kernel failed on a shard: {err}")),
         None => Ok(()),
     }
 }

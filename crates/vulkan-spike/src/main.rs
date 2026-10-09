@@ -89,8 +89,11 @@ const BLOCK: usize = 50;
 /// Rounds that always run, before convergence is even tested.
 const MIN_ROUNDS: usize = 3;
 /// Hard cap on rounds. Reaching it without converging is reported, not
-/// hidden.
-const MAX_ROUNDS: usize = 20;
+/// hidden. A round is ~70 ms, so 60 rounds is ~4 s of timed work. 20 was
+/// enough at locked throttled clocks (EXP-026 converged in 10 and 13 rounds)
+/// but not with turbo on, where round-to-round jitter in the block minimum
+/// restarts patience far more often.
+const MAX_ROUNDS: usize = 60;
 /// Consecutive rounds that must fail to improve an arm's running minimum
 /// before that minimum counts as converged.
 const PATIENCE: usize = 3;
@@ -223,6 +226,56 @@ fn run() -> Result<bool> {
 
     let mut cpu_out = vec![0f32; out_dim * N_ACTS];
 
+    // `RAMVAMP_SPIKE_CPU=hoisted` swaps the CPU arm to the row-hoist
+    // prototype. Anything else, or unset, is the production kernel.
+    let kernel = match std::env::var("RAMVAMP_SPIKE_CPU").as_deref() {
+        Ok("hoisted") => cpu::CpuKernel::Hoisted,
+        _ => cpu::CpuKernel::Production,
+    };
+    let cpu_label = match kernel {
+        cpu::CpuKernel::Production => "CPU  (pool, avx2)",
+        cpu::CpuKernel::Hoisted => "CPU  (pool, avx2, hoisted)",
+    };
+    println!("== CPU kernel ==\n  {kernel:?} (set RAMVAMP_SPIKE_CPU=hoisted for the prototype)");
+    let hoist_identical = if kernel == cpu::CpuKernel::Hoisted {
+        let mut prod = vec![0f32; out_dim * N_ACTS];
+        cpu::gemv_batched_pooled(
+            cpu::CpuKernel::Production,
+            &mut pool,
+            &slab.bytes,
+            in_dim,
+            out_dim,
+            &acts,
+            N_ACTS,
+            &mut prod,
+        )?;
+        cpu::gemv_batched_pooled(
+            kernel,
+            &mut pool,
+            &slab.bytes,
+            in_dim,
+            out_dim,
+            &acts,
+            N_ACTS,
+            &mut cpu_out,
+        )?;
+        let differ = prod
+            .iter()
+            .zip(&cpu_out)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!(
+            "  hoisted vs production on this slab: {} of {} outputs differ in bits [{}]",
+            differ,
+            prod.len(),
+            if differ == 0 { "PASS" } else { "FAIL" }
+        );
+        differ == 0
+    } else {
+        true
+    };
+    println!();
+
     // ---- arm B: the Vulkan dispatch -----------------------------------
     let gemv = gpu::GpuGemv::new(&ctx, gpu::SHADER_FORMAT, in_dim, out_dim, N_ACTS)?;
     gemv.upload_weights(&slab.bytes)
@@ -251,6 +304,7 @@ fn run() -> Result<bool> {
     let mut cpu_iter = || {
         let t = Instant::now();
         cpu::gemv_batched_pooled(
+            kernel,
             &mut pool,
             &slab.bytes,
             in_dim,
@@ -279,7 +333,7 @@ fn run() -> Result<bool> {
     let mut gpu_streamed = Vec::new();
     let mut gpu_device = Vec::new();
     let mut rounds = Vec::new();
-    let mut cpu_conv = Convergence::new("CPU  (pool, avx2)");
+    let mut cpu_conv = Convergence::new(cpu_label);
     let mut res_conv = Convergence::new("GPU  (weights resident)");
     let mut str_conv = Convergence::new("GPU  (weights streamed)");
     for round in 1..=MAX_ROUNDS {
@@ -334,7 +388,7 @@ fn run() -> Result<bool> {
     gemv.read_out(&mut gpu_out)?;
 
     // ---- numerical agreement ------------------------------------------
-    let numerics_ok = report_agreement(&cpu_out, &gpu_out);
+    let numerics_ok = report_agreement(&cpu_out, &gpu_out) && hoist_identical;
 
     // ---- performance ---------------------------------------------------
     let cpu = Stats::of(&mut cpu_times);
@@ -415,11 +469,14 @@ fn run() -> Result<bool> {
     }
     for (i, (c, r, s)) in rounds.iter().enumerate() {
         let head = format!(
-            "{tag}round {:2}: CPU median {:7.3} ms   GPU resident {:7.3} ms   GPU streamed {:7.3} ms",
+            "{tag}round {:2}: CPU median {:7.3} min {:6.3} ms   GPU resident {:7.3} min {:6.3} ms   GPU streamed {:7.3} min {:6.3} ms",
             i + 1,
             c.median * 1e3,
+            c.min * 1e3,
             r.median * 1e3,
+            r.min * 1e3,
             s.median * 1e3,
+            s.min * 1e3,
         );
         if invalid.is_empty() {
             println!(
@@ -432,7 +489,7 @@ fn run() -> Result<bool> {
         }
     }
     println!();
-    cpu.report("CPU  (pool, avx2)", flops, tag);
+    cpu.report(cpu_label, flops, tag);
     gpu_r.report("GPU  (weights resident)", flops, tag);
     gpu_s.report("GPU  (weights streamed)", flops, tag);
     if gpu_d.median > 0.0 {
@@ -447,7 +504,17 @@ fn run() -> Result<bool> {
         ctx.caps.host_cached_available,
         ctx.caps.subgroup_size,
     );
-    report_arm_asymmetry();
+    if kernel == cpu::CpuKernel::Hoisted {
+        println!(
+            "== the two arms run the same algorithm, up to the expansion ==\n  \
+             This run's CPU arm is the row-hoist prototype: it unpacks each weight\n  \
+             row once and reuses it across all {N_ACTS} activations, as the shader\n  \
+             does. Its expansion is deliberately scalar where the shader's is not,\n  \
+             so the CPU figure is still a floor on what the hoist is worth.\n"
+        );
+    } else {
+        report_arm_asymmetry();
+    }
 
     // Two ratios, because they answer different questions. The median-vs-
     // median one is what this box delivers as it is actually loaded. The
