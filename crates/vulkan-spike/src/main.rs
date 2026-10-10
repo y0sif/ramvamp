@@ -228,7 +228,7 @@ fn run() -> Result<bool> {
     let cpus: Vec<usize> = pool.topology().compute_cpus().to_vec();
     let lock = clock::requested().map_err(anyhow::Error::msg)?;
     let throttles = report_cpu_clock_caps(&cpus, lock.is_some());
-    let gt_dir = clock::gt_dir();
+    let gt = clock::render_gt();
     // Every way the clock lock failed: not in place before sampling, or did
     // not hold during it. Only ever non-empty on a locked run.
     let mut lock_problems = Vec::new();
@@ -239,13 +239,12 @@ fn run() -> Result<bool> {
             "  requested: CPU {:.2} GHz on cpus {cpus:?}, iGPU {} MHz ({})",
             lock.cpu_khz as f64 / 1e6,
             lock.gt_mhz,
-            gt_dir.as_deref().map_or_else(
-                || "no single i915 GT found".to_owned(),
-                |d| d.display().to_string()
+            gt.as_ref().map_or_else(
+                || "no single i915 render GT found".to_owned(),
+                clock::Gt::describe
             )
         );
-        lock_problems =
-            clock::check_in_place(lock, &clock::read_settings(&cpus, gt_dir.as_deref()));
+        lock_problems = clock::check_in_place(lock, &clock::read_settings(&cpus, gt.as_ref()));
         if lock_problems.is_empty() {
             println!(
                 "  in place: PASS (min = max on every pinned cpu; min = max = boost on the iGPU)"
@@ -393,10 +392,10 @@ fn run() -> Result<bool> {
             res_round.push(host);
             gpu_device.push(device);
             if i == BLOCK / 2 {
-                clocks.sample_gt(gt_dir.as_deref());
+                clocks.sample_gt(gt.as_ref());
             }
         }
-        clocks.sample_gt(gt_dir.as_deref());
+        clocks.sample_gt(gt.as_ref());
 
         let mut str_round = Vec::with_capacity(BLOCK);
         for _ in 0..REWARM {
@@ -406,10 +405,10 @@ fn run() -> Result<bool> {
             let (host, _) = gemv.run_streamed(&slab.bytes)?;
             str_round.push(host);
             if i == BLOCK / 2 {
-                clocks.sample_gt(gt_dir.as_deref());
+                clocks.sample_gt(gt.as_ref());
             }
         }
-        clocks.sample_gt(gt_dir.as_deref());
+        clocks.sample_gt(gt.as_ref());
 
         cpu_steady.observe(&cpu_round);
         res_steady.observe(&res_round);

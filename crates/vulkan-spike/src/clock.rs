@@ -89,11 +89,45 @@ fn read_u64(path: &Path) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// The i915 GT directory, the one `/sys/class/drm/cardN` that carries
-/// `gt_min_freq_mhz`. `None` when there is none, or more than one and so no
-/// way to tell which is the device Vulkan picked.
-pub fn gt_dir() -> Option<PathBuf> {
-    let mut found = std::fs::read_dir("/sys/class/drm")
+/// The render GT's frequency files.
+///
+/// On a part with more than one GT, such as Meteor Lake's render GT plus
+/// media GT, the card-level `gt_*_freq_mhz` files are not the render GT's. A
+/// write goes to every GT in turn and fails at the first that refuses it, and
+/// a read aggregates across GTs: the lowest min, the highest max. On
+/// 2026-10-10 a lock written through them set the render GT, was refused by
+/// the media GT (maximum 1300 MHz), and read back half-applied. The restore
+/// then wrote the media GT's 100 MHz minimum to a render GT whose floor is
+/// 800, was refused, and left the render GT pinned at 1400. The shader runs
+/// on the render GT, so these are its own files, `gt/gt0/rps_*_freq_mhz`.
+/// The card-level files are only the fallback on a single-GT part, where
+/// they are the same thing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gt {
+    dir: PathBuf,
+    prefix: &'static str,
+}
+
+impl Gt {
+    /// One frequency file: `name` is `min`, `max`, `boost` or `act`.
+    pub fn file(&self, name: &str) -> PathBuf {
+        self.dir.join(format!("{}{name}_freq_mhz", self.prefix))
+    }
+
+    pub fn describe(&self) -> String {
+        self.dir.display().to_string()
+    }
+}
+
+/// The render GT of the one i915 card under `/sys/class/drm`. `None` when
+/// there is no such card, or more than one and so no way to tell which is
+/// the device Vulkan picked.
+pub fn render_gt() -> Option<Gt> {
+    find_render_gt(Path::new("/sys/class/drm"))
+}
+
+fn find_render_gt(drm: &Path) -> Option<Gt> {
+    let mut found = std::fs::read_dir(drm)
         .ok()?
         .filter_map(Result::ok)
         .map(|e| e.path())
@@ -101,7 +135,22 @@ pub fn gt_dir() -> Option<PathBuf> {
             p.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("card") && !n.contains('-'))
-                && p.join("gt_min_freq_mhz").exists()
+        })
+        .filter_map(|card| {
+            let gt0 = card.join("gt").join("gt0");
+            if gt0.join("rps_min_freq_mhz").exists() {
+                Some(Gt {
+                    dir: gt0,
+                    prefix: "rps_",
+                })
+            } else if card.join("gt_min_freq_mhz").exists() {
+                Some(Gt {
+                    dir: card,
+                    prefix: "gt_",
+                })
+            } else {
+                None
+            }
         });
     let first = found.next()?;
     if found.next().is_some() {
@@ -114,13 +163,13 @@ pub fn gt_dir() -> Option<PathBuf> {
 pub struct Settings {
     /// `(cpu, scaling_min_freq, scaling_max_freq)` in kHz per pinned CPU.
     pub cpus: Vec<(usize, Option<u64>, Option<u64>)>,
-    /// `(gt_min, gt_max, gt_boost)` in MHz, or `None` when there is no
-    /// unambiguous i915 GT directory.
+    /// The render GT's `(min, max, boost)` in MHz, or `None` when there is
+    /// no unambiguous i915 render GT.
     pub gt: Option<(Option<u64>, Option<u64>, Option<u64>)>,
 }
 
 /// Read the lock settings for `cpus` and the iGPU.
-pub fn read_settings(cpus: &[usize], gt: Option<&Path>) -> Settings {
+pub fn read_settings(cpus: &[usize], gt: Option<&Gt>) -> Settings {
     let cpu_attr = |cpu: usize, attr: &str| {
         read_u64(Path::new(&format!(
             "/sys/devices/system/cpu/cpu{cpu}/cpufreq/{attr}"
@@ -137,11 +186,11 @@ pub fn read_settings(cpus: &[usize], gt: Option<&Path>) -> Settings {
                 )
             })
             .collect(),
-        gt: gt.map(|d| {
+        gt: gt.map(|g| {
             (
-                read_u64(&d.join("gt_min_freq_mhz")),
-                read_u64(&d.join("gt_max_freq_mhz")),
-                read_u64(&d.join("gt_boost_freq_mhz")),
+                read_u64(&g.file("min")),
+                read_u64(&g.file("max")),
+                read_u64(&g.file("boost")),
             )
         }),
     }
@@ -168,7 +217,8 @@ pub fn check_in_place(lock: &Lock, settings: &Settings) -> Vec<String> {
     let want = Some(u64::from(lock.gt_mhz));
     match settings.gt {
         None => problems.push(
-            "no single i915 GT under /sys/class/drm, so the iGPU lock cannot be checked".to_owned(),
+            "no single i915 render GT under /sys/class/drm, so the iGPU lock cannot be checked"
+                .to_owned(),
         ),
         Some((lo, hi, boost)) if lo != want || hi != want || boost != want => {
             problems.push(format!(
@@ -219,10 +269,10 @@ impl ClockLog {
         }
     }
 
-    /// Read `gt_act_freq_mhz`, the iGPU's actual frequency. Called between
+    /// Read the render GT's actual frequency. Called between
     /// GPU iterations, never inside a timed one.
-    pub fn sample_gt(&mut self, gt: Option<&Path>) {
-        let r = gt.and_then(|d| read_u64(&d.join("gt_act_freq_mhz")));
+    pub fn sample_gt(&mut self, gt: Option<&Gt>) {
+        let r = gt.and_then(|g| read_u64(&g.file("act")));
         self.record_gt(r);
     }
 
@@ -429,6 +479,61 @@ mod tests {
         l.record_gt(Some(0));
         assert!(l.violations(&LOCK).is_empty());
         assert_eq!(l.gt_idle, 1);
+    }
+
+    fn temp_drm(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("ramvamp-clock-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn touch(p: &Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "0").unwrap();
+    }
+
+    /// The defect this resolution exists for: on a render GT plus media GT
+    /// part, the card-level files fan writes out to both GTs. The render GT's
+    /// own files must win.
+    #[test]
+    fn a_multi_gt_card_resolves_to_the_render_gts_own_files() {
+        let drm = temp_drm("multi");
+        touch(&drm.join("card1/gt_min_freq_mhz"));
+        touch(&drm.join("card1/gt/gt0/rps_min_freq_mhz"));
+        touch(&drm.join("card1/gt/gt1/rps_min_freq_mhz"));
+        touch(&drm.join("card1-eDP-1/status"));
+        let gt = find_render_gt(&drm);
+        std::fs::remove_dir_all(&drm).unwrap();
+        let gt = gt.expect("one render GT");
+        assert_eq!(gt.file("min"), drm.join("card1/gt/gt0/rps_min_freq_mhz"));
+        assert_eq!(gt.file("act"), drm.join("card1/gt/gt0/rps_act_freq_mhz"));
+    }
+
+    /// With one GT there are no per-GT files to prefer, and the card-level
+    /// ones are that GT's.
+    #[test]
+    fn a_single_gt_card_falls_back_to_the_card_level_files() {
+        let drm = temp_drm("single");
+        touch(&drm.join("card0/gt_min_freq_mhz"));
+        let gt = find_render_gt(&drm);
+        std::fs::remove_dir_all(&drm).unwrap();
+        assert_eq!(
+            gt.expect("one GT").file("max"),
+            drm.join("card0/gt_max_freq_mhz")
+        );
+    }
+
+    /// Two i915 cards and no way to tell which one Vulkan picked.
+    #[test]
+    fn two_cards_are_ambiguous() {
+        let drm = temp_drm("two");
+        touch(&drm.join("card0/gt/gt0/rps_min_freq_mhz"));
+        touch(&drm.join("card1/gt/gt0/rps_min_freq_mhz"));
+        let gt = find_render_gt(&drm);
+        std::fs::remove_dir_all(&drm).unwrap();
+        assert_eq!(gt, None);
     }
 
     /// A lock nobody saw hold is not evidence that it held.
