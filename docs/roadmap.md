@@ -156,6 +156,39 @@ one llama.cpp command away. The other gates are the pattern to follow,
 including their shared exit-code convention: `scripts/bitident.py`,
 `scripts/kl_vs_reference.py` and `scripts/greedy_regression.py`.
 
+## Now: the CPU path on a machine in use
+
+Decided by the author on 2026-10-10, with the GPU backend set aside: the next
+work makes the CPU path behave on a machine that is also being used for
+other things, and then makes it faster. Every benchmark so far has needed a
+quiet machine. That requirement is a finding in its own right: the runtime's
+speed depends on what else is running.
+
+The mechanism is in `crates/core/src/threads.rs`. `ComputePool` splits every
+GEMV into six fixed, equal row ranges, one per P-core, each run by a thread
+pinned to that core, and the job finishes only when the slowest range does.
+Anything else running on one of those six cores, or on its hyperthread
+sibling, slows that range, and with it every GEMV in the token. EXP-026's
+locked-clock run shows this happening in practice: the GPU arms, driven from
+one submitting thread, held steady through the same background load that
+made the pool flip between two speeds.
+
+In order:
+
+1. **Measure it.** A paired diagnostic of the pool with and without a
+   controlled background load, so the cost of one busy core is a number.
+   Arms are interleaved, so ordinary background load falls on both, and
+   comparing them does not need a quiet machine.
+2. **Hand out work dynamically.** Split each job into many small row chunks
+   that threads claim from a shared counter, so a slowed core simply takes
+   fewer. For the GEMVs this is bit-identical by construction, because each
+   output row is one whole-row dot whichever thread computes it.
+3. **Loosen the pinning**, so the scheduler can move a worker off a busy
+   core instead of time-slicing it there.
+4. **Then speed.** The Q4_K row hoist for prefill, now bit-identical to
+   production (EXP-026), and the expert cache policy (see "Then, in no fixed
+   order" below).
+
 ## v1
 
 These are commitments to sequence, not to dates.
@@ -201,6 +234,37 @@ an expert blob has no slot for a shared-expert slab today, even though
 is an additional configuration and never a substitute for the CPU path.** The
 kernel trait exists for exactly this, and the CPU path stays the reference
 that correctness is measured against.
+
+**Decided 2026-10-10: not now.** A throwaway spike (EXP-026, preserved on
+branch `exp/vulkan-vs-hoist`) ported the one kernel worth porting first,
+prefill's Q4_K x Q8_K batched GEMV, to a Vulkan compute shader on the
+reference machine's Arc iGPU. Two of its results stand:
+
+- **The Q4_K arithmetic ports.** On a real expert slab the shader agrees with
+  the CPU kernel to a max absolute error of 1.490e-6. It is Q4_K only, for a
+  structural reason: the shader reads weights in 4-byte units, and Q6_K's
+  210 B block is not a whole number of them. Q6_K is the expert `down`
+  projection on 24 of 48 layers, so half the expert FFN would need a
+  different shader.
+- **The hardware has what the kernel needs.** The packed int8 dot product is
+  hardware-accelerated, and memory is unified, so buffers are written in
+  place with no staging copy.
+
+Whether the iGPU is faster was never established, and no run produced a
+quotable ratio. The last attempt locked both units' clocks (CPU 3.0 GHz, iGPU
+1.4 GHz). Both GPU arms held steady across it. The CPU pool did not: its
+per-round medians flipped between two levels about 1.7x apart while a browser
+and a download ran in the background. The stopping rule agreed before that
+run says an arm still unsteady at locked clocks means "not now", so the
+measurement stops here rather than going another round. The instability is
+the more useful finding, and it is what the next phase is about (see "Now"
+above).
+
+Reopen it when both of these hold: the CPU pool stays steady on a machine in
+normal use, so that a ratio means something; and there is reason to expect
+the iGPU to beat the best CPU kernel by 1.5x or more on this GEMV. That is the
+bar agreed before the last run, and it is set high because a backend costs a
+Q6_K shader, a streaming upload path and a second thing to keep correct.
 
 ### 3. Bring your own model
 
@@ -355,6 +419,7 @@ rather than default to measuring more.
 | The `attn_q` + `attn_v` fusion | **settled**: dropped, its bucket did not separate at either rung. The expert-phase fusion stays |
 | Reopen progressive miss execution | **open** |
 | Move the slot dial to 12 or 13 | **held**, needs a 13-slot arm at 4K context |
+| A GPU backend (v1 item 2) | **not now** (2026-10-10): no quotable ratio, because the CPU pool would not hold steady even at locked clocks (EXP-026). Reopen conditions are in the v1 section |
 
 The TUI (`chat --tui`) is kept rather than deleted, under the standing rule
 that measured-and-set-aside work is preserved. It is genuinely useful as an
