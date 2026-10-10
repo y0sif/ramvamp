@@ -117,6 +117,64 @@ impl Gt {
     pub fn describe(&self) -> String {
         self.dir.display().to_string()
     }
+
+    /// The lowest clock the GT runs at while active. A reading under it is
+    /// the GT idle or mid-transition, not a GT the package has slowed.
+    pub fn rpn(&self) -> Option<u64> {
+        read_u64(&self.file("RPn"))
+    }
+}
+
+/// `cpus` plus every hyperthread sibling of each, sorted.
+///
+/// A lock has to cover the siblings. Two threads of one core share its
+/// clock, and the core runs at the higher of their two requests, so an
+/// unlocked sibling with work to do pulls a locked shard's core off the lock.
+/// On 2026-10-10 the six locked shards were read at 2.26-4.50 GHz against a
+/// 3.00 GHz lock while their siblings were left unlocked.
+///
+/// # Errors
+///
+/// When a CPU's `thread_siblings_list` cannot be read or parsed: the lock
+/// would then be unchecked on a thread that can move the core's clock.
+pub fn with_siblings(cpus: &[usize]) -> Result<Vec<usize>, String> {
+    let mut all = Vec::new();
+    for &c in cpus {
+        let path = format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("could not read the hyperthread siblings of cpu{c}: {e}"))?;
+        let list = parse_cpu_list(&text).ok_or_else(|| {
+            format!("could not parse the hyperthread siblings of cpu{c}: {text:?}")
+        })?;
+        all.extend(list);
+        all.push(c);
+    }
+    all.sort_unstable();
+    all.dedup();
+    Ok(all)
+}
+
+/// Parse a kernel CPU list such as `0,5` or `1-2,8`. `None` on anything
+/// malformed, including an empty list and a descending range.
+fn parse_cpu_list(text: &str) -> Option<Vec<usize>> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for part in text.split(',') {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b) = (a.parse::<usize>().ok()?, b.parse::<usize>().ok()?);
+                if a > b {
+                    return None;
+                }
+                out.extend(a..=b);
+            }
+            None => out.push(part.parse().ok()?),
+        }
+    }
+    Some(out)
 }
 
 /// The render GT of the one i915 card under `/sys/class/drm`. `None` when
@@ -248,16 +306,28 @@ fn mhz(v: Option<u64>) -> String {
 /// The clocks the units actually ran at, read after each block of a run.
 #[derive(Default)]
 pub struct ClockLog {
-    /// Every CPU reading, kHz.
-    cpu: Vec<u64>,
+    /// Every CPU reading as `(cpu, kHz)`.
+    cpu: Vec<(usize, u64)>,
     cpu_unreadable: usize,
-    /// Every non-zero iGPU reading, MHz.
+    /// Every iGPU reading at or above [`Self::gt_floor`], MHz.
     gt: Vec<u64>,
-    /// iGPU readings of zero (the GT was already idle in RC6) or unreadable.
+    /// The GT's lowest active clock (RPn). Readings under it are the GT
+    /// idle or mid-transition; 0 when unknown, so only a zero counts.
+    gt_floor: u64,
+    /// iGPU readings of zero (idle in RC6), under the floor, or unreadable.
     gt_idle: usize,
 }
 
 impl ClockLog {
+    /// A log that counts iGPU readings under `floor`, the GT's lowest active
+    /// clock, as idle rather than as a slowed GT.
+    pub fn with_gt_floor(floor: Option<u64>) -> Self {
+        Self {
+            gt_floor: floor.unwrap_or(0),
+            ..Self::default()
+        }
+    }
+
     /// Read `scaling_cur_freq` on every pinned CPU. Called right after the
     /// CPU block, while the value still reflects the block.
     pub fn sample_cpus(&mut self, cpus: &[usize]) {
@@ -265,7 +335,7 @@ impl ClockLog {
             let r = read_u64(Path::new(&format!(
                 "/sys/devices/system/cpu/cpu{c}/cpufreq/scaling_cur_freq"
             )));
-            self.record_cpu(r);
+            self.record_cpu(c, r);
         }
     }
 
@@ -276,46 +346,73 @@ impl ClockLog {
         self.record_gt(r);
     }
 
-    fn record_cpu(&mut self, khz: Option<u64>) {
+    fn record_cpu(&mut self, cpu: usize, khz: Option<u64>) {
         match khz {
-            Some(k) => self.cpu.push(k),
+            Some(k) => self.cpu.push((cpu, k)),
             None => self.cpu_unreadable += 1,
         }
     }
 
     fn record_gt(&mut self, mhz: Option<u64>) {
         match mhz {
-            Some(m) if m > 0 => self.gt.push(m),
+            Some(m) if m > 0 && m >= self.gt_floor => self.gt.push(m),
             _ => self.gt_idle += 1,
         }
+    }
+
+    fn cpu_khz(&self) -> Vec<u64> {
+        self.cpu.iter().map(|&(_, k)| k).collect()
     }
 
     fn range(xs: &[u64]) -> Option<(u64, u64)> {
         Some((*xs.iter().min()?, *xs.iter().max()?))
     }
 
-    /// One line per unit: the range of clocks observed, and how many
-    /// readings were unusable.
+    /// The `p` percentile of `xs` by nearest rank; `xs` must be non-empty.
+    fn pct(xs: &[u64], p: f64) -> u64 {
+        let mut s = xs.to_vec();
+        s.sort_unstable();
+        let rank = ((p * s.len() as f64).ceil() as usize).clamp(1, s.len());
+        s[rank - 1]
+    }
+
+    /// One line per unit: the spread of clocks observed (5th, 50th and 95th
+    /// percentile, and the full range), and how many readings were unusable.
     pub fn summary(&self) -> Vec<String> {
-        let cpu = match Self::range(&self.cpu) {
+        let khz = self.cpu_khz();
+        let cpu = match Self::range(&khz) {
             Some((lo, hi)) => format!(
-                "CPU  observed {:.2}-{:.2} GHz over {} readings",
+                "CPU  observed p5/p50/p95 {:.2}/{:.2}/{:.2} GHz, range {:.2}-{:.2}, over {} readings",
+                Self::pct(&khz, 0.05) as f64 / 1e6,
+                Self::pct(&khz, 0.50) as f64 / 1e6,
+                Self::pct(&khz, 0.95) as f64 / 1e6,
                 lo as f64 / 1e6,
                 hi as f64 / 1e6,
-                self.cpu.len()
+                khz.len()
             ),
             None => "CPU  never observed".to_owned(),
         };
         let gt = match Self::range(&self.gt) {
             Some((lo, hi)) => format!(
-                "iGPU observed {lo}-{hi} MHz over {} readings",
+                "iGPU observed p5/p50/p95 {}/{}/{} MHz, range {lo}-{hi}, over {} readings",
+                Self::pct(&self.gt, 0.05),
+                Self::pct(&self.gt, 0.50),
+                Self::pct(&self.gt, 0.95),
                 self.gt.len()
             ),
             None => "iGPU never observed".to_owned(),
         };
+        let floor = if self.gt_floor > 0 {
+            format!(
+                "zero, under the {} MHz lowest active clock, or unreadable",
+                self.gt_floor
+            )
+        } else {
+            "zero or unreadable".to_owned()
+        };
         vec![
             format!("{cpu} ({} unreadable)", self.cpu_unreadable),
-            format!("{gt} ({} idle or unreadable)", self.gt_idle),
+            format!("{gt} ({} idle: {floor})", self.gt_idle),
         ]
     }
 
@@ -325,19 +422,35 @@ impl ClockLog {
     pub fn violations(&self, lock: &Lock) -> Vec<String> {
         let mut v = Vec::new();
         let off = |x: u64, want: u64| (x as f64 / want as f64 - 1.0).abs() > TOL_LOCK;
-        match Self::range(&self.cpu) {
+        match Self::range(&self.cpu_khz()) {
             None => v.push("CPU clock never observed".to_owned()),
             Some((lo, hi)) => {
-                let n = self.cpu.iter().filter(|&&k| off(k, lock.cpu_khz)).count();
+                // Per CPU, so a single misbehaving core is told apart from
+                // the whole package being stepped down.
+                let mut per_cpu: Vec<(usize, usize)> = Vec::new();
+                for &(c, k) in &self.cpu {
+                    if off(k, lock.cpu_khz) {
+                        match per_cpu.iter_mut().find(|(pc, _)| *pc == c) {
+                            Some(slot) => slot.1 += 1,
+                            None => per_cpu.push((c, 1)),
+                        }
+                    }
+                }
+                let n: usize = per_cpu.iter().map(|&(_, n)| n).sum();
                 if n > 0 {
+                    let on: Vec<String> = per_cpu
+                        .iter()
+                        .map(|(c, n)| format!("cpu{c} x{n}"))
+                        .collect();
                     v.push(format!(
                         "CPU ran at {:.2}-{:.2} GHz against {:.2} locked ({n} of {} readings \
-                         off by more than {:.0}%)",
+                         off by more than {:.0}%: {})",
                         lo as f64 / 1e6,
                         hi as f64 / 1e6,
                         lock.cpu_khz as f64 / 1e6,
                         self.cpu.len(),
-                        TOL_LOCK * 100.0
+                        TOL_LOCK * 100.0,
+                        on.join(", ")
                     ));
                 }
             }
@@ -437,8 +550,8 @@ mod tests {
 
     fn log(cpu: &[u64], gt: &[u64]) -> ClockLog {
         let mut l = ClockLog::default();
-        for &k in cpu {
-            l.record_cpu(Some(k));
+        for (i, &k) in cpu.iter().enumerate() {
+            l.record_cpu(i % 2, Some(k));
         }
         for &m in gt {
             l.record_gt(Some(m));
@@ -534,6 +647,55 @@ mod tests {
         let gt = find_render_gt(&drm);
         std::fs::remove_dir_all(&drm).unwrap();
         assert_eq!(gt, None);
+    }
+
+    /// Under the GT's lowest active clock is the GT idle or between states:
+    /// an active render GT cannot run there, so it is not a slowed GT.
+    #[test]
+    fn an_igpu_reading_under_its_floor_is_idle_not_slow() {
+        let mut l = ClockLog::with_gt_floor(Some(800));
+        l.record_cpu(0, Some(3_000_000));
+        l.record_gt(Some(1400));
+        l.record_gt(Some(100));
+        assert!(l.violations(&LOCK).is_empty(), "{:?}", l.violations(&LOCK));
+        assert_eq!(l.gt_idle, 1);
+        // A step-down to a clock the GT can run at is still caught.
+        l.record_gt(Some(900));
+        assert_eq!(l.violations(&LOCK).len(), 1);
+    }
+
+    /// The off readings are attributed per CPU.
+    #[test]
+    fn cpu_violations_name_the_cpus() {
+        let mut l = ClockLog::default();
+        l.record_cpu(0, Some(3_000_000));
+        l.record_cpu(3, Some(4_500_000));
+        l.record_cpu(3, Some(4_400_000));
+        l.record_gt(Some(1400));
+        let v = l.violations(&LOCK);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("cpu3 x2"), "{}", v[0]);
+        assert!(!v[0].contains("cpu0"), "{}", v[0]);
+    }
+
+    #[test]
+    fn cpu_lists_parse_as_the_kernel_writes_them() {
+        assert_eq!(parse_cpu_list("0,5\n"), Some(vec![0, 5]));
+        assert_eq!(parse_cpu_list("1-2"), Some(vec![1, 2]));
+        assert_eq!(parse_cpu_list("0-1,8"), Some(vec![0, 1, 8]));
+        assert_eq!(parse_cpu_list("7"), Some(vec![7]));
+        assert_eq!(parse_cpu_list(""), None);
+        assert_eq!(parse_cpu_list("3-1"), None);
+        assert_eq!(parse_cpu_list("a"), None);
+    }
+
+    #[test]
+    fn percentiles_are_nearest_rank() {
+        let xs: Vec<u64> = (1..=20).collect();
+        assert_eq!(ClockLog::pct(&xs, 0.05), 1);
+        assert_eq!(ClockLog::pct(&xs, 0.50), 10);
+        assert_eq!(ClockLog::pct(&xs, 0.95), 19);
+        assert_eq!(ClockLog::pct(&[7], 0.95), 7);
     }
 
     /// A lock nobody saw hold is not evidence that it held.

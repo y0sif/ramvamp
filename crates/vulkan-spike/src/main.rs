@@ -228,6 +228,10 @@ fn run() -> Result<bool> {
     let cpus: Vec<usize> = pool.topology().compute_cpus().to_vec();
     let lock = clock::requested().map_err(anyhow::Error::msg)?;
     let throttles = report_cpu_clock_caps(&cpus, lock.is_some());
+    // At the start as well as at exit: work started elsewhere on the box is
+    // the commonest reason a run here is unsteady, and the exit figure alone
+    // cannot say whether it was there from the beginning.
+    println!("  1-minute load average at start: {}", loadavg());
     let gt = clock::render_gt();
     // Every way the clock lock failed: not in place before sampling, or did
     // not hold during it. Only ever non-empty on a locked run.
@@ -235,8 +239,15 @@ fn run() -> Result<bool> {
     if let Some(lock) = &lock {
         println!();
         println!("== clock lock ==");
+        // The pinned cpus and their hyperthread siblings: a sibling shares
+        // its core's clock, so an unlocked one can move a locked shard.
+        let lock_cpus = clock::with_siblings(&cpus).unwrap_or_else(|e| {
+            lock_problems.push(e);
+            cpus.clone()
+        });
         println!(
-            "  requested: CPU {:.2} GHz on cpus {cpus:?}, iGPU {} MHz ({})",
+            "  requested: CPU {:.2} GHz on cpus {lock_cpus:?} (pinned plus hyperthread siblings), \
+             iGPU {} MHz ({})",
             lock.cpu_khz as f64 / 1e6,
             lock.gt_mhz,
             gt.as_ref().map_or_else(
@@ -244,17 +255,20 @@ fn run() -> Result<bool> {
                 clock::Gt::describe
             )
         );
-        lock_problems = clock::check_in_place(lock, &clock::read_settings(&cpus, gt.as_ref()));
+        lock_problems.extend(clock::check_in_place(
+            lock,
+            &clock::read_settings(&lock_cpus, gt.as_ref()),
+        ));
         if lock_problems.is_empty() {
             println!(
-                "  in place: PASS (min = max on every pinned cpu; min = max = boost on the iGPU)"
+                "  in place: PASS (min = max on every locked cpu; min = max = boost on the iGPU)"
             );
         }
         for problem in &lock_problems {
             println!("  !! {problem}");
         }
     }
-    let mut clocks = clock::ClockLog::default();
+    let mut clocks = clock::ClockLog::with_gt_floor(gt.as_ref().and_then(clock::Gt::rpn));
     println!();
 
     let mut cpu_out = vec![0f32; out_dim * N_ACTS];
