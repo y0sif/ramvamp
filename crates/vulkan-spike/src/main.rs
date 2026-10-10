@@ -48,6 +48,7 @@
 //! figure that is still printed is stamped [`INVALID_TAG`]. A screenshot of
 //! any one line of an invalid run must not read as a result.
 
+mod clock;
 mod cpu;
 mod data;
 mod gpu;
@@ -224,7 +225,37 @@ fn run() -> Result<bool> {
         pool.topology().compute_cpus(),
         pool.topology().performance_cpus()
     );
-    let throttles = report_cpu_clock_caps(pool.topology().compute_cpus());
+    let cpus: Vec<usize> = pool.topology().compute_cpus().to_vec();
+    let lock = clock::requested().map_err(anyhow::Error::msg)?;
+    let throttles = report_cpu_clock_caps(&cpus, lock.is_some());
+    let gt_dir = clock::gt_dir();
+    // Every way the clock lock failed: not in place before sampling, or did
+    // not hold during it. Only ever non-empty on a locked run.
+    let mut lock_problems = Vec::new();
+    if let Some(lock) = &lock {
+        println!();
+        println!("== clock lock ==");
+        println!(
+            "  requested: CPU {:.2} GHz on cpus {cpus:?}, iGPU {} MHz ({})",
+            lock.cpu_khz as f64 / 1e6,
+            lock.gt_mhz,
+            gt_dir.as_deref().map_or_else(
+                || "no single i915 GT found".to_owned(),
+                |d| d.display().to_string()
+            )
+        );
+        lock_problems =
+            clock::check_in_place(lock, &clock::read_settings(&cpus, gt_dir.as_deref()));
+        if lock_problems.is_empty() {
+            println!(
+                "  in place: PASS (min = max on every pinned cpu; min = max = boost on the iGPU)"
+            );
+        }
+        for problem in &lock_problems {
+            println!("  !! {problem}");
+        }
+    }
+    let mut clocks = clock::ClockLog::default();
     println!();
 
     let mut cpu_out = vec![0f32; out_dim * N_ACTS];
@@ -343,28 +374,42 @@ fn run() -> Result<bool> {
         for _ in 0..REWARM {
             cpu_iter()?;
         }
-        for _ in 0..BLOCK {
+        for i in 0..BLOCK {
             cpu_round.push(cpu_iter()?);
+            // Between iterations, never inside one: the read is outside every
+            // timed region.
+            if i == BLOCK / 2 {
+                clocks.sample_cpus(&cpus);
+            }
         }
+        clocks.sample_cpus(&cpus);
 
         let mut res_round = Vec::with_capacity(BLOCK);
         for _ in 0..REWARM {
             gemv.run()?;
         }
-        for _ in 0..BLOCK {
+        for i in 0..BLOCK {
             let (host, device) = gemv.run()?;
             res_round.push(host);
             gpu_device.push(device);
+            if i == BLOCK / 2 {
+                clocks.sample_gt(gt_dir.as_deref());
+            }
         }
+        clocks.sample_gt(gt_dir.as_deref());
 
         let mut str_round = Vec::with_capacity(BLOCK);
         for _ in 0..REWARM {
             gemv.run_streamed(&slab.bytes)?;
         }
-        for _ in 0..BLOCK {
+        for i in 0..BLOCK {
             let (host, _) = gemv.run_streamed(&slab.bytes)?;
             str_round.push(host);
+            if i == BLOCK / 2 {
+                clocks.sample_gt(gt_dir.as_deref());
+            }
         }
+        clocks.sample_gt(gt_dir.as_deref());
 
         cpu_steady.observe(&cpu_round);
         res_steady.observe(&res_round);
@@ -390,6 +435,10 @@ fn run() -> Result<bool> {
     let gpu_s = Stats::of(&mut gpu_streamed);
     let gpu_d = Stats::of(&mut gpu_device);
 
+    if let Some(lock) = &lock {
+        lock_problems.extend(clocks.violations(lock));
+    }
+
     let arms = [&cpu_steady, &res_steady, &str_steady];
     let unsteady: Vec<String> = arms
         .iter()
@@ -410,6 +459,7 @@ fn run() -> Result<bool> {
         slab.synthetic,
         &slab.provenance,
         &throttles,
+        &lock_problems,
         &unsteady,
     );
     // Two spaces when the run is valid, so the layout is unchanged; the
@@ -419,6 +469,15 @@ fn run() -> Result<bool> {
     } else {
         INVALID_TAG
     };
+
+    println!("== clocks observed during sampling ==");
+    for line in clocks.summary() {
+        println!("  {line}");
+    }
+    if lock.is_none() {
+        println!("  (unlocked run: informational, not gated)");
+    }
+    println!();
 
     println!(
         "== sampling ({} rounds x {BLOCK} timed runs per arm, {WARMUP} + {REWARM}/round warm-up, no early stop) ==",
@@ -525,11 +584,12 @@ fn run() -> Result<bool> {
         // expert slab are different claims, and the quotable line has to say
         // which one it is.
         let mut verdict = format!(
-            "VERDICT: on {}, against the {}-shard pinned CPU pool running the {kernel:?} \
-             kernel at {:.3} ms per pass, the iGPU is {resident:.2}x {} with the weights \
+            "VERDICT: on {}, at {}, against the {}-shard pinned CPU pool running the \
+             {kernel:?} kernel at {:.3} ms per pass, the iGPU is {resident:.2}x {} with the weights \
              resident ({:.3} ms) and {streamed:.2}x {} with the weight slab streamed \
              ({:.3} ms), comparing each arm's median of {ROUNDS} round medians.",
             slab.provenance,
+            lock.map_or_else(|| "unlocked clocks".to_owned(), |l| l.describe(cpus.len())),
             pool.shards(),
             cpu_t * 1e3,
             word(resident),
@@ -561,7 +621,7 @@ fn run() -> Result<bool> {
         "GATES: numerics {}, weights {}, machine {}, sampling {}",
         pass_fail(numerics_ok),
         pass_fail(!slab.synthetic),
-        pass_fail(throttles.is_empty()),
+        pass_fail(throttles.is_empty() && lock_problems.is_empty()),
         pass_fail(unsteady.is_empty())
     );
     // Every gate now has a reason on `invalid`, so this is the whole exit
@@ -594,6 +654,7 @@ fn invalidations(
     synthetic: bool,
     provenance: &str,
     throttles: &[String],
+    lock: &[String],
     unsteady: &[String],
 ) -> Vec<String> {
     let mut invalid = Vec::new();
@@ -611,6 +672,12 @@ fn invalidations(
     }
     if !throttles.is_empty() {
         invalid.push(format!("CPU throttled ({})", throttles.join(", ")));
+    }
+    if !lock.is_empty() {
+        invalid.push(format!(
+            "clock lock not in place or did not hold ({})",
+            lock.join("; ")
+        ));
     }
     if !unsteady.is_empty() {
         invalid.push(format!("not a steady state: {}", unsteady.join("; ")));
@@ -1062,7 +1129,12 @@ fn cpu_khz(cpu: usize, attr: &str) -> Option<u64> {
 /// have reported `performance` for a pool half of whose shards were pinned
 /// to a capped policy. `intel_pstate`'s `no_turbo` and `max_perf_pct` are
 /// package-wide and are read once.
-fn report_cpu_clock_caps(cpus: &[usize]) -> Vec<String> {
+///
+/// On a `locked` run the `scaling_max_freq` ceiling is deliberate, so that
+/// one comparison is skipped and [`clock`] gates it instead, more strictly:
+/// min must equal max at the locked value, and the observed clock must stay
+/// on it for the whole run. The other three knobs are still gated.
+fn report_cpu_clock_caps(cpus: &[usize], locked: bool) -> Vec<String> {
     let governors = per_cpu_attr(cpus, "scaling_governor");
     let max_freqs = per_cpu_attr(cpus, "scaling_max_freq");
     let hw_max_freqs = per_cpu_attr(cpus, "cpuinfo_max_freq");
@@ -1118,7 +1190,10 @@ fn report_cpu_clock_caps(cpus: &[usize]) -> Vec<String> {
     // because the ceiling is a per-policy value.
     let mut capped = Vec::new();
     let mut unreadable = Vec::new();
-    for &cpu in cpus {
+    if locked {
+        println!("    scaling_max_freq ceiling: deliberate, checked by the clock lock instead");
+    }
+    for &cpu in cpus.iter().filter(|_| !locked) {
         match (
             cpu_khz(cpu, "scaling_max_freq"),
             cpu_khz(cpu, "cpuinfo_max_freq"),
@@ -1211,7 +1286,7 @@ mod tests {
     /// A run with every gate satisfied. The one input shape that lets a ratio
     /// be printed, so every test below is a departure from it.
     fn clean() -> Vec<String> {
-        invalidations(true, false, "REAL slab", &[], &[])
+        invalidations(true, false, "REAL slab", &[], &[], &[])
     }
 
     /// The only way a ratio ever reaches stdout.
@@ -1226,7 +1301,7 @@ mod tests {
     /// thing, so their ratio is not a comparison at all.
     #[test]
     fn a_numerics_failure_invalidates_the_verdict() {
-        let v = invalidations(false, false, "REAL slab", &[], &[]);
+        let v = invalidations(false, false, "REAL slab", &[], &[], &[]);
         assert_eq!(v.len(), 1, "got {v:?}");
         assert!(
             v[0].contains("did not compute the same thing"),
@@ -1241,8 +1316,9 @@ mod tests {
     fn numerics_is_reported_first() {
         let throttles = ["no_turbo=1".to_owned()];
         let unsteady = ["CPU (windows apart)".to_owned()];
-        let v = invalidations(false, true, "SYNTHETIC bytes", &throttles, &unsteady);
-        assert_eq!(v.len(), 4, "every failing gate must contribute: {v:?}");
+        let lock = ["CPU ran at 2.40-3.00 GHz".to_owned()];
+        let v = invalidations(false, true, "SYNTHETIC bytes", &throttles, &lock, &unsteady);
+        assert_eq!(v.len(), 5, "every failing gate must contribute: {v:?}");
         assert!(v[0].contains("did not compute the same thing"), "{v:?}");
     }
 
@@ -1250,7 +1326,7 @@ mod tests {
     /// expert slab, and the provenance travels with the reason.
     #[test]
     fn synthetic_weights_invalidate_the_verdict() {
-        let v = invalidations(true, true, "SYNTHETIC q4_k bytes (768x2048)", &[], &[]);
+        let v = invalidations(true, true, "SYNTHETIC q4_k bytes (768x2048)", &[], &[], &[]);
         assert_eq!(v.len(), 1, "got {v:?}");
         assert!(v[0].contains("SYNTHETIC"), "{}", v[0]);
         assert!(
@@ -1269,7 +1345,7 @@ mod tests {
             "no_turbo=1".to_owned(),
             "scaling_max_freq below cpuinfo_max_freq on cpu0 2.30 of 4.80 GHz".to_owned(),
         ];
-        let v = invalidations(true, false, "REAL slab", &throttles, &[]);
+        let v = invalidations(true, false, "REAL slab", &throttles, &[], &[]);
         assert_eq!(v.len(), 1, "got {v:?}");
         assert!(v[0].contains("no_turbo=1"), "{}", v[0]);
         assert!(v[0].contains("scaling_max_freq"), "{}", v[0]);
@@ -1280,7 +1356,7 @@ mod tests {
     #[test]
     fn an_unsteady_arm_invalidates_the_verdict() {
         let a = arm("GPU  (weights streamed)", &PROD_STREAMED);
-        let v = invalidations(true, false, "REAL slab", &[], &[a.why_unsteady()]);
+        let v = invalidations(true, false, "REAL slab", &[], &[], &[a.why_unsteady()]);
         assert_eq!(v.len(), 1, "got {v:?}");
         assert!(v[0].contains("not a steady state"), "{}", v[0]);
         assert!(
@@ -1290,6 +1366,21 @@ mod tests {
         );
         assert!(
             v[0].contains("windows"),
+            "the evidence must travel: {}",
+            v[0]
+        );
+    }
+
+    /// A lock that was not in place, or did not hold, invalidates the
+    /// verdict: the ratio would be about clocks nobody ran at.
+    #[test]
+    fn a_failed_clock_lock_invalidates_the_verdict() {
+        let lock = ["iGPU ran at 900-1400 MHz against 1400 locked".to_owned()];
+        let v = invalidations(true, false, "REAL slab", &[], &lock, &[]);
+        assert_eq!(v.len(), 1, "got {v:?}");
+        assert!(v[0].contains("clock lock"), "{}", v[0]);
+        assert!(
+            v[0].contains("900-1400 MHz"),
             "the evidence must travel: {}",
             v[0]
         );
