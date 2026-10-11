@@ -37,7 +37,7 @@ TOTAL=5
 REPO="y0sif/ramvamp"
 ARTIFACT="ramvamp-linux-x86_64.tar.gz"
 
-echo -e "\n${BOLD}ramvamp installer${RESET}: 26-30B MoE models in about 3 GB of RAM\n"
+echo -e "\n${BOLD}ramvamp installer${RESET}: 26-30B MoE models in about 4 GB of RAM\n"
 
 # ── Refuse anything that is not Linux x86_64 ────────────────────────────
 #
@@ -78,7 +78,7 @@ done
 info "Platform:" "Linux x86_64"
 
 # io_uring landed in kernel 5.1. Losing it costs speed, not correctness: the
-# streamer falls back to pread, and the ~3 GB memory contract rides on O_DIRECT
+# streamer falls back to pread, and the ~4 GB memory contract rides on O_DIRECT
 # rather than on io_uring, so the budget survives the fallback.
 KERNEL="$(uname -r)"
 kmajor="${KERNEL%%.*}"
