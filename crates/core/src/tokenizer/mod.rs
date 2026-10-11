@@ -451,12 +451,26 @@ fn read_bytes_bounded(path: &Path) -> Result<Vec<u8>, TokenizerError> {
     if metadata.len() > MAX_TOKENIZER_FILE_BYTES {
         return Err(too_large());
     }
+    let file_for_advice = file.try_clone().map_err(|e| TokenizerError::io(path, e))?;
     let mut data = Vec::new();
     file.take(MAX_TOKENIZER_FILE_BYTES + 1)
         .read_to_end(&mut data)
         .map_err(|e| TokenizerError::io(path, e))?;
     if data.len() as u64 > MAX_TOKENIZER_FILE_BYTES {
         return Err(too_large());
+    }
+    // Parsed once and never read again, so the ~11 MiB `tokenizer.json`
+    // leaves the page cache now rather than sitting there for the kernel to
+    // reclaim later; reclaimed from a 3 GB benchmark cgroup, it is what failed
+    // most otherwise clean runs (EXP-031). Best effort: failure costs memory.
+    // SAFETY: a plain syscall on a valid descriptor, with no pointers.
+    unsafe {
+        libc::posix_fadvise(
+            std::os::fd::AsRawFd::as_raw_fd(&file_for_advice),
+            0,
+            0,
+            libc::POSIX_FADV_DONTNEED,
+        );
     }
     Ok(data)
 }

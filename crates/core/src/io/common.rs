@@ -16,7 +16,7 @@ use std::path::Path;
 
 use memmap2::{Mmap, MmapOptions};
 
-use crate::format::{COMMON_FILE, CommonTensor, Manifest};
+use crate::format::{COMMON_FILE, CommonTensor, FormatError, Manifest, sha256_bytes};
 
 use super::direct::{DIO_ALIGN, O_DIRECT};
 use super::{CommonMemory, IoError, LoadOptions, to_usize, verify_named_file};
@@ -54,7 +54,17 @@ impl MappedCommon {
     /// the file fails its size/hash check; [`IoError::Io`] when opening or
     /// mapping fails.
     pub fn open(dir: &Path, manifest: &Manifest, options: LoadOptions) -> Result<Self, IoError> {
-        verify_named_file(dir, manifest, COMMON_FILE, options)?;
+        // A resident load reads the whole file into its own memory anyway, so
+        // it hashes that copy rather than reading the file a second time
+        // through the page cache. Mapped, the hash read also warms the cache
+        // the map is about to use, so it stays where it was.
+        let resident = options.common_memory == CommonMemory::Resident;
+        let size_only = LoadOptions {
+            skip_hashes: true,
+            ..options
+        };
+        let verify = if resident { size_only } else { options };
+        verify_named_file(dir, manifest, COMMON_FILE, verify)?;
         let path = dir.join(COMMON_FILE);
         let file = File::open(&path).map_err(|e| IoError::io(&path, e))?;
         let len = file.metadata().map_err(|e| IoError::io(&path, e))?.len();
@@ -67,6 +77,18 @@ impl MappedCommon {
             CommonMemory::Resident => read_resident(&path, &file, len),
         }
         .map_err(|e| IoError::io(&path, e))?;
+        if resident && !options.skip_hashes {
+            let entry = &manifest.files[COMMON_FILE];
+            let actual = sha256_bytes(&map[..len]);
+            if !actual.eq_ignore_ascii_case(&entry.sha256) {
+                return Err(FormatError::HashMismatch {
+                    name: COMMON_FILE.to_owned(),
+                    expected: entry.sha256.clone(),
+                    actual,
+                }
+                .into());
+            }
+        }
         tracing::debug!(
             path = %path.display(),
             bytes = len,
@@ -245,6 +267,35 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// A resident load hashes its own copy, and a corrupted file still fails
+    /// the check, as it does mapped.
+    #[test]
+    fn a_resident_load_still_rejects_a_corrupt_file() {
+        let fx = build_install("resident-corrupt");
+        let path = fx.root.join(COMMON_FILE);
+        let mut data = std::fs::read(&path).unwrap();
+        data[10] ^= 0xff;
+        std::fs::write(&path, data).unwrap();
+        let resident = LoadOptions {
+            common_memory: CommonMemory::Resident,
+            ..LoadOptions::default()
+        };
+        let err = MappedCommon::open(&fx.root, &fx.manifest, resident).unwrap_err();
+        assert!(matches!(
+            err,
+            IoError::Format(FormatError::HashMismatch { ref name, .. }) if name == COMMON_FILE
+        ));
+        MappedCommon::open(
+            &fx.root,
+            &fx.manifest,
+            LoadOptions {
+                skip_hashes: true,
+                ..resident
+            },
+        )
+        .unwrap();
     }
 
     /// Reading through `O_DIRECT` on a real file system, where the temp dir

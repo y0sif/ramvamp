@@ -34,6 +34,14 @@ pub fn sha256_file(path: &Path) -> Result<String, FormatError> {
     Ok(to_hex(&hasher.finalize()))
 }
 
+/// The SHA-256 of bytes already in memory, in [`sha256_file`]'s format.
+///
+/// For a file the runtime has read into its own memory anyway: hashing that
+/// copy costs no second read, and no page cache.
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    to_hex(&Sha256::digest(bytes))
+}
+
 /// Check every `files` entry of the manifest against the install directory:
 /// exact size match first (cheap), then a streaming SHA-256 compare
 /// (case-insensitive on the manifest side).
