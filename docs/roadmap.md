@@ -95,6 +95,15 @@ inside `memory.max=3G` with swap off, at the shipped 11 slots per layer:
 | Fidelity | mean full-vocab KL **1.04e-2** against llama.cpp, top-1 agreement 8/8 (EXP-004) |
 | Model on disk | 17.35 GiB, about a 6x memory saving |
 
+**The current runtime, measured 2026-10-11** (EXP-032; `main` at `cdad0e7`,
+after the pool, prefill and memory work of EXP-027 to EXP-031), same
+conditions, with the machine in ordinary use and every run hygiene PASS: at ctx
+512, `--max-new 64`, **prefill 24.10 tok/s** (median of six, 23.93-24.21) and
+**decode 2.21 tok/s** (2.18-2.24), `memory.peak` 2,638-2,657 MiB. One context
+rung so far, and a separate session, so these sit beside the v0 figures above,
+not on their curves, and no ratio is drawn between them: the quotable gains are
+the paired ones inside EXP-027 to EXP-029.
+
 The one-line summary is **"about 2 tok/s"**. Rule 3 forbids drawing one curve
 through those two decode ladders: EXP-025 re-ran EXP-023's byte-identical
 binary on the same prompts and read it 3.1% slower at ctx 512 and 8.9% slower

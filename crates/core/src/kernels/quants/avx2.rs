@@ -165,10 +165,117 @@ pub fn vec_dot_q4_k_q8_k_rows(
     out: &mut [f32],
     force_scalar: bool,
 ) -> Result<(), KernelError> {
-    let block_bytes = QuantFormat::Q4_K.block_bytes();
+    dot_rows(Tiled::Q4K, weight_row, acts, n_acts, out, force_scalar)
+}
+
+/// Dot products of one packed Q6_K weight row with `n_acts` Q8_K activation
+/// rows: [`vec_dot_q4_k_q8_k_rows`] for Q6_K, the format of the expert `down`
+/// projection on 24 of the v0 model's 48 layers.
+///
+/// **Bit-identical** to calling [`vec_dot_q6_k_q8_k`] once per activation
+/// row with the same `force_scalar`, and tested to be. What the four-row
+/// tile shares is the f16 conversion, the 6-bit reconstruction from the low
+/// nibbles and the two high bits, and the sub-block scale pairs.
+///
+/// # Errors
+///
+/// As [`vec_dot_q4_k_q8_k_rows`].
+pub fn vec_dot_q6_k_q8_k_rows(
+    weight_row: &[u8],
+    acts: &[BlockQ8K],
+    n_acts: usize,
+    out: &mut [f32],
+    force_scalar: bool,
+) -> Result<(), KernelError> {
+    dot_rows(Tiled::Q6K, weight_row, acts, n_acts, out, force_scalar)
+}
+
+/// The k-quant formats with a four-row tile.
+#[derive(Clone, Copy)]
+enum Tiled {
+    Q4K,
+    Q6K,
+}
+
+impl Tiled {
+    fn format(self) -> QuantFormat {
+        match self {
+            Self::Q4K => QuantFormat::Q4_K,
+            Self::Q6K => QuantFormat::Q6_K,
+        }
+    }
+
+    /// The dispatched single-row dot.
+    fn single(
+        self,
+        weight_row: &[u8],
+        acts: &[BlockQ8K],
+        force_scalar: bool,
+    ) -> Result<f32, KernelError> {
+        match self {
+            Self::Q4K => vec_dot_q4_k_q8_k(weight_row, acts, force_scalar),
+            Self::Q6K => vec_dot_q6_k_q8_k(weight_row, acts, force_scalar),
+        }
+    }
+
+    /// The scalar reference dot.
+    fn scalar(self, weight_row: &[u8], acts: &[BlockQ8K]) -> Result<f32, KernelError> {
+        match self {
+            Self::Q4K => dot::vec_dot_q4_k_q8_k(weight_row, acts),
+            Self::Q6K => dot::vec_dot_q6_k_q8_k(weight_row, acts),
+        }
+    }
+
+    /// The AVX2 single-row dot.
+    ///
+    /// # Safety
+    ///
+    /// AVX2+FMA must be present and `weight_row` must be `acts.len()` blocks.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn one(self, weight_row: &[u8], acts: &[BlockQ8K]) -> f32 {
+        // SAFETY: the caller's contract is the kernels' contract.
+        unsafe {
+            match self {
+                Self::Q4K => x86::vec_dot_q4_k_q8_k(weight_row, acts),
+                Self::Q6K => x86::vec_dot_q6_k_q8_k(weight_row, acts),
+            }
+        }
+    }
+
+    /// The AVX2 four-row tile.
+    ///
+    /// # Safety
+    ///
+    /// AVX2+FMA must be present and `weight_row` must be as many blocks as
+    /// each of the four activation rows.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn four(self, weight_row: &[u8], acts: [&[BlockQ8K]; 4]) -> [f32; 4] {
+        // SAFETY: the caller's contract is the kernels' contract.
+        unsafe {
+            match self {
+                Self::Q4K => x86::vec_dot_q4_k_q8_k_x4(weight_row, acts),
+                Self::Q6K => x86::vec_dot_q6_k_q8_k_x4(weight_row, acts),
+            }
+        }
+    }
+}
+
+/// The shared body of the `_rows` entry points: validate, then four rows
+/// per pass on AVX2 with the single-row kernel for the remainder, or the
+/// scalar reference row by row.
+fn dot_rows(
+    tiled: Tiled,
+    weight_row: &[u8],
+    acts: &[BlockQ8K],
+    n_acts: usize,
+    out: &mut [f32],
+    force_scalar: bool,
+) -> Result<(), KernelError> {
+    let format = tiled.format();
+    let block_bytes = format.block_bytes();
     if !weight_row.len().is_multiple_of(block_bytes) {
         return Err(KernelError::RowBytesNotBlockMultiple {
-            format: QuantFormat::Q4_K,
+            format,
             len: weight_row.len(),
             block_bytes,
         });
@@ -182,15 +289,15 @@ pub fn vec_dot_q4_k_q8_k_rows(
     }
     if out.len() != n_acts {
         return Err(KernelError::LengthMismatch {
-            what: "vec_dot_q4_k_q8_k_rows: out vs n_acts",
+            what: "vec_dot_k_q8_k_rows: out vs n_acts",
             left: out.len(),
             right: n_acts,
         });
     }
     if n_blocks == 0 {
-        // Every dot over an empty row is the scalar kernel's empty sum.
-        for (a, o) in out.iter_mut().enumerate() {
-            *o = vec_dot_q4_k_q8_k(weight_row, &acts[a * n_blocks..a * n_blocks], force_scalar)?;
+        // Every dot over an empty row is the single-row kernel's empty sum.
+        for o in out.iter_mut() {
+            *o = tiled.single(weight_row, &[], force_scalar)?;
         }
         return Ok(());
     }
@@ -201,22 +308,21 @@ pub fn vec_dot_q4_k_q8_k_rows(
         while a + 4 <= n_acts {
             // SAFETY: AVX2+FMA presence was checked just above, and every
             // activation row is `n_blocks` blocks against a weight row of
-            // `n_blocks * 144` bytes, which is the single-row kernel's
-            // length contract, four times over.
-            let four = unsafe {
-                x86::vec_dot_q4_k_q8_k_x4(weight_row, [row(a), row(a + 1), row(a + 2), row(a + 3)])
-            };
+            // `n_blocks` blocks, which is the single-row kernel's length
+            // contract, four times over.
+            let four =
+                unsafe { tiled.four(weight_row, [row(a), row(a + 1), row(a + 2), row(a + 3)]) };
             out[a..a + 4].copy_from_slice(&four);
             a += 4;
         }
         for (k, o) in out[a..].iter_mut().enumerate() {
             // SAFETY: as above, for one row.
-            *o = unsafe { x86::vec_dot_q4_k_q8_k(weight_row, row(a + k)) };
+            *o = unsafe { tiled.one(weight_row, row(a + k)) };
         }
         return Ok(());
     }
     for (a, o) in out.iter_mut().enumerate() {
-        *o = dot::vec_dot_q4_k_q8_k(weight_row, row(a))?;
+        *o = tiled.scalar(weight_row, row(a))?;
     }
     Ok(())
 }
@@ -730,6 +836,98 @@ mod x86 {
         }
     }
 
+    /// [`vec_dot_q6_k_q8_k`] against four activation rows at once.
+    ///
+    /// Per dot, the float operations are the single-row kernel's, in its
+    /// order: per block one `fmadd` into the dot's own accumulator, then the
+    /// same horizontal sum at the end. Shared across the four is everything
+    /// that depends only on the weight row: the f16 conversion, the 6-bit
+    /// reconstruction from the low nibbles and the two high bits, and the
+    /// sub-block scale pairs. Integer sums are exact, so grouping them
+    /// differently could not move a bit either.
+    ///
+    /// Caller must have validated that every row in `acts` is
+    /// `weight_row.len() / 210` blocks, and checked AVX2+FMA.
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn vec_dot_q6_k_q8_k_x4(
+        weight_row: &[u8],
+        acts: [&[BlockQ8K]; 4],
+    ) -> [f32; 4] {
+        // SAFETY (whole body): the caller's length contract makes every load
+        // read inside `block` (210 B) or a `y.qs` (256 B), exactly as in
+        // `vec_dot_q6_k_q8_k`; loads are unaligned by construction.
+        unsafe {
+            let m4 = _mm256_set1_epi8(0xF);
+            let m2 = _mm256_set1_epi8(3);
+            let m32s = _mm256_set1_epi8(32);
+            let mut acc = [_mm256_setzero_ps(); 4];
+            for (b, block) in weight_row.chunks_exact(q6k::BYTES).enumerate() {
+                let ys = [&acts[0][b], &acts[1][b], &acts[2][b], &acts[3][b]];
+                let dw = f16_at(block, q6k::D);
+                let scs = &block[q6k::SCALES..q6k::SCALES + 16];
+                let mut sumi = [_mm256_setzero_si256(); 4];
+                for half in 0..2 {
+                    let base = 128 * half;
+                    let q4bits1 =
+                        _mm256_loadu_si256(block.as_ptr().add(q6k::QL + 64 * half).cast());
+                    let q4bits2 =
+                        _mm256_loadu_si256(block.as_ptr().add(q6k::QL + 64 * half + 32).cast());
+                    let bits_h = _mm256_loadu_si256(block.as_ptr().add(q6k::QH + 32 * half).cast());
+                    let q4h_0 = _mm256_slli_epi16::<4>(_mm256_and_si256(bits_h, m2));
+                    let q4h_1 = _mm256_slli_epi16::<4>(_mm256_and_si256(
+                        _mm256_srli_epi16::<2>(bits_h),
+                        m2,
+                    ));
+                    let q4h_2 = _mm256_slli_epi16::<4>(_mm256_and_si256(
+                        _mm256_srli_epi16::<4>(bits_h),
+                        m2,
+                    ));
+                    let q4h_3 = _mm256_slli_epi16::<4>(_mm256_and_si256(
+                        _mm256_srli_epi16::<6>(bits_h),
+                        m2,
+                    ));
+                    let q4 = [
+                        _mm256_or_si256(_mm256_and_si256(q4bits1, m4), q4h_0),
+                        _mm256_or_si256(_mm256_and_si256(q4bits2, m4), q4h_1),
+                        _mm256_or_si256(
+                            _mm256_and_si256(_mm256_srli_epi16::<4>(q4bits1), m4),
+                            q4h_2,
+                        ),
+                        _mm256_or_si256(
+                            _mm256_and_si256(_mm256_srli_epi16::<4>(q4bits2), m4),
+                            q4h_3,
+                        ),
+                    ];
+                    let s = 8 * half;
+                    let sc = [
+                        scale_pair(scs[s] as i8, scs[s + 1] as i8),
+                        scale_pair(scs[s + 2] as i8, scs[s + 3] as i8),
+                        scale_pair(scs[s + 4] as i8, scs[s + 5] as i8),
+                        scale_pair(scs[s + 6] as i8, scs[s + 7] as i8),
+                    ];
+                    for (y, sumi) in ys.iter().zip(sumi.iter_mut()) {
+                        let mut p32 = [_mm256_setzero_si256(); 4];
+                        for (k, p) in p32.iter_mut().enumerate() {
+                            let q8 = _mm256_loadu_si256(y.qs.as_ptr().add(base + 32 * k).cast());
+                            let p16 = _mm256_sub_epi16(
+                                _mm256_maddubs_epi16(q4[k], q8),
+                                _mm256_maddubs_epi16(m32s, q8),
+                            );
+                            *p = _mm256_madd_epi16(sc[k], p16);
+                        }
+                        *sumi = _mm256_add_epi32(*sumi, _mm256_add_epi32(p32[0], p32[1]));
+                        *sumi = _mm256_add_epi32(*sumi, _mm256_add_epi32(p32[2], p32[3]));
+                    }
+                }
+                for ((y, sumi), acc) in ys.iter().zip(sumi).zip(acc.iter_mut()) {
+                    let d = dw * y.d;
+                    *acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), *acc);
+                }
+            }
+            [0, 1, 2, 3].map(|a| hsum_ps_8(acc[a]))
+        }
+    }
+
     /// AVX2 port of the scalar `vec_dot_q8_0_q8_0`. Caller must have
     /// validated `weight_row.len() == acts.len() * 34` and checked
     /// AVX2+FMA.
@@ -1127,6 +1325,75 @@ mod tests {
                     vec_dot_q4_k_q8_k_rows(row, acts, n_acts, &mut got, force).unwrap();
                     for (a, &g) in got.iter().enumerate() {
                         let want = vec_dot_q4_k_q8_k(row, &acts[a..=a], force).unwrap();
+                        assert_eq!(g.to_bits(), want.to_bits(), "n_acts {n_acts}, row {a}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `vec_dot_q6_k_q8_k_rows` is the single-row Q6_K kernel, called per
+    /// row: bit for bit, on both paths, every tile remainder, four in-dims.
+    #[test]
+    fn the_four_row_q6_k_tile_is_bit_identical_to_one_row_at_a_time() {
+        let mut rng = Lcg(0x6_7113);
+        for in_dim in [256usize, 768, 2048, 4096] {
+            let xw: Vec<f32> = (0..in_dim).map(|_| rng.next_f32() * 4.0).collect();
+            let wb = quantize_row_q6_k_test(&xw);
+            for n_acts in 0..=13usize {
+                let xa: Vec<f32> = (0..in_dim * n_acts).map(|_| rng.next_f32() * 3.0).collect();
+                let acts = q8_k_acts(&xa);
+                let blocks = in_dim / 256;
+                for force in [false, true] {
+                    let mut got = vec![f32::NAN; n_acts];
+                    vec_dot_q6_k_q8_k_rows(&wb, &acts, n_acts, &mut got, force).unwrap();
+                    for (a, &g) in got.iter().enumerate() {
+                        let want =
+                            vec_dot_q6_k_q8_k(&wb, &acts[a * blocks..(a + 1) * blocks], force)
+                                .unwrap();
+                        assert_eq!(
+                            g.to_bits(),
+                            want.to_bits(),
+                            "in_dim {in_dim}, n_acts {n_acts}, row {a}, force_scalar {force}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Q6_K tile on adversarial blocks: every 6-bit value at its ends,
+    /// extreme signed scales, and a huge `d`, against i8 extremes.
+    #[test]
+    fn the_four_row_q6_k_tile_is_bit_identical_on_adversarial_blocks() {
+        let rows = [
+            build_q6k(0xFF, 0xFF, 127, 1.0),
+            build_q6k(0x00, 0x00, -128, 1.0),
+            build_q6k(0xA5, 0x5A, -1, -2.5),
+            build_q6k(0x0F, 0xF0, 64, 65504.0),
+        ];
+        let extreme = |q: i8, d: f32| BlockQ8K {
+            d,
+            qs: [q; 256],
+            bsums: [i16::from(q) * 16; 16],
+        };
+        let mut acts = vec![
+            extreme(127, 1.0),
+            extreme(-128, 1.0),
+            extreme(-128, 1e-3),
+            extreme(0, 0.0),
+        ];
+        for seed in 0..5u64 {
+            acts.extend(random_q8_k_block(0x6AD_0000 + seed));
+        }
+        for row in &rows {
+            for n_acts in [1usize, 4, 5, 9] {
+                let acts = &acts[..n_acts];
+                for force in [false, true] {
+                    let mut got = vec![f32::NAN; n_acts];
+                    vec_dot_q6_k_q8_k_rows(row, acts, n_acts, &mut got, force).unwrap();
+                    for (a, &g) in got.iter().enumerate() {
+                        let want = vec_dot_q6_k_q8_k(row, &acts[a..=a], force).unwrap();
                         assert_eq!(g.to_bits(), want.to_bits(), "n_acts {n_acts}, row {a}");
                     }
                 }
