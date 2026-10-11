@@ -257,7 +257,14 @@ against `main` as above, and each lands as its own PR.
    enough activation rows to pay for the scratch, and measure it cold. It
    covers the expert `gate` and `up` projections and every Q4_K attention
    projection.
-3. **The expert cache policy for decode.** Capture a routing trace with
+3. **Done (EXP-030), a negative result.** On a simulator that now matches
+   the runtime to 0.01 points, no classic policy beats the shipped
+   ghost-LFU, and the best decaying variant gains about 0.4 points, too
+   little to measure end to end. The gap to Belady is 6.6 points at 11
+   slots, not 11 or more. The shipped policy stays; the simulator's
+   `--pin-step` mode, five new policies and one committed trace in
+   `scripts/traces/` ship. The plan was: **the expert cache policy for
+   decode.** Capture a routing trace with
    `generate --trace-experts`, commit a small one so the work needs no model,
    score the untried policies in `scripts/lfu_sim.py` (LRU-K, ARC, S3-FIFO,
    and a layer-aware variant), and give the best one a single paired cold
@@ -406,9 +413,11 @@ Recorded so they stop being re-derived.
 
 **Throughput**
 
-- **Expert cache policy. The largest measured lever, and it is answerable
-  offline.** See "Good first contributions" below for the numbers and the
-  method. One paired cold sweep confirms whatever the offline work picks.
+- **Expert cache policy. Measured and closed for now (EXP-030).** The best
+  online policy found beats the shipped ghost-LFU by about 0.4 points; the
+  remaining 6.6 points to Belady at 11 slots is the price of not knowing the
+  future. The slot dial is worth 2.2-2.4 points a slot, so for decode that
+  dial, and the drive, are the levers left.
 - **Overlap instrumentation.** The `expert io` bucket is a residual, not the
   drive's busy time: miss reads are already in flight during hit compute, so
   the bucket measures only the part of a read that hit compute did not cover.
@@ -515,48 +524,30 @@ it by hand and chose to keep it.
 Things a newcomer can do without a 3 GB cgroup or the reference drive. Read
 `CONTRIBUTING.md` first for the gate a change has to pass.
 
-**Offline expert-cache policy work.** This is the largest measured lever in
-the project and it is answerable on a laptop. `scripts/lfu_sim.py` replays
-recorded `--trace-experts` routing traces against the real per-layer strides,
-sweeps slot counts, and already scores `lfu`, `lfu-aged`, `lfu-ghost`,
-`lfu-window`, `lru` and `opt` (Belady's offline optimum). **LRU-K, ARC,
-S3-FIFO and a layer-aware variant exploiting the per-layer slot arrays are all
-untried.**
+**Offline expert-cache policy work.** Answerable on a laptop with no model
+installed: `scripts/traces/` holds a recorded routing trace and the per-layer
+strides, and `scripts/lfu_sim.py` replays it. With `--pin-step` the simulator
+pins a whole layer-step the way the runtime does, and then it reproduces the
+runtime's live hit rate to within 0.01 points (EXP-030), so a policy's
+simulated rate is the number the runtime would measure.
 
-The headroom is real, and here is the evidence stated at matched conditions,
-because it is easy to quote wrongly:
+What has been tried, pooled over four 256-token traces at 11 slots (EXP-030):
+the shipped ghost-LFU at **55.74%**; S3-FIFO -0.9 points, LRU-2 -1.2, ARC
+-2.2, LRU -3.1; decaying ghost counts and LRFU about **+0.4** at their best,
+out of sample; Belady's optimum **62.30%**. Older material quoting a gap of 11
+points or more to Belady compared simulator figures taken without step
+pinning; on the matched instrument the gap is 5.1 points at 10 slots to 8.4
+at 13.
 
-- Replaying the shipped `io/cache.rs` over four recorded traces (213,504
-  accesses) the way the runtime actually calls it, with the whole step
-  pinned, gives **50.02% at 10 slots and 54.48% at 12** (EXP-005 Correction).
-  That is the shipped policy's number on this instrument.
-- On the simulator's own scale, ghost-LFU against Belady's offline optimum is
-  **44.8% against 55.8% at 10 slots** and **58.1% against 72.0% at 16 slots**.
-  Belady at 12 slots was never computed. If you meet the pairing "49.9%
-  against 72.0% at 12 slots" in older material, it is wrong twice over: 49.9%
-  is the simulator rather than the replay, and 72.0% is the 16-slot row.
-- The simulator understates the shipped cache by about 5 points because of how
-  it models pinning, so the true oracle gap is smaller than a raw subtraction
-  of those columns. It is still 11 points or more at matched slots.
-- Live, cold, at the shipped 11 slots, the runtime measures **53.0% to 59.3%**
-  across five context rungs (EXP-023).
-
-Why it is worth doing beyond the size of the gap: a cache-policy change is
-**bit-safe by construction**, because which experts are resident changes
-nothing about what is computed, and it **costs no memory**, because it works
-inside the existing slot budget rather than asking for more. It also attacks
-the largest term. At ctx 512 expert I/O is 44.4% of a decode token, cold
-(EXP-023), and it is the largest single term below 2,048 tokens of context.
-Fewer misses is the direct lever on it, and unlike a compute win it cannot be
-handed straight back as newly exposed read latency.
-
-The loop is fast: add a policy, score it in seconds, and hand over a candidate
-worth exactly one paired cold sweep. One honest caveat, which is itself a
-contribution: **no routing trace is committed to the repository today.**
-Capturing one needs an installed model and one run of
-`ramvamp generate --trace-experts`, not a benchmark cgroup and not the
-reference drive. Committing a small trace, so that this work needs no model
-download at all, would be a genuinely useful first patch.
+So the easy part of this is done and the answer was "the shipped policy is
+already close". What is genuinely open: **long multi-turn traces**, where the
+topic drifts and a decaying policy should do better than it can over one
+256-token reply; and policies that use more than recency and frequency, such
+as a per-layer slot split or the router's own probabilities. Anything that
+scores more than about a point above the shipped policy on the matched
+simulator is worth one paired cold run. A cache-policy change is still
+**bit-safe by construction** and **costs no memory**, which is why it is worth
+a contributor's afternoon even with the bar where it is.
 
 **Benchmark reports from other NVMe drives.** The single cheapest experiment
 in the project, and the one that turns a published band into a curve. The
