@@ -217,9 +217,15 @@ change is in "Open decisions".
 Each one is bit-identical to what it replaces, each is measured paired
 against `main` as above, and each lands as its own PR.
 
-1. **Prefill's single-threaded work onto the pool.** Three loops in
-   `model/prefill.rs` run on the submitting thread, one row at a time, while
-   the pool waits:
+1. **Done (EXP-028): prefill's single-threaded work is on the pool.** Cold
+   and paired against `main` at ctx 512, prefill went from **11.80 to 17.49
+   tok/s** (medians), **1.36x** worst run against best, with identical
+   output; decode did not separate. Not publishable for the same hygiene
+   reason as EXP-027. The router turned out to be about 6.5 s of a ~40 s
+   prefill rather than the 9.8 s estimated below, and the per-expert glue,
+   which the plan had not sized, 3.8 s. What the step was, as planned: three
+   loops in `model/prefill.rs` ran on the submitting thread, one row at a
+   time, while the pool waited:
    - **the router**: per row, a 128 x 2048 f32 matvec, softmax and top-k.
      Decode measures that matvec at 0.40 ms per layer-token, so at 512 rows
      and 48 layers it is roughly 9.8 s of the 42.5 s prefill above. That is

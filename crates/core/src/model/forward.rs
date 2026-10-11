@@ -613,7 +613,7 @@ pub struct ForwardState {
     prefill_timing: PrefillTiming,
     /// Where the decode that followed the last prefill spent its wall time.
     ///
-    /// The same five phases and the same `PhaseClock`, charged by the same
+    /// The same six phases and the same `PhaseClock`, charged by the same
     /// [`forward_token`] — the only difference is which accumulator the clock
     /// points at, which `prefill_charging` decides. Unlike `prefill_timing`
     /// this one *accumulates* across tokens: a per-token split would be noise,
@@ -1271,9 +1271,8 @@ enum GemvSite {
     /// The `[vocab]` head. One fan-out a token, and only when logits are
     /// wanted.
     LmHead,
-    /// The f32 router matvec. **Not pooled** — it runs serial on the decode
-    /// thread through [`dot_f32`] — so it has no barrier to wait at and its
-    /// `wait` is structurally zero rather than measured.
+    /// The f32 router matvec, split across the pool by expert. Each expert's
+    /// logit is still one serial [`dot_f32`], so the split changes no bit.
     Router,
 }
 
@@ -1499,22 +1498,6 @@ impl<'a> GemvClock<'a> {
         // non-monotonic platform clock must not panic in library code.
         bucket.own += t1.saturating_duration_since(t0);
         bucket.wait += t2.saturating_duration_since(t1);
-        bucket.scatters += 1;
-    }
-
-    /// Close a region that never fanned out, charging all of it to `own`.
-    ///
-    /// For [`GemvSite::Router`], whose matvec is serial on the decode thread:
-    /// there is no barrier, so `wait` stays zero by construction rather than
-    /// by measuring a zero.
-    #[inline]
-    fn close_serial(&mut self, site: GemvSite, opened: Option<Instant>) {
-        let (Some(split), Some(t0)) = (self.split.as_deref_mut(), opened) else {
-            return;
-        };
-        let now = Instant::now();
-        let bucket = split.bucket(site);
-        bucket.own += now.saturating_duration_since(t0);
         bucket.scatters += 1;
     }
 }
@@ -2662,22 +2645,27 @@ pub fn forward_token_traced<'s>(
         // (equivalent to top-k by logit; first index wins ties like
         // torch.topk), then renormalize when norm_topk_prob.
         //
-        // The matvec is the one GEMV on this path that never reaches the
-        // compute pool, so the sub-split charges it serially: all `own`, no
-        // barrier to wait at. Its two clock reads bracket the loop alone, not
-        // the softmax and top-k scan the coarse `Projections` region also
-        // covers, which is why the two instruments do not sum to each other
-        // here.
+        // The matvec is split across the pool by expert: each logit is one
+        // whole serial `dot_f32`, whichever thread computes it, so no bit
+        // moves. Its two clock reads bracket the fan-out alone, not the
+        // softmax and top-k scan the coarse `Router` region also covers, which
+        // is why the two instruments do not sum to each other here.
         let opened = gemv.open();
-        for (row, logit) in lw
-            .router
-            .data()
-            .chunks_exact(hidden)
-            .zip(router_logits.iter_mut())
         {
-            *logit = dot_f32(row, normed);
+            let router = lw.router.data();
+            let stamp = opened.is_some();
+            let normed = &*normed;
+            pool.scatter_chunks(router_logits, |chunk, logits| {
+                let rows = &router[chunk.rows.start * hidden..chunk.rows.end * hidden];
+                for (row, logit) in rows.chunks_exact(hidden).zip(logits.iter_mut()) {
+                    *logit = dot_f32(row, normed);
+                }
+                if stamp && chunk.on_caller {
+                    CALLER_DONE.set(Some(Instant::now()));
+                }
+            });
         }
-        gemv.close_serial(GemvSite::Router, opened);
+        gemv.close(GemvSite::Router, opened);
         router_probs.copy_from_slice(router_logits);
         softmax(router_probs)?;
         topk.clear();
@@ -2699,9 +2687,8 @@ pub fn forward_token_traced<'s>(
                 *w /= sum;
             }
         }
-        // Charged to `Projections`: the f32 router matvec dominates the
-        // softmax, the top-k scan and the sink it shares this region with.
-        clock.charge(Phase::Projections);
+        // The sink shares the region: it is the caller's, and cheap.
+        clock.charge(Phase::Router);
         if let Some(sink) = on_route.as_deref_mut() {
             sink(layer, topk);
         }
@@ -4413,11 +4400,11 @@ mod tests {
         assert_eq!(
             gemv_scatters(&split, "router"),
             layers * tokens,
-            "one serial matvec a layer: {split:?}"
+            "one router fan-out a layer: {split:?}"
         );
 
         let accounted = gemv_accounted(&split);
-        let inside = coarse.projections + coarse.expert_compute;
+        let inside = coarse.projections + coarse.router + coarse.expert_compute;
         assert!(
             accounted <= inside,
             "the sub-split {accounted:?} exceeds the coarse phases {inside:?} it \
@@ -4454,21 +4441,12 @@ mod tests {
         // nothing") rather than like a dead instrument. Over the several dozen
         // real fan-outs above, a barrier that measures zero every single time
         // is that failure and nothing else.
-        let pooled_wait: Duration = split[..3].iter().map(|&(_, _, wait, _)| wait).sum();
+        let pooled_wait: Duration = split.iter().map(|&(_, _, wait, _)| wait).sum();
         assert!(
             pooled_wait > Duration::ZERO,
             "every pooled fan-out reported a zero barrier: the caller stamp is \
              not reaching the submitting thread, so `own` is the whole call and \
              the split says nothing: {split:?}"
-        );
-
-        // The router never fans out, so it has no barrier to wait at.
-        let (_, _, router_wait, _) = split[3];
-        assert_eq!(split[3].0, "router");
-        assert_eq!(
-            router_wait,
-            Duration::ZERO,
-            "the serial router cannot wait at a barrier it never reaches"
         );
 
         // Same lifetime as the coarse split: a reset drops both.
@@ -4486,7 +4464,7 @@ mod tests {
     /// structural cause of it: [`GemvClock::open`] returns before it does
     /// anything at all, which is why it can neither clear [`CALLER_DONE`] nor
     /// call `Instant::now`. A sentinel left in the cell across the whole
-    /// open/close/close_serial cycle is what pins that.
+    /// open/close cycle is what pins that.
     #[test]
     fn a_disarmed_gemv_clock_does_nothing() {
         let sentinel = Instant::now();
@@ -4506,7 +4484,7 @@ mod tests {
         // And charging is a no-op even when handed an instant by a caller that
         // armed and then disarmed.
         clock.close(GemvSite::Experts, Some(sentinel));
-        clock.close_serial(GemvSite::Router, Some(sentinel));
+        clock.close(GemvSite::Router, Some(sentinel));
         assert_eq!(
             CALLER_DONE.get(),
             Some(sentinel),
@@ -4520,9 +4498,14 @@ mod tests {
         let opened = clock.open();
         assert!(opened.is_some());
         assert_eq!(CALLER_DONE.get(), None, "`open` arms a fresh stamp");
-        clock.close_serial(GemvSite::Router, opened);
+        CALLER_DONE.set(opened);
+        clock.close(GemvSite::Router, opened);
         assert_eq!(split.router.scatters, 1);
-        assert_eq!(split.router.wait, Duration::ZERO);
+        assert_eq!(
+            split.router.own,
+            Duration::ZERO,
+            "a stamp at the open instant charges the whole call to the barrier"
+        );
 
         CALLER_DONE.set(None);
     }

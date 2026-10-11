@@ -1265,6 +1265,16 @@ accordingly.
 
 ### Prefill fans over rows, by cost, out of the arena
 
+Every per-row step of a swept chunk runs on the compute pool, not only
+attention (EXP-028): the router (each row's f32 matvec, softmax and top-k),
+both RMSNorm-and-quantize blocks, QK-norm and RoPE, the Q/K/V transposes, the
+residual adds and the top-k reduction go through `prefill::for_each_row`, and
+each expert's gather, SwiGLU, transpose and re-quantization go through the pool
+inside the sweep. Each row's arithmetic is unchanged, so the result is
+bit-identical to the token-major path; the route sink is still called in row
+order after the parallel part. Only the KV appends, the inverse routing index
+and the embedding stay on the submitting thread.
+
 `prefill::scatter_attention` submits one row per unit to the compute pool.
 Rows are independent: each is a separate `attention_at_in` call reading an
 immutable `q` and an immutable cache and writing only its own `[q_dim]` span of
@@ -1388,18 +1398,19 @@ shard 0 there, so both halves are observable from one thread without any worker
 touching a clock), into:
 
 - `own`: set-up, the job descriptor, the failure-slot `Mutex`, the publish
-  including its `futex` wake when workers are parked, and **this core's
-  `1/shards` of the rows**;
-- `wait`, the barrier: straggler shards, worker wake latency, and whatever
-  the even row split costs on cores of different speeds.
+  including its `futex` wake when workers are parked, and **the rows of every
+  chunk this core claimed**;
+- `wait`, the barrier: the last chunks still running on other threads, and
+  worker wake latency.
 
-Four buckets: **projections, experts, lm_head, router**. The **router is
-serial on the decode thread, so its `wait` is zero by construction rather than
-measured**, and the block says so on its own last line. The four buckets are
-disjoint spans strictly inside the first block's `projections` and
-`expert compute` phases, so their sum can never exceed those two; the gap is
-the non-GEMV work those phases also cover (the softmax and top-k scan, SwiGLU,
-the intermediate quantization, the expert view carves).
+Four buckets: **projections, experts, lm_head, router**. Since EXP-028 the
+router is pooled too, split by expert, so its `wait` is measured like the
+others'; before that it was serial on the decode thread and its `wait` was
+zero by construction. The four buckets are disjoint spans strictly inside the
+first block's `projections`, `router` and `expert compute` phases, so their sum
+can never exceed those three; the gap is the non-GEMV work those phases also
+cover (the softmax and top-k scan, SwiGLU, the intermediate quantization, the
+expert view carves).
 
 Two things about the counts column changed with the fused fan-out and will
 mislead a reader who assumes otherwise:
@@ -1973,8 +1984,8 @@ are neither now, and they should not come back without new evidence.
   thread):`, which decomposes the pooled GEMVs of the first block's
   `projections` and `expert compute` phases into `own` and barrier `wait`
   across projections / experts / lm_head / router; see "Instrumentation" for
-  what changed about the counts column and why the router's `wait` is zero by
-  construction. **That second block has now been read cold too** (EXP-025), but
+  what changed about the counts column, and for the router, which was serial
+  until EXP-028. **That second block has now been read cold too** (EXP-025), but
   it **cannot be paired**: the phase-8 reference binary predates it and emits
   no such block, so every cold ratio in EXP-025 is taken on the first block's
   phase split instead. The second block's cold readings are single-arm
