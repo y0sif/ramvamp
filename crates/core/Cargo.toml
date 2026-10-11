@@ -27,6 +27,10 @@ harness = false
 name = "pool"
 harness = false
 
+[[bench]]
+name = "batched"
+harness = false
+
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }

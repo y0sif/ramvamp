@@ -59,16 +59,22 @@
 //! has no cold, cgroup-bounded measurement of expert-GEMV bandwidth to cite
 //! (see `docs/experiments.md` for what is and is not measured).
 //!
-//! **No arithmetic changes.** The batched path issues the *same* per-row
-//! `vec_dot` call, on the same `(weight_row, activation_row)` bytes, as the
-//! single-vector path; only the loop nesting and the destination index
-//! differ. Dequantization stays fused into the dot: a weight row is never
-//! dequantized once into scratch and reused across activations, because
-//! that would break the per-super-block accumulation order the kernels fix
-//! and float addition is not associative. So
-//! `out[(r - rows.start) * n_acts + a]` is bit-identical to the
+//! **No arithmetic changes.** The batched path performs, for every
+//! `(weight_row, activation_row)` pair, exactly the operations the
+//! single-vector path's `vec_dot` does on the same bytes; only the loop
+//! nesting and the destination index differ. Dequantization stays fused into
+//! the dot: a weight row is never dequantized once into float scratch and
+//! reused across activations, because that would break the per-super-block
+//! accumulation order the kernels fix and float addition is not associative.
+//! What *is* shared, for Q4_K with four or more activation rows, is the
+//! integer and conversion work that depends only on the weight row: the
+//! four-row tile ([`avx2::vec_dot_q4_k_q8_k_rows`], EXP-029) splits the
+//! nibbles, unpacks the scales and converts `d`/`dmin` once per block for
+//! four dots, and leaves each dot's float operations exactly as they were.
+//! So `out[(r - rows.start) * n_acts + a]` is bit-identical to the
 //! single-vector result for weight row `r` and activation row `a` — the
-//! same guarantee, and for the same reason, as the row ranges above.
+//! same guarantee, and for the same reason, as the row ranges above, and the
+//! tile's tests check it bit for bit.
 //!
 //! `out` is `[weight_row][activation]`, row-major, `rows.len() * n_acts`
 //! floats. Activation-major would scatter each weight row's writes across
@@ -414,7 +420,11 @@ pub fn gemv_q8_k_rows(
 ///
 /// Every element is bit-identical to the [`gemv_q8_k_rows`] result for the
 /// same weight row and activation row: same kernel, same bytes, only the
-/// loop order and destination index differ (see the module docs).
+/// loop order and destination index differ (see the module docs). Q4_K
+/// with four or more activation rows goes through
+/// [`avx2::vec_dot_q4_k_q8_k_rows`], which dots four activation rows per pass
+/// over a weight row and shares the work that depends only on the weight
+/// row; it is bit-identical to the single-row kernel and tested to be.
 ///
 /// `n_acts == 0` and an empty `rows` are both well-defined no-ops (with an
 /// empty `out`), not panics.
@@ -439,6 +449,11 @@ pub fn gemv_q8_k_batched(
     rows: Range<usize>,
     out: &mut [f32],
 ) -> Result<(), KernelError> {
+    // Below one full tile there is nothing to share, and the tile's extra
+    // per-row dispatch made one to three rows 2-5% slower than this loop.
+    if format == QuantFormat::Q4_K && n_acts >= Q4_K_TILE {
+        return gemv_q4_k_batched(weight, in_dim, out_dim, acts, n_acts, rows, out);
+    }
     let dot = k_quant_dot("gemv_q8_k_batched", format)?;
     gemv_impl(
         dot,
@@ -457,6 +472,51 @@ pub fn gemv_q8_k_batched(
         out,
         force_scalar(),
     )
+}
+
+/// Activation rows the Q4_K tile dots per pass over a weight row; fewer than
+/// this in a batched call take the one-dot-per-element loop.
+const Q4_K_TILE: usize = 4;
+
+/// [`gemv_q8_k_batched`]'s Q4_K path: the same validation and loop, with
+/// each weight row dotted against all `n_acts` activation rows by
+/// [`avx2::vec_dot_q4_k_q8_k_rows`] instead of one call per element.
+fn gemv_q4_k_batched(
+    weight: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+    acts: &[BlockQ8K],
+    n_acts: usize,
+    rows: Range<usize>,
+    out: &mut [f32],
+) -> Result<(), KernelError> {
+    let m = Matrix {
+        format: QuantFormat::Q4_K,
+        bytes: weight,
+        in_dim,
+        out_dim,
+    };
+    let row_bytes = validate(
+        "gemv_q8_k_batched: weight bytes vs rows / out vs range x n_acts",
+        m,
+        acts.len(),
+        n_acts,
+        &rows,
+        out.len(),
+    )?;
+    if n_acts == 0 {
+        // `validate` proved `out` is empty; `chunks_mut(0)` would panic.
+        return Ok(());
+    }
+    let scalar = force_scalar();
+    for (i, dst) in out.chunks_mut(n_acts).enumerate() {
+        // `r < out_dim` and `out_dim * row_bytes == weight.len()`, both
+        // established by `validate`.
+        let r = rows.start + i;
+        let weight_row = &weight[r * row_bytes..(r + 1) * row_bytes];
+        avx2::vec_dot_q4_k_q8_k_rows(weight_row, acts, n_acts, dst, scalar)?;
+    }
+    Ok(())
 }
 
 /// GEMV of a Q8_0 weight matrix against a Q8_0 activation row:
