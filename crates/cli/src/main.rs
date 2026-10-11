@@ -1756,11 +1756,6 @@ fn decode_gemv_lines(
          that change"
             .to_string(),
     );
-    lines.push(
-        "  router is serial on the decode thread: its wait is zero by construction, \
-         not measured"
-            .to_string(),
-    );
     lines
 }
 
@@ -3988,8 +3983,8 @@ mod tests {
         let lines = decode_gemv_lines(&timing, &split);
         assert_eq!(
             lines.len(),
-            7,
-            "a heading, four buckets and two notes: {lines:?}"
+            6,
+            "a heading, four buckets and a note: {lines:?}"
         );
         assert_eq!(
             lines[0],
@@ -4029,11 +4024,6 @@ mod tests {
             "  a fan-out is one pooled job, not one matrix: an experts fan-out is \
              a whole phase's routed experts, so ms/fan-out is not comparable \
              across that change"
-        );
-        assert_eq!(
-            lines[6],
-            "  router is serial on the decode thread: its wait is zero by \
-             construction, not measured"
         );
 
         // Nothing has decoded: nothing is printed, for the same reason the

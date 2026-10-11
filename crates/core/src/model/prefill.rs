@@ -1423,7 +1423,13 @@ fn scatter_attention(
 ///
 /// [`ForwardError::Kernel`] with [`KernelError::LengthMismatch`] when either
 /// slice is not `rows * cols` long, or when that product overflows.
-fn transpose(src: &[f32], rows: usize, cols: usize, dst: &mut [f32]) -> Result<(), ForwardError> {
+fn transpose(
+    pool: &mut ComputePool,
+    src: &[f32],
+    rows: usize,
+    cols: usize,
+    dst: &mut [f32],
+) -> Result<(), ForwardError> {
     let expected = rows.checked_mul(cols).ok_or(KernelError::LengthMismatch {
         what: "prefill transpose: rows * cols overflows",
         left: rows,
@@ -1445,14 +1451,17 @@ fn transpose(src: &[f32], rows: usize, cols: usize, dst: &mut [f32]) -> Result<(
     if expected == 0 {
         return Ok(());
     }
-    // `c < cols` and `r < rows`, so `c * rows + r < cols * rows == dst.len()`:
-    // the index below is in bounds because the lengths were just checked.
-    for (r, row) in src.chunks_exact(cols).take(rows).enumerate() {
-        for (c, &value) in row.iter().enumerate() {
-            dst[c * rows + r] = value;
+    // One output row per body: output row `c` is column `c` of `src`. A plain
+    // copy, so how the rows are split cannot change a bit.
+    let out = Rows::new(dst, rows, cols)?;
+    for_each_row(pool, cols, |c| {
+        // SAFETY: `for_each_row` hands row `c` to this body once.
+        let out = unsafe { out.row(c) };
+        for (r, value) in out.iter_mut().enumerate() {
+            *value = src[r * cols + c];
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1870,7 +1879,13 @@ fn run_chunk(
                 &mut s.tmat[..q_dim * n],
             )?;
             clock.charge(Phase::Projections);
-            transpose(&s.tmat[..q_dim * n], q_dim, n, &mut s.q[..n * q_dim])?;
+            transpose(
+                state.pool,
+                &s.tmat[..q_dim * n],
+                q_dim,
+                n,
+                &mut s.q[..n * q_dim],
+            )?;
             clock.charge(Phase::Elementwise);
             pool_batched_q8_0(
                 state.pool,
@@ -1882,7 +1897,13 @@ fn run_chunk(
                 &mut s.tmat[..kv_dim * n],
             )?;
             clock.charge(Phase::Projections);
-            transpose(&s.tmat[..kv_dim * n], kv_dim, n, &mut s.k[..n * kv_dim])?;
+            transpose(
+                state.pool,
+                &s.tmat[..kv_dim * n],
+                kv_dim,
+                n,
+                &mut s.k[..n * kv_dim],
+            )?;
             clock.charge(Phase::Elementwise);
             pool_batched_q8_k(
                 state.pool,
@@ -1895,7 +1916,13 @@ fn run_chunk(
                 &mut s.tmat[..kv_dim * n],
             )?;
             clock.charge(Phase::Projections);
-            transpose(&s.tmat[..kv_dim * n], kv_dim, n, &mut s.v[..n * kv_dim])?;
+            transpose(
+                state.pool,
+                &s.tmat[..kv_dim * n],
+                kv_dim,
+                n,
+                &mut s.v[..n * kv_dim],
+            )?;
 
             // (d) Per-head QK-RMSNorm then RoPE, at this row's absolute
             // position. HF order, exactly as `forward_token` does it.
@@ -2227,10 +2254,32 @@ fn run_expert(
     // Gather this expert's rows' activations into one contiguous batch: the
     // batched kernels take `n_acts` consecutive rows, and a routed set is by
     // nature scattered across the chunk.
-    for (j, entry) in s.index[lo..hi].iter().enumerate() {
-        let src = entry.row as usize * blocks;
-        s.acts_gather[j * blocks..(j + 1) * blocks]
-            .copy_from_slice(&s.acts_hidden[src..src + blocks]);
+    let entries = &s.index[lo..hi];
+    // Every destination row the scatter at the end writes, checked once up
+    // front: it writes through a raw pointer, where an out-of-range row would
+    // be undefined behaviour rather than a panic.
+    let staged_rows = n_rows * dims.top_k;
+    for entry in entries {
+        let (row, slot) = (entry.row as usize, entry.slot as usize);
+        if row >= n_rows || slot >= dims.top_k {
+            return Err(KernelError::LengthMismatch {
+                what: "prefill expert scatter: staged row vs n_rows * top_k",
+                left: row * dims.top_k + slot,
+                right: staged_rows,
+            }
+            .into());
+        }
+    }
+    {
+        let acts_hidden = &*s.acts_hidden;
+        let gather = Rows::new(&mut *s.acts_gather, blocks, count)?;
+        for_each_row(pool, count, |j| {
+            let src = entries[j].row as usize * blocks;
+            // SAFETY: `for_each_row` hands row `j` to this body once.
+            let dst = unsafe { gather.row(j) };
+            dst.copy_from_slice(&acts_hidden[src..src + blocks]);
+            Ok(())
+        })?;
     }
     let acts = &s.acts_gather[..count * blocks];
 
@@ -2260,18 +2309,34 @@ fn run_expert(
     )?;
     // SwiGLU is elementwise, so it is layout-agnostic: running it over the
     // whole `[moe][count]` plane performs exactly the per-row operations.
-    swiglu_combine(&mut s.gate[..moe * count], &s.up[..moe * count])?;
-    transpose(
-        &s.gate[..moe * count],
-        moe,
-        count,
-        &mut s.moe_t[..count * moe],
-    )?;
-    for j in 0..count {
-        quantize_row_q8_k(
-            &s.moe_t[j * moe..(j + 1) * moe],
-            &mut s.acts_moe[j * dims.moe_q8k..(j + 1) * dims.moe_q8k],
-        )?;
+    // SwiGLU is elementwise, so the flat `[moe][count]` buffer splits
+    // anywhere.
+    {
+        let up = &s.up[..moe * count];
+        let failure: Mutex<Option<(usize, ForwardError)>> = Mutex::new(None);
+        pool.scatter_chunks(&mut s.gate[..moe * count], |chunk, gate| {
+            if let Err(err) = swiglu_combine(gate, &up[chunk.rows]) {
+                record(&failure, chunk.index, err.into());
+            }
+        });
+        taken(failure)?;
+    }
+    // Transpose to `[count][moe]` and quantize, one output row at a time:
+    // row `j` of `moe_t` is column `j` of `gate`, copied, then the same
+    // per-row quantization as before.
+    {
+        let gate = &s.gate[..moe * count];
+        let moe_t = Rows::new(&mut *s.moe_t, moe, count)?;
+        let acts_moe = Rows::new(&mut *s.acts_moe, dims.moe_q8k, count)?;
+        for_each_row(pool, count, |j| {
+            // SAFETY: `for_each_row` hands row `j` to this body once.
+            let (row, acts) = unsafe { (moe_t.row(j), acts_moe.row(j)) };
+            for (i, value) in row.iter_mut().enumerate() {
+                *value = gate[i * count + j];
+            }
+            quantize_row_q8_k(row, acts)?;
+            Ok(())
+        })?;
     }
     pool_batched_q8_k(
         pool,
@@ -2283,12 +2348,27 @@ fn run_expert(
         count,
         &mut s.tmat[..hidden * count],
     )?;
-    for (j, entry) in s.index[lo..hi].iter().enumerate() {
-        let base = (entry.row as usize * dims.top_k + entry.slot as usize) * hidden;
-        let dst = &mut s.staged[base..base + hidden];
-        for (h, slot) in dst.iter_mut().enumerate() {
-            *slot = s.tmat[h * count + j];
-        }
+    // Back to `[row][slot][hidden]` staging, split by hidden column: each
+    // thread writes its own columns of every destination row, so two threads
+    // never write the same element, whatever the index holds.
+    {
+        let tmat = &s.tmat[..hidden * count];
+        let staged = SendPtr(s.staged.as_mut_ptr());
+        pool.run_chunks(hidden, |chunk| {
+            for h in chunk.rows {
+                let src = &tmat[h * count..(h + 1) * count];
+                for (entry, &value) in entries.iter().zip(src) {
+                    let at = (entry.row as usize * dims.top_k + entry.slot as usize) * hidden + h;
+                    // SAFETY: in bounds, because every entry's row and slot
+                    // were checked against `n_rows * top_k` above, `h <
+                    // hidden`, and `staged` is `[n_rows][top_k][hidden]`.
+                    // Disjoint across threads, because each owns its own
+                    // `h`s. No reference to `staged` is formed while the job
+                    // runs, only these element writes.
+                    unsafe { staged.get().add(at).write(value) };
+                }
+            }
+        });
     }
     Ok(count)
 }
@@ -2352,6 +2432,16 @@ mod tests {
         skip_hashes: true,
         verify_layer_hashes: false,
     };
+
+    /// A small unpinned pool for the helpers that fan out on their own.
+    fn test_pool() -> crate::threads::ComputePool {
+        crate::threads::ComputePool::with_config(crate::threads::PoolConfig {
+            shards: Some(3),
+            placement: crate::threads::Placement::Off,
+            pin_caller: false,
+            ..crate::threads::PoolConfig::default()
+        })
+    }
 
     fn load_fixture(tag: &str) -> (Fixture, Model) {
         let fx = build_install(tag);
@@ -3192,13 +3282,7 @@ mod tests {
             }
         }
         s.residual.fill(0.0);
-        let mut pool = crate::threads::ComputePool::with_config(crate::threads::PoolConfig {
-            shards: Some(2),
-            placement: crate::threads::Placement::Off,
-            pin_caller: false,
-            ..crate::threads::PoolConfig::default()
-        });
-        reduce_experts(&mut pool, &mut s, &dims, 1).unwrap();
+        reduce_experts(&mut test_pool(), &mut s, &dims, 1).unwrap();
 
         // Top-k order sums big first, so both small terms vanish.
         let want_topk = ((0.0f32 + big) + small) + small;
@@ -3595,7 +3679,7 @@ mod tests {
     fn transpose_moves_every_element() {
         let src: Vec<f32> = (0..12).map(|i| i as f32).collect();
         let mut dst = vec![0.0f32; 12];
-        transpose(&src, 3, 4, &mut dst).unwrap();
+        transpose(&mut test_pool(), &src, 3, 4, &mut dst).unwrap();
         for r in 0..3 {
             for c in 0..4 {
                 assert_eq!(dst[c * 3 + r], src[r * 4 + c]);
@@ -3604,8 +3688,8 @@ mod tests {
         // Degenerate shapes are no-ops rather than panics, as long as both
         // slices agree with `rows * cols == 0`.
         let mut empty: [f32; 0] = [];
-        transpose(&[], 0, 4, &mut empty).unwrap();
-        transpose(&[], 3, 0, &mut empty).unwrap();
+        transpose(&mut test_pool(), &[], 0, 4, &mut empty).unwrap();
+        transpose(&mut test_pool(), &[], 3, 0, &mut empty).unwrap();
     }
 
     /// A mis-sized `transpose` is a typed refusal, not a partial copy.
@@ -3626,7 +3710,7 @@ mod tests {
         // A source one row short would have been silently truncated, leaving
         // the last output column holding whatever `dst` already had.
         assert!(matches!(
-            transpose(&src[..8], 3, 4, &mut dst),
+            transpose(&mut test_pool(), &src[..8], 3, 4, &mut dst),
             Err(ForwardError::Kernel(KernelError::LengthMismatch {
                 left: 8,
                 right: 12,
@@ -3635,7 +3719,7 @@ mod tests {
         ));
         // A destination one element short would have dropped that write.
         assert!(matches!(
-            transpose(&src, 3, 4, &mut dst[..11]),
+            transpose(&mut test_pool(), &src, 3, 4, &mut dst[..11]),
             Err(ForwardError::Kernel(KernelError::LengthMismatch {
                 left: 11,
                 right: 12,
@@ -3643,9 +3727,9 @@ mod tests {
             }))
         ));
         // And a degenerate shape does not excuse a mis-sized slice either.
-        assert!(transpose(&[], 0, 4, &mut dst).is_err());
+        assert!(transpose(&mut test_pool(), &[], 0, 4, &mut dst).is_err());
         // `rows * cols` overflowing is typed rather than wrapping.
-        assert!(transpose(&src, usize::MAX, 2, &mut dst).is_err());
+        assert!(transpose(&mut test_pool(), &src, usize::MAX, 2, &mut dst).is_err());
     }
 
     /// All three dials refuse at one point.
