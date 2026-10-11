@@ -536,7 +536,7 @@ rather than default to measuring more.
 | Shipping surface | **settled**: `ramvamp-server`. Building a terminal UI reimplements something that already exists in many good versions and is outside what this project contributes; the contribution is the streaming runtime, and a server is the universal interface to it |
 | The `attn_q` + `attn_v` fusion | **settled**: dropped, its bucket did not separate at either rung. The expert-phase fusion stays |
 | Reopen progressive miss execution | **open** |
-| Move the slot dial to 12 or 13 | **held**, needs a 13-slot arm at 4K context |
+| The memory contract: 3 GB with 11 slots, or 4 GB with up to 19 | **open**, measured (EXP-033): with resident common weights the footprint is the `ramvamp plan` projection to 2 MiB, so 12 slots no longer fit 3 GB at 4K (3,092 MiB). 4 GB holds 19 slots and buys decode 1.26x at ctx 512 and 1.12x at 4K, cold, every run clean; 15 slots buys 1.14x for half the memory. Prefill and output do not change. Moving it changes the project's ~3 GB headline |
 | A GPU backend (v1 item 2) | **not now** (2026-10-10): no quotable ratio, because the CPU pool would not hold steady even at locked clocks (EXP-026). Reopen conditions are in the v1 section |
 | Hold the common weights resident by default | **settled** (2026-10-11): yes. Fits 3 GB at 4K context with 109 MiB spare, matches `ramvamp plan` to 2 MiB, and no resident run has had to read a page back (EXP-031). `--common-memory mapped` is the opt-out, and the hard rules say so |
 | Run everyday sessions in their own swap-off cgroup | **settled** (2026-10-11): yes, automatically. Model commands re-launch once in a `systemd-run --user` scope with `MemorySwapMax=0`, skipped where swap is already off or with `RAMVAMP_NO_SCOPE` set |
