@@ -56,6 +56,19 @@ What it checks, and why each check exists:
    with no breakdown at all still counts the whole total — unknown stays
    DIRTY.
 
+   *Refault amendment* (EXP-031, decided by the author 2026-10-11): reclaim
+   fails a run only when what it took had to be read back. `kswapd` reclaims
+   from every cgroup when the *machine* is short of memory, whatever the
+   cgroup's own headroom, so on a machine in ordinary use a strict gate
+   failed nearly every run on pages the runtime never needed again (an
+   11 MiB `tokenizer.json` parsed once, later a few hundred KiB). What
+   distorts a timing is a reclaimed page the run needs again, and
+   `workingset_refault_file` + `workingset_refault_anon` count exactly those.
+   So: more than `REFAULT_LIMIT_BYTES` read back is HARD; reclaim with less
+   is a SOFT note; `memory.events` stays HARD. A run recorded before the
+   refault counters were captured has no evidence either way and keeps the
+   strict verdict, because unknown is still DIRTY.
+
 5. Bytes actually fetched from the block layer are reported. `read_bytes`
    in `/proc/<pid>/io` is per-task and is *not* inherited by the parent
    on exit, so the inner wrapper samples the child's `/proc/<pid>/io`
@@ -594,6 +607,22 @@ def pg_split(pg: dict[str, int], prefix: str) -> tuple[int, int]:
     return total - khugepaged, khugepaged
 
 
+# Reclaimed pages a run may need back before reclaim fails it (refault
+# amendment, item 4). A mapped ctx-512 run on a quiet moment refaults 28-90
+# pages, mostly shared libraries evicted before it began; the worst reclaim
+# EXP-031 recorded refaulted 110,308.
+REFAULT_LIMIT_BYTES = 1 << 20
+
+
+def refaulted_pages(run: dict) -> int | None:
+    """Reclaimed pages the run had to read back, or None if not recorded."""
+    detail = run.get("memory_detail") or {}
+    keys = ("workingset_refault_file", "workingset_refault_anon")
+    if not any(k in detail for k in keys):
+        return None
+    return sum(detail.get(k, 0) for k in keys)
+
+
 # Problem severities. HARD invalidates the measurement; SOFT is reported
 # but survivable. The severity travels with the problem as a field, so
 # rewording a message can never change a verdict — the previous version
@@ -631,11 +660,25 @@ def classify(run: dict, want_max: int) -> tuple[str, list[dict]]:
     else:
         steal, steal_thp = pg_split(pg, "pgsteal")
         scan, scan_thp = pg_split(pg, "pgscan")
-        if steal:
+        refaults = refaulted_pages(run)
+        if steal and refaults is None:
             note(HARD,
                  f"pgsteal {steal} pages ({mib(steal * PAGE)}) reclaimed "
-                 f"under pressure — the working set did not fit, the timing "
-                 f"is not a clean {want_max // 2**30} GB measurement")
+                 f"under pressure, and this run recorded no refault "
+                 f"counters to show whether any had to be read back — the "
+                 f"timing is not a clean {want_max // 2**30} GB measurement")
+        elif refaults is not None and refaults * PAGE > REFAULT_LIMIT_BYTES:
+            note(HARD,
+                 f"{refaults} reclaimed pages ({mib(refaults * PAGE)}) had to "
+                 f"be read back (pgsteal {steal}) — the run lost memory it "
+                 f"needed, so the timing is not a clean "
+                 f"{want_max // 2**30} GB measurement")
+        elif steal:
+            note(SOFT,
+                 f"pgsteal {steal} pages ({mib(steal * PAGE)}) reclaimed by "
+                 f"pressure, {refaults} read back, under the "
+                 f"{mib(REFAULT_LIMIT_BYTES)} limit: pages the run did not "
+                 f"need again (refault amendment)")
         elif scan:
             # Pressure the kernel survived: worth reporting, but it did not
             # cost the run any resident page, so the timing still stands.
