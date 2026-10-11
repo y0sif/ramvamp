@@ -66,11 +66,12 @@
 //! the dot: a weight row is never dequantized once into float scratch and
 //! reused across activations, because that would break the per-super-block
 //! accumulation order the kernels fix and float addition is not associative.
-//! What *is* shared, for Q4_K with four or more activation rows, is the
-//! integer and conversion work that depends only on the weight row: the
-//! four-row tile ([`avx2::vec_dot_q4_k_q8_k_rows`], EXP-029) splits the
-//! nibbles, unpacks the scales and converts `d`/`dmin` once per block for
-//! four dots, and leaves each dot's float operations exactly as they were.
+//! What *is* shared, for Q4_K and Q6_K with four or more activation rows,
+//! is the integer and conversion work that depends only on the weight row:
+//! the four-row tiles ([`avx2::vec_dot_q4_k_q8_k_rows`], EXP-029;
+//! [`avx2::vec_dot_q6_k_q8_k_rows`], EXP-032) unpack the quants and scales
+//! and convert the f16 scales once per block for four dots, and leave each
+//! dot's float operations exactly as they were.
 //! So `out[(r - rows.start) * n_acts + a]` is bit-identical to the
 //! single-vector result for weight row `r` and activation row `a` — the
 //! same guarantee, and for the same reason, as the row ranges above, and the
@@ -420,11 +421,12 @@ pub fn gemv_q8_k_rows(
 ///
 /// Every element is bit-identical to the [`gemv_q8_k_rows`] result for the
 /// same weight row and activation row: same kernel, same bytes, only the
-/// loop order and destination index differ (see the module docs). Q4_K
-/// with four or more activation rows goes through
-/// [`avx2::vec_dot_q4_k_q8_k_rows`], which dots four activation rows per pass
-/// over a weight row and shares the work that depends only on the weight
-/// row; it is bit-identical to the single-row kernel and tested to be.
+/// loop order and destination index differ (see the module docs). Q4_K and
+/// Q6_K with four or more activation rows go through
+/// [`avx2::vec_dot_q4_k_q8_k_rows`] and [`avx2::vec_dot_q6_k_q8_k_rows`],
+/// which dot four activation rows per pass over a weight row and share the
+/// work that depends only on the weight row; both are bit-identical to the
+/// single-row kernels and tested to be.
 ///
 /// `n_acts == 0` and an empty `rows` are both well-defined no-ops (with an
 /// empty `out`), not panics.
@@ -451,8 +453,8 @@ pub fn gemv_q8_k_batched(
 ) -> Result<(), KernelError> {
     // Below one full tile there is nothing to share, and the tile's extra
     // per-row dispatch made one to three rows 2-5% slower than this loop.
-    if format == QuantFormat::Q4_K && n_acts >= Q4_K_TILE {
-        return gemv_q4_k_batched(weight, in_dim, out_dim, acts, n_acts, rows, out);
+    if matches!(format, QuantFormat::Q4_K | QuantFormat::Q6_K) && n_acts >= ROW_TILE {
+        return gemv_tiled_batched(format, weight, in_dim, out_dim, acts, n_acts, rows, out);
     }
     let dot = k_quant_dot("gemv_q8_k_batched", format)?;
     gemv_impl(
@@ -474,14 +476,17 @@ pub fn gemv_q8_k_batched(
     )
 }
 
-/// Activation rows the Q4_K tile dots per pass over a weight row; fewer than
-/// this in a batched call take the one-dot-per-element loop.
-const Q4_K_TILE: usize = 4;
+/// Activation rows the Q4_K and Q6_K tiles dot per pass over a weight row;
+/// fewer than this in a batched call take the one-dot-per-element loop.
+const ROW_TILE: usize = 4;
 
-/// [`gemv_q8_k_batched`]'s Q4_K path: the same validation and loop, with
-/// each weight row dotted against all `n_acts` activation rows by
-/// [`avx2::vec_dot_q4_k_q8_k_rows`] instead of one call per element.
-fn gemv_q4_k_batched(
+/// [`gemv_q8_k_batched`]'s Q4_K and Q6_K path: the same validation and loop,
+/// with each weight row dotted against all `n_acts` activation rows by
+/// [`avx2::vec_dot_q4_k_q8_k_rows`] or [`avx2::vec_dot_q6_k_q8_k_rows`]
+/// instead of one call per element.
+#[allow(clippy::too_many_arguments)]
+fn gemv_tiled_batched(
+    format: QuantFormat,
     weight: &[u8],
     in_dim: usize,
     out_dim: usize,
@@ -490,8 +495,12 @@ fn gemv_q4_k_batched(
     rows: Range<usize>,
     out: &mut [f32],
 ) -> Result<(), KernelError> {
+    let rows_dot = match format {
+        QuantFormat::Q6_K => avx2::vec_dot_q6_k_q8_k_rows,
+        _ => avx2::vec_dot_q4_k_q8_k_rows,
+    };
     let m = Matrix {
-        format: QuantFormat::Q4_K,
+        format,
         bytes: weight,
         in_dim,
         out_dim,
@@ -514,7 +523,7 @@ fn gemv_q4_k_batched(
         // established by `validate`.
         let r = rows.start + i;
         let weight_row = &weight[r * row_bytes..(r + 1) * row_bytes];
-        avx2::vec_dot_q4_k_q8_k_rows(weight_row, acts, n_acts, dst, scalar)?;
+        rows_dot(weight_row, acts, n_acts, dst, scalar)?;
     }
     Ok(())
 }
