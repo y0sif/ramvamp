@@ -212,6 +212,22 @@ counter at zero, because the machine as a whole was short of memory. Rule 2
 fails any reclaim, wherever the pressure came from, so whether that should
 change is in "Open decisions".
 
+### Running while the machine is busy, inside 3 GB (EXP-031)
+
+Most cold runs since EXP-027 failed rule 2 because the machine was short of
+memory, not because the runtime was: a 4 GB cap changes nothing, since `kswapd`
+takes pages from any cgroup when the whole machine is short. What it could take
+from the runtime was the 1 GiB of mmap'd common weights, and once it took 801
+MiB of them mid-run and decode fell to 1.43 tok/s. `--common-memory resident`
+reads them into anonymous memory instead, which a swap-off cgroup cannot lose:
+zero refaults across every resident run, same speed, +0.75 s of load and +70
+MiB of peak, and 2,963 MiB at 4K context against the 3,072 cap and `ramvamp
+plan`'s own 2,961 projection. Two fixes help both modes: `tokenizer.json` (11
+MiB) no longer lingers in the page cache, and btrfs's habit of caching direct
+reads of compressed extents is handled. Whether resident becomes the default,
+whether everyday sessions get their own swap-off cgroup, and what rule 2 should
+count are in "Open decisions".
+
 ### Next: three speed steps, in order
 
 Each one is bit-identical to what it replaces, each is measured paired
@@ -506,7 +522,9 @@ rather than default to measuring more.
 | Reopen progressive miss execution | **open** |
 | Move the slot dial to 12 or 13 | **held**, needs a 13-slot arm at 4K context |
 | A GPU backend (v1 item 2) | **not now** (2026-10-10): no quotable ratio, because the CPU pool would not hold steady even at locked clocks (EXP-026). Reopen conditions are in the v1 section |
-| Reclaim from pressure outside the cgroup under rule 2 | **open** (2026-10-11): `kswapd` reclaim with every `memory.events` counter zero and `memory.peak` well under the limit currently fails a run, so no run on a machine short of memory can be published (EXP-027). Keep it, or treat it like the khugepaged amendment |
+| Hold the common weights resident by default | **open** (2026-10-11): `--common-memory resident` keeps them out of reach of other programs' memory pressure, fits 3 GB at 4K context with 109 MiB spare, and matches `ramvamp plan` to 2 MiB (EXP-031). Making it the default changes the hard rule that common weights are mmap'd |
+| Run everyday sessions in their own swap-off cgroup | **open** (2026-10-11): resident memory is only protected where swap is off for the process; outside a benchmark cgroup the kernel could swap it out instead (EXP-031). `systemd-run --user` can do it without root |
+| What rule 2's hygiene gate should count | **open** (2026-10-11): it fails any reclaimed page, but with resident common weights the runs that fail lose 0-2 MiB of pages that are never read back (`workingset_refault_file` 0-11). Gating on refaults and `memory.events` would pass them while still failing a run that lost something it needed (EXP-031) |
 
 The TUI (`chat --tui`) is kept rather than deleted, under the standing rule
 that measured-and-set-aside work is preserved. It is genuinely useful as an

@@ -192,7 +192,7 @@ Consequences accepted:
 ```text
 model.rvmp/
   manifest.json        # see schema below; written last, atomically promoted
-  common.bin           # embeddings, lm_head, attention, routers, norms; mmap'd
+  common.bin           # embeddings, lm_head, attention, routers, norms; mmap'd, or read into anonymous memory with --common-memory resident (EXP-031)
   tokenizer/           # tokenizer.json + chat template + generation defaults
   experts/
     layout.json        # per-layer stride, per-projection offsets and quant types
