@@ -164,30 +164,52 @@ other things, and then makes it faster. Every benchmark so far has needed a
 quiet machine. That requirement is a finding in its own right: the runtime's
 speed depends on what else is running.
 
-The mechanism is in `crates/core/src/threads.rs`. `ComputePool` splits every
+The mechanism was in `crates/core/src/threads.rs`. `ComputePool` split every
 GEMV into six fixed, equal row ranges, one per P-core, each run by a thread
-pinned to that core, and the job finishes only when the slowest range does.
+pinned to that core, and the job finished only when the slowest range did.
 Anything else running on one of those six cores, or on its hyperthread
-sibling, slows that range, and with it every GEMV in the token. EXP-026's
-locked-clock run shows this happening in practice: the GPU arms, driven from
-one submitting thread, held steady through the same background load that
-made the pool flip between two speeds.
+sibling, slowed that range, and with it every GEMV in the token. EXP-026's
+locked-clock run showed this happening: the GPU arms, driven from one
+submitting thread, held steady through the same background load that made
+the pool flip between two speeds.
 
-In order:
+Steps 1 to 3 are done (EXP-027), on branch `feat/pool-chunks`:
 
-1. **Measure it.** A paired diagnostic of the pool with and without a
-   controlled background load, so the cost of one busy core is a number.
-   Arms are interleaved, so ordinary background load falls on both, and
-   comparing them does not need a quiet machine.
-2. **Hand out work dynamically.** Split each job into many small row chunks
-   that threads claim from a shared counter, so a slowed core simply takes
-   fewer. For the GEMVs this is bit-identical by construction, because each
-   output row is one whole-row dot whichever thread computes it.
-3. **Loosen the pinning**, so the scheduler can move a worker off a busy
-   core instead of time-slicing it there.
-4. **Then speed.** The Q4_K row hoist for prefill, now bit-identical to
-   production (EXP-026), and the expert cache policy (see "Then, in no fixed
-   order" below).
+1. **Measured.** `cargo bench -p ramvamp-core --bench pool` runs the real
+   kernels at the v0 expert shapes through five pool arms, under four loads
+   (nothing added, a spinner on one pool core, one on its hyperthread sibling,
+   two floating), interleaved so ordinary background load falls on every arm.
+   It needs no quiet machine. On v0's pool one busy core cost the decode
+   expert phase up to 2.1x and the prefill expert GEMV up to 2.3x.
+2. **Work is handed out dynamically.** Every GEMV is split into
+   `shards x 4` chunks claimed from a shared counter
+   (`ComputePool::run_chunks`). Attention keeps its fixed split, because its
+   scratch is carved per shard. Bit-identical by construction, and checked:
+   all 12 end-to-end runs below produced the same text.
+3. **The pinning is loosened.** `--placement shared`, now the default, lets
+   every thread run on any P-core thread or L3 E-core and leaves the choice
+   to the scheduler. `--placement per-core` keeps v0's layout.
+
+End to end, warm, ctx 512, `--max-new 32`, paired against `main` over two
+rounds on a machine doing its ordinary work (load average 2.5 to 5.3): the
+default build prefills **1.14-1.22x** and decodes **1.13x** faster with
+nothing added, and **1.34-1.38x** and **1.17-1.21x** faster with one core
+busy. A busy core now costs prefill 4-5%, against 19-22% on `main`. These are
+warm diagnostics under rule 2; the published figures at the top of this file
+predate the change and stay until a cold paired run replaces them. The
+trade-off, from the microbench on a quieter moment: when nothing else runs,
+pinning per core is still about 4% faster on decode's GEMVs and 8% on
+prefill's, which is why `per-core` remains an option.
+
+What is left:
+
+- **A cold paired run** of `main` against this branch, which is what turns
+  the figures above into publishable ones.
+- **Step 4, speed.** The Q4_K row hoist for prefill, now bit-identical to
+  production (EXP-026), and the expert cache policy (see "Then, in no fixed
+  order" below). Prefill's own split points at a third candidate: on the run
+  above, `elementwise` was 16% of prefill (7.0 s of 42.5 s) and runs on one
+  thread.
 
 ## v1
 

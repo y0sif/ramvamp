@@ -23,6 +23,10 @@ io-uring = ["dep:io-uring"]
 name = "kernels"
 harness = false
 
+[[bench]]
+name = "pool"
+harness = false
+
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -58,6 +58,7 @@ use ramvamp_core::model::{
     ForwardError, ForwardState, LoadOptions, Model, PrefillMode, PrefillTiming, StreamPhase,
     prefill_prompt,
 };
+use ramvamp_core::threads::Placement;
 use ramvamp_core::tokenizer::{ChatMessage, Role, RvmpTokenizer};
 
 mod config;
@@ -140,8 +141,7 @@ struct RuntimeArgs {
 
     /// Compute threads, counting the decode thread itself. Defaults to the
     /// runtime's own CPU topology detection: one thread per physical
-    /// performance core, no SMT siblings, pinned. Degrades to unpinned on
-    /// any machine whose topology cannot be read.
+    /// performance core. Where they run is `--placement`.
     ///
     /// Range-checked here rather than clamped later: `ComputePool` clamps to
     /// `1..=MAX_SHARDS`, so `--threads 0` used to run a correct one-shard
@@ -153,6 +153,15 @@ struct RuntimeArgs {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=MAX_THREADS),
     )]
     threads: Option<usize>,
+
+    /// Where compute threads may run: `shared` lets every thread run on any
+    /// performance core or any efficiency core with an L3, so the scheduler
+    /// can move one off a core something else is using; `per-core` pins one
+    /// thread to each performance core, a few percent faster on an otherwise
+    /// idle machine and much slower on a busy one; `off` sets no affinity.
+    /// Unset: shared, or `RAMVAMP_PLACEMENT`, or the profile's `placement`.
+    #[arg(long, value_name = "MODE", value_parser = parse_placement)]
+    placement: Option<Placement>,
 
     /// Skip every SHA-256 integrity check (fast dev loads). Size checks
     /// still run.
@@ -311,6 +320,18 @@ fn parse_prefill_mode(text: &str) -> Result<PrefillMode, String> {
         "token" | "token-major" | "token_major" => Ok(PrefillMode::TokenMajor),
         other => Err(format!(
             "unknown prefill mode {other:?} (use sweep or token-major)"
+        )),
+    }
+}
+
+/// Parse `--placement`, `RAMVAMP_PLACEMENT` and a profile's `placement`.
+fn parse_placement(text: &str) -> Result<Placement, String> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "per-core" | "per_core" | "percore" => Ok(Placement::PerCore),
+        "shared" => Ok(Placement::Shared),
+        "off" => Ok(Placement::Off),
+        other => Err(format!(
+            "unknown placement {other:?} (use per-core, shared or off)"
         )),
     }
 }
@@ -1705,7 +1726,7 @@ fn decode_gemv_lines(
     };
     let mut lines = vec![format!(
         "decode gemv split (submitting thread): {} tokens; \
-         own = set-up + this core's shard, wait = pool barrier",
+         own = set-up + this core's chunks, wait = pool barrier",
         timing.tokens
     )];
     for &(label, own, wait, scatters) in split {
@@ -3310,21 +3331,24 @@ mod tests {
         let unset = Flags::from_args(args.context, args.prefill, &args.runtime);
         assert_eq!(unset, Flags::default());
 
-        // ... so an environment that sets the three dials it has variables for
+        // ... so an environment that sets the four dials it has variables for
         // wins them.
         let env = Env {
             context: Some(2048),
             prefill: Some(PrefillMode::TokenMajor),
             prefill_chunk: Some(77),
+            placement: Some(Placement::Shared),
         };
         let dials = Dials::resolve(Selection::default(), &unset, &env);
         assert_eq!(dials.context.value, 2048);
         assert_eq!(dials.prefill.value, PrefillMode::TokenMajor);
         assert_eq!(dials.prefill_chunk.value, 77);
+        assert_eq!(dials.placement.value, Placement::Shared);
         for source in [
             dials.context.source,
             dials.prefill.source,
             dials.prefill_chunk.source,
+            dials.placement.source,
         ] {
             assert_eq!(source, Source::Env);
         }
@@ -3966,7 +3990,7 @@ mod tests {
         assert_eq!(
             lines[0],
             "decode gemv split (submitting thread): 64 tokens; own = set-up + this \
-             core's shard, wait = pool barrier"
+             core's chunks, wait = pool barrier"
         );
         for line in &lines {
             assert!(!line.contains("decode: 64 tokens"), "{line}");

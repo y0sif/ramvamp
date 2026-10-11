@@ -119,7 +119,7 @@ use crate::kernels::quants::{
 use crate::kernels::gemv::{FusedPart, fused_out_dim, fused_row_parts, gemv_q8_k_fused_rows};
 use crate::kernels::{gemv_q8_0_rows, gemv_q8_k_rows};
 use crate::kv::{KvCache, KvError};
-use crate::threads::{ComputePool, PoolConfig};
+use crate::threads::{ComputePool, Placement, PoolConfig};
 use thiserror::Error;
 
 use super::error::ModelError;
@@ -157,9 +157,9 @@ pub struct RuntimeConfig {
     /// shard per physical P-core.
     pub threads: Option<usize>,
 
-    /// Pin compute threads (and the decode thread) to their CPUs. Failures
-    /// degrade to unpinned; see [`crate::threads`].
-    pub pin: bool,
+    /// Where compute threads (and the decode thread) may run. Failures
+    /// degrade to unplaced; see [`crate::threads::Placement`].
+    pub placement: Placement,
 }
 
 impl Default for RuntimeConfig {
@@ -167,7 +167,7 @@ impl Default for RuntimeConfig {
         Self {
             cache_bytes: DEFAULT_CACHE_BYTES,
             threads: None,
-            pin: true,
+            placement: Placement::Shared,
         }
     }
 }
@@ -184,7 +184,7 @@ impl RuntimeConfig {
         Self {
             cache_bytes: 4 * 1024 * 1024,
             threads: Some(2),
-            pin: false,
+            placement: Placement::Off,
         }
     }
 }
@@ -770,9 +770,10 @@ impl ForwardState {
 
         let pool = ComputePool::with_config(PoolConfig {
             shards: config.threads,
-            pin: config.pin,
-            pin_caller: config.pin,
+            placement: config.placement,
+            pin_caller: true,
             inline_caller: true,
+            ..PoolConfig::default()
         });
         let stream = ExpertStream::new(
             model.dir(),
@@ -1281,14 +1282,13 @@ enum GemvSite {
 ///
 /// # What the split means
 ///
-/// The pool runs shard 0 **inline on the submitting thread**
-/// ([`PoolConfig::inline_caller`], which [`ForwardState::with_config`] always
-/// sets): the submitter publishes the job, runs shard 0 itself, and only then
-/// joins at the barrier. So the decode thread's own timeline through one
-/// fan-out is
+/// The submitting thread **claims chunks like any worker**
+/// ([`ComputePool::run_chunks`]): it publishes the job, runs chunks until none
+/// are left to claim, and only then joins at the barrier. So the decode
+/// thread's own timeline through one fan-out is
 ///
 /// ```text
-/// t0 --[ set-up + publish + this core's shard ]-- t1 --[ barrier ]-- t2
+/// t0 --[ set-up + publish + this core's chunks ]-- t1 --[ barrier ]-- t2
 /// ```
 ///
 /// and `own = t1 - t0`, `wait = t2 - t1`. EXP-023 left ~248 ms/token of GEMV
@@ -1316,7 +1316,7 @@ enum GemvSite {
 ///
 /// `own` carries the [`Mutex`] the failure slot needs, the job descriptor's
 /// construction, the publish (including the `futex` wake when workers are
-/// parked) and this core's `1/shards` of the rows. `wait` carries the barrier
+/// parked) and the rows of every chunk this core claimed. `wait` carries the barrier
 /// spin, the park, and the uncontended `take_panic` lock on the way out. Both
 /// are attributed to the *fan-out*, which is what the question is about; the
 /// components are named here so nobody reads `own` as pure arithmetic.
@@ -1392,21 +1392,23 @@ impl GemvSplit {
 }
 
 thread_local! {
-    /// When the pooled GEMV in flight finished **this thread's** shard.
+    /// When the pooled GEMV in flight finished **this thread's** last chunk.
     ///
     /// This is the one piece of the instrument that cannot live on the
-    /// submitting thread's side of the call: `t1` is the instant
-    /// [`ComputePool::run`] returns from `f(Shard { index: 0, .. })`, which is
-    /// *inside* `run`, and the pool exposes no hook there. It is read from the
-    /// closure instead, under two conditions that keep the worker hot path
+    /// submitting thread's side of the call: `t1` is the instant the
+    /// submitting thread, which claims chunks like any worker inside
+    /// [`ComputePool::run_chunks`], runs out of chunks to claim, and the pool
+    /// exposes no hook there. It is written from the closure instead, after
+    /// every chunk the submitting thread runs, so the value left behind is
+    /// the end of its last one. Two conditions keep the worker hot path
     /// untouched:
     ///
     /// - only when the sub-split is armed, which the closure captures as a
     ///   plain `bool`, so a prefill's fan-outs and every non-decode caller take
     ///   a predicted-not-taken branch and nothing else;
-    /// - only from `shard.index == 0`, which under
-    ///   [`PoolConfig::inline_caller`] is the submitting thread itself. Every
-    ///   worker shard evaluates one comparison and skips.
+    /// - only from a chunk with [`Chunk::on_caller`](crate::threads::Chunk)
+    ///   set, which is the submitting thread itself. Every worker chunk
+    ///   evaluates one comparison and skips.
     ///
     /// So no worker ever reads a clock, no worker ever writes shared state, and
     /// the wake/park pattern the instrument is trying to measure is not itself
@@ -1414,12 +1416,10 @@ thread_local! {
     /// value never crosses a thread, and an atomic would put a store on the
     /// only line where a straggler's timing matters.
     ///
-    /// Without `inline_caller` shard 0 is a worker, this cell is never written
-    /// on the submitting thread, and [`GemvClock::close`] falls back to
-    /// `own = t2 - t0`, `wait = 0`. That is a degenerate report, not a wrong
-    /// one, and it is unreachable from [`ForwardState`], which hard-codes
-    /// `inline_caller: true`.
-    static SHARD0_DONE: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// When the submitting thread claims no chunk at all, this cell is never
+    /// written and [`GemvClock::close`] falls back to `own = t2 - t0`,
+    /// `wait = 0`. That is a degenerate report, not a wrong one.
+    static CALLER_DONE: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 /// A stopwatch over a [`GemvSplit`], charged per fan-out rather than per
@@ -1478,7 +1478,7 @@ impl<'a> GemvClock<'a> {
     #[inline]
     fn open(&self) -> Option<Instant> {
         self.split.as_ref()?;
-        SHARD0_DONE.set(None);
+        CALLER_DONE.set(None);
         Some(Instant::now())
     }
 
@@ -1493,7 +1493,7 @@ impl<'a> GemvClock<'a> {
         // `ComputePool::run` returns from without calling `f` at all. The whole
         // call is then this thread's and there was no barrier, which is exactly
         // what `t1 = t2` records.
-        let t1 = SHARD0_DONE.replace(None).unwrap_or(t2);
+        let t1 = CALLER_DONE.replace(None).unwrap_or(t2);
         let bucket = split.bucket(site);
         // Saturating for the same reason `PhaseClock::charge` saturates: a
         // non-monotonic platform clock must not panic in library code.
@@ -1536,7 +1536,7 @@ pub(super) fn pool_gemv_q8_k(
     pool_gemv_q8_k_stamped(pool, format, weight, in_dim, out_dim, acts, out, false)
 }
 
-/// [`pool_gemv_q8_k`], stamping [`SHARD0_DONE`] when `stamp` is set.
+/// [`pool_gemv_q8_k`], stamping [`CALLER_DONE`] when `stamp` is set.
 ///
 /// Split out rather than folded into the public helper so that every caller
 /// that does not want the decode sub-split — the sweep, the token-major
@@ -1555,15 +1555,15 @@ fn pool_gemv_q8_k_stamped(
     stamp: bool,
 ) -> Result<(), KernelError> {
     let failure: Mutex<Option<(usize, KernelError)>> = Mutex::new(None);
-    pool.scatter(out, |shard, chunk| {
-        let index = shard.index;
-        if let Err(err) = gemv_q8_k_rows(format, weight, in_dim, out_dim, acts, shard.rows, chunk) {
+    pool.scatter_chunks(out, |chunk, dst| {
+        let (index, on_caller) = (chunk.index, chunk.on_caller);
+        if let Err(err) = gemv_q8_k_rows(format, weight, in_dim, out_dim, acts, chunk.rows, dst) {
             record(&failure, index, err);
         }
-        // Last, so it is the end of this core's arithmetic and not the middle
-        // of it. See `SHARD0_DONE` for why a worker never reaches the read.
-        if stamp && index == 0 {
-            SHARD0_DONE.set(Some(Instant::now()));
+        // Last, so it is the end of this chunk's arithmetic and not the middle
+        // of it. See `CALLER_DONE` for why a worker never reaches the read.
+        if stamp && on_caller {
+            CALLER_DONE.set(Some(Instant::now()));
         }
     });
     taken(failure)
@@ -1597,13 +1597,13 @@ fn pool_gemv_q8_k_fused(
         });
     }
     let failure: Mutex<Option<(usize, KernelError)>> = Mutex::new(None);
-    pool.scatter(out, |shard, chunk| {
-        let index = shard.index;
-        if let Err(err) = gemv_q8_k_fused_rows(parts, shard.rows, chunk) {
+    pool.scatter_chunks(out, |chunk, dst| {
+        let (index, on_caller) = (chunk.index, chunk.on_caller);
+        if let Err(err) = gemv_q8_k_fused_rows(parts, chunk.rows, dst) {
             record(&failure, index, err);
         }
-        if stamp && index == 0 {
-            SHARD0_DONE.set(Some(Instant::now()));
+        if stamp && on_caller {
+            CALLER_DONE.set(Some(Instant::now()));
         }
     });
     taken(failure)
@@ -1639,7 +1639,7 @@ const FUSED_SPAN_COUNT: &str = "pool fused gemv: destination spans vs parts";
 ///
 /// [`KernelError::LengthMismatch`] when `at` disagrees with `parts`, a span
 /// runs past `dst`, or two spans overlap or descend; otherwise whatever the
-/// kernel reports for the lowest-indexed shard that fails.
+/// kernel reports for the lowest-indexed chunk that fails.
 fn pool_gemv_q8_k_fused_at(
     pool: &mut ComputePool,
     parts: &[FusedPart<'_>],
@@ -1680,18 +1680,18 @@ fn pool_gemv_q8_k_fused_at(
     let total = fused_out_dim(parts);
     let failure: Mutex<Option<(usize, KernelError)>> = Mutex::new(None);
     let base = SendPtr(dst.as_mut_ptr());
-    pool.run(total, |shard| {
-        let index = shard.index;
-        for (p, local) in fused_row_parts(parts, shard.rows.clone()) {
+    pool.run_chunks(total, |chunk| {
+        let index = chunk.index;
+        for (p, local) in fused_row_parts(parts, chunk.rows.clone()) {
             let part = parts[p];
             let start = at[p] + local.start;
             let len = local.len();
             // SAFETY: the same invariant as `pool_decode_attention`'s —
-            // **shard windows are the image of a tiling under an injective
+            // **chunk windows are the image of a tiling under an injective
             // map**. `fused_row_parts` carries the pool's tiling of
             // `0..total` to, per part, a tiling of that part's own
             // `0..out_dim` (`the_fused_row_map_covers_every_part_row_exactly_once`),
-            // so distinct shards never name the same `(part, local row)`;
+            // so distinct chunks never name the same `(part, local row)`;
             // and the spans `at` names are pairwise disjoint by the
             // watermark walk above, so distinct parts never name the same
             // element of `dst` either. In bounds because
@@ -1710,13 +1710,15 @@ fn pool_gemv_q8_k_fused_at(
                 chunk,
             ) {
                 record(&failure, index, err);
-                // Deterministic: the reported error is the lowest shard's,
-                // and within a shard the first part in fused order.
+                // Deterministic: the reported error is the lowest chunk's,
+                // and within a chunk the first part in fused order. Every
+                // chunk runs whatever the others report, so which is lowest
+                // does not depend on timing.
                 break;
             }
         }
-        if stamp && index == 0 {
-            SHARD0_DONE.set(Some(Instant::now()));
+        if stamp && chunk.on_caller {
+            CALLER_DONE.set(Some(Instant::now()));
         }
     });
     taken(failure)
@@ -1733,13 +1735,13 @@ fn pool_gemv_q8_0(
     stamp: bool,
 ) -> Result<(), KernelError> {
     let failure: Mutex<Option<(usize, KernelError)>> = Mutex::new(None);
-    pool.scatter(out, |shard, chunk| {
-        let index = shard.index;
-        if let Err(err) = gemv_q8_0_rows(weight, in_dim, out_dim, acts, shard.rows, chunk) {
+    pool.scatter_chunks(out, |chunk, dst| {
+        let (index, on_caller) = (chunk.index, chunk.on_caller);
+        if let Err(err) = gemv_q8_0_rows(weight, in_dim, out_dim, acts, chunk.rows, dst) {
             record(&failure, index, err);
         }
-        if stamp && index == 0 {
-            SHARD0_DONE.set(Some(Instant::now()));
+        if stamp && on_caller {
+            CALLER_DONE.set(Some(Instant::now()));
         }
     });
     taken(failure)
@@ -3075,9 +3077,10 @@ mod tests {
         for shards in [1usize, 2, 3, 4, 5, 8] {
             let mut pool = ComputePool::with_config(PoolConfig {
                 shards: Some(shards),
-                pin: false,
+                placement: Placement::Off,
                 pin_caller: false,
                 inline_caller: true,
+                ..PoolConfig::default()
             });
             for case in &cases {
                 // Exactly what `ForwardState` allocates: one carve per
@@ -3139,7 +3142,7 @@ mod tests {
             let config = RuntimeConfig {
                 cache_bytes: 4 * 1024 * 1024,
                 threads: Some(threads),
-                pin: false,
+                placement: Placement::Off,
             };
             let st = ForwardState::with_config(&model, cap, config).unwrap();
             let shards = st.pool.shards();
@@ -3200,7 +3203,7 @@ mod tests {
         let single = RuntimeConfig {
             cache_bytes: 4 * 1024 * 1024,
             threads: Some(1),
-            pin: false,
+            placement: Placement::Off,
         };
         let mut one = ForwardState::with_config(&model, 16, single).unwrap();
         let want = run(&model, &mut one, &prompt);
@@ -3219,7 +3222,7 @@ mod tests {
                 let config = RuntimeConfig {
                     cache_bytes,
                     threads: Some(threads),
-                    pin: false,
+                    placement: Placement::Off,
                 };
                 let mut many = ForwardState::with_config(&model, 16, config).unwrap();
                 // Warm the cache, then re-run the same prompt.
@@ -3621,9 +3624,10 @@ mod tests {
         for shards in [1usize, 2, 3, 5] {
             let mut pool = ComputePool::with_config(PoolConfig {
                 shards: Some(shards),
-                pin: false,
+                placement: Placement::Off,
                 pin_caller: false,
                 inline_caller: true,
+                ..PoolConfig::default()
             });
             let mut dst = vec![FILL; 8 * out_dim];
             pool_gemv_q8_k_fused_at(&mut pool, &parts, &at, &mut dst, false).unwrap();
@@ -3665,9 +3669,10 @@ mod tests {
         // The disjointness the `unsafe` rests on is checked, not assumed.
         let mut pool = ComputePool::with_config(PoolConfig {
             shards: Some(2),
-            pin: false,
+            placement: Placement::Off,
             pin_caller: false,
             inline_caller: true,
+            ..PoolConfig::default()
         });
         let mut dst = vec![0.0f32; 8 * out_dim];
         let overlap = [0usize, out_dim - 1, 4 * out_dim];
@@ -4155,7 +4160,7 @@ mod tests {
         assert_eq!(config.cache_bytes, DEFAULT_CACHE_BYTES);
         assert_eq!(config.cache_bytes, 1_509_949_440);
         assert_eq!(config.threads, None);
-        assert!(config.pin);
+        assert_eq!(config.placement, Placement::Shared);
     }
 
     // -----------------------------------------------------------------------
@@ -4341,7 +4346,7 @@ mod tests {
     ///   50% so that it pins the instrument rather than the fixture's SwiGLU.
     /// - **Liveness.** At least one pooled barrier measured non-zero, which is
     ///   the only thing that distinguishes "the barrier is free" from "the
-    ///   shard-0 stamp never arrived and `own` swallowed the whole call".
+    ///   caller stamp never arrived and `own` swallowed the whole call".
     ///
     /// No absolute duration is asserted anywhere, for the reason the prefill
     /// timing tests give: this machine runs the model under a cgroup while the
@@ -4442,7 +4447,7 @@ mod tests {
             );
         }
 
-        // The instrument's own failure mode: if the shard-0 stamp never reaches
+        // The instrument's own failure mode: if the caller stamp never reaches
         // the submitting thread, `close` falls back to `t1 = t2` and every
         // pooled bucket reports its whole fan-out as `own` with a `wait` of
         // exactly zero — which reads like a finding ("the barrier costs
@@ -4452,7 +4457,7 @@ mod tests {
         let pooled_wait: Duration = split[..3].iter().map(|&(_, _, wait, _)| wait).sum();
         assert!(
             pooled_wait > Duration::ZERO,
-            "every pooled fan-out reported a zero barrier: the shard-0 stamp is \
+            "every pooled fan-out reported a zero barrier: the caller stamp is \
              not reaching the submitting thread, so `own` is the whole call and \
              the split says nothing: {split:?}"
         );
@@ -4479,13 +4484,13 @@ mod tests {
     ///
     /// "No clock reads" is not directly observable, so this asserts the
     /// structural cause of it: [`GemvClock::open`] returns before it does
-    /// anything at all, which is why it can neither clear [`SHARD0_DONE`] nor
+    /// anything at all, which is why it can neither clear [`CALLER_DONE`] nor
     /// call `Instant::now`. A sentinel left in the cell across the whole
     /// open/close/close_serial cycle is what pins that.
     #[test]
     fn a_disarmed_gemv_clock_does_nothing() {
         let sentinel = Instant::now();
-        SHARD0_DONE.set(Some(sentinel));
+        CALLER_DONE.set(Some(sentinel));
 
         let mut clock = GemvClock::disarmed();
         assert!(
@@ -4493,7 +4498,7 @@ mod tests {
             "a disarmed clock has no instant to hand back, so it read none"
         );
         assert_eq!(
-            SHARD0_DONE.get(),
+            CALLER_DONE.get(),
             Some(sentinel),
             "`open` cleared the stamp, so it did more than return"
         );
@@ -4503,7 +4508,7 @@ mod tests {
         clock.close(GemvSite::Experts, Some(sentinel));
         clock.close_serial(GemvSite::Router, Some(sentinel));
         assert_eq!(
-            SHARD0_DONE.get(),
+            CALLER_DONE.get(),
             Some(sentinel),
             "a disarmed close consumed the stamp"
         );
@@ -4514,11 +4519,11 @@ mod tests {
         let mut clock = GemvClock::new(&mut split, true);
         let opened = clock.open();
         assert!(opened.is_some());
-        assert_eq!(SHARD0_DONE.get(), None, "`open` arms a fresh stamp");
+        assert_eq!(CALLER_DONE.get(), None, "`open` arms a fresh stamp");
         clock.close_serial(GemvSite::Router, opened);
         assert_eq!(split.router.scatters, 1);
         assert_eq!(split.router.wait, Duration::ZERO);
 
-        SHARD0_DONE.set(None);
+        CALLER_DONE.set(None);
     }
 }
