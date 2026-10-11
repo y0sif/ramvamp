@@ -173,7 +173,7 @@ locked-clock run showed this happening: the GPU arms, driven from one
 submitting thread, held steady through the same background load that made
 the pool flip between two speeds.
 
-Steps 1 to 3 are done (EXP-027), on branch `feat/pool-chunks`:
+Steps 1 to 3 are done (EXP-027) and merged (PR #4):
 
 1. **Measured.** `cargo bench -p ramvamp-core --bench pool` runs the real
    kernels at the v0 expert shapes through five pool arms, under four loads
@@ -201,15 +201,58 @@ trade-off, from the microbench on a quieter moment: when nothing else runs,
 pinning per core is still about 4% faster on decode's GEMVs and 8% on
 prefill's, which is why `per-core` remains an option.
 
-What is left:
+The cold paired run followed on 2026-10-11, in the 3 GB cgroup at ctx 512
+and `--max-new 64`: prefill **9.14 to 12.68 tok/s** and decode **2.01 to
+2.12** (medians, three scored runs each), ranges disjoint, outputs identical.
+Quote it as 1.13x and 1.045x, the worst new run against the best reference
+run, because the reference arm drifted down during its own runs. It is **not
+publishable**: five of the six scored runs lost 9-11 MiB to `kswapd` while
+the cgroup sat at least 480 MiB under its limit with every `memory.events`
+counter at zero, because the machine as a whole was short of memory. Rule 2
+fails any reclaim, wherever the pressure came from, so whether that should
+change is in "Open decisions".
 
-- **A cold paired run** of `main` against this branch, which is what turns
-  the figures above into publishable ones.
-- **Step 4, speed.** The Q4_K row hoist for prefill, now bit-identical to
-  production (EXP-026), and the expert cache policy (see "Then, in no fixed
-  order" below). Prefill's own split points at a third candidate: on the run
-  above, `elementwise` was 16% of prefill (7.0 s of 42.5 s) and runs on one
-  thread.
+### Next: three speed steps, in order
+
+Each one is bit-identical to what it replaces, each is measured paired
+against `main` as above, and each lands as its own PR.
+
+1. **Prefill's single-threaded work onto the pool.** Three loops in
+   `model/prefill.rs` run on the submitting thread, one row at a time, while
+   the pool waits:
+   - **the router**: per row, a 128 x 2048 f32 matvec, softmax and top-k.
+     Decode measures that matvec at 0.40 ms per layer-token, so at 512 rows
+     and 48 layers it is roughly 9.8 s of the 42.5 s prefill above. That is
+     an **estimate**: prefill charges the router to `projections` and does
+     not time it separately. The first change gives it its own bucket.
+   - **the elementwise rows**: the two RMSNorms, the Q8_K and Q8_0
+     quantizations, QK-norm and RoPE, the residual adds and the top-k
+     reduction. 7.0 s, 16% of prefill.
+   - **the per-expert glue** inside the sweep: SwiGLU, the transpose and the
+     re-quantization between `up` and `down`, inside `expert compute`.
+
+   Every row is independent, so splitting rows across threads leaves each
+   row's arithmetic unchanged. The router's f32 dot stays a serial sum per
+   row, on purpose: vectorizing it would reorder the sum and could flip a
+   near-tie in top-k. The route sink is still called in row order, after the
+   parallel part. Decode's router, 128 experts per token, can split the same
+   way across experts for about 4% of a token.
+2. **The Q4_K row hoist for prefill's batched GEMV.** It expands each weight
+   row once and reuses it across every activation row routed to it, instead
+   of once per activation. The prototype on `perf/q4k-row-hoist-prototype`
+   is already bit-identical to production. What remains: vectorize its
+   expansion, dispatch it from `gemv_q8_k_batched` for Q4_K when there are
+   enough activation rows to pay for the scratch, and measure it cold. It
+   covers the expert `gate` and `up` projections and every Q4_K attention
+   projection.
+3. **The expert cache policy for decode.** Capture a routing trace with
+   `generate --trace-experts`, commit a small one so the work needs no model,
+   score the untried policies in `scripts/lfu_sim.py` (LRU-K, ARC, S3-FIFO,
+   and a layer-aware variant), and give the best one a single paired cold
+   run. Expert reads are 44.4% of a cold decode token at ctx 512 (EXP-023), the
+   largest single term, so this is the lever there,
+   but the gain is bounded by the hit-rate gap (11 points or more to the
+   offline optimum) and by the drive.
 
 ## v1
 
@@ -442,6 +485,7 @@ rather than default to measuring more.
 | Reopen progressive miss execution | **open** |
 | Move the slot dial to 12 or 13 | **held**, needs a 13-slot arm at 4K context |
 | A GPU backend (v1 item 2) | **not now** (2026-10-10): no quotable ratio, because the CPU pool would not hold steady even at locked clocks (EXP-026). Reopen conditions are in the v1 section |
+| Reclaim from pressure outside the cgroup under rule 2 | **open** (2026-10-11): `kswapd` reclaim with every `memory.events` counter zero and `memory.peak` well under the limit currently fails a run, so no run on a machine short of memory can be published (EXP-027). Keep it, or treat it like the khugepaged amendment |
 
 The TUI (`chat --tui`) is kept rather than deleted, under the standing rule
 that measured-and-set-aside work is preserved. It is genuinely useful as an
