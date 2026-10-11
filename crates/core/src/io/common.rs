@@ -127,10 +127,18 @@ impl MappedCommon {
 /// The region comes from `mmap(MAP_ANONYMOUS)`, so it is page-aligned, which
 /// is what `O_DIRECT` needs of the buffer, and its length is rounded up to
 /// [`DIO_ALIGN`], so every read is a whole number of aligned units even at
-/// the end of the file. Reading with `O_DIRECT` keeps the file's bytes out of
-/// the page cache, so loading never holds the weights twice. Where the file
-/// system refuses `O_DIRECT` (tmpfs, for one) the read falls back to a
-/// buffered one and then asks the kernel to drop the cached pages.
+/// the end of the file. Where the file system refuses `O_DIRECT` (tmpfs, for
+/// one) the read falls back to a buffered one.
+///
+/// **`O_DIRECT` alone does not keep the file out of the page cache.** btrfs
+/// serves a direct read of a *compressed* extent through the page cache, and
+/// the installed `common.bin` is mostly compressed extents (430 of them on the
+/// reference install; the expert files have none). Without help, loading
+/// would leave the whole file cached beside its anonymous copy, twice the
+/// footprint, which in a 3 GB cgroup is the difference between fitting and
+/// reclaiming (EXP-031). So every chunk is dropped from the page cache right
+/// after it is read, whichever path read it, and the transient cost is one
+/// chunk.
 fn read_resident(path: &Path, buffered: &File, len: usize) -> std::io::Result<Mmap> {
     let align = DIO_ALIGN as usize;
     let rounded = len.div_ceil(align).max(1) * align;
@@ -150,7 +158,10 @@ fn read_resident(path: &Path, buffered: &File, len: usize) -> std::io::Result<Mm
                 Ok(0) => break,
                 // A short read is only legitimate at the end of the file;
                 // anywhere else the next aligned read picks up from it.
-                Ok(n) => filled += n,
+                Ok(n) => {
+                    drop_cached(buffered, filled, n);
+                    filled += n;
+                }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 // The open succeeded but this file system will not do the
                 // transfer: finish buffered from where we are.
@@ -159,24 +170,31 @@ fn read_resident(path: &Path, buffered: &File, len: usize) -> std::io::Result<Mm
             }
         }
     }
-    if filled < len {
+    while filled < len {
+        let end = (filled + RESIDENT_CHUNK).min(len);
         let mut file = buffered;
         std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(filled as u64))?;
-        file.read_exact(&mut region[filled..len])?;
-        filled = len;
-        // Best effort: what the buffered read just cached is not needed.
-        // SAFETY: plain syscall on a valid descriptor; failure is ignored.
-        unsafe {
-            libc::posix_fadvise(
-                std::os::fd::AsRawFd::as_raw_fd(buffered),
-                0,
-                0,
-                libc::POSIX_FADV_DONTNEED,
-            );
-        }
+        file.read_exact(&mut region[filled..end])?;
+        drop_cached(buffered, filled, end - filled);
+        filled = end;
     }
-    debug_assert!(filled >= len);
     region.make_read_only()
+}
+
+/// Ask the kernel to drop `len` bytes at `offset` of `file` from the page
+/// cache. Best effort: `POSIX_FADV_DONTNEED` only drops clean pages nothing
+/// maps, which is all a just-read range of an unmapped file is, and a
+/// failure costs memory, not correctness.
+fn drop_cached(file: &File, offset: usize, len: usize) {
+    // SAFETY: a plain syscall on a valid descriptor, with no pointers.
+    unsafe {
+        libc::posix_fadvise(
+            std::os::fd::AsRawFd::as_raw_fd(file),
+            offset as libc::off_t,
+            len as libc::off_t,
+            libc::POSIX_FADV_DONTNEED,
+        );
+    }
 }
 
 #[cfg(test)]
