@@ -480,6 +480,12 @@ def inner(args) -> int:
         "memory_events": read_kv(os.path.join(cg, "memory.events")) if cg else {},
         "pg": {k: v for k, v in stat.items()
                if k.startswith("pgscan") or k.startswith("pgsteal")},
+        # Which kind of page the cgroup held at exit, and how often reclaimed
+        # pages had to come back. Not part of the verdict: they say *what*
+        # reclaim took, for a reader deciding whether it mattered.
+        "memory_detail": {k: stat[k] for k in (
+            "anon", "file", "file_mapped", "workingset_refault_anon",
+            "workingset_refault_file", "pgmajfault") if k in stat},
         "read_bytes_child_sampled": peak_child_read,
         "read_bytes_rusage_children": ru.ru_inblock * 512,
         "read_bytes_self_delta": (io_after.get("read_bytes", 0)
@@ -921,6 +927,15 @@ def main() -> int:
                              "actually bought is therefore never assumed here: "
                              "read it off the `model loaded in` line of the "
                              "stderr this harness now records.")
+    parser.add_argument("--ramvamp-arg", action="append", default=[],
+                        metavar="ARG",
+                        help="append ARG to the ramvamp command line, verbatim "
+                             "(repeatable; `--ramvamp-arg=--flag` for an ARG "
+                             "that starts with a dash). For runtime options "
+                             "this script has no flag of its own, such as "
+                             "`--common-memory resident`. Recorded in the "
+                             "argv like everything else, so two arms that "
+                             "differ by one stay distinguishable")
     parser.add_argument("--repeats", type=int, default=3,
                         help="scored runs (after the warmups)")
     parser.add_argument("--warmup", type=int, default=1,
@@ -1035,6 +1050,7 @@ def main() -> int:
     # reader establishes that two runs measured the same workload.
     if args.cache_bytes is not None:
         args.workload += ["--cache-bytes", args.cache_bytes]
+    args.workload += args.ramvamp_arg
     if not args.sampled:
         args.workload.append("--greedy")
     # Recorded like the prompt is, and for the same reason: a run whose dial

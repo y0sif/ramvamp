@@ -323,12 +323,14 @@ mod tests {
     const SKIP: LoadOptions = LoadOptions {
         skip_hashes: true,
         verify_layer_hashes: false,
+        common_memory: crate::io::CommonMemory::Mapped,
     };
 
     /// Opt in to the full per-layer SHA-256.
     const VERIFY: LoadOptions = LoadOptions {
         skip_hashes: false,
         verify_layer_hashes: true,
+        common_memory: crate::io::CommonMemory::Mapped,
     };
 
     #[test]

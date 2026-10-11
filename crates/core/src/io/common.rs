@@ -1,20 +1,30 @@
 //! Read-only mapping of `common.bin`.
 //!
 //! The common core (embeddings, lm_head, attention, routers, norms) is
-//! touched every token, so it is `mmap`'d read-only and the page cache
-//! keeps it resident. Integrity is checked before the map is handed out:
-//! the file's size must match the manifest entry, and unless hashes are
-//! skipped its SHA-256 must too (~1 GiB for the v0 model — a one-time
-//! load cost the design accepts).
+//! touched every token. By default it is `mmap`'d read-only and the page
+//! cache keeps it resident, for as long as nothing else needs the memory;
+//! with [`CommonMemory::Resident`] it is read once into anonymous memory
+//! instead, which nothing but swap can take away. Integrity is checked
+//! before the bytes are handed out: the file's size must match the manifest
+//! entry, and unless hashes are skipped its SHA-256 must too (~1 GiB for the
+//! v0 model — a one-time load cost the design accepts).
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Read};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 
 use crate::format::{COMMON_FILE, CommonTensor, Manifest};
 
-use super::{IoError, LoadOptions, to_usize, verify_named_file};
+use super::direct::{DIO_ALIGN, O_DIRECT};
+use super::{CommonMemory, IoError, LoadOptions, to_usize, verify_named_file};
+
+/// Bytes per read when loading [`CommonMemory::Resident`]: large enough to
+/// keep the drive streaming, a multiple of [`DIO_ALIGN`] as `O_DIRECT`
+/// requires.
+const RESIDENT_CHUNK: usize = 16 << 20;
 
 /// Read-only memory map of an install's `common.bin`.
 ///
@@ -24,7 +34,12 @@ use super::{IoError, LoadOptions, to_usize, verify_named_file};
 /// the standard mmap contract, not something this layer can defend against.
 #[derive(Debug)]
 pub struct MappedCommon {
+    /// The file's bytes: the file mapping itself, or an anonymous region
+    /// read from it and then made read-only. The anonymous region is rounded
+    /// up to [`DIO_ALIGN`], so only the first `len` bytes are the file.
     map: Mmap,
+    len: usize,
+    memory: CommonMemory,
 }
 
 impl MappedCommon {
@@ -42,31 +57,47 @@ impl MappedCommon {
         verify_named_file(dir, manifest, COMMON_FILE, options)?;
         let path = dir.join(COMMON_FILE);
         let file = File::open(&path).map_err(|e| IoError::io(&path, e))?;
-        // SAFETY: the map is read-only and private. The install directory
-        // is treated as immutable while open (see the struct docs); the
-        // size was just verified against the manifest.
-        let map = unsafe { Mmap::map(&file) }.map_err(|e| IoError::io(&path, e))?;
+        let len = file.metadata().map_err(|e| IoError::io(&path, e))?.len();
+        let len = to_usize(len, "common.bin length")?;
+        let map = match options.common_memory {
+            // SAFETY: the map is read-only and private. The install
+            // directory is treated as immutable while open (see the struct
+            // docs); the size was just verified against the manifest.
+            CommonMemory::Mapped => unsafe { Mmap::map(&file) },
+            CommonMemory::Resident => read_resident(&path, &file, len),
+        }
+        .map_err(|e| IoError::io(&path, e))?;
         tracing::debug!(
             path = %path.display(),
-            bytes = map.len(),
-            "mapped common weights"
+            bytes = len,
+            memory = ?options.common_memory,
+            "loaded common weights"
         );
-        Ok(Self { map })
+        Ok(Self {
+            map,
+            len,
+            memory: options.common_memory,
+        })
     }
 
     /// The whole file as a byte slice.
     pub fn bytes(&self) -> &[u8] {
-        &self.map
+        &self.map[..self.len]
     }
 
-    /// Length of the mapping in bytes.
+    /// Length of the file in bytes.
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.len
     }
 
-    /// Whether the mapping is empty (never true for a valid install).
+    /// Whether the file is empty (never true for a valid install).
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len == 0
+    }
+
+    /// How the bytes are held.
+    pub fn memory(&self) -> CommonMemory {
+        self.memory
     }
 
     /// Bounds-checked byte slice of one tensor from the manifest index.
@@ -79,15 +110,73 @@ impl MappedCommon {
     pub fn tensor(&self, name: &str, entry: &CommonTensor) -> Result<&[u8], IoError> {
         let offset = to_usize(entry.offset, "common tensor offset")?;
         let len = to_usize(entry.len, "common tensor len")?;
-        self.map
-            .get(offset..offset + len)
+        self.bytes()
+            .get(offset..offset.saturating_add(len))
             .ok_or_else(|| IoError::RangeOutOfBounds {
                 what: format!("common tensor {name:?}"),
                 offset: entry.offset,
                 len: entry.len,
-                available: self.map.len() as u64,
+                available: self.len as u64,
             })
     }
+}
+
+/// Read `len` bytes of `path` into a fresh anonymous region and make it
+/// read-only.
+///
+/// The region comes from `mmap(MAP_ANONYMOUS)`, so it is page-aligned, which
+/// is what `O_DIRECT` needs of the buffer, and its length is rounded up to
+/// [`DIO_ALIGN`], so every read is a whole number of aligned units even at
+/// the end of the file. Reading with `O_DIRECT` keeps the file's bytes out of
+/// the page cache, so loading never holds the weights twice. Where the file
+/// system refuses `O_DIRECT` (tmpfs, for one) the read falls back to a
+/// buffered one and then asks the kernel to drop the cached pages.
+fn read_resident(path: &Path, buffered: &File, len: usize) -> std::io::Result<Mmap> {
+    let align = DIO_ALIGN as usize;
+    let rounded = len.div_ceil(align).max(1) * align;
+    let mut region = MmapOptions::new().len(rounded).map_anon()?;
+    let direct = O_DIRECT.and_then(|flag| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(flag)
+            .open(path)
+            .ok()
+    });
+    let mut filled = 0usize;
+    if let Some(file) = direct {
+        while filled < len {
+            let end = (filled + RESIDENT_CHUNK).min(rounded);
+            match file.read_at(&mut region[filled..end], filled as u64) {
+                Ok(0) => break,
+                // A short read is only legitimate at the end of the file;
+                // anywhere else the next aligned read picks up from it.
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                // The open succeeded but this file system will not do the
+                // transfer: finish buffered from where we are.
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => break,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    if filled < len {
+        let mut file = buffered;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(filled as u64))?;
+        file.read_exact(&mut region[filled..len])?;
+        filled = len;
+        // Best effort: what the buffered read just cached is not needed.
+        // SAFETY: plain syscall on a valid descriptor; failure is ignored.
+        unsafe {
+            libc::posix_fadvise(
+                std::os::fd::AsRawFd::as_raw_fd(buffered),
+                0,
+                0,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
+    }
+    debug_assert!(filled >= len);
+    region.make_read_only()
 }
 
 #[cfg(test)]
@@ -108,6 +197,57 @@ mod tests {
         let whole = common.bytes();
         let offset = entry.offset as usize;
         assert_eq!(&whole[offset..offset + bytes.len()], bytes);
+    }
+
+    /// Resident and mapped hand out the same bytes and the same tensors. The
+    /// fixture's `common.bin` is not a multiple of the 4 KiB alignment, so the
+    /// rounded tail is exercised; under a tmpfs temp dir the `O_DIRECT` open
+    /// is refused and the buffered fallback runs instead.
+    #[test]
+    fn resident_and_mapped_hold_the_same_bytes() {
+        let fx = build_install("resident-common");
+        let mapped = MappedCommon::open(&fx.root, &fx.manifest, LoadOptions::default()).unwrap();
+        let resident = MappedCommon::open(
+            &fx.root,
+            &fx.manifest,
+            LoadOptions {
+                common_memory: CommonMemory::Resident,
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(resident.memory(), CommonMemory::Resident);
+        assert_eq!(mapped.memory(), CommonMemory::Mapped);
+        assert_eq!(resident.len(), mapped.len());
+        assert_eq!(resident.bytes(), mapped.bytes());
+        for (name, entry) in &fx.manifest.common_tensors {
+            assert_eq!(
+                resident.tensor(name, entry).unwrap(),
+                mapped.tensor(name, entry).unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    /// Reading through `O_DIRECT` on a real file system, where the temp dir
+    /// supports it: the same bytes as a plain read, for lengths on and off the
+    /// alignment.
+    #[test]
+    fn read_resident_matches_a_plain_read_at_awkward_lengths() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("resident-read-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        for len in [1usize, 4095, 4096, 4097, (16 << 20) + 513] {
+            let path = dir.join(format!("blob-{len}"));
+            let data: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            std::fs::write(&path, &data).unwrap();
+            let file = File::open(&path).unwrap();
+            let region = read_resident(&path, &file, len).unwrap();
+            assert_eq!(&region[..len], &data[..], "len {len}");
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 
     #[test]

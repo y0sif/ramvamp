@@ -98,6 +98,27 @@ pub struct LoadOptions {
     /// Ignored when [`LoadOptions::skip_hashes`] is set; that flag skips
     /// everything.
     pub verify_layer_hashes: bool,
+
+    /// How `common.bin` is held in memory. See [`CommonMemory`].
+    pub common_memory: CommonMemory,
+}
+
+/// How the common weights (`common.bin`: embeddings, lm_head, attention,
+/// routers, norms; ~1 GiB for the v0 model) are held in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommonMemory {
+    /// Memory-mapped read-only: file-backed pages the kernel may drop under
+    /// memory pressure and fault back in from disk.
+    #[default]
+    Mapped,
+    /// Read once into anonymous memory with `O_DIRECT`, so the bytes are
+    /// not also in the page cache. Anonymous pages can only leave memory
+    /// through swap, so in a cgroup with swap disabled the kernel cannot
+    /// reclaim them at all: other processes' memory pressure can no longer
+    /// evict the weights the runtime touches every token. Same size either
+    /// way, so the footprint does not change; the load is one sequential
+    /// read of the file.
+    Resident,
 }
 
 /// Map a lowercase on-disk quant name (as the repacker writes it) to the

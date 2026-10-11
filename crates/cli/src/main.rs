@@ -53,7 +53,7 @@ use ramvamp_core::format::{load_layout, load_manifest};
 use ramvamp_core::generate::{
     GenerateParams, GenerateStats, StopReason, TracePhase, generate, generate_from, generate_traced,
 };
-use ramvamp_core::io::{StreamStats, resident_ceiling};
+use ramvamp_core::io::{CommonMemory, StreamStats, resident_ceiling};
 use ramvamp_core::model::{
     ForwardError, ForwardState, LoadOptions, Model, PrefillMode, PrefillTiming, StreamPhase,
     prefill_prompt,
@@ -176,6 +176,26 @@ struct RuntimeArgs {
     /// `ramvamp-repack verify-install` remains the thorough check.
     #[arg(long)]
     verify_layer_hashes: bool,
+
+    /// How the ~1 GiB of common weights is held: `mapped` memory-maps
+    /// `common.bin`, so the kernel may drop those pages when other programs
+    /// need memory and read them back later; `resident` reads it once into
+    /// memory that only swap can take away, so with swap off for the process
+    /// (a cgroup with `MemorySwapMax=0`) nothing else can evict it. Same size
+    /// either way.
+    #[arg(long, value_name = "MODE", value_parser = parse_common_memory, default_value = "mapped")]
+    common_memory: CommonMemory,
+}
+
+/// Parse `--common-memory`.
+fn parse_common_memory(text: &str) -> Result<CommonMemory, String> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "mapped" => Ok(CommonMemory::Mapped),
+        "resident" => Ok(CommonMemory::Resident),
+        other => Err(format!(
+            "unknown common memory mode {other:?} (use mapped or resident)"
+        )),
+    }
 }
 
 impl RuntimeArgs {
@@ -189,6 +209,7 @@ impl RuntimeArgs {
         LoadOptions {
             skip_hashes: self.skip_hashes,
             verify_layer_hashes: self.verify_layer_hashes,
+            common_memory: self.common_memory,
         }
     }
 }
