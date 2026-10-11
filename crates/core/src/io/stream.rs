@@ -3938,6 +3938,7 @@ mod tests {
             LoadOptions {
                 skip_hashes: false,
                 verify_layer_hashes: true,
+                common_memory: crate::io::CommonMemory::Mapped,
             },
         )
         .unwrap();

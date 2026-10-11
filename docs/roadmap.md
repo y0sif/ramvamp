@@ -38,9 +38,13 @@ claims are worth anything.
    `read_bytes` as a positive control that the run really was cold.
    *In-cgroup* means `systemd-run --user` at `MemoryMax=3G` and
    `MemorySwapMax=0`, with counters read from inside the cgroup before exit;
-   zram counts as swap. *Hygiene PASS* means the reclaimers stole zero pages,
-   every `memory.events` counter is zero, swap peak is zero, and both processes
-   exited 0. This rule is also why a simulated or replayed cache hit rate is
+   zram counts as swap. *Hygiene PASS* means no more than 1 MiB of reclaimed
+   pages had to be read back, every `memory.events` counter is zero, swap peak
+   is zero, and both processes exited 0. Reclaim the run never needed back is
+   a note, not a failure: the machine's own memory pressure reclaims from every
+   cgroup, and a run on a machine in ordinary use should not fail on pages it
+   was done with (the refault amendment, EXP-031). A run recorded without the
+   refault counters keeps the stricter zero-reclaim test. This rule is also why a simulated or replayed cache hit rate is
    always named as a simulation or a replay and is never quoted as the
    runtime's hit rate.
 3. **Comparison.** Every entry records its own baseline. Figures from different
@@ -211,6 +215,25 @@ the cgroup sat at least 480 MiB under its limit with every `memory.events`
 counter at zero, because the machine as a whole was short of memory. Rule 2
 fails any reclaim, wherever the pressure came from, so whether that should
 change is in "Open decisions".
+
+### Running while the machine is busy, inside 3 GB (EXP-031)
+
+Most cold runs since EXP-027 failed rule 2 because the machine was short of
+memory, not because the runtime was: a 4 GB cap changes nothing, since `kswapd`
+takes pages from any cgroup when the whole machine is short. What it could take
+from the runtime was the 1 GiB of mmap'd common weights, and once it took 801
+MiB of them mid-run and decode fell to 1.43 tok/s. `--common-memory resident`
+reads them into anonymous memory instead, which a swap-off cgroup cannot lose:
+zero refaults across every resident run, same speed, +0.75 s of load and +70
+MiB of peak, and 2,963 MiB at 4K context against the 3,072 cap and `ramvamp
+plan`'s own 2,961 projection. Two fixes help both modes: `tokenizer.json` (11
+MiB) no longer lingers in the page cache, and btrfs's habit of caching direct
+reads of compressed extents is handled. The author then settled three things:
+resident is the default, model commands put themselves in a swap-off cgroup,
+and rule 2 now fails a run on pages it had to read back rather than on any
+reclaim. Under that rule every resident run so far passes and the mapped runs
+that lost real working set still fail. EXP-027 to EXP-030 recorded no refault
+counters, so their figures stay unpublishable until re-run.
 
 ### Next: three speed steps, in order
 
@@ -506,7 +529,9 @@ rather than default to measuring more.
 | Reopen progressive miss execution | **open** |
 | Move the slot dial to 12 or 13 | **held**, needs a 13-slot arm at 4K context |
 | A GPU backend (v1 item 2) | **not now** (2026-10-10): no quotable ratio, because the CPU pool would not hold steady even at locked clocks (EXP-026). Reopen conditions are in the v1 section |
-| Reclaim from pressure outside the cgroup under rule 2 | **open** (2026-10-11): `kswapd` reclaim with every `memory.events` counter zero and `memory.peak` well under the limit currently fails a run, so no run on a machine short of memory can be published (EXP-027). Keep it, or treat it like the khugepaged amendment |
+| Hold the common weights resident by default | **settled** (2026-10-11): yes. Fits 3 GB at 4K context with 109 MiB spare, matches `ramvamp plan` to 2 MiB, and no resident run has had to read a page back (EXP-031). `--common-memory mapped` is the opt-out, and the hard rules say so |
+| Run everyday sessions in their own swap-off cgroup | **settled** (2026-10-11): yes, automatically. Model commands re-launch once in a `systemd-run --user` scope with `MemorySwapMax=0`, skipped where swap is already off or with `RAMVAMP_NO_SCOPE` set |
+| What rule 2's hygiene gate should count | **settled** (2026-10-11): reclaimed pages that had to be read back, over 1 MiB, plus `memory.events`. Other reclaim is a note (the refault amendment, EXP-031) |
 
 The TUI (`chat --tui`) is kept rather than deleted, under the standing rule
 that measured-and-set-aside work is preserved. It is genuinely useful as an

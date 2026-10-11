@@ -2431,6 +2431,7 @@ mod tests {
     const SKIP: LoadOptions = LoadOptions {
         skip_hashes: true,
         verify_layer_hashes: false,
+        common_memory: crate::io::CommonMemory::Mapped,
     };
 
     /// A small unpinned pool for the helpers that fan out on their own.

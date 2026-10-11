@@ -53,7 +53,7 @@ use ramvamp_core::format::{load_layout, load_manifest};
 use ramvamp_core::generate::{
     GenerateParams, GenerateStats, StopReason, TracePhase, generate, generate_from, generate_traced,
 };
-use ramvamp_core::io::{StreamStats, resident_ceiling};
+use ramvamp_core::io::{CommonMemory, StreamStats, resident_ceiling};
 use ramvamp_core::model::{
     ForwardError, ForwardState, LoadOptions, Model, PrefillMode, PrefillTiming, StreamPhase,
     prefill_prompt,
@@ -63,6 +63,7 @@ use ramvamp_core::tokenizer::{ChatMessage, Role, RvmpTokenizer};
 
 mod config;
 mod repl;
+mod scope;
 mod tui;
 
 use config::{Dials, ProfileArgs, plan_lines, resolve_dials};
@@ -176,6 +177,26 @@ struct RuntimeArgs {
     /// `ramvamp-repack verify-install` remains the thorough check.
     #[arg(long)]
     verify_layer_hashes: bool,
+
+    /// How the ~1 GiB of common weights is held: `resident` (the default)
+    /// reads `common.bin` once into memory that only swap can take away, so
+    /// with swap off for the process nothing else on the machine can evict
+    /// it; `mapped` memory-maps it, so the kernel may drop those pages when
+    /// other programs need memory and read them back later. Same size either
+    /// way; resident costs under a second more to load.
+    #[arg(long, value_name = "MODE", value_parser = parse_common_memory, default_value = "resident")]
+    common_memory: CommonMemory,
+}
+
+/// Parse `--common-memory`.
+fn parse_common_memory(text: &str) -> Result<CommonMemory, String> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "mapped" => Ok(CommonMemory::Mapped),
+        "resident" => Ok(CommonMemory::Resident),
+        other => Err(format!(
+            "unknown common memory mode {other:?} (use mapped or resident)"
+        )),
+    }
 }
 
 impl RuntimeArgs {
@@ -189,6 +210,7 @@ impl RuntimeArgs {
         LoadOptions {
             skip_hashes: self.skip_hashes,
             verify_layer_hashes: self.verify_layer_hashes,
+            common_memory: self.common_memory,
         }
     }
 }
@@ -749,7 +771,16 @@ fn main() -> anyhow::Result<()> {
         return tui::selftest();
     }
 
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    // The commands that load a model hold its common weights in anonymous
+    // memory, which only a swap-off cgroup fully protects. See `scope`.
+    if matches!(
+        command,
+        Command::Generate(_) | Command::Chat(_) | Command::Serve(_) | Command::Logits(_)
+    ) {
+        scope::ensure_swap_off();
+    }
+    match command {
         Command::Tokenize(args) => tokenize(&args.model, args.prompt, args.messages_file),
         Command::Generate(args) => run_generate(*args),
         Command::Chat(args) => run_chat(*args),

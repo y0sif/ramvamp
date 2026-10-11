@@ -116,7 +116,7 @@ pub const DIO_ALIGN: u64 = 4096;
         target_arch = "loongarch64",
     )
 ))]
-const O_DIRECT: Option<i32> = Some(0o0040000);
+pub(super) const O_DIRECT: Option<i32> = Some(0o0040000);
 
 /// `O_DIRECT` is not hard-coded for this target; see the other arm.
 #[cfg(not(all(
@@ -132,7 +132,7 @@ const O_DIRECT: Option<i32> = Some(0o0040000);
         target_arch = "loongarch64",
     )
 )))]
-const O_DIRECT: Option<i32> = None;
+pub(super) const O_DIRECT: Option<i32> = None;
 
 /// Why direct I/O is unavailable, or available but not bypassing anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

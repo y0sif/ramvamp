@@ -57,7 +57,7 @@ pub use manifest::{
     ArchInfo, CommonTensor, FileEntry, MAX_EXPERTS, MAX_LAYERS, Manifest, QuantInfo, SourceInfo,
     layer_file_name,
 };
-pub use verify::{sha256_file, verify_files};
+pub use verify::{sha256_bytes, sha256_file, verify_files};
 
 /// Manifest schema version this build reads and writes.
 pub const RVMP_VERSION: u32 = 1;

@@ -56,6 +56,19 @@ What it checks, and why each check exists:
    with no breakdown at all still counts the whole total — unknown stays
    DIRTY.
 
+   *Refault amendment* (EXP-031, decided by the author 2026-10-11): reclaim
+   fails a run only when what it took had to be read back. `kswapd` reclaims
+   from every cgroup when the *machine* is short of memory, whatever the
+   cgroup's own headroom, so on a machine in ordinary use a strict gate
+   failed nearly every run on pages the runtime never needed again (an
+   11 MiB `tokenizer.json` parsed once, later a few hundred KiB). What
+   distorts a timing is a reclaimed page the run needs again, and
+   `workingset_refault_file` + `workingset_refault_anon` count exactly those.
+   So: more than `REFAULT_LIMIT_BYTES` read back is HARD; reclaim with less
+   is a SOFT note; `memory.events` stays HARD. A run recorded before the
+   refault counters were captured has no evidence either way and keeps the
+   strict verdict, because unknown is still DIRTY.
+
 5. Bytes actually fetched from the block layer are reported. `read_bytes`
    in `/proc/<pid>/io` is per-task and is *not* inherited by the parent
    on exit, so the inner wrapper samples the child's `/proc/<pid>/io`
@@ -480,6 +493,12 @@ def inner(args) -> int:
         "memory_events": read_kv(os.path.join(cg, "memory.events")) if cg else {},
         "pg": {k: v for k, v in stat.items()
                if k.startswith("pgscan") or k.startswith("pgsteal")},
+        # Which kind of page the cgroup held at exit, and how often reclaimed
+        # pages had to come back. Not part of the verdict: they say *what*
+        # reclaim took, for a reader deciding whether it mattered.
+        "memory_detail": {k: stat[k] for k in (
+            "anon", "file", "file_mapped", "workingset_refault_anon",
+            "workingset_refault_file", "pgmajfault") if k in stat},
         "read_bytes_child_sampled": peak_child_read,
         "read_bytes_rusage_children": ru.ru_inblock * 512,
         "read_bytes_self_delta": (io_after.get("read_bytes", 0)
@@ -588,6 +607,22 @@ def pg_split(pg: dict[str, int], prefix: str) -> tuple[int, int]:
     return total - khugepaged, khugepaged
 
 
+# Reclaimed pages a run may need back before reclaim fails it (refault
+# amendment, item 4). A mapped ctx-512 run on a quiet moment refaults 28-90
+# pages, mostly shared libraries evicted before it began; the worst reclaim
+# EXP-031 recorded refaulted 110,308.
+REFAULT_LIMIT_BYTES = 1 << 20
+
+
+def refaulted_pages(run: dict) -> int | None:
+    """Reclaimed pages the run had to read back, or None if not recorded."""
+    detail = run.get("memory_detail") or {}
+    keys = ("workingset_refault_file", "workingset_refault_anon")
+    if not any(k in detail for k in keys):
+        return None
+    return sum(detail.get(k, 0) for k in keys)
+
+
 # Problem severities. HARD invalidates the measurement; SOFT is reported
 # but survivable. The severity travels with the problem as a field, so
 # rewording a message can never change a verdict — the previous version
@@ -625,11 +660,25 @@ def classify(run: dict, want_max: int) -> tuple[str, list[dict]]:
     else:
         steal, steal_thp = pg_split(pg, "pgsteal")
         scan, scan_thp = pg_split(pg, "pgscan")
-        if steal:
+        refaults = refaulted_pages(run)
+        if steal and refaults is None:
             note(HARD,
                  f"pgsteal {steal} pages ({mib(steal * PAGE)}) reclaimed "
-                 f"under pressure — the working set did not fit, the timing "
-                 f"is not a clean {want_max // 2**30} GB measurement")
+                 f"under pressure, and this run recorded no refault "
+                 f"counters to show whether any had to be read back — the "
+                 f"timing is not a clean {want_max // 2**30} GB measurement")
+        elif refaults is not None and refaults * PAGE > REFAULT_LIMIT_BYTES:
+            note(HARD,
+                 f"{refaults} reclaimed pages ({mib(refaults * PAGE)}) had to "
+                 f"be read back (pgsteal {steal}) — the run lost memory it "
+                 f"needed, so the timing is not a clean "
+                 f"{want_max // 2**30} GB measurement")
+        elif steal:
+            note(SOFT,
+                 f"pgsteal {steal} pages ({mib(steal * PAGE)}) reclaimed by "
+                 f"pressure, {refaults} read back, under the "
+                 f"{mib(REFAULT_LIMIT_BYTES)} limit: pages the run did not "
+                 f"need again (refault amendment)")
         elif scan:
             # Pressure the kernel survived: worth reporting, but it did not
             # cost the run any resident page, so the timing still stands.
@@ -921,6 +970,15 @@ def main() -> int:
                              "actually bought is therefore never assumed here: "
                              "read it off the `model loaded in` line of the "
                              "stderr this harness now records.")
+    parser.add_argument("--ramvamp-arg", action="append", default=[],
+                        metavar="ARG",
+                        help="append ARG to the ramvamp command line, verbatim "
+                             "(repeatable; `--ramvamp-arg=--flag` for an ARG "
+                             "that starts with a dash). For runtime options "
+                             "this script has no flag of its own, such as "
+                             "`--common-memory resident`. Recorded in the "
+                             "argv like everything else, so two arms that "
+                             "differ by one stay distinguishable")
     parser.add_argument("--repeats", type=int, default=3,
                         help="scored runs (after the warmups)")
     parser.add_argument("--warmup", type=int, default=1,
@@ -1035,6 +1093,7 @@ def main() -> int:
     # reader establishes that two runs measured the same workload.
     if args.cache_bytes is not None:
         args.workload += ["--cache-bytes", args.cache_bytes]
+    args.workload += args.ramvamp_arg
     if not args.sampled:
         args.workload.append("--greedy")
     # Recorded like the prompt is, and for the same reason: a run whose dial
