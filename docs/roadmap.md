@@ -2,7 +2,7 @@
 
 ramvamp is a Rust runtime that runs fine-grained Mixture-of-Experts models
 without loading the checkpoint into memory. The always-needed common weights
-stay memory-mapped; the routed experts, which are most of the model, live on
+are read into memory once; the routed experts, which are most of the model, live on
 NVMe in a page-aligned packed format and are fetched with io_uring and
 O_DIRECT only when the router asks for them, through a small per-layer cache.
 CPU only, Linux first.
@@ -11,6 +11,13 @@ CPU only, Linux first.
 memory cgroup with a cold page cache, validated against llama.cpp on
 byte-identical weights, driven from a CLI, a chat REPL, or a loopback
 OpenAI-compatible HTTP server with streaming and tool calls.
+
+**The memory contract is 4 GB since 2026-10-11** (EXP-033, the author's
+decision): the default expert cache is 19 slots per layer, which peaks at
+4,008 MiB at a 4K context and buys decode 1.26x at ctx 512 and 1.12x at 4K
+over the 11 slots that fit 3 GB. `--cache-bytes 1440M` keeps the 3 GB
+configuration. Everything recorded before EXP-033, v0's figures included, was
+measured at 3G and says so.
 
 This file is the plan of record for **what is done, what is next, and what is
 open**. Three companions carry the rest, and each is authoritative on its own
@@ -36,7 +43,8 @@ claims are worth anything.
    `posix_fadvise(POSIX_FADV_DONTNEED)`, the eviction proven with `mincore`
    rather than trusted from a return code, and non-zero block-layer
    `read_bytes` as a positive control that the run really was cold.
-   *In-cgroup* means `systemd-run --user` at `MemoryMax=3G` and
+   *In-cgroup* means `systemd-run --user` at the contract's `MemoryMax`
+   (`4G` since EXP-033, `3G` before it) and
    `MemorySwapMax=0`, with counters read from inside the cgroup before exit;
    zram counts as swap. *Hygiene PASS* means no more than 1 MiB of reclaimed
    pages had to be read back, every `memory.events` counter is zero, swap peak
@@ -95,7 +103,12 @@ inside `memory.max=3G` with swap off, at the shipped 11 slots per layer:
 | Fidelity | mean full-vocab KL **1.04e-2** against llama.cpp, top-1 agreement 8/8 (EXP-004) |
 | Model on disk | 17.35 GiB, about a 6x memory saving |
 
-**The current runtime, measured 2026-10-11** (EXP-032; `main` at `cdad0e7`,
+**The current runtime at the 4 GB contract** (EXP-033; 19 slots, `memory.max=4G`,
+every run clean, the machine in ordinary use): decode **2.78 to 2.81 tok/s** at
+ctx 512 (`--max-new 128`) and **1.96** at ctx 3,961; prefill about **25 tok/s**
+at ctx 512; peak **3,690 to 4,008 MiB** of 4,096.
+
+**The current runtime at the 3 GB contract, measured 2026-10-11** (EXP-032; `main` at `cdad0e7`,
 after the pool, prefill and memory work of EXP-027 to EXP-031), same
 conditions, with the machine in ordinary use and every run hygiene PASS: at ctx
 512, `--max-new 64`, **prefill 24.10 tok/s** (median of six, 23.93-24.21) and
@@ -536,7 +549,7 @@ rather than default to measuring more.
 | Shipping surface | **settled**: `ramvamp-server`. Building a terminal UI reimplements something that already exists in many good versions and is outside what this project contributes; the contribution is the streaming runtime, and a server is the universal interface to it |
 | The `attn_q` + `attn_v` fusion | **settled**: dropped, its bucket did not separate at either rung. The expert-phase fusion stays |
 | Reopen progressive miss execution | **open** |
-| The memory contract: 3 GB with 11 slots, or 4 GB with up to 19 | **open**, measured (EXP-033): with resident common weights the footprint is the `ramvamp plan` projection to 2 MiB, so 12 slots no longer fit 3 GB at 4K (3,092 MiB). 4 GB holds 19 slots and buys decode 1.26x at ctx 512 and 1.12x at 4K, cold, every run clean; 15 slots buys 1.14x for half the memory. Prefill and output do not change. Moving it changes the project's ~3 GB headline |
+| The memory contract: 3 GB with 11 slots, or 4 GB with up to 19 | **settled** (2026-10-11): 4 GB, 19 slots. Measured clean and paired (EXP-033): decode 1.26x at ctx 512 and 1.12x at 4K, prefill and output unchanged, 4,008 MiB peak at 4K against `ramvamp plan`'s 4,007. `--cache-bytes 1440M` keeps the 3 GB setup |
 | A GPU backend (v1 item 2) | **not now** (2026-10-10): no quotable ratio, because the CPU pool would not hold steady even at locked clocks (EXP-026). Reopen conditions are in the v1 section |
 | Hold the common weights resident by default | **settled** (2026-10-11): yes. Fits 3 GB at 4K context with 109 MiB spare, matches `ramvamp plan` to 2 MiB, and no resident run has had to read a page back (EXP-031). `--common-memory mapped` is the opt-out, and the hard rules say so |
 | Run everyday sessions in their own swap-off cgroup | **settled** (2026-10-11): yes, automatically. Model commands re-launch once in a `systemd-run --user` scope with `MemorySwapMax=0`, skipped where swap is already off or with `RAMVAMP_NO_SCOPE` set |
@@ -555,7 +568,7 @@ it by hand and chose to keep it.
 
 ## Good first contributions
 
-Things a newcomer can do without a 3 GB cgroup or the reference drive. Read
+Things a newcomer can do without a benchmark cgroup or the reference drive. Read
 `CONTRIBUTING.md` first for the gate a change has to pass.
 
 **Offline expert-cache policy work.** Answerable on a laptop with no model

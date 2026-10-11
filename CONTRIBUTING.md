@@ -1,7 +1,7 @@
 # Contributing to ramvamp
 
 ramvamp streams fine-grained MoE expert weights from NVMe so a 26-30B model
-runs on a CPU in about 3 GB of RAM. That constraint is the project. Most of
+runs on a CPU in about 4 GB of RAM. That constraint is the project. Most of
 the rules below exist because a reasonable-looking change would quietly break
 it.
 
@@ -93,7 +93,7 @@ it is not neutral, say so in the PR and expect the numerics gates to be re-run.
 This is where a well-meaning change most often goes wrong. A number taken
 outside these conditions is not usable, however carefully it was taken.
 
-**Published numbers come from cold runs inside a `memory.max=3G` cgroup with
+**Published numbers come from cold runs inside a `memory.max=4G` cgroup (3G before EXP-033) with
 `memory.swap.max=0`.** zram counts as swap. `scripts/cold_bench.py` sets that
 up and then verifies it rather than assuming it: eviction is confirmed with
 `mincore` instead of trusted from the `fadvise` return code, and every run is

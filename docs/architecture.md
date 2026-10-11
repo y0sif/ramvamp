@@ -249,10 +249,20 @@ the thorough path is `ramvamp-repack verify-install`.
 
 ## Memory contract (option B, agreed; dial revised 2026-08-03, twice)
 
+**Revised again 2026-10-11 (EXP-031, EXP-033): the contract is 4 GiB, with 19
+slots per layer.** The common core is now read into anonymous memory at load
+rather than mapped, so every row below is resident in full and the footprint is
+`Footprint::project`'s figure to within 2 MiB: at a 4,096-token context, 1,023.3
+common + 2,484.8 experts (19 x 130.78) + 384 KV + 115.1 runtime = 4,007.3 MiB,
+measured 4,008.4, 88 MiB under 4,096. The table below is the 3 GiB contract it
+replaces, which `--cache-bytes 1440M` still selects (11 slots, 2,961 MiB, measured
+2,960.8); its rows other than the expert pool are unchanged.
+
 The expert-cache dial is a total memory budget, divided by the summed
 per-layer blob strides to get slots per layer. This keeps one config
 meaningful across models, and **it ships**: `DEFAULT_CACHE_BYTES`
-(`crates/core/src/model/forward.rs`) is a 1,440 MiB total byte budget, and
+(`crates/core/src/model/forward.rs`) is a 2,485 MiB total byte budget (1,440 MiB
+under the 3 GiB contract this section first described), and
 `--cache-bytes` sets it. Earlier revisions of this section said the byte
 conversion "is still owed", which was true when `SlotPool::new` and
 `LayerCache::new` were the only entry points; those still take slot counts,

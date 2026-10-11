@@ -3,21 +3,21 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ramvamp - run 26-30B MoE models in about 3 GB of RAM, no GPU</title>
-  <meta name="description" content="CPU-first Rust runtime that streams Mixture-of-Experts weights from NVMe with io_uring and O_DIRECT. Qwen3-30B-A3B in about 3 GB of RAM on an ordinary Linux x86_64 machine.">
+  <title>ramvamp - run 26-30B MoE models in about 4 GB of RAM, no GPU</title>
+  <meta name="description" content="CPU-first Rust runtime that streams Mixture-of-Experts weights from NVMe with io_uring and O_DIRECT. Qwen3-30B-A3B in about 4 GB of RAM on an ordinary Linux x86_64 machine.">
   <meta name="keywords" content="llm, inference, mixture of experts, moe, nvme, io_uring, rust, cpu, quantization">
   <meta name="author" content="y0sif">
 
   <!-- Open Graph -->
   <meta property="og:type" content="website">
-  <meta property="og:title" content="ramvamp - run 26-30B MoE models in about 3 GB of RAM, no GPU">
-  <meta property="og:description" content="A Rust runtime that streams experts from NVMe instead of holding them hostage in memory. 30B parameters, about 3 GB of RAM, CPU only.">
+  <meta property="og:title" content="ramvamp - run 26-30B MoE models in about 4 GB of RAM, no GPU">
+  <meta property="og:description" content="A Rust runtime that streams experts from NVMe instead of holding them hostage in memory. 30B parameters, about 4 GB of RAM, CPU only.">
   <meta property="og:url" content="https://y0sif.github.io/ramvamp/">
   <meta property="og:site_name" content="ramvamp">
 
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="ramvamp - run 26-30B MoE models in about 3 GB of RAM, no GPU">
+  <meta name="twitter:title" content="ramvamp - run 26-30B MoE models in about 4 GB of RAM, no GPU">
   <meta name="twitter:description" content="Streams Mixture-of-Experts weights from NVMe with io_uring and O_DIRECT. CPU-first, Linux-first, open source.">
 
   <!-- JSON-LD: SoftwareApplication -->
@@ -31,7 +31,7 @@
     "operatingSystem": "Linux",
     "processorRequirements": "x86_64",
     "storageRequirements": "17.35 GiB for the installed model, on an NVMe SSD",
-    "memoryRequirements": "About 3 GB",
+    "memoryRequirements": "About 4 GB",
     "offers": {
       "@type": "Offer",
       "price": "0",
@@ -59,10 +59,10 @@
     "mainEntity": [
       {
         "@type": "Question",
-        "name": "How does a 30B model fit in 3 GB of RAM?",
+        "name": "How does a 30B model fit in 4 GB of RAM?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "It does not fit, and it is never asked to. In a fine-grained Mixture-of-Experts model most of the weights are routed experts, and only 8 of 128 per layer are needed for any given token. ramvamp keeps the always-needed common weights memory-mapped, about 1,023 MiB, and leaves the experts on disk in a page-aligned packed format, reading the ones the router asks for with io_uring and O_DIRECT through a small per-layer LFU cache. Measured peak resident memory is 2,497 to 2,929 MiB inside a 3,072 MiB ceiling."
+          "text": "It does not fit, and it is never asked to. In a fine-grained Mixture-of-Experts model most of the weights are routed experts, and only 8 of 128 per layer are needed for any given token. ramvamp reads the always-needed common weights into memory once, about 1,023 MiB, and leaves the experts on disk in a page-aligned packed format, reading the ones the router asks for with io_uring and O_DIRECT through a per-layer LFU cache. Measured peak resident memory is 3,690 to 4,008 MiB inside a 4,096 MiB ceiling, and 2,961 MiB with the cache cut to fit 3 GB."
         }
       },
       {
@@ -70,7 +70,7 @@
         "name": "How fast is ramvamp?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "About 2 tokens per second of decode on the reference machine, which is an Intel Core Ultra 9 185H with a Micron 2400 DRAM-less QLC NVMe: 1.46 to 2.19 tok/s across context 64 to 3,961. Prefill is 11.25 tok/s at context 512. Decode is I/O-bound, so the number belongs to the drive as much as to the code, and no figure is published without naming its drive."
+          "text": "About 2.8 tokens per second of decode on the reference machine, which is an Intel Core Ultra 9 185H with a Micron 2400 DRAM-less QLC NVMe: 2.78 to 2.81 tok/s at context 512 and 1.96 at 3,961. Prefill is about 25 tok/s at context 512. Decode is I/O-bound, so the number belongs to the drive as much as to the code, and no figure is published without naming its drive."
         }
       },
       {
@@ -368,7 +368,7 @@
  ||:  | | | (_| | | | | | \ V / (_| | | | | | | |_) |  :||
  ||   |_|  \__,_|_| |_| |_|\_/ \__,_|_| |_| |_| .__/    ||
  ||                                           |_|       ||</pre>
-    <h1>Run 26-30B MoE models in about 3 GB of RAM</h1>
+    <h1>Run 26-30B MoE models in about 4 GB of RAM</h1>
     <p>A Rust runtime that streams Mixture-of-Experts weights from NVMe instead of holding them hostage in memory. CPU only, no GPU, on an ordinary Linux x86_64 machine.</p>
     <div class="badges">
       <a href="https://github.com/y0sif/ramvamp/actions/workflows/ci.yml"><img src="https://github.com/y0sif/ramvamp/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
@@ -425,27 +425,27 @@
     <section>
       <h2>Measured, not projected</h2>
       <p class="note">
-        Qwen3-30B-A3B Q4_K_M, cold page cache, inside a <code>memory.max=3G</code> cgroup with
+        Qwen3-30B-A3B Q4_K_M, cold page cache, inside a <code>memory.max=4G</code> cgroup with
         <code>memory.swap.max=0</code>, on the reference machine: Intel Core Ultra 9 185H, CPU
-        only, Micron 2400 DRAM-less QLC NVMe.
+        only, Micron 2400 DRAM-less QLC NVMe, with the machine in ordinary use.
       </p>
       <div style="overflow-x: auto;">
         <table>
           <tbody>
             <tr>
               <td>Decode</td>
-              <td class="num">about 2 tok/s</td>
-              <td>1.46 to 2.19 across context 64 to 3,961, on this DRAM-less QLC drive</td>
+              <td class="num">about 2.8 tok/s</td>
+              <td>2.78 to 2.81 at context 512, 1.96 at context 3,961, on this DRAM-less QLC drive</td>
             </tr>
             <tr>
               <td>Prefill</td>
-              <td class="num">11.25 tok/s</td>
-              <td>at context 512</td>
+              <td class="num">about 25 tok/s</td>
+              <td>at context 512, 18.2 at context 3,961</td>
             </tr>
             <tr>
               <td>Peak RAM</td>
-              <td class="num">2,497 to 2,929 MiB</td>
-              <td>of a 3,072 MiB ceiling</td>
+              <td class="num">3,690 to 4,008 MiB</td>
+              <td>of a 4,096 MiB ceiling, context 512 to 3,961</td>
             </tr>
             <tr>
               <td>Model on disk</td>
@@ -523,7 +523,7 @@
             <tr><td>OS</td><td>Linux, x86_64. Nothing else, on purpose: io_uring and AVX2 are the design</td></tr>
             <tr><td>Kernel</td><td>5.1 or newer for io_uring. Older kernels fall back to pread, which works and is slower</td></tr>
             <tr><td>CPU</td><td>Any x86_64. AVX2, FMA and F16C are detected at runtime, with a scalar fallback</td></tr>
-            <tr><td>RAM</td><td>About 3 GB for the default 4,096-token context. Larger contexts cost more and <code>plan</code> will tell you how much</td></tr>
+            <tr><td>RAM</td><td>About 4 GB for the default 4,096-token context, or 3 GB with a smaller expert cache (<code>--cache-bytes 1440M</code>). Larger contexts cost more and <code>plan</code> will tell you how much</td></tr>
             <tr><td>Disk</td><td>17.35 GiB free on an NVMe SSD. It runs on slower storage, well below these figures</td></tr>
             <tr><td>GPU</td><td>None</td></tr>
             <tr><td>Rust</td><td>1.88 or newer, and only if you build from source. The prebuilt binary needs no toolchain</td></tr>
@@ -538,13 +538,13 @@
       <h2>FAQ</h2>
 
       <div class="faq-item">
-        <h3>How does a 30B model fit in 3 GB of RAM?</h3>
-        <p>It does not fit, and it is never asked to. Only 8 of 128 experts per layer are needed for a given token, so the common weights stay memory-mapped at about 1,023 MiB and the experts stay on disk, read on demand through a small per-layer cache. Measured peak resident memory is 2,497 to 2,929 MiB inside a 3,072 MiB ceiling.</p>
+        <h3>How does a 30B model fit in 4 GB of RAM?</h3>
+        <p>It does not fit, and it is never asked to. Only 8 of 128 experts per layer are needed for a given token, so the common weights are read into memory once at about 1,023 MiB and the experts stay on disk, read on demand through a per-layer cache. Measured peak resident memory is 3,690 to 4,008 MiB inside a 4,096 MiB ceiling.</p>
       </div>
 
       <div class="faq-item">
         <h3>How fast is it, honestly?</h3>
-        <p>About 2 tokens per second of decode on the reference machine, 1.46 to 2.19 across context 64 to 3,961, on a Micron 2400 DRAM-less QLC NVMe. Prefill is 11.25 tok/s at context 512. That is the number, and a faster drive is the thing most likely to move it.</p>
+        <p>About 2.8 tokens per second of decode on the reference machine at context 512, and 1.96 at 3,961, on a Micron 2400 DRAM-less QLC NVMe. Prefill is about 25 tok/s at context 512. That is the number, and a faster drive is the thing most likely to move it.</p>
       </div>
 
       <div class="faq-item">
@@ -569,7 +569,7 @@
 
       <div class="faq-item">
         <h3>Is it finished?</h3>
-        <p>No. This is v0, and it runs: coherent generation on CPU inside a 3 GB cgroup with a cold page cache, validated against llama.cpp on identical weights. The plan of record, including what is not done, is <a href="https://github.com/y0sif/ramvamp/blob/main/docs/roadmap.md">docs/roadmap.md</a>.</p>
+        <p>No. This is v0, and it runs: coherent generation on CPU inside a 4 GB cgroup with a cold page cache, validated against llama.cpp on identical weights. The plan of record, including what is not done, is <a href="https://github.com/y0sif/ramvamp/blob/main/docs/roadmap.md">docs/roadmap.md</a>.</p>
       </div>
     </section>
 

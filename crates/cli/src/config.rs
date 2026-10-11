@@ -1303,7 +1303,7 @@ mod tests {
         );
         // The documented default really is the documented number, on both
         // paths: this is what keeps a bare command line byte-identical.
-        assert_eq!(parse_bytes("1440M").unwrap(), DEFAULT_CACHE_BYTES);
+        assert_eq!(parse_bytes("2485M").unwrap(), DEFAULT_CACHE_BYTES);
     }
 
     /// A profile name the file does not define is an error listing the ones it
@@ -1488,19 +1488,22 @@ mod tests {
         let lines = plan_lines(&dials, Path::new("/m.rvmp"), &projected, None);
         assert!(lines[11].contains("cannot be judged"), "{lines:#?}");
 
-        // The built-in default, which is the published 4K/11-slot
-        // configuration, does fit the 3 GiB budget — and says so with every
-        // source reading `default`.
+        // The built-in default, the 4K/19-slot configuration of the 4 GiB
+        // contract (EXP-033), fits 4 GiB — and says so with every source
+        // reading `default` — and does not fit the 3 GiB of the contract
+        // before it, which is what `--cache-bytes 1440M` is for.
         let bare = Dials::resolve(Selection::default(), &Flags::default(), &Env::default());
         let projected = bare.project(&manifest, &layout).unwrap();
-        let lines = plan_lines(&bare, Path::new("/m.rvmp"), &projected, Some(3 << 30));
+        let lines = plan_lines(&bare, Path::new("/m.rvmp"), &projected, Some(4 << 30));
         assert_eq!(
             lines[0],
             "profile: none (built-in defaults; no config path)"
         );
         assert_eq!(lines[1], "  context        4096          default");
         assert_eq!(lines[3], "  threads        auto          default");
-        assert_eq!(lines[11], "verdict:   fits, 111 MiB spare");
+        assert_eq!(lines[11], "verdict:   fits, 89 MiB spare");
+        let lines = plan_lines(&bare, Path::new("/m.rvmp"), &projected, Some(3 << 30));
+        assert_eq!(lines[11], "verdict:   does not fit, 935 MiB over");
     }
 
     /// The MiB column is the memory contract's rounding and grouping, which is

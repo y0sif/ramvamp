@@ -1,13 +1,36 @@
 # Benchmarks
 
-Covers every published throughput, memory and fidelity number for v0, the
-conditions each one was measured under, and why they are stated per drive.
+Covers every published throughput, memory and fidelity number, the conditions
+each one was measured under, and why they are stated per drive.
 
-## Measured on the reference machine
+## The current runtime, at the 4 GB contract
 
 Intel Core Ultra 9 185H (CPU only, 16 GB RAM, **Micron 2400 DRAM-less QLC**
 NVMe) running Qwen3-30B-A3B Q4_K_M with a cold page cache inside
-`memory.max=3G` and `memory.swap.max=0`:
+`memory.max=4G` and `memory.swap.max=0`, at the default 19 expert slots per
+layer, with the machine in ordinary use (other programs running, swap full) and
+every run hygiene-clean (EXP-033, 2026-10-11):
+
+| | measured |
+| --- | --- |
+| Decode, ctx 512, `--max-new 128` | **2.78 to 2.81 tok/s** (median 2.795 of four) |
+| Decode, ctx 3,961, `--max-new 64` | **1.96 tok/s** (one scored run) |
+| Prefill | **24.48 to 25.27 tok/s** at ctx 512, 18.23 at ctx 3,961 |
+| Expert cache hit rate | 67.1% at ctx 512, 68.3% at ctx 3,961 |
+| Peak RAM | **3,690 to 3,697 MiB** at ctx 512 and **4,008.4 MiB** at ctx 3,961, of a 4,096 MiB ceiling |
+
+The same runtime at the earlier 3 GB contract (`--cache-bytes 1440M`, 11
+slots), same conditions but `memory.max=3G` (EXP-032): decode **2.18 to 2.24
+tok/s** and prefill **23.93 to 24.21 tok/s** at ctx 512, peak 2,638 to 2,657
+MiB; 2,960.8 MiB at ctx 3,961 (EXP-033). The two contracts' decode figures
+were paired in one session in EXP-033: 19 slots is 1.26x 11 at ctx 512 and
+1.12x at ctx 3,961.
+
+## v0, as first published
+
+Intel Core Ultra 9 185H (CPU only, 16 GB RAM, **Micron 2400 DRAM-less QLC**
+NVMe) running Qwen3-30B-A3B Q4_K_M with a cold page cache inside
+`memory.max=3G` and `memory.swap.max=0`, 11 slots per layer:
 
 | | measured |
 | --- | --- |
@@ -24,7 +47,7 @@ skips one is a diagnostic, not a published figure.
 
 - **Cold.** The page cache is evicted before the run, and the harness proves
   the eviction rather than assuming it.
-- **In-cgroup at `memory.max=3G` with `memory.swap.max=0`.** Swap is off
+- **In-cgroup at the contract's `memory.max` (4G now, 3G for v0) with `memory.swap.max=0`.** Swap is off
   because zram counts as swap, and a run that swaps is measuring reclaim
   rather than decode.
 - **A release build** (`cargo build --release`). The debug profile is

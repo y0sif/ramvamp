@@ -126,19 +126,22 @@ use super::error::ModelError;
 use super::prefill::{Phase, PhaseClock, PrefillConfig, PrefillMode, PrefillTiming, SendPtr};
 use super::weights::Model;
 
-/// Default total expert-cache budget: 1,440 MiB.
+/// Default total expert-cache budget: 2,485 MiB, 19 slots per layer.
 ///
 /// The dial is a **total** byte budget for the whole model, divided by the
 /// summed per-layer blob strides to get slots per layer. On Qwen3-30B-A3B one
 /// slot across all 48 layers costs `24 * 3,059,712 + 24 * 2,654,208` =
-/// 137,134,080 B = 130.78 MiB, so 11 slots/layer costs **1,438.59 MiB** and
-/// the budget must clear that. 1,438 MiB does not: it floors to 10.
+/// 137,134,080 B = 130.78 MiB, so 19 slots/layer costs **2,484.84 MiB** and
+/// the budget must clear that, which 2,485 MiB does by 0.16 MiB. 2,484 MiB
+/// does not: it floors to 18.
 ///
-/// 11 slots/layer is what the 3 GiB memory contract leaves once anonymous
-/// runtime allocations are counted (EXP-012): 1,438.59 pool + 1,023.34 mmap'd
-/// core + 384 KV + 115.1 anon = 2,961.03 MiB, 111.0 MiB spare. 12 would be
-/// 19.8 MiB over.
-pub const DEFAULT_CACHE_BYTES: u64 = 1440 * 1024 * 1024;
+/// 19 slots/layer is what the 4 GiB memory contract (decided 2026-10-11,
+/// EXP-033) leaves at a 4,096-token context: 2,484.84 pool + 1,023.34
+/// resident common core + 384 KV + 115.1 anon = 4,007.3 MiB, measured
+/// 4,008.4, 88 MiB spare. Against the previous 3 GiB contract's 11 slots
+/// (`--cache-bytes 1440M`, 2,961 MiB) it buys decode 1.26x at ctx 512 and
+/// 1.12x at 4K, cold; 20 slots would be 42 MiB over.
+pub const DEFAULT_CACHE_BYTES: u64 = 2485 * 1024 * 1024;
 
 /// Runtime dials for [`ForwardState::with_config`].
 ///
@@ -4146,7 +4149,7 @@ mod tests {
     fn default_runtime_config_is_the_documented_budget() {
         let config = RuntimeConfig::default();
         assert_eq!(config.cache_bytes, DEFAULT_CACHE_BYTES);
-        assert_eq!(config.cache_bytes, 1_509_949_440);
+        assert_eq!(config.cache_bytes, 2_605_711_360);
         assert_eq!(config.threads, None);
         assert_eq!(config.placement, Placement::Shared);
     }
@@ -4265,19 +4268,21 @@ mod tests {
         );
     }
 
-    /// The default budget must clear 11 slots/layer on the audited Qwen3
-    /// geometry, and it clears it by only 1.4 MiB. One slot across all 48
-    /// layers costs `24 * 3,059,712 + 24 * 2,654,208` = 137,134,080 B, so 11
-    /// slots is 1,508,474,880 B (1,438.59 MiB). A budget expressed as a round
-    /// 1,438 MiB floors to **10**, which is the bug this pins: the dial
+    /// The default budget must clear 19 slots/layer on the audited Qwen3
+    /// geometry, and it clears it by only 0.16 MiB. One slot across all 48
+    /// layers costs `24 * 3,059,712 + 24 * 2,654,208` = 137,134,080 B, so 19
+    /// slots is 2,605,547,520 B (2,484.84 MiB). A budget expressed as a round
+    /// 2,484 MiB floors to **18**, which is the bug this pins: the dial
     /// divides and floors, so the default has to clear the boundary, not sit
-    /// on it.
+    /// on it. The 3 GiB contract's `1440M` has the same property at 11.
     #[test]
-    fn the_default_budget_clears_eleven_slots_per_layer() {
+    fn the_default_budget_clears_nineteen_slots_per_layer() {
         const PER_SLOT_ALL_LAYERS: u64 = 24 * 3_059_712 + 24 * 2_654_208;
         assert_eq!(PER_SLOT_ALL_LAYERS, 137_134_080);
 
-        assert_eq!(DEFAULT_CACHE_BYTES / PER_SLOT_ALL_LAYERS, 11);
+        assert_eq!(DEFAULT_CACHE_BYTES / PER_SLOT_ALL_LAYERS, 19);
+        assert_eq!(2484 * 1024 * 1024 / PER_SLOT_ALL_LAYERS, 18);
+        assert_eq!(1440 * 1024 * 1024 / PER_SLOT_ALL_LAYERS, 11);
         assert_eq!(1438 * 1024 * 1024 / PER_SLOT_ALL_LAYERS, 10);
     }
 

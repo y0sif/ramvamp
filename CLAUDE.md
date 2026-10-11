@@ -1,7 +1,7 @@
 # ramvamp
 
 Rust runtime for streaming fine-grained MoE experts from NVMe: 26-30B models
-in ~3 GB RAM, CPU-first (AVX2), Linux-first (io_uring). v0 model:
+in ~4 GB RAM, CPU-first (AVX2), Linux-first (io_uring). v0 model:
 Qwen3-30B-A3B.
 
 **Read `docs/roadmap.md` first**: it is the plan of record, covering what v0
@@ -66,7 +66,7 @@ Pre-push: all four must pass.
 - Every performance change gets an entry in `docs/experiments/README.md`
   (baseline, result, verdict), and a one-line row in the public
   `docs/experiments.md` citing it. Published numbers come from cold runs
-  inside a `memory.max=3G` cgroup with `memory.swap.max=0` (zram counts as
+  inside a `memory.max=4G` cgroup (3G before EXP-033) with `memory.swap.max=0` (zram counts as
   swap); warm-cache runs are diagnostics.
 - Vectorized kernels must document and test the alignment they assume;
   packed sub-tensor offsets may be only 2-byte aligned.
