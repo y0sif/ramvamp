@@ -1,11 +1,23 @@
-//! Pinned compute pool and CPU topology.
+//! Compute pool and CPU topology.
 //!
-//! Owned by wave-1 lane D. Six compute shards, one per physical P-core with
-//! no SMT sibling, joined by a barrier for the duration of a token step.
-//! With the default [`PoolConfig::inline_caller`] those six shards are five
-//! spawned worker threads plus the submitting decode thread, which runs
-//! shard 0 itself; with `inline_caller: false` they are six spawned workers
-//! and the decode thread only waits.
+//! Owned by wave-1 lane D. Six compute shards, one per physical P-core,
+//! joined by a barrier for the duration of a token step. With the default
+//! [`PoolConfig::inline_caller`] those six shards are five spawned worker
+//! threads plus the submitting decode thread, which works too; with
+//! `inline_caller: false` they are six spawned workers.
+//!
+//! A job is divided one of two ways. [`ComputePool::run`] gives each thread
+//! one fixed row range ([`shard_range`]), which attention needs because it
+//! carves scratch per shard. [`ComputePool::run_chunks`] splits the rows into
+//! more chunks than threads and lets every thread claim them from a shared
+//! counter, so a thread slowed by something else on its core takes fewer;
+//! every GEMV uses it.
+//!
+//! Where the threads run is a [`Placement`]. The default, `Shared`, lets every
+//! thread run on any P-core thread or L3 E-core and leaves the choice to the
+//! scheduler. `PerCore` pins one thread to each P-core with no SMT sibling,
+//! which is v0's layout: a few percent faster on an idle machine, and as slow
+//! as its busiest core on a machine doing anything else (EXP-027).
 //!
 //! Topology on the reference machine (Core Ultra 9 185H) is not guessable
 //! from core ids: `/sys/devices/cpu_core/cpus` is `0-11` and
@@ -95,7 +107,7 @@ use std::io::ErrorKind;
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -358,6 +370,29 @@ fn set_affinity(_mask: &CpuMask) -> Result<(), PinError> {
     Err(PinError::Unsupported)
 }
 
+/// Restrict the calling thread to `mask`, or log and carry on unplaced.
+/// Returns whether the placement took effect.
+///
+/// A one-CPU mask goes through [`pin_current_thread`] and its affinity
+/// check. A wider one comes from [`Topology`], whose every CPU is already
+/// inside the process's affinity mask.
+fn place_or_warn(mask: &CpuMask, what: &'static str) -> bool {
+    let mut cpus = mask.iter();
+    if let (Some(cpu), None) = (cpus.next(), cpus.next()) {
+        return pin_or_warn(cpu, what);
+    }
+    match pin_current_thread_to(mask) {
+        Ok(()) => {
+            debug!(cpus = %mask, thread = what, "placed thread");
+            true
+        }
+        Err(err) => {
+            warn!(cpus = %mask, thread = what, error = %err, "cpu placement failed; running unplaced");
+            false
+        }
+    }
+}
+
 /// Pin, or log and carry on unpinned. Returns whether the pin took effect.
 fn pin_or_warn(cpu: usize, what: &'static str) -> bool {
     match pin_current_thread(cpu) {
@@ -597,6 +632,17 @@ impl Topology {
     #[must_use]
     pub fn l3_efficiency_cpus(&self) -> &[usize] {
         &self.l3_efficiency
+    }
+
+    /// The CPUs [`Placement::Shared`] lets threads run on: every allowed
+    /// P-core thread and every allowed E-core with an L3.
+    #[must_use]
+    pub fn shared_cpus(&self) -> CpuMask {
+        self.performance
+            .iter()
+            .chain(&self.l3_efficiency)
+            .copied()
+            .collect()
     }
 
     /// One logical CPU per physical compute core, ascending.
@@ -899,6 +945,43 @@ pub fn shard_range(rows: usize, shards: usize, index: usize) -> Range<usize> {
     start..start + len
 }
 
+/// Default for [`PoolConfig::chunks_per_shard`].
+pub const CHUNKS_PER_SHARD: usize = 4;
+
+/// One chunk of a [`ComputePool::run_chunks`] job.
+///
+/// Unlike a [`Shard`], a chunk is not tied to a thread: every thread in the
+/// pool claims chunks from a shared counter until none are left, so which
+/// thread runs a given chunk changes from job to job. What does not change is
+/// the chunk itself. Its `rows` are [`shard_range`]`(rows, count, index)`, a
+/// pure function of the job, so a closure whose output depends only on the
+/// rows it is handed produces the same bits whichever thread runs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Chunk {
+    /// Zero-based chunk index.
+    pub index: usize,
+    /// Total chunks this job was split into.
+    pub count: usize,
+    /// Half-open row range this chunk owns.
+    pub rows: Range<usize>,
+    /// Whether this chunk is running on the submitting thread.
+    ///
+    /// The submitting thread claims chunks like any worker. The last chunk it
+    /// runs ends its own share of the job; anything it waits for after that
+    /// is the rest of the pool.
+    pub on_caller: bool,
+}
+
+/// How many chunks [`ComputePool::run_chunks`] splits `rows` into.
+///
+/// `shards * per_shard`, but never more chunks than rows, and at least one.
+/// A pure function of its inputs, so the chunk boundaries of a job never
+/// depend on timing.
+#[must_use]
+pub fn chunk_count(rows: usize, shards: usize, per_shard: usize) -> usize {
+    shards.saturating_mul(per_shard).clamp(1, rows.max(1))
+}
+
 // ---------------------------------------------------------------------------
 // Parking
 // ---------------------------------------------------------------------------
@@ -1004,9 +1087,24 @@ type PanicPayload = Box<dyn std::any::Any + Send + 'static>;
 #[derive(Clone, Copy)]
 struct JobRef {
     data: *const (),
-    call: unsafe fn(*const (), Shard),
+    work: Work,
     rows: usize,
-    shards: usize,
+}
+
+/// How a published job is divided among the threads.
+#[derive(Clone, Copy)]
+enum Work {
+    /// Each thread runs the one [`shard_range`] its shard index names.
+    Shards {
+        call: unsafe fn(*const (), Shard),
+        shards: usize,
+    },
+    /// Every thread claims chunks from [`Shared::next_chunk`] until all
+    /// `count` are taken.
+    Chunks {
+        call: unsafe fn(*const (), Chunk),
+        count: usize,
+    },
 }
 
 /// Restore `&F` from an erased pointer and invoke it.
@@ -1023,6 +1121,19 @@ unsafe fn call_job<F: Fn(Shard) + Sync>(data: *const (), shard: Shard) {
     f(shard);
 }
 
+/// [`call_job`] for a chunked job.
+///
+/// # Safety
+///
+/// As [`call_job`]: `data` must be a live `*const F` published by
+/// [`ComputePool::run_chunks`] for a job that has not yet completed its
+/// barrier.
+unsafe fn call_chunk<F: Fn(Chunk) + Sync>(data: *const (), chunk: Chunk) {
+    // SAFETY: as in `call_job`.
+    let f = unsafe { &*data.cast::<F>() };
+    f(chunk);
+}
+
 /// State shared between the submitting thread and the workers.
 ///
 /// # Protocol
@@ -1037,6 +1148,12 @@ unsafe fn call_job<F: Fn(Shard) + Sync>(data: *const (), shard: Shard) {
 ///   after observing the new `seq`, and strictly before the `fetch_sub` that
 ///   retires their shard. Those facts are what make the `UnsafeCell` sound;
 ///   see [`Shared::publish`].
+/// * `next_chunk` is the claim counter of a chunked job. Each `fetch_add`
+///   hands out one chunk index, so no two threads ever run the same chunk.
+///   The submitter resets it in `publish`, and the argument is the same one
+///   that makes the `job` write sound: a worker's last claim is sequenced
+///   before the `fetch_sub` that retires it, so the reset happens-after every
+///   claim of the previous job.
 /// * `workers_parked` / `lead_parked` let each side skip the `futex` syscall
 ///   when nobody is actually asleep. Both are updated with `SeqCst` and
 ///   paired against a `SeqCst` access of the corresponding futex word, which
@@ -1088,6 +1205,7 @@ struct Shared {
     /// load-bearing.
     lead_parked: AtomicU32,
     quit: AtomicU32,
+    next_chunk: AtomicUsize,
     job: UnsafeCell<Option<JobRef>>,
     panic: Mutex<Option<PanicPayload>>,
     /// Test-only interleaving control; not present in any other build.
@@ -1111,6 +1229,7 @@ impl Shared {
             workers_parked: AtomicU32::new(0),
             lead_parked: AtomicU32::new(0),
             quit: AtomicU32::new(0),
+            next_chunk: AtomicUsize::new(0),
             job: UnsafeCell::new(None),
             panic: Mutex::new(None),
             #[cfg(test)]
@@ -1130,6 +1249,18 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
+    }
+
+    /// Claim the next chunk of a job split into `count`, or `None` once every
+    /// chunk has been handed out.
+    ///
+    /// `Relaxed` is enough: the counter only has to hand each index out once,
+    /// which atomicity alone guarantees. The data a chunk reads was published
+    /// by the `seq` store, and the rows it writes are released by the
+    /// `fetch_sub` that retires the thread.
+    fn claim(&self, count: usize) -> Option<usize> {
+        let index = self.next_chunk.fetch_add(1, Ordering::Relaxed);
+        (index < count).then_some(index)
     }
 
     /// Publish a job and release the workers.
@@ -1152,6 +1283,8 @@ impl Shared {
         unsafe {
             *self.job.get() = Some(job);
         }
+        // Released by the same `seq` store; see the type docs.
+        self.next_chunk.store(0, Ordering::Relaxed);
         self.pending.store(workers, Ordering::Relaxed);
         let next = self.seq.load(Ordering::Relaxed).wrapping_add(1);
         self.seq.store(next, Ordering::SeqCst);
@@ -1278,6 +1411,33 @@ impl Drop for BarrierGuard<'_> {
     }
 }
 
+/// Where a [`ComputePool`] lets its threads run.
+///
+/// On a machine without a detectable hybrid topology ([`Topology::pins`] is
+/// false) every placement behaves as [`Placement::Off`].
+///
+/// [`Placement::Shared`] is the default because it is the one that holds up
+/// on a machine doing other work, which is the machine this runtime is for
+/// (EXP-027). [`Placement::PerCore`] is a few percent faster when nothing
+/// else runs, and up to twice as slow when one other process lands on one of
+/// its cores.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Placement {
+    /// One thread pinned to each compute CPU, one per physical P-core, with
+    /// the submitting thread on the first. Anything else that runs on one of
+    /// those cores, or on its hyperthread sibling, has to share it with a
+    /// thread that cannot move.
+    PerCore,
+    /// Every thread, the submitting one included, may run on any P-core
+    /// thread or any E-core that shares the L3, and the scheduler places
+    /// them. A thread whose core gets busy can be moved instead of
+    /// time-sliced. The LP E-cores, which have no L3, are left out.
+    #[default]
+    Shared,
+    /// No affinity is set: threads run wherever the process may.
+    Off,
+}
+
 /// How to build a [`ComputePool`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolConfig {
@@ -1290,12 +1450,13 @@ pub struct PoolConfig {
     /// process rather than unwinding — which is not something a `#[must_use]`
     /// constructor documented as infallible is allowed to do.
     pub shards: Option<usize>,
-    /// Attempt to pin worker threads. Failures degrade to unpinned.
-    pub pin: bool,
-    /// Also pin the thread that constructs the pool to the lead compute CPU.
+    /// Where the threads may run. Failures degrade to unplaced.
+    pub placement: Placement,
+    /// Also place the thread that constructs the pool: on the lead compute
+    /// CPU under [`Placement::PerCore`] (only with `inline_caller`), within
+    /// the shared set under [`Placement::Shared`].
     ///
-    /// Only meaningful with `inline_caller`; the constructing thread is
-    /// assumed to be the decode thread. Use
+    /// The constructing thread is assumed to be the decode thread. Use
     /// [`ComputePool::pin_calling_thread`] if it is not.
     pub pin_caller: bool,
     /// Run shard 0 on the submitting thread instead of a worker.
@@ -1304,15 +1465,22 @@ pub struct PoolConfig {
     /// plus the decode thread, one per physical P-core, and it removes one
     /// wake and one barrier hop from every GEMV.
     pub inline_caller: bool,
+    /// Chunks per shard in a [`ComputePool::run_chunks`] job.
+    ///
+    /// More chunks let a thread slowed by something else on its core hand
+    /// more of the job to the others, at the cost of one shared atomic
+    /// increment per chunk. Clamped to at least 1.
+    pub chunks_per_shard: usize,
 }
 
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
             shards: None,
-            pin: true,
+            placement: Placement::Shared,
             pin_caller: true,
             inline_caller: true,
+            chunks_per_shard: CHUNKS_PER_SHARD,
         }
     }
 }
@@ -1332,7 +1500,10 @@ pub struct ComputePool {
     topology: Topology,
     shards: usize,
     inline_caller: bool,
+    chunks_per_shard: usize,
+    placement: Placement,
     lead_cpu: Option<usize>,
+    caller: Option<CpuMask>,
 }
 
 impl ComputePool {
@@ -1370,30 +1541,42 @@ impl ComputePool {
             .unwrap_or_else(|| topology.shard_count())
             .clamp(1, MAX_SHARDS);
         let inline_caller = config.inline_caller;
-        let pin = config.pin && topology.pins();
+        let placement = if topology.pins() {
+            config.placement
+        } else {
+            Placement::Off
+        };
         let compute = topology.compute_cpus().to_vec();
+        let shared_cpus = topology.shared_cpus();
 
         let offset = usize::from(inline_caller);
         let worker_count = shards.saturating_sub(offset);
-        let lead_cpu = if pin && inline_caller {
+        let lead_cpu = if placement == Placement::PerCore && inline_caller {
             compute.first().copied()
         } else {
             None
+        };
+        let caller = match placement {
+            Placement::PerCore => lead_cpu.map(|cpu| std::iter::once(cpu).collect()),
+            Placement::Shared => Some(shared_cpus.clone()),
+            Placement::Off => None,
         };
 
         let shared = Arc::new(Shared::new());
         let mut workers = Vec::with_capacity(worker_count);
         for i in 0..worker_count {
             let shard_index = i + offset;
-            let cpu = if pin {
-                compute.get(shard_index).copied()
-            } else {
-                None
+            let place: Option<CpuMask> = match placement {
+                Placement::PerCore => compute
+                    .get(shard_index)
+                    .map(|&cpu| std::iter::once(cpu).collect()),
+                Placement::Shared => Some(shared_cpus.clone()),
+                Placement::Off => None,
             };
             let shared = Arc::clone(&shared);
             let spawned = std::thread::Builder::new()
                 .name(format!("rvmp-compute-{shard_index}"))
-                .spawn(move || worker_loop(&shared, shard_index, cpu));
+                .spawn(move || worker_loop(&shared, shard_index, place));
             match spawned {
                 Ok(handle) => workers.push(handle),
                 Err(err) => {
@@ -1415,18 +1598,20 @@ impl ComputePool {
             topology,
             shards: shards.max(1),
             inline_caller,
+            chunks_per_shard: config.chunks_per_shard.max(1),
+            placement,
             lead_cpu,
+            caller,
         };
 
-        if config.pin_caller
-            && let Some(cpu) = pool.lead_cpu
-        {
-            pin_or_warn(cpu, "compute-lead");
+        if config.pin_caller {
+            pool.pin_calling_thread();
         }
         debug!(
             shards = pool.shards,
             workers = pool.workers.len(),
             inline_caller,
+            ?placement,
             "compute pool ready"
         );
         pool
@@ -1444,19 +1629,29 @@ impl ComputePool {
         &self.topology
     }
 
-    /// The CPU the submitting thread should run on, if pinning is in effect.
+    /// The placement in effect: the configured one, or [`Placement::Off`] on
+    /// a machine whose topology does not support placing threads.
+    #[must_use]
+    pub fn placement(&self) -> Placement {
+        self.placement
+    }
+
+    /// The CPU the submitting thread should run on, if it is pinned to one.
     #[must_use]
     pub fn lead_cpu(&self) -> Option<usize> {
         self.lead_cpu
     }
 
-    /// Pin the calling thread to [`ComputePool::lead_cpu`].
+    /// Place the calling thread where this pool's placement puts the
+    /// submitting thread: [`ComputePool::lead_cpu`] under
+    /// [`Placement::PerCore`], the shared set under [`Placement::Shared`].
     ///
     /// For the case where the pool is built on a different thread than the
-    /// one that will drive the decode loop. Returns whether a pin happened.
+    /// one that will drive the decode loop. Returns whether a placement
+    /// happened.
     pub fn pin_calling_thread(&self) -> bool {
-        match self.lead_cpu {
-            Some(cpu) => pin_or_warn(cpu, "compute-lead"),
+        match &self.caller {
+            Some(mask) => place_or_warn(mask, "compute-lead"),
             None => false,
         }
     }
@@ -1498,9 +1693,11 @@ impl ComputePool {
 
         let job = JobRef {
             data: std::ptr::from_ref(&f).cast::<()>(),
-            call: call_job::<F>,
+            work: Work::Shards {
+                call: call_job::<F>,
+                shards,
+            },
             rows,
-            shards,
         };
 
         let shared: &Shared = &self.shared;
@@ -1556,6 +1753,112 @@ impl ComputePool {
             f(shard, chunk);
         });
     }
+
+    /// How many chunks [`ComputePool::run_chunks`] splits `rows` into.
+    ///
+    /// One for a pool with no workers, which runs every job inline.
+    #[must_use]
+    pub fn chunks(&self, rows: usize) -> usize {
+        if self.workers.is_empty() {
+            return 1;
+        }
+        chunk_count(rows, self.shards, self.chunks_per_shard)
+    }
+
+    /// Run `f` once per chunk of `0..rows`, with every thread claiming chunks
+    /// until none are left, and return when all have finished.
+    ///
+    /// [`ComputePool::run`] gives each thread one fixed range, so a job takes
+    /// as long as its slowest thread, and a thread sharing its core with
+    /// anything else slows every job. Here a slowed thread just claims fewer
+    /// chunks. The chunk boundaries are still a pure function of
+    /// `(rows, chunks(rows))`; only which thread runs which chunk varies.
+    ///
+    /// A job with one chunk, or a pool with no workers, runs on the calling
+    /// thread as the single chunk `0..rows`. `rows == 0` calls `f` not at all.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a closure panic exactly as [`ComputePool::run`] does. The
+    /// other threads keep claiming, so every chunk is still attempted.
+    pub fn run_chunks<F>(&mut self, rows: usize, f: F)
+    where
+        F: Fn(Chunk) + Sync,
+    {
+        if rows == 0 {
+            return;
+        }
+        let count = self.chunks(rows);
+        let workers = self.workers.len() as u32;
+        if count == 1 {
+            f(Chunk {
+                index: 0,
+                count: 1,
+                rows: 0..rows,
+                on_caller: true,
+            });
+            return;
+        }
+
+        let job = JobRef {
+            data: std::ptr::from_ref(&f).cast::<()>(),
+            work: Work::Chunks {
+                call: call_chunk::<F>,
+                count,
+            },
+            rows,
+        };
+
+        let shared: &Shared = &self.shared;
+        // Armed before publishing, for the reason given in `run`.
+        let guard = BarrierGuard { shared };
+        shared.publish(job, workers);
+        // The submitting thread claims chunks too. `inline_caller: false`
+        // only changes `run`, where it means a seventh fixed range would sit
+        // on a thread that does nothing but wait; here waiting is all the
+        // caller would otherwise do while chunks are still unclaimed.
+        while let Some(index) = shared.claim(count) {
+            f(Chunk {
+                index,
+                count,
+                rows: shard_range(rows, count, index),
+                on_caller: true,
+            });
+        }
+        drop(guard);
+
+        if let Some(payload) = shared.take_panic() {
+            resume_unwind(payload);
+        }
+    }
+
+    /// [`ComputePool::scatter`] over chunks: split `out` into
+    /// `chunks(out.len())` disjoint contiguous pieces and run `f` on each,
+    /// claimed as in [`ComputePool::run_chunks`].
+    ///
+    /// # Panics
+    ///
+    /// Propagates a closure panic exactly as [`ComputePool::run`] does.
+    pub fn scatter_chunks<T, F>(&mut self, out: &mut [T], f: F)
+    where
+        T: Send,
+        F: Fn(Chunk, &mut [T]) + Sync,
+    {
+        let rows = out.len();
+        let base = SendPtr(out.as_mut_ptr());
+        self.run_chunks(rows, |chunk| {
+            let start = chunk.rows.start;
+            let len = chunk.rows.len();
+            // SAFETY: `shard_range` yields disjoint sub-ranges of `0..rows`,
+            // and `Shared::claim` hands each chunk index to exactly one
+            // thread, so the reconstructed `&mut [T]` never aliases another
+            // chunk's. `out` is mutably borrowed for the whole call, and
+            // `run_chunks` does not return until every chunk has dropped its
+            // slice.
+            let piece = unsafe { std::slice::from_raw_parts_mut(base.get().add(start), len) };
+            f(chunk, piece);
+        });
+    }
 }
 
 impl Default for ComputePool {
@@ -1570,6 +1873,8 @@ impl fmt::Debug for ComputePool {
             .field("shards", &self.shards)
             .field("workers", &self.workers.len())
             .field("inline_caller", &self.inline_caller)
+            .field("chunks_per_shard", &self.chunks_per_shard)
+            .field("placement", &self.placement)
             .field("lead_cpu", &self.lead_cpu)
             .finish()
     }
@@ -1629,9 +1934,9 @@ impl Drop for ShardGuard<'_> {
     }
 }
 
-fn worker_loop(shared: &Shared, shard_index: usize, cpu: Option<usize>) {
-    if let Some(cpu) = cpu {
-        pin_or_warn(cpu, "compute-worker");
+fn worker_loop(shared: &Shared, shard_index: usize, place: Option<CpuMask>) {
+    if let Some(mask) = place {
+        place_or_warn(&mask, "compute-worker");
     }
     let mut last = 0u32;
     loop {
@@ -1648,43 +1953,60 @@ fn worker_loop(shared: &Shared, shard_index: usize, cpu: Option<usize>) {
         // From here on the decrement happens no matter how this iteration
         // ends.
         let _retire = ShardGuard { shared };
-        if let Some(job) = job {
-            let rows = shard_range(job.rows, job.shards, shard_index);
-            if !rows.is_empty() {
-                let shard = Shard {
-                    index: shard_index,
-                    count: job.shards,
-                    rows,
-                };
-                // `AssertUnwindSafe`: the closure's captures are the
-                // caller's, and a panic here is re-raised on the caller's
-                // thread, so no torn state is ever observed by anyone who
-                // did not also unwind.
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    // SAFETY: `job.data` came from `&F` in `run`, which is
+        match job.map(|job| (job.data, job.rows, job.work)) {
+            None => {}
+            Some((data, rows, Work::Shards { call, shards })) => {
+                let rows = shard_range(rows, shards, shard_index);
+                if !rows.is_empty() {
+                    let shard = Shard {
+                        index: shard_index,
+                        count: shards,
+                        rows,
+                    };
+                    // SAFETY: `data` came from `&F` in `run`, which is
                     // blocked on the barrier until this call returns.
-                    unsafe { (job.call)(job.data, shard) }
-                }));
-                if let Err(payload) = result {
-                    // Recording can itself unwind, in exactly one way: the
-                    // payload's own `Drop` panics when `record_panic` drops
-                    // it (the slot was already occupied). `ShardGuard` would
-                    // still retire the shard, but the unwind would leave
-                    // `worker_loop` and kill the thread, and the pool sizes
-                    // its `pending` from the number of join handles, not
-                    // from the number of live threads — so the *next* job
-                    // would never retire. Contain it here instead.
-                    if let Err(second) =
-                        catch_unwind(AssertUnwindSafe(|| shared.record_panic(payload)))
-                    {
-                        // Deliberately leaked, not dropped: dropping it
-                        // would re-enter the same panicking destructor with
-                        // no `catch_unwind` left to catch it.
-                        std::mem::forget(second);
-                        warn!("panic while recording a worker panic; payload leaked");
-                    }
+                    contain(shared, || unsafe { call(data, shard) });
                 }
             }
+            Some((data, rows, Work::Chunks { call, count })) => {
+                while let Some(index) = shared.claim(count) {
+                    let chunk = Chunk {
+                        index,
+                        count,
+                        rows: shard_range(rows, count, index),
+                        on_caller: false,
+                    };
+                    // SAFETY: `data` came from `&F` in `run_chunks`, which is
+                    // blocked on the barrier until this thread retires, and
+                    // this thread retires only after its last claim fails.
+                    contain(shared, || unsafe { call(data, chunk) });
+                }
+            }
+        }
+    }
+}
+
+/// Run one piece of a job on a worker, recording a panic instead of letting
+/// it unwind out of the thread.
+///
+/// `AssertUnwindSafe`: the closure's captures are the caller's, and a panic
+/// here is re-raised on the caller's thread, so no torn state is ever
+/// observed by anyone who did not also unwind.
+fn contain(shared: &Shared, piece: impl FnOnce()) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(piece)) {
+        // Recording can itself unwind, in exactly one way: the payload's own
+        // `Drop` panics when `record_panic` drops it (the slot was already
+        // occupied). `ShardGuard` would still retire the shard, but the
+        // unwind would leave `worker_loop` and kill the thread, and the pool
+        // sizes its `pending` from the number of join handles, not from the
+        // number of live threads — so the *next* job would never retire.
+        // Contain it here instead.
+        if let Err(second) = catch_unwind(AssertUnwindSafe(|| shared.record_panic(payload))) {
+            // Deliberately leaked, not dropped: dropping it would re-enter
+            // the same panicking destructor with no `catch_unwind` left to
+            // catch it.
+            std::mem::forget(second);
+            warn!("panic while recording a worker panic; payload leaked");
         }
     }
 }
@@ -2277,9 +2599,10 @@ mod tests {
             Topology::unpinned(CpuMask::up_to(shards.max(1))),
             PoolConfig {
                 shards: Some(shards),
-                pin: false,
+                placement: Placement::Off,
                 pin_caller: false,
                 inline_caller: true,
+                ..PoolConfig::default()
             },
         )
     }
@@ -2562,6 +2885,166 @@ mod tests {
     }
 
     #[test]
+    fn chunk_counts_are_bounded_by_rows_and_never_zero() {
+        assert_eq!(chunk_count(1000, 6, 4), 24);
+        assert_eq!(chunk_count(10, 6, 4), 10);
+        assert_eq!(chunk_count(1, 6, 4), 1);
+        assert_eq!(chunk_count(0, 6, 4), 1);
+        assert_eq!(chunk_count(1000, 0, 4), 1);
+        assert_eq!(chunk_count(1000, usize::MAX, 4), 1000);
+    }
+
+    #[test]
+    fn every_chunk_runs_once_with_the_rows_its_index_names() {
+        for shards in [1usize, 2, 3, 6] {
+            let mut pool = test_pool(shards);
+            for rows in [1usize, 5, 23, 24, 25, 1000] {
+                let count = pool.chunks(rows);
+                let runs: Vec<AtomicU32> = (0..count).map(|_| AtomicU32::new(0)).collect();
+                let visits: Vec<AtomicU32> = (0..rows).map(|_| AtomicU32::new(0)).collect();
+                pool.run_chunks(rows, |chunk| {
+                    assert_eq!(chunk.count, count);
+                    assert_eq!(chunk.rows, shard_range(rows, count, chunk.index));
+                    runs[chunk.index].fetch_add(1, Ordering::Relaxed);
+                    for row in chunk.rows {
+                        visits[row].fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+                for (i, r) in runs.iter().enumerate() {
+                    assert_eq!(
+                        r.load(Ordering::Relaxed),
+                        1,
+                        "{shards} shards, {rows} rows, chunk {i}"
+                    );
+                }
+                for (row, v) in visits.iter().enumerate() {
+                    assert_eq!(
+                        v.load(Ordering::Relaxed),
+                        1,
+                        "{shards} shards, {rows} rows, row {row}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_scatter_matches_the_single_threaded_reference() {
+        let rows = 2003;
+        let weights: Vec<f32> = (0..rows).map(|i| (i as f32).mul_add(0.25, -3.0)).collect();
+        let expected: Vec<f32> = weights.iter().map(|w| w.mul_add(*w, *w)).collect();
+        for shards in [1usize, 2, 3, 7] {
+            let mut pool = test_pool(shards);
+            let mut got = vec![0.0f32; rows];
+            pool.scatter_chunks(&mut got, |chunk, piece| {
+                assert_eq!(piece.len(), chunk.rows.len());
+                for (k, slot) in piece.iter_mut().enumerate() {
+                    let w = weights[chunk.rows.start + k];
+                    *slot = w.mul_add(w, w);
+                }
+            });
+            assert_eq!(got, expected, "{shards} shards");
+        }
+    }
+
+    #[test]
+    fn chunked_and_sharded_jobs_interleave_on_one_pool() {
+        // The claim counter is reset per job; a stale count from the previous
+        // chunked job would skip chunks of the next one.
+        let mut pool = test_pool(4);
+        for round in 0..200 {
+            let rows = 50 + round % 13;
+            let sum = AtomicUsize::new(0);
+            if round % 3 == 0 {
+                pool.run(rows, |shard| {
+                    sum.fetch_add(shard.rows.len(), Ordering::Relaxed);
+                });
+            } else {
+                pool.run_chunks(rows, |chunk| {
+                    sum.fetch_add(chunk.rows.len(), Ordering::Relaxed);
+                });
+            }
+            assert_eq!(sum.load(Ordering::Relaxed), rows, "round {round}");
+        }
+    }
+
+    #[test]
+    fn a_stalled_thread_leaves_the_rest_of_the_job_to_the_others() {
+        // Chunk 0 is the first one claimed, by whichever thread gets there
+        // first, and it stalls that thread for far longer than the rest of
+        // the job takes. Under `run` the stalled thread would still owe its
+        // whole range; here it must end up having run chunk 0 and nothing
+        // else, because the other threads claimed everything while it slept.
+        let mut pool = test_pool(4);
+        let rows = 400;
+        let count = pool.chunks(rows);
+        assert!(count > 4, "the test needs more chunks than threads");
+        let ran: Mutex<Vec<(std::thread::ThreadId, usize)>> = Mutex::new(Vec::new());
+        pool.run_chunks(rows, |chunk| {
+            if chunk.index == 0 {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            ran.lock()
+                .expect("lock")
+                .push((std::thread::current().id(), chunk.index));
+        });
+        let ran = ran.into_inner().expect("into_inner");
+        assert_eq!(ran.len(), count);
+        let stalled = ran.iter().find(|(_, i)| *i == 0).expect("chunk 0 ran").0;
+        let by_stalled: Vec<usize> = ran
+            .iter()
+            .filter(|(t, _)| *t == stalled)
+            .map(|(_, i)| *i)
+            .collect();
+        assert_eq!(by_stalled, vec![0], "the stalled thread ran {by_stalled:?}");
+    }
+
+    #[test]
+    fn the_caller_runs_chunks_and_says_so() {
+        let mut pool = test_pool(4);
+        let caller = std::thread::current().id();
+        let rows = 4000;
+        pool.run_chunks(rows, |chunk| {
+            let here = std::thread::current().id() == caller;
+            assert_eq!(chunk.on_caller, here, "chunk {}", chunk.index);
+        });
+        // A pool with no workers runs the job inline as one chunk.
+        let mut solo = test_pool(1);
+        solo.run_chunks(rows, |chunk| {
+            assert!(chunk.on_caller);
+            assert_eq!(chunk.rows, 0..rows);
+        });
+    }
+
+    #[test]
+    fn a_panicking_chunk_neither_deadlocks_nor_poisons_the_pool() {
+        let mut pool = test_pool(4);
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let attempted = AtomicUsize::new(0);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            pool.run_chunks(400, |chunk| {
+                attempted.fetch_add(1, Ordering::Relaxed);
+                assert!(chunk.index != 5, "boom");
+            });
+        }));
+        std::panic::set_hook(hook);
+        assert!(result.is_err(), "a chunk panic must propagate");
+        assert_eq!(
+            attempted.load(Ordering::Relaxed),
+            pool.chunks(400),
+            "every chunk is still attempted"
+        );
+
+        let sum = AtomicUsize::new(0);
+        pool.run_chunks(400, |chunk| {
+            sum.fetch_add(chunk.rows.len(), Ordering::Relaxed);
+        });
+        assert_eq!(sum.load(Ordering::Relaxed), 400);
+    }
+
+    #[test]
     fn dropping_the_pool_joins_every_worker() {
         let pool = test_pool(6);
         let watch = Arc::clone(&pool.shared);
@@ -2589,9 +3072,10 @@ mod tests {
             Topology::unpinned(CpuMask::up_to(4)),
             PoolConfig {
                 shards: Some(4),
-                pin: false,
+                placement: Placement::Off,
                 pin_caller: false,
                 inline_caller: false,
+                ..PoolConfig::default()
             },
         );
         assert_eq!(pool.shards(), 4);

@@ -76,13 +76,23 @@ use ramvamp_core::io::{Footprint, FootprintError};
 use ramvamp_core::model::{
     DEFAULT_CACHE_BYTES, ForwardState, PrefillConfig, PrefillMode, RuntimeConfig,
 };
+use ramvamp_core::threads::Placement;
 use serde_json::Value;
 
 use crate::repl::DEFAULT_CONTEXT;
 use crate::{
     ContextArgs, MAX_THREADS, PrefillArgs, RuntimeArgs, parse_bytes, parse_context_var,
-    parse_prefill_mode,
+    parse_placement, parse_prefill_mode,
 };
+
+/// The spelling `--placement` takes for `placement`.
+pub fn placement_name(placement: Placement) -> &'static str {
+    match placement {
+        Placement::PerCore => "per-core",
+        Placement::Shared => "shared",
+        Placement::Off => "off",
+    }
+}
 
 /// Schema version this build reads. A file that declares anything else is
 /// refused rather than read optimistically, exactly as `install-state.json`
@@ -105,9 +115,10 @@ const ROOT_KEYS: [&str; 3] = ["default_profile", "profiles", "version"];
 
 /// Keys one profile object may carry. Each one is a dial with a flag, and the
 /// spelling is the flag's with `-` written `_`.
-const PROFILE_KEYS: [&str; 5] = [
+const PROFILE_KEYS: [&str; 6] = [
     "cache_bytes",
     "context",
+    "placement",
     "prefill",
     "prefill_chunk",
     "threads",
@@ -172,6 +183,8 @@ pub struct Profile {
     pub prefill: Option<PrefillMode>,
     /// `prefill_chunk`: positions carried through the model together.
     pub prefill_chunk: Option<usize>,
+    /// `placement`: `per-core`, `shared` or `off`.
+    pub placement: Option<Placement>,
 }
 
 /// A parsed config file, or the empty stand-in for not having one.
@@ -487,6 +500,13 @@ fn parse_profile(path: &Path, name: &str, value: &Value) -> anyhow::Result<Profi
                 profile.prefill =
                     Some(parse_prefill_mode(text).map_err(|e| anyhow::anyhow!("{}: {e}", at()))?);
             }
+            "placement" => {
+                let text = value.as_str().with_context(|| {
+                    format!("{}: expected \"per-core\", \"shared\" or \"off\"", at())
+                })?;
+                profile.placement =
+                    Some(parse_placement(text).map_err(|e| anyhow::anyhow!("{}: {e}", at()))?);
+            }
             // Unreachable: `reject_unknown` accepts exactly the keys these
             // arms handle. Written as a refusal rather than an `unreachable!`
             // so that adding a key to `PROFILE_KEYS` and forgetting its arm is
@@ -618,6 +638,8 @@ pub struct Flags {
     pub prefill: Option<PrefillMode>,
     /// `--prefill-chunk`.
     pub prefill_chunk: Option<usize>,
+    /// `--placement`.
+    pub placement: Option<Placement>,
 }
 
 impl Flags {
@@ -629,13 +651,14 @@ impl Flags {
             threads: runtime.threads,
             prefill: prefill.prefill,
             prefill_chunk: prefill.prefill_chunk,
+            placement: runtime.placement,
         }
     }
 }
 
 /// What the environment asked for.
 ///
-/// Only three dials have a variable today. `threads` and `cache_bytes` have
+/// Only four dials have a variable today. `threads` and `cache_bytes` have
 /// none, so their `Env` entries do not exist rather than being permanently
 /// `None` — a variable that does not exist cannot be resolved from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -646,10 +669,12 @@ pub struct Env {
     pub prefill: Option<PrefillMode>,
     /// `RAMVAMP_PREFILL_CHUNK`.
     pub prefill_chunk: Option<usize>,
+    /// `RAMVAMP_PLACEMENT`.
+    pub placement: Option<Placement>,
 }
 
 impl Env {
-    /// Read the three variables.
+    /// Read the four variables.
     ///
     /// An unusable value is ignored rather than fatal, which is what the
     /// runtime already does with all three: a variable a shell profile set
@@ -669,6 +694,21 @@ impl Env {
                 .ok()
                 .and_then(|raw| raw.trim().parse::<usize>().ok())
                 .filter(|&chunk| chunk > 0),
+            placement: parse_placement_var(std::env::var("RAMVAMP_PLACEMENT").ok()),
+        }
+    }
+}
+
+/// `RAMVAMP_PLACEMENT`, or `None` with a warning when it is set to something
+/// this build does not read: like the other variables, a bad value must not
+/// stop the binary from starting.
+fn parse_placement_var(raw: Option<String>) -> Option<Placement> {
+    let raw = raw?;
+    match parse_placement(&raw) {
+        Ok(placement) => Some(placement),
+        Err(e) => {
+            eprintln!("warning: ignoring RAMVAMP_PLACEMENT: {e}");
+            None
         }
     }
 }
@@ -688,6 +728,8 @@ pub struct Dials {
     pub prefill: Dial<PrefillMode>,
     /// Prefill chunk in positions.
     pub prefill_chunk: Dial<usize>,
+    /// Where compute threads may run.
+    pub placement: Dial<Placement>,
 }
 
 impl Dials {
@@ -716,6 +758,12 @@ impl Dials {
                 file.prefill_chunk,
                 defaults.chunk,
             ),
+            placement: pick(
+                flags.placement,
+                env.placement,
+                file.placement,
+                Placement::default(),
+            ),
             selection,
         }
     }
@@ -725,7 +773,7 @@ impl Dials {
         RuntimeConfig {
             cache_bytes: self.cache_bytes.value,
             threads: self.threads.value,
-            pin: true,
+            placement: self.placement.value,
         }
     }
 
@@ -884,6 +932,11 @@ pub fn plan_lines(
             dials.prefill_chunk.value.to_string(),
             dials.prefill_chunk.source,
         ),
+        (
+            "placement",
+            placement_name(dials.placement.value).to_owned(),
+            dials.placement.source,
+        ),
     ] {
         lines.push(format!("  {name:<13}  {value:<12}  {}", source.label()));
     }
@@ -965,6 +1018,7 @@ mod tests {
             threads: Some(4),
             prefill: Some(PrefillMode::TokenMajor),
             prefill_chunk: Some(256),
+            placement: Some(Placement::Off),
         };
         let selection = Selection {
             name: Some("agent".to_owned()),
@@ -978,11 +1032,13 @@ mod tests {
             threads: Some(3),
             prefill: Some(PrefillMode::Sweep),
             prefill_chunk: Some(8),
+            placement: Some(Placement::Shared),
         };
         let env = Env {
             context: Some(2048),
             prefill: Some(PrefillMode::Sweep),
             prefill_chunk: Some(64),
+            placement: Some(Placement::PerCore),
         };
 
         // All four layers: the command line wins every dial it names.
@@ -997,8 +1053,10 @@ mod tests {
         assert_eq!(all.prefill.source, Source::Flag);
         assert_eq!(all.prefill_chunk.value, 8);
         assert_eq!(all.prefill_chunk.source, Source::Flag);
+        assert_eq!(all.placement.value, Placement::Shared);
+        assert_eq!(all.placement.source, Source::Flag);
 
-        // No flags: the environment wins the three dials it has variables for,
+        // No flags: the environment wins the four dials it has variables for,
         // and the file keeps the two it does not.
         let no_flags = Dials::resolve(selection.clone(), &Flags::default(), &env);
         assert_eq!(no_flags.context.value, 2048);
@@ -1007,6 +1065,8 @@ mod tests {
         assert_eq!(no_flags.prefill.source, Source::Env);
         assert_eq!(no_flags.prefill_chunk.value, 64);
         assert_eq!(no_flags.prefill_chunk.source, Source::Env);
+        assert_eq!(no_flags.placement.value, Placement::PerCore);
+        assert_eq!(no_flags.placement.source, Source::Env);
         assert_eq!(no_flags.cache_bytes.value, 512 << 20);
         assert_eq!(no_flags.cache_bytes.source, Source::Profile);
         assert_eq!(no_flags.threads.value, Some(4));
@@ -1020,6 +1080,8 @@ mod tests {
         assert_eq!(file_only.prefill.source, Source::Profile);
         assert_eq!(file_only.prefill_chunk.value, 256);
         assert_eq!(file_only.prefill_chunk.source, Source::Profile);
+        assert_eq!(file_only.placement.value, Placement::Off);
+        assert_eq!(file_only.placement.source, Source::Profile);
 
         // And with nothing at all, the built-in defaults — which are the
         // measured, published configuration, unchanged by this feature.
@@ -1029,12 +1091,14 @@ mod tests {
         assert_eq!(bare.threads.value, None);
         assert_eq!(bare.prefill.value, PrefillMode::Sweep);
         assert_eq!(bare.prefill_chunk.value, PrefillConfig::default().chunk);
+        assert_eq!(bare.placement.value, Placement::Shared);
         for source in [
             bare.context.source,
             bare.cache_bytes.source,
             bare.threads.source,
             bare.prefill.source,
             bare.prefill_chunk.source,
+            bare.placement.source,
         ] {
             assert_eq!(source, Source::Default);
         }
@@ -1150,7 +1214,7 @@ mod tests {
         assert!(err.contains("unknown key \"contxt\""), "{err}");
         assert!(err.contains("profile \"chat\""), "{err}");
         assert!(
-            err.contains("cache_bytes, context, prefill, prefill_chunk, threads"),
+            err.contains("cache_bytes, context, placement, prefill, prefill_chunk, threads"),
             "{err}"
         );
     }
@@ -1410,18 +1474,19 @@ mod tests {
         assert_eq!(lines[3], "  threads        4             profile");
         assert_eq!(lines[4], "  prefill        token-major   profile");
         assert_eq!(lines[5], "  prefill-chunk  256           profile");
-        assert_eq!(lines[7], "model:     /m.rvmp");
-        assert!(lines[9].starts_with("available: 16,384 MiB"), "{lines:#?}");
-        assert!(lines[10].starts_with("verdict:   fits"), "{lines:#?}");
+        assert_eq!(lines[6], "  placement      shared        default");
+        assert_eq!(lines[8], "model:     /m.rvmp");
+        assert!(lines[10].starts_with("available: 16,384 MiB"), "{lines:#?}");
+        assert!(lines[11].starts_with("verdict:   fits"), "{lines:#?}");
 
         // The same configuration under the published 3 GiB cgroup.
         let lines = plan_lines(&dials, Path::new("/m.rvmp"), &projected, Some(3 << 30));
-        assert_eq!(lines[9], "available: 3,072 MiB");
-        assert_eq!(lines[10], "verdict:   does not fit, 1,041 MiB over");
+        assert_eq!(lines[10], "available: 3,072 MiB");
+        assert_eq!(lines[11], "verdict:   does not fit, 1,041 MiB over");
 
         // A kernel that will not say is not a verdict of "fits".
         let lines = plan_lines(&dials, Path::new("/m.rvmp"), &projected, None);
-        assert!(lines[10].contains("cannot be judged"), "{lines:#?}");
+        assert!(lines[11].contains("cannot be judged"), "{lines:#?}");
 
         // The built-in default, which is the published 4K/11-slot
         // configuration, does fit the 3 GiB budget — and says so with every
@@ -1435,7 +1500,7 @@ mod tests {
         );
         assert_eq!(lines[1], "  context        4096          default");
         assert_eq!(lines[3], "  threads        auto          default");
-        assert_eq!(lines[10], "verdict:   fits, 111 MiB spare");
+        assert_eq!(lines[11], "verdict:   fits, 111 MiB spare");
     }
 
     /// The MiB column is the memory contract's rounding and grouping, which is

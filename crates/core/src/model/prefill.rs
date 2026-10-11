@@ -1059,17 +1059,17 @@ where
     }
     let failure: Mutex<Option<(usize, KernelError)>> = Mutex::new(None);
     let base = SendPtr(out.as_mut_ptr());
-    pool.run(out_dim, |shard| {
-        let index = shard.index;
-        let start = shard.rows.start * n_acts;
-        let len = shard.rows.len() * n_acts;
-        // SAFETY: `shard_range` yields disjoint sub-ranges of `0..out_dim`,
-        // each visited by exactly one thread, so scaling them by `n_acts`
-        // yields disjoint sub-ranges of `0..out_dim * n_acts` — which is
-        // `out.len()`, checked above. `out` is mutably borrowed for the whole
-        // call, and `run` joins before returning.
-        let chunk = unsafe { std::slice::from_raw_parts_mut(base.get().add(start), len) };
-        if let Err(err) = f(shard.rows.clone(), chunk) {
+    pool.run_chunks(out_dim, |chunk| {
+        let index = chunk.index;
+        let start = chunk.rows.start * n_acts;
+        let len = chunk.rows.len() * n_acts;
+        // SAFETY: chunks are disjoint sub-ranges of `0..out_dim`, each run by
+        // exactly one thread, so scaling them by `n_acts` yields disjoint
+        // sub-ranges of `0..out_dim * n_acts` — which is `out.len()`, checked
+        // above. `out` is mutably borrowed for the whole call, and
+        // `run_chunks` joins before returning.
+        let dst = unsafe { std::slice::from_raw_parts_mut(base.get().add(start), len) };
+        if let Err(err) = f(chunk.rows, dst) {
             record(&failure, index, err);
         }
     });
@@ -2407,7 +2407,7 @@ mod tests {
         let runtime = RuntimeConfig {
             cache_bytes: 24 * 1024 * 1024,
             threads: Some(2),
-            pin: false,
+            placement: crate::threads::Placement::Off,
         };
         let mut st = ForwardState::with_config(model, cap, runtime).unwrap();
         st.set_prefill_config(prefill).unwrap();

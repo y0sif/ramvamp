@@ -609,11 +609,26 @@ slots/layer), fewer slots/layer. A global slot pool shared across layers is
 
 ## Thread topology (v0)
 
-- Compute pool: 6 shards pinned to P-cores, one per physical core, no SMT
-  siblings. Six shards is **five spawned threads** at the default
-  `PoolConfig::inline_caller`: the submitting decode thread runs shard 0
-  itself, and only `inline_caller: false` makes all six workers. Spin barrier
-  within a token step (ggml-style), condvar sleep between generations.
+- Compute pool: 6 shards, one per physical P-core. Six shards is **five
+  spawned threads** at the default `PoolConfig::inline_caller`: the
+  submitting decode thread works too, and only `inline_caller: false` makes
+  all six workers. Spin barrier within a token step (ggml-style), futex sleep
+  between jobs.
+- Where the threads run is `--placement` (`Placement` in `threads.rs`). The
+  default, `shared`, lets every thread, the decode thread included, run on any
+  P-core thread or any E-core that shares the L3, and leaves the choice to the
+  scheduler, so a thread whose core something else is using can be moved
+  instead of time-sliced. `per-core` pins one thread to each P-core, no SMT
+  siblings, which was v0's layout: a few percent faster when nothing else
+  runs, and as slow as its busiest core otherwise (EXP-027). `off` sets no
+  affinity.
+- How a job is divided: the GEMVs, prefill's and decode's alike, are split
+  into `shards x 4` chunks that every thread claims from a shared counter
+  (`ComputePool::run_chunks`), so a thread slowed by anything else on its core
+  takes fewer chunks instead of holding up the whole job. Each output row is
+  one whole-row dot whichever thread computes it, so the result is
+  bit-identical to a fixed split. Attention keeps the fixed split
+  (`ComputePool::run`), because its scratch is carved per shard.
 - What the pool runs: expert and projection GEMVs, and since phase 7 attention
   as well: over **rows** in prefill and over **kv heads** in decode. Two
   things follow. `ComputePool::run` runs a job inline as a single shard when
