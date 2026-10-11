@@ -12,7 +12,9 @@ folklore.
 Inputs:
 
   * one or more binary traces from `ramvamp generate --trace-experts`
-  * `models/qwen3.rvmp/experts/layout.json`, for the real per-layer expert
+    (`scripts/traces/` holds a committed one)
+  * `models/qwen3.rvmp/experts/layout.json`, or the committed
+    `scripts/traces/qwen3-30b-a3b-strides.json`, for the real per-layer expert
     stride (Qwen3-30B-A3B is not uniform: 24 layers are 3,059,712 B and 24
     are 2,654,208 B, interleaved), which turns hit rates into bytes and
     slot counts into MiB
@@ -22,7 +24,10 @@ and cache"): one independent slot array per layer, `--slots` entries each,
 fetch on miss, evict by policy. Prefill bypasses the cache, so only decode
 records are simulated by default. Experts already fetched for the token
 being decoded are pinned for that step: a later miss in the same layer and
-token cannot evict them (the runtime is holding those slabs).
+token cannot evict them (the runtime is holding those slabs). With
+`--pin-step`, every expert the step routes is pinned before the first
+access instead, which is how the runtime plans a step, and the simulated
+rate then matches the runtime's live one to within 0.01 points (EXP-030).
 
 Trace format `RVMPTRC1`, written by `TraceWriter` in `crates/cli/src/main.rs`
 (which documents the same layout); every integer little-endian:
@@ -470,6 +475,294 @@ class WindowLfuCache(LfuCache):
         return best
 
 
+class AgedGhostLfuCache(GhostLfuCache):
+    """`lfu-ghost` whose per-expert counts halve every `age_period` accesses.
+
+    The shipped policy's counts never decay, so an expert that was hot early
+    in a long conversation stays hard to evict after the topic moves on.
+    Halving bounds how much history one expert can bank while keeping the
+    survive-eviction property that made ghost counts win in EXP-005.
+    """
+
+    label = "lfu-ghost-aged"
+
+    def __init__(
+        self, slots: int, age_period: int = DEFAULT_AGE_PERIOD, **kwargs: object
+    ) -> None:
+        super().__init__(slots, **kwargs)
+        self.age_period = max(1, age_period)
+        self.since_decay = 0
+
+    def access(self, expert: int, clock: int, pinned: set[int]) -> Access:
+        out = super().access(expert, clock, pinned)
+        self.since_decay += 1
+        if self.since_decay >= self.age_period:
+            self.since_decay = 0
+            for e in self.ghost:
+                self.ghost[e] //= 2
+        return out
+
+
+class Lru2Cache:
+    """LRU-K with K = 2 (O'Neil et al., 1993).
+
+    The victim is the resident expert whose second most recent access is
+    oldest; an expert seen only once has no second access and goes first,
+    oldest last access first among those. History is kept for every expert,
+    resident or not, which at 128 experts a layer costs nothing.
+    """
+
+    label = "lru-2"
+
+    def __init__(self, slots: int, **_: object) -> None:
+        self.slots = slots
+        self.resident: set[int] = set()
+        # expert -> (last access, the access before it, or -1)
+        self.hist: dict[int, tuple[int, int]] = {}
+
+    def access(self, expert: int, clock: int, pinned: set[int]) -> Access:
+        last, _ = self.hist.get(expert, (-1, -1))
+        self.hist[expert] = (clock, last)
+        if expert in self.resident:
+            return True, None
+        victim = None
+        if len(self.resident) >= self.slots:
+            best, best_key = None, None
+            for e in self.resident:
+                if e in pinned:
+                    continue
+                last_e, second_e = self.hist[e]
+                key = (second_e, last_e)
+                if best_key is None or key < best_key:
+                    best, best_key = e, key
+            if best is None:
+                return False, None
+            victim = best
+            self.resident.discard(victim)
+        self.resident.add(expert)
+        return False, victim
+
+
+class ArcCache:
+    """ARC, Adaptive Replacement Cache (Megiddo and Modha, FAST 2003).
+
+    Two resident LRU lists, T1 (seen once recently) and T2 (seen at least
+    twice), two ghost lists B1 and B2 of the same, and a target size `p` for
+    T1 that a ghost hit moves: a B1 hit says recency was undervalued, a B2
+    hit says frequency was. Pinned experts are skipped when choosing a
+    victim, and when everything is pinned the slab is read and dropped, as
+    for the other policies.
+    """
+
+    label = "arc"
+
+    def __init__(self, slots: int, **_: object) -> None:
+        self.c = slots
+        self.p = 0.0
+        self.t1: dict[int, None] = {}
+        self.t2: dict[int, None] = {}
+        self.b1: dict[int, None] = {}
+        self.b2: dict[int, None] = {}
+
+    @staticmethod
+    def _lru_unpinned(lst: dict[int, None], pinned: set[int]) -> int | None:
+        for e in lst:
+            if e not in pinned:
+                return e
+        return None
+
+    def _replace(self, expert: int, pinned: set[int]) -> int | None:
+        prefer_t1 = len(self.t1) > 0 and (
+            len(self.t1) > self.p or (expert in self.b2 and len(self.t1) == int(self.p))
+        )
+        order = ((self.t1, self.b1), (self.t2, self.b2))
+        if not prefer_t1:
+            order = order[::-1]
+        for resident, ghost in order:
+            victim = self._lru_unpinned(resident, pinned)
+            if victim is not None:
+                del resident[victim]
+                ghost[victim] = None
+                return victim
+        return None
+
+    def access(self, expert: int, clock: int, pinned: set[int]) -> Access:
+        c = self.c
+        if expert in self.t1 or expert in self.t2:
+            self.t1.pop(expert, None)
+            self.t2.pop(expert, None)
+            self.t2[expert] = None
+            return True, None
+        victim = None
+        full = len(self.t1) + len(self.t2) >= c
+        if expert in self.b1:
+            self.p = min(c, self.p + max(len(self.b2) / len(self.b1), 1))
+            if full:
+                victim = self._replace(expert, pinned)
+                if victim is None:
+                    return False, None
+            del self.b1[expert]
+            self.t2[expert] = None
+            return False, victim
+        if expert in self.b2:
+            self.p = max(0.0, self.p - max(len(self.b1) / len(self.b2), 1))
+            if full:
+                victim = self._replace(expert, pinned)
+                if victim is None:
+                    return False, None
+            del self.b2[expert]
+            self.t2[expert] = None
+            return False, victim
+        # A complete miss.
+        if len(self.t1) + len(self.b1) >= c:
+            if len(self.t1) < c:
+                self.b1.pop(next(iter(self.b1)))
+                if full:
+                    victim = self._replace(expert, pinned)
+                    if victim is None:
+                        return False, None
+            else:
+                victim = self._lru_unpinned(self.t1, pinned)
+                if victim is None:
+                    return False, None
+                del self.t1[victim]
+        else:
+            total = len(self.t1) + len(self.t2) + len(self.b1) + len(self.b2)
+            if total >= c:
+                if total >= 2 * c and self.b2:
+                    self.b2.pop(next(iter(self.b2)))
+                if full:
+                    victim = self._replace(expert, pinned)
+                    if victim is None:
+                        return False, None
+        self.t1[expert] = None
+        return False, victim
+
+
+class S3FifoCache:
+    """S3-FIFO (Yang et al., SOSP 2023): a small probationary FIFO, a main
+    FIFO, and a ghost FIFO of experts recently evicted from the small one.
+
+    New experts enter the small queue (a tenth of the slots, at least one)
+    unless the ghost queue remembers them, in which case they go straight to
+    main. Leaving the small queue, an expert that was hit while there is
+    promoted to main and one that was not is evicted and remembered.
+    Leaving main, an expert with a nonzero hit count is reinserted at the
+    head with its count decremented. Counts cap at 3.
+    """
+
+    label = "s3-fifo"
+
+    def __init__(self, slots: int, **_: object) -> None:
+        self.small_cap = max(1, round(slots / 10))
+        self.main_cap = max(1, slots - self.small_cap)
+        self.small: list[int] = []  # head is the end of the list
+        self.main: list[int] = []
+        self.ghost: dict[int, None] = {}
+        self.freq: dict[int, int] = {}
+
+    def _evict_small(self, pinned: set[int]) -> int | None:
+        for _ in range(len(self.small)):
+            t = self.small.pop(0)
+            if t in pinned:
+                self.small.append(t)
+                continue
+            if self.freq.get(t, 0) > 0:
+                self.main.append(t)
+                if len(self.main) > self.main_cap:
+                    victim = self._evict_main(pinned)
+                    if victim is not None:
+                        return victim
+                continue
+            self.freq.pop(t, None)
+            self.ghost[t] = None
+            if len(self.ghost) > self.main_cap:
+                self.ghost.pop(next(iter(self.ghost)))
+            return t
+        return None
+
+    def _evict_main(self, pinned: set[int]) -> int | None:
+        for _ in range(4 * len(self.main) + 1):
+            if not self.main:
+                return None
+            t = self.main.pop(0)
+            if t in pinned:
+                self.main.append(t)
+                continue
+            if self.freq.get(t, 0) > 0:
+                self.freq[t] -= 1
+                self.main.append(t)
+                continue
+            self.freq.pop(t, None)
+            return t
+        return None
+
+    def access(self, expert: int, clock: int, pinned: set[int]) -> Access:
+        if expert in self.freq:
+            self.freq[expert] = min(3, self.freq[expert] + 1)
+            return True, None
+        victim = None
+        if len(self.small) + len(self.main) >= self.small_cap + self.main_cap:
+            if len(self.small) >= self.small_cap:
+                victim = self._evict_small(pinned)
+            if victim is None:
+                victim = self._evict_main(pinned)
+            if victim is None:
+                victim = self._evict_small(pinned)
+            if victim is None:
+                return False, None
+        if expert in self.ghost:
+            del self.ghost[expert]
+            self.main.append(expert)
+        else:
+            self.small.append(expert)
+        self.freq[expert] = 0
+        return False, victim
+
+
+class LrfuCache:
+    """LRFU (Lee et al., 2001): each expert's score is a sum over its past
+    accesses of `2 ** (-lam * age)`, age in this layer's accesses, kept as
+    one decayed number per expert. `lam = 0` is ghost LFU with no recency
+    tie-break; large `lam` approaches LRU. History survives eviction, as the
+    shipped policy's counts do. `lam` comes from `age_period` as
+    `1 / age_period`, so the one dial covers both decaying policies.
+    """
+
+    label = "lrfu"
+
+    def __init__(self, slots: int, age_period: int = DEFAULT_AGE_PERIOD, **_: object) -> None:
+        self.slots = slots
+        self.lam = 1.0 / max(1, age_period)
+        self.crf: dict[int, float] = {}
+        self.last: dict[int, int] = {}
+        self.resident: set[int] = set()
+
+    def _score(self, e: int, clock: int) -> float:
+        return self.crf.get(e, 0.0) * 2.0 ** (-self.lam * (clock - self.last.get(e, clock)))
+
+    def access(self, expert: int, clock: int, pinned: set[int]) -> Access:
+        self.crf[expert] = self._score(expert, clock) + 1.0
+        self.last[expert] = clock
+        if expert in self.resident:
+            return True, None
+        victim = None
+        if len(self.resident) >= self.slots:
+            best, best_key = None, None
+            for e in self.resident:
+                if e in pinned:
+                    continue
+                key = (self._score(e, clock), self.last[e])
+                if best_key is None or key < best_key:
+                    best, best_key = e, key
+            if best is None:
+                return False, None
+            victim = best
+            self.resident.discard(victim)
+        self.resident.add(expert)
+        return False, victim
+
+
 class OptCache:
     """Belady's optimal replacement: evict whatever is needed farthest away.
 
@@ -528,6 +821,11 @@ POLICIES = {
     LruCache.label: LruCache,
     AgedLfuCache.label: AgedLfuCache,
     WindowLfuCache.label: WindowLfuCache,
+    AgedGhostLfuCache.label: AgedGhostLfuCache,
+    Lru2Cache.label: Lru2Cache,
+    ArcCache.label: ArcCache,
+    S3FifoCache.label: S3FifoCache,
+    LrfuCache.label: LrfuCache,
     OptCache.label: OptCache,
 }
 
@@ -557,8 +855,15 @@ def simulate(
     age_period: int,
     warm_from_prefill: bool,
     window_tokens: int = DEFAULT_WINDOW_TOKENS,
+    pin_step: bool = False,
 ) -> dict:
     """Replay every trace's decode records through one cache configuration.
+
+    With `pin_step`, every expert the step routes is pinned before the
+    first access, which is how the runtime calls its cache: it plans the
+    whole layer-step, so a miss can never evict an expert the same step is
+    about to hit. Without it, experts are pinned one at a time as they are
+    accessed, which EXP-005 found reads about 5 points low.
 
     Each trace starts from an empty cache (a generation is one session).
     With `warm_from_prefill` the prefill records are replayed first to warm
@@ -612,7 +917,7 @@ def simulate(
         clock = 0
         for r in prefill:
             for layer in range(n_layers):
-                pinned: set[int] = set()
+                pinned: set[int] = set(trace.routed(r, layer)) if pin_step else set()
                 for e in trace.routed(r, layer):
                     _, victim = caches[layer].access(e, clock, pinned)
                     fetched[layer].add(e)
@@ -626,7 +931,7 @@ def simulate(
             token_accesses = 0
             for layer in range(n_layers):
                 cache = caches[layer]
-                pinned = set()
+                pinned = set(trace.routed(r, layer)) if pin_step else set()
                 for e in trace.routed(r, layer):
                     hit, victim = cache.access(e, clock, pinned)
                     if hit:
@@ -1451,6 +1756,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="skip the per-layer hit curves and the global-pool comparison "
         "(the slowest section)",
     )
+    p.add_argument(
+        "--pin-step",
+        action="store_true",
+        help="pin every expert a layer-step routes before its first access, as "
+        "the runtime does, instead of one at a time as they are accessed",
+    )
     p.add_argument("--out", metavar="FILE", help="write the full results as JSON here")
     return p.parse_args(argv)
 
@@ -1546,6 +1857,7 @@ def main(argv: list[str]) -> int:
                     args.age_period,
                     False,
                     args.window_tokens,
+                    args.pin_step,
                 )
             )
 
