@@ -177,13 +177,13 @@ struct RuntimeArgs {
     #[arg(long)]
     verify_layer_hashes: bool,
 
-    /// How the ~1 GiB of common weights is held: `mapped` memory-maps
-    /// `common.bin`, so the kernel may drop those pages when other programs
-    /// need memory and read them back later; `resident` reads it once into
-    /// memory that only swap can take away, so with swap off for the process
-    /// (a cgroup with `MemorySwapMax=0`) nothing else can evict it. Same size
-    /// either way.
-    #[arg(long, value_name = "MODE", value_parser = parse_common_memory, default_value = "mapped")]
+    /// How the ~1 GiB of common weights is held: `resident` (the default)
+    /// reads `common.bin` once into memory that only swap can take away, so
+    /// with swap off for the process nothing else on the machine can evict
+    /// it; `mapped` memory-maps it, so the kernel may drop those pages when
+    /// other programs need memory and read them back later. Same size either
+    /// way; resident costs under a second more to load.
+    #[arg(long, value_name = "MODE", value_parser = parse_common_memory, default_value = "resident")]
     common_memory: CommonMemory,
 }
 

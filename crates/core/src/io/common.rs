@@ -246,16 +246,16 @@ mod tests {
     #[test]
     fn resident_and_mapped_hold_the_same_bytes() {
         let fx = build_install("resident-common");
-        let mapped = MappedCommon::open(&fx.root, &fx.manifest, LoadOptions::default()).unwrap();
-        let resident = MappedCommon::open(
+        let mapped = MappedCommon::open(
             &fx.root,
             &fx.manifest,
             LoadOptions {
-                common_memory: CommonMemory::Resident,
+                common_memory: CommonMemory::Mapped,
                 ..LoadOptions::default()
             },
         )
         .unwrap();
+        let resident = MappedCommon::open(&fx.root, &fx.manifest, LoadOptions::default()).unwrap();
         assert_eq!(resident.memory(), CommonMemory::Resident);
         assert_eq!(mapped.memory(), CommonMemory::Mapped);
         assert_eq!(resident.len(), mapped.len());

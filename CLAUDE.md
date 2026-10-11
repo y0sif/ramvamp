@@ -51,11 +51,15 @@ Pre-push: all four must pass.
 - Explicit reads for experts, never mmap demand paging (TurboFieldfare
   measured mmap 3.54x slower per cold expert read, and ~8x slower end to end
   in their full-token simulator; two separate measurements, see
-  `docs/landscape.md`). Common weights are mmap'd; experts are
-  pread/io_uring'd.
+  `docs/landscape.md`). Common weights are read into anonymous memory once
+  at load (`--common-memory resident`, EXP-031; `mapped` is the opt-out);
+  experts are pread/io_uring'd.
 - No speculative cross-layer expert prefetch (measured ~7% predictability).
 - No full model, shard, or tensor may ever be materialized in heap memory,
-  in the runtime or the repacker.
+  in the runtime or the repacker. The one exception is the resident common
+  core: a single anonymous mapping of `common.bin`, read once with the page
+  cache dropped behind it, and counted in full by the footprint projection
+  (EXP-031).
 - The repacker copies quantized bytes unchanged; it never requantizes.
 - Library code returns typed errors (`thiserror`); binaries use `anyhow`.
   No panics in `ramvamp-core` on untrusted input.

@@ -105,11 +105,17 @@ pub struct LoadOptions {
 
 /// How the common weights (`common.bin`: embeddings, lm_head, attention,
 /// routers, norms; ~1 GiB for the v0 model) are held in memory.
+///
+/// [`CommonMemory::Resident`] is the default (EXP-031): on a machine short of
+/// memory, `kswapd` took up to 801 MiB of the mapped weights mid-run and
+/// decode fell to 1.43 tok/s, while resident runs never had to read a page
+/// back, at the same speed, for +0.75 s of load. At 4K context it peaks at
+/// 2,963 MiB, inside the 3 GB contract and within 2 MiB of the footprint
+/// projection, which always assumed the whole file resident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CommonMemory {
     /// Memory-mapped read-only: file-backed pages the kernel may drop under
     /// memory pressure and fault back in from disk.
-    #[default]
     Mapped,
     /// Read once into anonymous memory with `O_DIRECT`, so the bytes are
     /// not also in the page cache. Anonymous pages can only leave memory
@@ -118,6 +124,7 @@ pub enum CommonMemory {
     /// evict the weights the runtime touches every token. Same size either
     /// way, so the footprint does not change; the load is one sequential
     /// read of the file.
+    #[default]
     Resident,
 }
 
