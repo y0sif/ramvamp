@@ -243,7 +243,13 @@ against `main` as above, and each lands as its own PR.
    near-tie in top-k. The route sink is still called in row order, after the
    parallel part. Decode's router, 128 experts per token, can split the same
    way across experts for about 4% of a token.
-2. **The Q4_K row hoist for prefill's batched GEMV.** It expands each weight
+2. **Done (EXP-029), not as planned below.** Instead of the prototype's
+   expanded scratch row, the batched Q4_K GEMV now dots four activation rows
+   per pass and shares the weight-only work across them, bit-identical and
+   with no scratch. Cold and paired against EXP-028's build, prefill went
+   from **15.34 to 21.57 tok/s** (medians), **1.32x** worst against best.
+   Q6_K `down` (24 of 48 layers) is not tiled yet. The plan was: **the Q4_K
+   row hoist for prefill's batched GEMV.** It expands each weight
    row once and reuses it across every activation row routed to it, instead
    of once per activation. The prototype on `perf/q4k-row-hoist-prototype`
    is already bit-identical to production. What remains: vectorize its
