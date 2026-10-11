@@ -63,6 +63,7 @@ use ramvamp_core::tokenizer::{ChatMessage, Role, RvmpTokenizer};
 
 mod config;
 mod repl;
+mod scope;
 mod tui;
 
 use config::{Dials, ProfileArgs, plan_lines, resolve_dials};
@@ -770,7 +771,16 @@ fn main() -> anyhow::Result<()> {
         return tui::selftest();
     }
 
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    // The commands that load a model hold its common weights in anonymous
+    // memory, which only a swap-off cgroup fully protects. See `scope`.
+    if matches!(
+        command,
+        Command::Generate(_) | Command::Chat(_) | Command::Serve(_) | Command::Logits(_)
+    ) {
+        scope::ensure_swap_off();
+    }
+    match command {
         Command::Tokenize(args) => tokenize(&args.model, args.prompt, args.messages_file),
         Command::Generate(args) => run_generate(*args),
         Command::Chat(args) => run_chat(*args),
