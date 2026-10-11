@@ -962,7 +962,7 @@ def main() -> int:
                              "before this flag existed. A slot costs the sum "
                              "of every layer's page-aligned stride, which is "
                              "130.781 MiB for the shipped Qwen3-30B-A3B "
-                             "layout, so 1440M (ramvamp's default) buys 11 "
+                             "layout, so 1440M (the 3 GB contract) buys 11 "
                              "slots/layer, 1570M buys 12 and 1701M buys 13 — "
                              "but each of those clears its threshold by under "
                              "1 MiB, and a repack with a different stride "
@@ -984,8 +984,9 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=1,
                         help="discarded leading runs; run 1 is contaminated "
                              "by btrfs metadata warm-up")
-    parser.add_argument("--memory-max", default="3G",
-                        help="cgroup MemoryMax (docs rule: 3G)")
+    parser.add_argument("--memory-max", default="4G",
+                        help="cgroup MemoryMax (docs rule: 4G since EXP-033; "
+                             "3G for the 3 GB contract and every entry before it)")
     parser.add_argument("--workdir", default="scratch/cold-bench",
                         help="where per-run JSON lands")
     parser.add_argument("--json",

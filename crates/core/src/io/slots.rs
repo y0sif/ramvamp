@@ -1876,6 +1876,8 @@ mod tests {
 
     /// The 3 GB benchmark cgroup every published number comes from.
     const CGROUP_3G: u64 = 3 << 30;
+    /// The 4 GiB contract (EXP-033), as `memory.max` spells it.
+    const CGROUP_4G: u64 = 4 << 30;
 
     /// `models/qwen3.rvmp/common.bin`, exactly — 1,023.34 MiB, the "Common
     /// core" row of the memory contract in `docs/architecture.md`.
@@ -1944,14 +1946,14 @@ mod tests {
         (manifest, layout)
     }
 
-    /// **The published claim.** 11 slots per layer at a 4,096-token context
-    /// under `memory.max=3G` is the configuration every number in
-    /// `docs/architecture.md` was measured at. A predictor that refuses it is
-    /// wrong about the runtime, not the other way around — so this pins every
-    /// tenant against the memory contract's table, byte for byte, and then
-    /// pins the verdict.
+    /// **The published claim.** 19 slots per layer at a 4,096-token context
+    /// under `memory.max=4G` is the 4 GiB contract (EXP-033), measured at a
+    /// 4,008.4 MiB peak. A predictor that refuses it is wrong about the
+    /// runtime, not the other way around — so this pins every tenant byte for
+    /// byte, then the verdict, and then that the 3 GiB contract before it
+    /// still holds at `--cache-bytes 1440M`.
     #[test]
-    fn the_shipped_default_fits_the_published_three_gigabyte_budget() {
+    fn the_shipped_default_fits_the_published_four_gigabyte_budget() {
         let (manifest, layout) = v0_install();
         let projected =
             Footprint::project(&manifest, &layout, crate::model::DEFAULT_CACHE_BYTES, 4096)
@@ -1960,23 +1962,32 @@ mod tests {
         // Row by row against docs/architecture.md's memory contract.
         assert_eq!(projected.common, V0_COMMON_BYTES, "common core row");
         assert_eq!(V0_PER_SLOT, 137_134_080);
-        assert_eq!(projected.experts, 11 * V0_PER_SLOT, "expert slot pool row");
-        assert_eq!(projected.experts, 1_508_474_880);
+        assert_eq!(projected.experts, 19 * V0_PER_SLOT, "expert slot pool row");
+        assert_eq!(projected.experts, 2_605_547_520);
         assert_eq!(projected.kv, 384 << 20, "KV cache row at 4K");
         assert_eq!(projected.runtime, RUNTIME_ANON_BYTES, "anonymous row");
         assert_eq!(projected.context_cap, 4096);
 
-        // 2,961.03 MiB, the table's provisional subtotal.
-        assert_eq!(mib(projected.total()), "2,961");
+        // 4,007.28 MiB, against a measured 4,008.4 (EXP-033).
+        assert_eq!(mib(projected.total()), "4,007");
         assert!(
-            projected.fits_within(CGROUP_3G),
+            projected.fits_within(CGROUP_4G),
             "the shipped default must be accepted: {projected}"
         );
+        // And it clears the ceiling by 88.7 MiB, not by a hair — if this
+        // moves, the prediction has drifted from the measurement.
+        let spare = u128::from(CGROUP_4G) - projected.total();
+        assert_eq!(mib(spare), "89");
+        // One slot more would not fit.
+        let twenty = Footprint::project(&manifest, &layout, 20 * V0_PER_SLOT, 4096).unwrap();
+        assert!(!twenty.fits_within(CGROUP_4G), "{twenty}");
 
-        // And it clears the ceiling by the 111.0 MiB the table claims, not by
-        // a hair — if this moves, the prediction has drifted from the doc.
-        let spare = u128::from(CGROUP_3G) - projected.total();
-        assert_eq!(mib(spare), "111");
+        // The 3 GiB contract before it: 11 slots, 2,961.03 MiB, 111 spare.
+        let three = Footprint::project(&manifest, &layout, 1440 << 20, 4096).unwrap();
+        assert_eq!(three.experts, 11 * V0_PER_SLOT);
+        assert_eq!(mib(three.total()), "2,961");
+        assert!(three.fits_within(CGROUP_3G), "{three}");
+        assert_eq!(mib(u128::from(CGROUP_3G) - three.total()), "111");
     }
 
     /// The KV term is the dial that is about to become configurable, so it is
@@ -1998,7 +2009,7 @@ mod tests {
             assert_eq!(projected.context_cap, cap);
             // Only the KV term moves with the context.
             assert_eq!(projected.common, V0_COMMON_BYTES);
-            assert_eq!(projected.experts, 11 * V0_PER_SLOT);
+            assert_eq!(projected.experts, 19 * V0_PER_SLOT);
             assert_eq!(projected.runtime, RUNTIME_ANON_BYTES);
         }
         // 4K is 384 MiB and 16K is 1,536 MiB, the two figures the docs quote.
@@ -2152,7 +2163,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             projected.to_string(),
-            "about 4,113 MiB (common 1,023 + experts 1,439 + KV 1,536 \
+            "about 5,159 MiB (common 1,023 + experts 2,485 + KV 1,536 \
              at 16384 tokens + runtime 115)"
         );
     }

@@ -5,18 +5,19 @@
 </p>
 
 <p align="center">
-  <strong>Run 26-30B MoE models in about 3 GB of RAM. No GPU required.</strong><br>A Rust runtime that streams experts from NVMe instead of holding them hostage in memory.
+  <strong>Run 26-30B MoE models in about 4 GB of RAM. No GPU required.</strong><br>A Rust runtime that streams experts from NVMe instead of holding them hostage in memory.
 </p>
 
-> **Status: v0, and it runs.** Qwen3-30B-A3B generates coherent text on CPU inside a 3 GB cgroup
-> with a cold page cache, validated against llama.cpp on identical weights. The shipping surface
+> **Status: v0, and it runs.** Qwen3-30B-A3B generates coherent text on CPU inside a 4 GB cgroup
+> with a cold page cache, on a machine in ordinary use, validated against llama.cpp on identical
+> weights. The shipping surface
 > is `ramvamp serve`: the OpenAI Chat Completions API on loopback, with streaming SSE, tool
 > calls, and named configuration profiles.
 
 ramvamp is a CPU-first local LLM inference runtime, written in Rust, for fine-grained
 Mixture-of-Experts models. It runs a 30B-parameter quantized model on an ordinary Linux x86_64
 machine with an NVMe SSD, no GPU and no 32 GB of RAM, by never loading the full checkpoint into
-memory. The always-needed common weights stay memory-mapped; the routed experts, which are most
+memory. The always-needed common weights (about 1 GiB) are read into memory once; the routed experts, which are most
 of the model, live on disk in a page-aligned packed format and are fetched with io_uring and
 O_DIRECT only when the router asks for them, through a small per-layer LFU cache.
 Qwen3-30B-A3B is the v0 model; Gemma 4 26B-A4B is the intended second model and is **roadmap,
@@ -25,20 +26,22 @@ anything else by name.
 
 ## At a glance
 
-Qwen3-30B-A3B Q4_K_M, cold, inside `memory.max=3G` with `memory.swap.max=0`, on the reference
-machine (Intel Core Ultra 9 185H, CPU only, **Micron 2400 DRAM-less QLC** NVMe):
+Qwen3-30B-A3B Q4_K_M, cold, inside `memory.max=4G` with `memory.swap.max=0`, the default 19
+expert slots per layer, on the reference machine (Intel Core Ultra 9 185H, CPU only, **Micron
+2400 DRAM-less QLC** NVMe), with the machine in ordinary use and every run hygiene-clean (EXP-033):
 
 | | measured |
 | --- | --- |
-| Decode | **about 2 tok/s** on this DRAM-less QLC drive: 1.46 to 2.19 over ctx 64-3,961 (EXP-023), and 1.43 to 2.16 over the same rungs on a later branch (EXP-025) |
-| Prefill | **11.25 tok/s** at ctx 512 (EXP-023) |
-| Peak RAM | **2,497 to 2,929 MiB** of a 3,072 MiB ceiling: 2,497.0 at ctx 64 (EXP-025), 2,929.3 at ctx 3,961 (EXP-023) |
+| Decode | **2.78 to 2.81 tok/s** at ctx 512 (`--max-new 128`), **1.96 tok/s** at ctx 3,961, on this DRAM-less QLC drive |
+| Prefill | **about 25 tok/s** at ctx 512 (24.48 to 25.27), 18.2 at ctx 3,961 |
+| Peak RAM | **3,690 to 3,697 MiB** at ctx 512 and **4,008 MiB** at ctx 3,961, of a 4,096 MiB ceiling |
 | Model on disk | 17.35 GiB, a **~6x** memory saving |
 | Fidelity | mean full-vocab KL **1.04e-2** vs llama.cpp, top-1 agreement 8/8 (EXP-004) |
 
 **Throughput is stated per drive on purpose**: decode is I/O-bound and this part sustains about
-1.6 GB/s at decode's own read geometry, so no figure appears without its drive. Full table,
-conditions and drive detail: [docs/benchmarks.md](docs/benchmarks.md).
+1.6 GB/s at decode's own read geometry, so no figure appears without its drive. With
+`--cache-bytes 1440M` (11 slots) it fits the earlier 3 GB contract, at 2.2 tok/s decode at ctx 512.
+Full table, conditions, the v0 figures and drive detail: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Install
 
@@ -121,7 +124,7 @@ across requests by longest common prefix, and refuses fields it cannot honour ex
 
 `--context` (default **4096**) is the dial that trades conversation length against resident
 bytes, and `plan` prices any value of it without loading the model; a 32K profile projects about
-5,649 MiB and needs a bigger budget than 3 GB, which is what named profiles exist to express.
+6,695 MiB and needs a bigger budget than 4 GB, which is what named profiles exist to express.
 Profiles, `--profile` / `--config` / `--no-config`, the four-layer precedence chain and the three
 environment variables: [docs/configuration.md](docs/configuration.md).
 

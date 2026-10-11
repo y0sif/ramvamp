@@ -17,9 +17,11 @@ rather than an error.
 ./target/release/ramvamp plan --model ~/models/qwen3-30b-a3b.rvmp --context 32768
 ```
 
-A 32K profile projects about **5,649 MiB**, about 5.5 GiB, and needs a bigger
-budget than 3 GB. That is what profiles exist to express: the 3 GB contract is
-a property of the 4K default, not of the runtime. `plan` exits nonzero when a
+A 32K profile projects about **6,695 MiB**, about 6.5 GiB, at the default
+19-slot cache, and needs a bigger budget than 4 GB. That is what profiles exist
+to express: the 4 GB contract is a property of the 4K default, not of the
+runtime, and a 3 GB machine runs the same 4K context with `"cache_bytes":
+"1440M"` (11 slots, 2,961 MiB). `plan` exits nonzero when a
 configuration will not fit, naming every term, so a script can ask the question
 without parsing the answer.
 

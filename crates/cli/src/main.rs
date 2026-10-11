@@ -120,18 +120,19 @@ struct Cli {
 struct RuntimeArgs {
     /// Total expert-cache budget for the whole model, divided across its
     /// layers. Accepts a plain byte count or a binary suffix (K/M/G/T,
-    /// optionally spelled KiB/MiB/...), e.g. `1440M` or `1.4G`. This is a
-    /// budget, not a slot count: 1440M buys 11 slots/layer on
-    /// Qwen3-30B-A3B, and a model with a different layer count or expert
-    /// size gets a different number of slots out of the same budget.
-    /// Unset: 1440M, or the profile's `cache_bytes`.
+    /// optionally spelled KiB/MiB/...), e.g. `2485M` or `2.4G`. This is a
+    /// budget, not a slot count: 2485M buys 19 slots/layer on
+    /// Qwen3-30B-A3B, which fits the 4 GB memory contract at a 4K context,
+    /// and 1440M buys 11, which fits 3 GB; a model with a different layer
+    /// count or expert size gets a different number of slots out of the same
+    /// budget. Unset: 2485M, or the profile's `cache_bytes`.
     //
     // `Option` rather than a clap `default_value`, for the reason
     // [`ContextArgs`] spells out: a default here is indistinguishable from the
     // user typing `--cache-bytes 1440M`, and would silently beat a profile on
     // every run. The default itself is unchanged — it is
     // [`ramvamp_core::model::DEFAULT_CACHE_BYTES`], which is exactly what
-    // `1440M` parses to, and `a_bare_command_line_resolves_to_the_published_
+    // `2485M` parses to, and `a_bare_command_line_resolves_to_the_published_
     // defaults` pins that.
     #[arg(
         long,
@@ -3539,7 +3540,7 @@ mod tests {
 
         assert_eq!(dials.context.value, repl::DEFAULT_CONTEXT);
         assert_eq!(dials.cache_bytes.value, DEFAULT_CACHE_BYTES);
-        assert_eq!(dials.cache_bytes.value, parse_bytes("1440M").unwrap());
+        assert_eq!(dials.cache_bytes.value, parse_bytes("2485M").unwrap());
         // What the removed clap defaults used to produce, term for term.
         assert_eq!(dials.runtime_config(), RuntimeConfig::default());
         assert_eq!(

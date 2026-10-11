@@ -1372,7 +1372,7 @@ impl ExpertStream {
                 mode = %stream.mode,
                 direct_io = %stream.support,
                 verdict = if measured { "measured" } else { "unmeasurable" },
-                "{}; the 3 GB memory contract does not hold in this mode",
+                "{}; the memory contract does not hold in this mode",
                 if measured {
                     "expert reads are charged to the page cache"
                 } else {
