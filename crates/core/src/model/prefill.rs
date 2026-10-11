@@ -85,6 +85,7 @@
 //! prompt, which `sweep_and_token_major_agree_bit_for_bit` asserts across
 //! several chunk sizes and prompt lengths.
 
+use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 use std::ops::Range;
 use std::sync::Mutex;
@@ -97,7 +98,7 @@ use crate::kernels::attention::{
     AttentionError, attention_at_in, scratch_len as attention_scratch_len,
 };
 use crate::kernels::primitives::{
-    rmsnorm, rmsnorm_in_place, rope_neox_heads, softmax, swiglu_combine, vec_add,
+    rmsnorm, rmsnorm_in_place, rope_neox_heads, softmax, swiglu_combine,
 };
 use crate::kernels::quants::{
     BlockQ8_0, BlockQ8K, QuantFormat, quantize_row_q8_0, quantize_row_q8_k,
@@ -249,10 +250,12 @@ pub(super) enum Phase {
     /// are fanned out across the compute pool, so this is wall time, not core
     /// time.
     Attention,
-    /// GEMVs against resident weights: Q/K/V, `o_proj`, the router matvec
-    /// (with its softmax and top-k selection, which it dominates) and
-    /// `lm_head`.
+    /// GEMVs against resident weights: Q/K/V, `o_proj` and `lm_head`.
     Projections,
+    /// Routing: the f32 router matvec, the softmax over every expert and the
+    /// top-k selection. Its own phase because, unlike the projections, it
+    /// never reaches the compute pool on the token-major path.
+    Router,
     /// Expert arithmetic: gate/up, SwiGLU, the intermediate quantization and
     /// down, for every routed expert. Excludes waiting for its bytes.
     ExpertCompute,
@@ -281,14 +284,14 @@ pub(super) enum Phase {
 /// # What sums to what
 ///
 /// [`PrefillTiming::total`] is the wall time of the whole `prefill_prompt`
-/// call. The five phase fields are **disjoint** spans inside it, charged by
+/// call. The six phase fields are **disjoint** spans inside it, charged by
 /// [`PhaseClock`] at region boundaries rather than opened and closed
 /// independently, so [`accounted`](PrefillTiming::accounted) cannot exceed
 /// `total` and [`other`](PrefillTiming::other) closes the sum exactly.
 ///
 /// `other` is not noise. It is the arena plan, `begin_prefill`/`session
 /// finish`, the per-block scratch carves, and the chunk loop's own
-/// scaffolding — real work that is simply none of the five, made visible
+/// scaffolding — real work that is simply none of the six, made visible
 /// instead of being folded into whichever phase happened to be open.
 ///
 /// # I/O wait is not measured twice
@@ -326,6 +329,8 @@ pub struct PrefillTiming {
     pub attention: Duration,
     /// [`Phase::Projections`].
     pub projections: Duration,
+    /// [`Phase::Router`].
+    pub router: Duration,
     /// [`Phase::ExpertCompute`].
     pub expert_compute: Duration,
     /// [`Phase::ExpertIo`].
@@ -335,10 +340,15 @@ pub struct PrefillTiming {
 }
 
 impl PrefillTiming {
-    /// The five phases together.
+    /// The six phases together.
     #[must_use]
     pub fn accounted(&self) -> Duration {
-        self.attention + self.projections + self.expert_compute + self.expert_io + self.elementwise
+        self.attention
+            + self.projections
+            + self.router
+            + self.expert_compute
+            + self.expert_io
+            + self.elementwise
     }
 
     /// The share of [`PrefillTiming::total`] no phase claimed.
@@ -363,12 +373,13 @@ impl PrefillTiming {
     /// Returned as an array rather than printed here because
     /// `ramvamp-core` does not print.
     #[must_use]
-    pub fn phases(&self) -> [(&'static str, Duration); 6] {
+    pub fn phases(&self) -> [(&'static str, Duration); 7] {
         [
             ("attention", self.attention),
             ("expert compute", self.expert_compute),
             ("expert io", self.expert_io),
             ("projections", self.projections),
+            ("router", self.router),
             ("elementwise", self.elementwise),
             ("other", self.other()),
         ]
@@ -423,7 +434,7 @@ impl<'a> PhaseClock<'a> {
         }
     }
 
-    /// A clock over one **decoded token**: the same five phases, plus the
+    /// A clock over one **decoded token**: the same six phases, plus the
     /// token's own wall time and the token itself when [`PhaseClock::close`]
     /// runs.
     ///
@@ -469,6 +480,7 @@ impl<'a> PhaseClock<'a> {
         let slot = match phase {
             Phase::Attention => &mut timing.attention,
             Phase::Projections => &mut timing.projections,
+            Phase::Router => &mut timing.router,
             Phase::ExpertCompute => &mut timing.expert_compute,
             Phase::ExpertIo => &mut timing.expert_io,
             Phase::Elementwise => &mut timing.elementwise,
@@ -679,8 +691,6 @@ struct Scratch<'a> {
     up: &'a mut [f32],
     /// SwiGLU output transposed to `[n][moe]` for per-row quantization.
     moe_t: &'a mut [f32],
-    /// One row's weighted expert accumulator, `[hidden]`.
-    expert_acc: &'a mut [f32],
     /// Per-shard attention scratch, `[shards][attn_shard]`: one whole
     /// [`attention_scratch_len`] carve per compute shard, so the per-row
     /// attention can run on every pinned core at once without a heap byte.
@@ -853,8 +863,7 @@ fn accumulate(total: &mut usize, count: usize, unit: usize) -> Result<(), Forwar
 /// `A` is one shard's [`attention_scratch_len`] carve:
 ///
 /// ```text
-/// f32   rows * (2H + 2Q + 2V + W + K*H + 3M + 2E)   + H            [expert_acc]
-///                                                   + S*A          [attn_shards]
+/// f32   rows * (2H + 2Q + 2V + W + K*H + 3M + 2E)   + S*A          [attn_shards]
 /// Q8_K  rows * (2 * H/256 + Q/256 + M/256)          blocks of 292 B
 /// Q8_0  rows * (H/32)                               blocks of  36 B
 /// pairs rows * K                                    of 8 B, twice  [topk, index]
@@ -868,13 +877,12 @@ fn accumulate(total: &mut usize, count: usize, unit: usize) -> Result<(), Forwar
 /// f32     512 * 36,352 floats           = 74,448,896 B   71.00 MiB
 ///   of which staging (K*H)              = 33,554,432 B   32.00 MiB
 ///   of which q + attn_out (2Q)          = 16,777,216 B   16.00 MiB
-/// expert_acc                            =      8,192 B
 /// attn_shards  6 * 33,024 * 4 B         =    792,576 B    0.76 MiB
 /// Q8_K    512 * 35 blocks * 292 B       =  5,232,640 B    4.99 MiB
 /// Q8_0    512 * 64 blocks *  36 B       =  1,179,648 B    1.13 MiB
 /// topk + index  2 * 512 * 8 * 8 B       =     65,536 B
 /// CSR     257 * 4 B                     =      1,028 B
-/// total                                 = 81,728,516 B   77.94 MiB
+/// total                                 = 81,720,324 B   77.93 MiB
 /// ```
 ///
 /// against a ~1,438 MiB slab whose sweep ring costs a further ~46.7 MiB at the
@@ -909,7 +917,6 @@ fn scratch_bytes(dims: &PrefillDims, rows: usize) -> Result<usize, ForwardError>
     ] {
         accumulate(&mut total, rows.saturating_mul(width), f32_bytes)?;
     }
-    accumulate(&mut total, dims.hidden, f32_bytes)?;
     accumulate(&mut total, dims.attn_scratch(), f32_bytes)?;
     accumulate(&mut total, rows.saturating_mul(dims.n_experts), f32_bytes)?;
     accumulate(&mut total, rows.saturating_mul(dims.n_experts), f32_bytes)?;
@@ -966,7 +973,6 @@ fn carve<'a>(
         gate: c.take(rows * dims.moe)?,
         up: c.take(rows * dims.moe)?,
         moe_t: c.take(rows * dims.moe)?,
-        expert_acc: c.take(dims.hidden)?,
         attn_shards: c.take(dims.attn_scratch())?,
         router_logits: c.take(rows * dims.n_experts)?,
         router_probs: c.take(rows * dims.n_experts)?,
@@ -986,6 +992,90 @@ fn carve<'a>(
 // ---------------------------------------------------------------------------
 // Pool fan-out for the batched kernels
 // ---------------------------------------------------------------------------
+
+/// A row-major buffer whose rows are handed out across the pool's threads.
+///
+/// [`for_each_row`] gives each row to exactly one body, and a body only
+/// rebuilds the rows it was given, so no two threads ever hold a view of the
+/// same row. The buffer stays mutably borrowed for as long as this lives, so
+/// nothing outside can see it either.
+struct Rows<'a, T> {
+    base: *mut T,
+    width: usize,
+    rows: usize,
+    _borrow: PhantomData<&'a mut [T]>,
+}
+
+impl<'a, T> Rows<'a, T> {
+    /// The first `rows * width` elements of `buf`, as `rows` rows.
+    fn new(buf: &'a mut [T], width: usize, rows: usize) -> Result<Self, ForwardError> {
+        let need = width.checked_mul(rows).ok_or(KernelError::LengthMismatch {
+            what: "prefill rows: width * rows overflows",
+            left: width,
+            right: rows,
+        })?;
+        if buf.len() < need {
+            return Err(KernelError::LengthMismatch {
+                what: "prefill rows: buffer vs width * rows",
+                left: buf.len(),
+                right: need,
+            }
+            .into());
+        }
+        Ok(Self {
+            base: buf.as_mut_ptr(),
+            width,
+            rows,
+            _borrow: PhantomData,
+        })
+    }
+
+    /// Row `r`.
+    ///
+    /// # Safety
+    ///
+    /// No other view of row `r` may be live. Call it only from a
+    /// [`for_each_row`] body, only for the row that body was handed, and only
+    /// once per call.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn row(&self, r: usize) -> &mut [T] {
+        assert!(r < self.rows, "prefill rows: row {r} of {}", self.rows);
+        // SAFETY: in bounds, because `r < rows` and `new` checked
+        // `rows * width <= buf.len()`; exclusive by the caller's contract;
+        // alive no longer than the borrow `PhantomData` holds.
+        unsafe { std::slice::from_raw_parts_mut(self.base.add(r * self.width), self.width) }
+    }
+}
+
+// SAFETY: `Rows` only ever hands out disjoint rows (see `row`), each to one
+// thread, under a `&mut` borrow of the whole buffer that outlives the job.
+unsafe impl<T: Send> Send for Rows<'_, T> {}
+// SAFETY: see `Send`.
+unsafe impl<T: Send> Sync for Rows<'_, T> {}
+
+/// Run `body(r)` for every row `r` in `0..n`, with rows claimed in chunks by
+/// every thread of the pool.
+///
+/// The error returned is the one a serial `for r in 0..n` would have stopped
+/// at: chunks are contiguous and ascending, each stops at its own first
+/// failing row, and [`record`] keeps the lowest chunk's. Rows past a failure
+/// may still have run in other chunks, which does not matter, because a
+/// failed pass leaves state its caller discards either way.
+fn for_each_row<F>(pool: &mut ComputePool, n: usize, body: F) -> Result<(), ForwardError>
+where
+    F: Fn(usize) -> Result<(), ForwardError> + Sync,
+{
+    let failure: Mutex<Option<(usize, ForwardError)>> = Mutex::new(None);
+    pool.run_chunks(n, |chunk| {
+        for r in chunk.rows {
+            if let Err(err) = body(r) {
+                record(&failure, chunk.index, err);
+                return;
+            }
+        }
+    });
+    taken(failure)
+}
 
 /// A raw pointer shared across shards.
 ///
@@ -1745,18 +1835,25 @@ fn run_chunk(
             let (mut s, _) = carve(session.scratch(), dims, rows)?;
 
             // (a) attention RMSNorm and (b) both activation quantizations.
-            for r in 0..n {
-                let residual = &s.residual[r * hidden..(r + 1) * hidden];
-                let normed = &mut s.normed[r * hidden..(r + 1) * hidden];
-                rmsnorm(residual, lw.attn_norm, eps, normed)?;
-                quantize_row_q8_k(
-                    normed,
-                    &mut s.acts_hidden[r * dims.hidden_q8k..(r + 1) * dims.hidden_q8k],
-                )?;
-                quantize_row_q8_0(
-                    normed,
-                    &mut s.acts_q80[r * dims.hidden_q80..(r + 1) * dims.hidden_q80],
-                )?;
+            {
+                let residual = &*s.residual;
+                let normed = Rows::new(&mut *s.normed, hidden, n)?;
+                let acts_k = Rows::new(&mut *s.acts_hidden, dims.hidden_q8k, n)?;
+                let acts_0 = Rows::new(&mut *s.acts_q80, dims.hidden_q80, n)?;
+                for_each_row(state.pool, n, |r| {
+                    // SAFETY: `for_each_row` hands row `r` to this body once.
+                    let (normed, acts_k, acts_0) =
+                        unsafe { (normed.row(r), acts_k.row(r), acts_0.row(r)) };
+                    rmsnorm(
+                        &residual[r * hidden..(r + 1) * hidden],
+                        lw.attn_norm,
+                        eps,
+                        normed,
+                    )?;
+                    quantize_row_q8_k(normed, acts_k)?;
+                    quantize_row_q8_0(normed, acts_0)?;
+                    Ok(())
+                })?;
             }
 
             // (c) Q, K and V for the whole chunk, then transposed back to
@@ -1802,20 +1899,25 @@ fn run_chunk(
 
             // (d) Per-head QK-RMSNorm then RoPE, at this row's absolute
             // position. HF order, exactly as `forward_token` does it.
-            for r in 0..n {
-                let position = start + r;
-                let rope_pos = u32::try_from(position)
-                    .map_err(|_| ForwardError::PositionOverflow { position })?;
-                let q = &mut s.q[r * q_dim..(r + 1) * q_dim];
-                for head in q.chunks_exact_mut(dims.head_dim) {
-                    rmsnorm_in_place(head, lw.attn_q_norm, eps)?;
-                }
-                rope_neox_heads(q, dims.n_heads, dims.head_dim, rope_pos, theta)?;
-                let k = &mut s.k[r * kv_dim..(r + 1) * kv_dim];
-                for head in k.chunks_exact_mut(dims.head_dim) {
-                    rmsnorm_in_place(head, lw.attn_k_norm, eps)?;
-                }
-                rope_neox_heads(k, dims.n_kv_heads, dims.head_dim, rope_pos, theta)?;
+            {
+                let q_rows = Rows::new(&mut *s.q, q_dim, n)?;
+                let k_rows = Rows::new(&mut *s.k, kv_dim, n)?;
+                for_each_row(state.pool, n, |r| {
+                    let position = start + r;
+                    let rope_pos = u32::try_from(position)
+                        .map_err(|_| ForwardError::PositionOverflow { position })?;
+                    // SAFETY: `for_each_row` hands row `r` to this body once.
+                    let (q, k) = unsafe { (q_rows.row(r), k_rows.row(r)) };
+                    for head in q.chunks_exact_mut(dims.head_dim) {
+                        rmsnorm_in_place(head, lw.attn_q_norm, eps)?;
+                    }
+                    rope_neox_heads(q, dims.n_heads, dims.head_dim, rope_pos, theta)?;
+                    for head in k.chunks_exact_mut(dims.head_dim) {
+                        rmsnorm_in_place(head, lw.attn_k_norm, eps)?;
+                    }
+                    rope_neox_heads(k, dims.n_kv_heads, dims.head_dim, rope_pos, theta)?;
+                    Ok(())
+                })?;
             }
 
             // (e) The inversion: the whole chunk's K/V goes in before any of
@@ -1854,11 +1956,15 @@ fn run_chunk(
             clock.charge(Phase::Attention);
 
             // (g) Output projection and the attention residual add.
-            for r in 0..n {
-                quantize_row_q8_k(
-                    &s.attn_out[r * q_dim..(r + 1) * q_dim],
-                    &mut s.acts_attn[r * dims.attn_q8k..(r + 1) * dims.attn_q8k],
-                )?;
+            {
+                let attn_out = &*s.attn_out;
+                let acts = Rows::new(&mut *s.acts_attn, dims.attn_q8k, n)?;
+                for_each_row(state.pool, n, |r| {
+                    // SAFETY: `for_each_row` hands row `r` to this body once.
+                    let acts = unsafe { acts.row(r) };
+                    quantize_row_q8_k(&attn_out[r * q_dim..(r + 1) * q_dim], acts)?;
+                    Ok(())
+                })?;
             }
             clock.charge(Phase::Elementwise);
             pool_batched_q8_k(
@@ -1872,64 +1978,79 @@ fn run_chunk(
                 &mut s.tmat[..hidden * n],
             )?;
             clock.charge(Phase::Projections);
-            for r in 0..n {
-                let residual = &mut s.residual[r * hidden..(r + 1) * hidden];
-                for (h, value) in residual.iter_mut().enumerate() {
-                    // The same single f32 add `vec_add` performs; only the
-                    // source's layout differs.
-                    *value += s.tmat[h * n + r];
-                }
+            // The attention residual add, then (h) the FFN RMSNorm and the
+            // expert activations, one row at a time on whichever thread
+            // claims it.
+            {
+                let tmat = &*s.tmat;
+                let residual_rows = Rows::new(&mut *s.residual, hidden, n)?;
+                let normed = Rows::new(&mut *s.normed, hidden, n)?;
+                let acts_k = Rows::new(&mut *s.acts_hidden, dims.hidden_q8k, n)?;
+                for_each_row(state.pool, n, |r| {
+                    // SAFETY: `for_each_row` hands row `r` to this body once.
+                    let (residual, normed, acts_k) =
+                        unsafe { (residual_rows.row(r), normed.row(r), acts_k.row(r)) };
+                    for (h, value) in residual.iter_mut().enumerate() {
+                        // The same single f32 add `vec_add` performs; only the
+                        // source's layout differs.
+                        *value += tmat[h * n + r];
+                    }
+                    rmsnorm(residual, lw.ffn_norm, eps, normed)?;
+                    quantize_row_q8_k(normed, acts_k)?;
+                    Ok(())
+                })?;
             }
 
-            // (h) FFN RMSNorm and the expert activations.
-            for r in 0..n {
-                let residual = &s.residual[r * hidden..(r + 1) * hidden];
-                let normed = &mut s.normed[r * hidden..(r + 1) * hidden];
-                rmsnorm(residual, lw.ffn_norm, eps, normed)?;
-                quantize_row_q8_k(
-                    normed,
-                    &mut s.acts_hidden[r * dims.hidden_q8k..(r + 1) * dims.hidden_q8k],
-                )?;
-            }
-
-            // (i) Routing, per row, exactly as `forward_token` routes.
-            //
-            // Charged to `Projections`: the f32 router matvec is
-            // `n_experts * hidden` scalar MACs per row, which dwarfs the
-            // softmax and the top-k scan it shares this loop with.
+            // (i) Routing, per row, exactly as `forward_token` routes. Each
+            // row's matvec stays one serial f32 sum per expert, in the same
+            // order as decode's: splitting rows across threads leaves every
+            // row's arithmetic alone, where vectorizing the sum would reorder
+            // it and could flip a near-tie in the top-k.
             clock.charge(Phase::Elementwise);
-            for r in 0..n {
-                let normed = &s.normed[r * hidden..(r + 1) * hidden];
-                let logits = &mut s.router_logits[r * dims.n_experts..(r + 1) * dims.n_experts];
-                for (row, logit) in lw.router.data().chunks_exact(hidden).zip(logits.iter_mut()) {
-                    *logit = dot_f32(row, normed);
-                }
-                let probs = &mut s.router_probs[r * dims.n_experts..(r + 1) * dims.n_experts];
-                probs.copy_from_slice(logits);
-                softmax(probs)?;
-                let topk = &mut s.topk[r * top_k..(r + 1) * top_k];
-                for entry in topk.iter_mut() {
-                    let mut best_e = 0usize;
-                    let mut best_p = f32::NEG_INFINITY;
-                    for (e, &p) in probs.iter().enumerate() {
-                        if p > best_p {
-                            best_p = p;
-                            best_e = e;
+            {
+                let normed = &*s.normed;
+                let router = lw.router.data();
+                let logits_rows = Rows::new(&mut *s.router_logits, dims.n_experts, n)?;
+                let probs_rows = Rows::new(&mut *s.router_probs, dims.n_experts, n)?;
+                let topk_rows = Rows::new(&mut *s.topk, top_k, n)?;
+                for_each_row(state.pool, n, |r| {
+                    let normed = &normed[r * hidden..(r + 1) * hidden];
+                    // SAFETY: `for_each_row` hands row `r` to this body once.
+                    let (logits, probs, topk) =
+                        unsafe { (logits_rows.row(r), probs_rows.row(r), topk_rows.row(r)) };
+                    for (row, logit) in router.chunks_exact(hidden).zip(logits.iter_mut()) {
+                        *logit = dot_f32(row, normed);
+                    }
+                    probs.copy_from_slice(logits);
+                    softmax(probs)?;
+                    for entry in topk.iter_mut() {
+                        let mut best_e = 0usize;
+                        let mut best_p = f32::NEG_INFINITY;
+                        for (e, &p) in probs.iter().enumerate() {
+                            if p > best_p {
+                                best_p = p;
+                                best_e = e;
+                            }
+                        }
+                        *entry = TopkEntry {
+                            expert: best_e as u32,
+                            weight: best_p,
+                        };
+                        probs[best_e] = f32::NEG_INFINITY;
+                    }
+                    if arch.norm_topk_prob {
+                        let sum: f32 = topk.iter().map(|entry| entry.weight).sum();
+                        for entry in topk.iter_mut() {
+                            entry.weight /= sum;
                         }
                     }
-                    *entry = TopkEntry {
-                        expert: best_e as u32,
-                        weight: best_p,
-                    };
-                    probs[best_e] = f32::NEG_INFINITY;
-                }
-                if arch.norm_topk_prob {
-                    let sum: f32 = topk.iter().map(|entry| entry.weight).sum();
-                    for entry in topk.iter_mut() {
-                        entry.weight /= sum;
-                    }
-                }
-                if let Some(sink) = on_route.as_deref_mut() {
+                    Ok(())
+                })?;
+            }
+            // The sink is the caller's and sees rows in order, as before.
+            if let Some(sink) = on_route.as_deref_mut() {
+                for r in 0..n {
+                    let topk = &s.topk[r * top_k..(r + 1) * top_k];
                     state.sink_buf.clear();
                     state
                         .sink_buf
@@ -1938,7 +2059,7 @@ fn run_chunk(
                 }
             }
 
-            clock.charge(Phase::Projections);
+            clock.charge(Phase::Router);
 
             // (j) The inverse index, and the routed set the sweep plans on.
             build_index(&mut s, dims, n)?;
@@ -1983,7 +2104,7 @@ fn run_chunk(
         // 2l. Reduce each row's staging in top-k order and add the residual.
         {
             let (mut s, _) = carve(session.scratch(), dims, rows)?;
-            reduce_experts(&mut s, dims, n)?;
+            reduce_experts(state.pool, &mut s, dims, n)?;
         }
         clock.charge(Phase::Elementwise);
     }
@@ -2183,24 +2304,39 @@ fn run_expert(
 /// stage every expert's output and reduce afterwards — which is exactly what
 /// `forward_token` already does for its own two-phase hit/miss split.
 ///
-/// The operations are literally the same: separate multiply and add (never
-/// `mul_add`, whose single rounding differs), an `expert_acc` zeroed per row,
-/// and one `vec_add` into the residual.
-fn reduce_experts(s: &mut Scratch<'_>, dims: &PrefillDims, n: usize) -> Result<(), ForwardError> {
+/// The operations are literally the same as `forward_token`'s: separate
+/// multiply and add (never `mul_add`, whose single rounding differs), an
+/// accumulator starting at 0.0 that takes each slot in top-k order, and one add
+/// into the residual. Rows are independent, so they are split across the pool.
+fn reduce_experts(
+    pool: &mut ComputePool,
+    s: &mut Scratch<'_>,
+    dims: &PrefillDims,
+    n: usize,
+) -> Result<(), ForwardError> {
     let (hidden, top_k) = (dims.hidden, dims.top_k);
-    for r in 0..n {
-        s.expert_acc.fill(0.0);
-        for slot in 0..top_k {
-            let entry = s.topk[r * top_k + slot];
-            let base = (r * top_k + slot) * hidden;
-            let staged = &s.staged[base..base + hidden];
-            for (acc, &d) in s.expert_acc.iter_mut().zip(staged) {
-                *acc += entry.weight * d;
+    let (topk, staged) = (&*s.topk, &*s.staged);
+    let residual_rows = Rows::new(&mut *s.residual, hidden, n)?;
+    for_each_row(pool, n, |r| {
+        // SAFETY: `for_each_row` hands row `r` to this body once.
+        let residual = unsafe { residual_rows.row(r) };
+        let weights = &topk[r * top_k..(r + 1) * top_k];
+        let staged = &staged[r * top_k * hidden..(r + 1) * top_k * hidden];
+        // Element by element, the same operations in the same order as
+        // `forward_token` accumulating whole rows into a zeroed `expert_acc`
+        // and then `vec_add`ing it: start at 0.0, add each slot's
+        // `weight * d` in slot order, then one add into the residual. Only
+        // the loop nest is turned inside out, which is what lets it run
+        // without a shared accumulator row.
+        for (h, value) in residual.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for (slot, entry) in weights.iter().enumerate() {
+                acc += entry.weight * staged[slot * hidden + h];
             }
+            *value += acc;
         }
-        vec_add(&mut s.residual[r * hidden..(r + 1) * hidden], s.expert_acc)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -3056,7 +3192,13 @@ mod tests {
             }
         }
         s.residual.fill(0.0);
-        reduce_experts(&mut s, &dims, 1).unwrap();
+        let mut pool = crate::threads::ComputePool::with_config(crate::threads::PoolConfig {
+            shards: Some(2),
+            placement: crate::threads::Placement::Off,
+            pin_caller: false,
+            ..crate::threads::PoolConfig::default()
+        });
+        reduce_experts(&mut pool, &mut s, &dims, 1).unwrap();
 
         // Top-k order sums big first, so both small terms vanish.
         let want_topk = ((0.0f32 + big) + small) + small;
@@ -3124,16 +3266,16 @@ mod tests {
         }
     }
 
-    /// The documented v0 figures, to the byte. A 512-row chunk costs 77.94
+    /// The documented v0 figures, to the byte. A 512-row chunk costs 77.93
     /// MiB of the ~1,438 MiB slot slab, of which the `[rows][top_k][hidden]`
     /// staging that makes the reduction order-independent is 32 MiB and the
     /// six per-shard attention carves are 0.76 MiB.
     #[test]
     fn the_documented_v0_scratch_arithmetic_holds() {
         let dims = qwen3_30b_a3b_dims();
-        assert_eq!(scratch_bytes(&dims, 512).unwrap(), 81_728_516);
+        assert_eq!(scratch_bytes(&dims, 512).unwrap(), 81_720_324);
         // Just under 77.94 MiB.
-        assert_eq!(81_728_516 / 1024 / 1024, 77);
+        assert_eq!(81_720_324 / 1024 / 1024, 77);
         // Staging alone, and the pair of `[rows][q_dim]` planes.
         assert_eq!(512 * dims.top_k * dims.hidden * 4, 33_554_432);
         assert_eq!(2 * 512 * dims.q_dim * 4, 16_777_216);
@@ -3141,7 +3283,7 @@ mod tests {
         // shards, which is exactly what the previous total grew by.
         assert_eq!(dims.attn_shard(), 33_024);
         assert_eq!(dims.attn_scratch() * 4, 792_576);
-        assert_eq!(80_935_940 + 792_576, 81_728_516);
+        assert_eq!(80_927_748 + 792_576, 81_720_324);
         // Affine in rows, which `plan_arena` divides by: the attention carve
         // is per *shard*, not per row, so the slope is untouched.
         let per_row = scratch_bytes(&dims, 2).unwrap() - scratch_bytes(&dims, 1).unwrap();
@@ -3156,7 +3298,7 @@ mod tests {
         let shipped = layout_of(&[(3_059_712, 128), (2_654_208, 128)]);
         let ring = ring_bytes(&shipped, 8, 2);
         assert_eq!(ring, 48_955_392);
-        assert!(ring + 81_728_516 < 1_438 * 1024 * 1024);
+        assert!(ring + 81_720_324 < 1_438 * 1024 * 1024);
     }
 
     // ---- the attention split ---------------------------------------------
@@ -3300,7 +3442,6 @@ mod tests {
             s.normed.fill(f32::from_bits(0x0202_0202));
             s.q.fill(f32::from_bits(0x0303_0303));
             s.staged.fill(f32::from_bits(0x0404_0404));
-            s.expert_acc.fill(f32::from_bits(0x0505_0505));
             s.attn_shards.fill(f32::from_bits(0x0808_0808));
             s.index_start.fill(0x0606_0606);
             s.index_cursor.fill(0x0707_0707);
@@ -3312,7 +3453,6 @@ mod tests {
         assert!(s.normed.iter().all(|v| v.to_bits() == 0x0202_0202));
         assert!(s.q.iter().all(|v| v.to_bits() == 0x0303_0303));
         assert!(s.staged.iter().all(|v| v.to_bits() == 0x0404_0404));
-        assert!(s.expert_acc.iter().all(|v| v.to_bits() == 0x0505_0505));
         assert!(s.attn_shards.iter().all(|v| v.to_bits() == 0x0808_0808));
         assert!(s.index_start.iter().all(|&v| v == 0x0606_0606));
         assert!(s.index_cursor.iter().all(|&v| v == 0x0707_0707));
@@ -3673,7 +3813,7 @@ mod tests {
     // one of these catches it.
 
     /// [`PrefillTiming::other`] closes the sum by construction, and
-    /// [`PrefillTiming::accounted`] is exactly the five phases. Pure
+    /// [`PrefillTiming::accounted`] is exactly the six phases. Pure
     /// arithmetic: no model, no clock, nothing to flake.
     #[test]
     fn the_unaccounted_remainder_closes_the_sum() {
@@ -3684,12 +3824,13 @@ mod tests {
             total: ms(1000),
             attention: ms(400),
             projections: ms(30),
+            router: ms(5),
             expert_compute: ms(450),
             expert_io: ms(90),
             elementwise: ms(20),
         };
-        assert_eq!(timing.accounted(), ms(990));
-        assert_eq!(timing.other(), ms(10));
+        assert_eq!(timing.accounted(), ms(995));
+        assert_eq!(timing.other(), ms(5));
         assert_eq!(
             timing.accounted() + timing.other(),
             timing.total,
@@ -3710,7 +3851,7 @@ mod tests {
         assert!(!fresh.ran());
         assert_eq!(fresh.accounted(), Duration::ZERO);
         assert_eq!(fresh.other(), Duration::ZERO);
-        assert_eq!(fresh.phases().len(), 6);
+        assert_eq!(fresh.phases().len(), 7);
     }
 
     /// Both paths report, and both report phases that fit inside their own

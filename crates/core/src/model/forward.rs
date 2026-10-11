@@ -613,7 +613,7 @@ pub struct ForwardState {
     prefill_timing: PrefillTiming,
     /// Where the decode that followed the last prefill spent its wall time.
     ///
-    /// The same five phases and the same `PhaseClock`, charged by the same
+    /// The same six phases and the same `PhaseClock`, charged by the same
     /// [`forward_token`] — the only difference is which accumulator the clock
     /// points at, which `prefill_charging` decides. Unlike `prefill_timing`
     /// this one *accumulates* across tokens: a per-token split would be noise,
@@ -2699,9 +2699,8 @@ pub fn forward_token_traced<'s>(
                 *w /= sum;
             }
         }
-        // Charged to `Projections`: the f32 router matvec dominates the
-        // softmax, the top-k scan and the sink it shares this region with.
-        clock.charge(Phase::Projections);
+        // The sink shares the region: it is the caller's, and cheap.
+        clock.charge(Phase::Router);
         if let Some(sink) = on_route.as_deref_mut() {
             sink(layer, topk);
         }

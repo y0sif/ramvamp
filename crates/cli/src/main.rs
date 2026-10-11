@@ -3855,13 +3855,14 @@ mod tests {
             tokens: 512,
             total: ms(131_200),
             attention: ms(51_300),
-            projections: ms(4_200),
+            projections: ms(3_000),
+            router: ms(1_200),
             expert_compute: ms(60_100),
             expert_io: ms(13_400),
             elementwise: ms(1_800),
         };
         let lines = prefill_timing_lines(&timing, ms(12_830));
-        assert_eq!(lines.len(), 7, "a heading and six phases: {lines:?}");
+        assert_eq!(lines.len(), 8, "a heading and seven phases: {lines:?}");
         assert_eq!(lines[0], "prefill split (sweep): 512 tokens in 131.20s");
 
         // Everything `TIMING_RE` anchors on: `prefill:` immediately followed
@@ -3880,7 +3881,8 @@ mod tests {
             lines[3], "       expert io:   13.40s ( 10.2%) [12.83s blocked on the drive]",
             "the drive-blocked share comes from the streamer, not a second timer"
         );
-        assert_eq!(lines[6], "           other:    0.40s (  0.3%)");
+        assert_eq!(lines[5], "          router:    1.20s (  0.9%)");
+        assert_eq!(lines[7], "           other:    0.40s (  0.3%)");
 
         // The token-major path reports the same shape against `io_wait`, so
         // the two can be read side by side.
@@ -3922,13 +3924,14 @@ mod tests {
             tokens: 64,
             total: ms(30_000),
             attention: ms(21_000),
-            projections: ms(3_000),
+            projections: ms(2_400),
+            router: ms(600),
             expert_compute: ms(2_500),
             expert_io: ms(2_000),
             elementwise: ms(1_000),
         };
         let lines = decode_timing_lines(&timing);
-        assert_eq!(lines.len(), 7, "a heading and six phases: {lines:?}");
+        assert_eq!(lines.len(), 8, "a heading and seven phases: {lines:?}");
         assert_eq!(
             lines[0],
             "decode split (forward_token): 64 tokens in 30.00s (469 ms/token)"
@@ -3939,7 +3942,7 @@ mod tests {
             assert!(!line.contains("tok/s"), "{line}");
         }
         assert_eq!(lines[1], "       attention:   21.00s ( 70.0%)");
-        assert_eq!(lines[6], "           other:    0.50s (  1.7%)");
+        assert_eq!(lines[7], "           other:    0.50s (  1.7%)");
 
         // Nothing has decoded: nothing is printed. `mode` stays `None` on this
         // accumulator, so `ran()` is the wrong question and `tokens` is asked
@@ -3952,7 +3955,7 @@ mod tests {
                 ..PrefillTiming::default()
             })
             .len()
-                == 7
+                == 8
         );
     }
 
@@ -3970,6 +3973,7 @@ mod tests {
             total: ms(30_000),
             attention: ms(21_000),
             projections: ms(3_000),
+            router: ms(0),
             expert_compute: ms(2_500),
             expert_io: ms(2_000),
             elementwise: ms(1_000),
