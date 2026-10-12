@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/repack", "crates/server", "crates/cli"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/y0sif/ramvamp"
@@ -20,9 +20,9 @@ rust-version = "1.88"
 [workspace.dependencies]
 # Internal. Each carries both a `path` and a `version`: the path wins for local
 # builds, and `cargo publish` rejects a path dependency that has no version.
-ramvamp-core = { path = "crates/core", version = "0.1.0" }
-ramvamp-repack = { path = "crates/repack", version = "0.1.0" }
-ramvamp-server = { path = "crates/server", version = "0.1.0" }
+ramvamp-core = { path = "crates/core", version = "0.1.1" }
+ramvamp-repack = { path = "crates/repack", version = "0.1.1" }
+ramvamp-server = { path = "crates/server", version = "0.1.1" }
 
 # Errors and logging
 anyhow = "1"
