@@ -207,9 +207,9 @@ Decided by the author on 2026-10-12, after phase 10 below. Three items:
 3. **Gemma 4 26B-A4B as model #2** (v1 item 1), starting with obtaining and
    auditing a checkpoint, then the repacker, loader and forward-pass work that
    section lists, with a correctness gate against llama.cpp before any speed
-   work. **Waiting on the author's choice of checkpoint** (Open decisions):
-   a first survey (v1 item 1) found that each candidate needs one new kernel,
-   and which one depends on the file.
+   work. **Checkpoint chosen by the author on 2026-10-12: Google's QAT Q4_0
+   GGUF**, which makes Q4_0 the one new kernel (Open decisions). Next: obtain
+   it and audit it locally, which turns the survey in v1 item 1 into figures.
 
 **A second drive stays deferred**: the author has no faster NVMe available, so
 the cheapest experiment in the project waits for one (or for a contributor's
@@ -406,7 +406,8 @@ logit softcap of 30. And a down-projection row of 704 is not a whole number of
 256-wide k-quant blocks, so no "Q4_K_M" file uses k-quants there: llama.cpp
 falls back to Q5_0, Q5_1 or Q8_0. **Whichever checkpoint is chosen needs one
 new kernel**: Q4_0 for Google's QAT file, Q5_0 for bartowski's Q4_K_M (17.04
-GB), Q5_1 for unsloth's. The choice is open, below.
+GB), Q5_1 for unsloth's. The author chose Google's QAT Q4_0 (Open
+decisions).
 
 What it brings that v0 does not implement, as first written: sliding-window
 KV rings, a per-layer attention-type mix, logit softcap, and a second quant
@@ -616,7 +617,7 @@ rather than default to measuring more.
 | The `attn_q` + `attn_v` fusion | **settled**: dropped, its bucket did not separate at either rung. The expert-phase fusion stays |
 | Gate 5's pass criterion | **settled** (2026-10-12, before the run): the final and every running perplexity within 1% of llama.cpp b10217's. The reference's +/-0.16588 is its corpus sampling error, not an engine tolerance. Passed (EXP-035) |
 | Reopen progressive miss execution | **open** |
-| Gemma 4's checkpoint, and with it the new kernel (v1 item 1) | **open**. Recommended: Google's QAT Q4_0 (official, smallest per token, one kernel, trained for the format). The alternatives are bartowski's Q4_K_M (Q5_0 kernel) and unsloth's UD-Q4_K_M (Q5_1). See the survey in v1 item 1 |
+| Gemma 4's checkpoint, and with it the new kernel (v1 item 1) | **settled** (2026-10-12): Google's official QAT Q4_0 GGUF (`google/gemma-4-26B-A4B-it-qat-q4_0-gguf`), so the new kernel is Q4_0. Chosen over bartowski's Q4_K_M (Q5_0 kernel) and unsloth's UD-Q4_K_M (Q5_1): official, smallest per token, one kernel, trained for the format. See the survey in v1 item 1 |
 | The memory contract: 3 GB with 11 slots, or 4 GB with up to 19 | **settled** (2026-10-11): 4 GB, 19 slots. Measured clean and paired (EXP-033): decode 1.26x at ctx 512 and 1.12x at 4K, prefill and output unchanged, 4,008 MiB peak at 4K against `ramvamp plan`'s 4,007. `--cache-bytes 1440M` keeps the 3 GB setup |
 | A GPU backend (v1 item 2) | **not now** (2026-10-10): no quotable ratio, because the CPU pool would not hold steady even at locked clocks (EXP-026). Reopen conditions are in the v1 section |
 | Hold the common weights resident by default | **settled** (2026-10-11): yes. Fits 3 GB at 4K context with 109 MiB spare, matches `ramvamp plan` to 2 MiB, and no resident run has had to read a page back (EXP-031). `--common-memory mapped` is the opt-out, and the hard rules say so |
