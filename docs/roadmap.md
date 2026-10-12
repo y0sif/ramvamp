@@ -100,7 +100,7 @@ inside `memory.max=3G` with swap off, at the shipped 11 slots per layer:
 | Prefill, ctx 512 | **11.25 tok/s** (EXP-023), **11.07** (EXP-025) |
 | Expert cache hit rate, ctx 64 to 3,961 | **53.0% to 59.3%**, no trend in context (EXP-023) |
 | `memory.peak` | **2,497 to 2,929 MiB** of 3,072 (2,497.0 is EXP-025's fused arm at ctx 64, 2,929.3 is EXP-023 at ctx 3,961) |
-| Fidelity | mean full-vocab KL **1.04e-2** against llama.cpp, top-1 agreement 8/8 (EXP-004) |
+| Fidelity | mean full-vocab KL **1.04e-2** against llama.cpp, top-1 agreement 8/8 (EXP-004); WikiText-2 perplexity **6.3598** against llama.cpp's 6.3810, -0.33% (EXP-035) |
 | Model on disk | 17.35 GiB, about a 6x memory saving |
 
 **The current runtime at the 4 GB contract** (EXP-033; 19 slots, `memory.max=4G`,
@@ -123,11 +123,14 @@ binary on the same prompts and read it 3.1% slower at ctx 512 and 8.9% slower
 at 3,961. On a DRAM-less QLC part a decode figure describes its session as
 well as its device.
 
-One caveat those decode figures carry, stated rather than buried: at
-`--max-new 64` the run starts from a cache the prefill sweep emptied, so the
-published curve describes **the first 63 tokens after a prompt**. Steady-state
-decode at 256 generated tokens and beyond has not been measured cold. It is on
-the list below.
+Those decode figures are short windows, 64 or 128 generated tokens, that
+start from a cache the prefill sweep left empty. **EXP-034 measured longer
+windows cold and the cache is not the issue**: at the 4 GB default the live
+hit rate is 67.1% over 128 tokens, 67.7% over 256 and 67.1% over 512, because
+the cache is full within a few tokens. A long reply is slower anyway, by
+attention's growth with context: decode **2.80 tok/s over 128 new tokens, 2.79
+over 256 and 2.61 over 512** at ctx 512 (medians, paired in one session), and
+**2.04 over 128 new tokens at ctx 3,961**.
 
 A faster drive should move this and by how much is **unknown**. No mainstream
 TLC Gen4 part has been measured here. That is the cheapest remaining
@@ -151,7 +154,7 @@ experiment in the project.
 | Configurable context and profiles | **done**. `--context`, `RAMVAMP_CONTEXT`, a JSON profile file, `--no-config`, and a `plan` subcommand that resolves the dials and projects the memory footprint without loading the model. A configuration that cannot fit is refused before allocation instead of OOM-killed part way through prefill |
 | Usable by an agent client | **done**. OpenCode drives the server with working tool calls on a 32K-context profile. That profile does **not** fit in 3 GB: it projects roughly 5,649 MiB, about 5.5 GiB, which is what profiles exist to express. The 3 GB contract is a property of the 4K default, not of the runtime |
 | Distribution: install script and landing page | **in tree, not yet live**. `install.sh` resolves the latest release, refuses anything that is not Linux x86_64, installs both binaries, and prints the 17.35 GiB model install rather than starting it. `site/index.html` is the one-page site, and `.github/workflows/sync-installer.yml` mirrors both onto `gh-pages`. **Pages still has to be switched on by hand once** (Settings > Pages > deploy from `gh-pages`, root), and until then `https://y0sif.github.io/ramvamp/install.sh` is a 404 and the README's one-liner does not work |
-| **Gate 5: perplexity** | **open**, and it is the only open v0 gate |
+| Gate 5: perplexity | **done** (EXP-035): WikiText-2 PPL 6.3598 against llama.cpp's 6.3810 on the same GGUF, -0.33%, inside the author's 1% bar at every one of 40 windows, token streams identical |
 
 Four claims above have no numbered experiment behind them, which is worth
 saying in a project with this file's rules. The tokenizer's 17 fixtures, the
@@ -163,42 +166,50 @@ pinned tenant by tenant to the architecture document's memory table by a test,
 and it inherits that table's caveats, including a provisional anonymous-memory
 row that overpredicted the one measured 4K point by 31.7 MiB.
 
-### Gate 5 is phase 11's first item
+### Gate 5 passed (EXP-035), and every v0 gate with it
 
-The llama.cpp side is banked: **PPL 6.3810 +/- 0.16588** (EXP-004). The
-reference is `llama-perplexity` from llama.cpp b10217, run on the WikiText-2
-raw test split (`wiki.test.raw`) at `-c 512 --chunks 40`, against the same
-Qwen3-30B-A3B Q4_K_M GGUF the runtime installs from. The corpus and the
-per-chunk log are kept outside the repository, and nothing about them is
-private: build llama.cpp at b10217, fetch `wiki.test.raw` from the
-wikitext-2-raw-v1 archive, and re-run that command on your own GGUF to
-regenerate the reference locally. **The ramvamp side has never been run.**
+The llama.cpp side was banked in EXP-004: `llama-perplexity` from llama.cpp
+b10217 on the WikiText-2 raw test split (`wiki.test.raw`) at `-c 512 --chunks
+40`, against the same Qwen3-30B-A3B Q4_K_M GGUF the runtime installs from,
+**PPL 6.3810 +/- 0.16588**. The corpus and the per-chunk log are kept outside
+the repository, and nothing about them is private: build llama.cpp at b10217,
+fetch `wiki.test.raw` from the wikitext-2-raw-v1 archive, and re-run that
+command on your own GGUF to regenerate the reference.
 
-The work is to compute perplexity over the same corpus with the same chunking
-on the same GGUF bytes and compare. It is self-contained. It needs an
-installed model, but it is a correctness measurement, which rule 2 exempts, so
-it does not need the benchmark cgroup or a quiet machine, and the reference is
-one llama.cpp command away. The other gates are the pattern to follow,
-including their shared exit-code convention: `scripts/bitident.py`,
-`scripts/kl_vs_reference.py` and `scripts/greedy_regression.py`.
+`ramvamp perplexity` applies the same protocol, read from b10217's source
+rather than assumed: the file less one trailing newline, tokenized once, no
+BOS (the GGUF sets `add_bos_token = false`), each 512-token window from an
+empty KV cache, positions 256..510 scored. `scripts/perplexity_gate.py`
+checks the token stream against `llama-tokenize` and then gates, with the
+other gates' exit codes. The criterion is the author's, set before the run:
+**the final and every running PPL within 1% of llama.cpp's**. ramvamp scores
+**6.3598 +/- 0.16504, -0.33%**, its worst running gap is -0.69% at window 3,
+and the token streams are identical. Every running value sits slightly below
+the reference, a consistent -0.0033 nats per token that is a third of the bar
+and is recorded rather than explained.
+
+Prefill keeps only the last row's logits, so scoring needed a new path:
+`prefill_prompt_scored` sends the scored rows through `lm_head` a block at a
+time inside the scratch the chunk already holds. No `[rows][vocab]` buffer
+exists and the footprint does not change.
 
 ## Now: phase 11, Gemma 4, Gate 5 and steady-state decode
 
 Decided by the author on 2026-10-12, after phase 10 below. Three items:
 
-1. **Gate 5, perplexity** (above): the ramvamp side of the WikiText-2 run, matched
-   to `llama-perplexity` b10217's protocol, scored chunk by chunk against the
-   banked log. Needs every scored position's log-probability, which prefill does
-   not produce today (it keeps the last row's logits only); scoring by row block
-   inside the sweep's tail avoids a `[rows][vocab]` buffer. The pass criterion
-   is not yet set and is the author's.
-2. **Steady-state decode, cold** ("Then, in no fixed order" below): longer
-   `--max-new` windows at the 4 GB default, so the published decode figure stops
-   describing only a cache the prefill sweep has just emptied.
+1. **Done (EXP-035): Gate 5, perplexity.** PASS: 6.3598 against llama.cpp's
+   6.3810, -0.33%, within the author's 1% bar at every window (above).
+2. **Done (EXP-034): steady-state decode, cold.** The hit rate is flat at
+   67.1-67.7% over 128, 256 and 512 new tokens, so the short published windows
+   were not measuring a colder cache than a long reply sees. Decode over 512
+   new tokens is 0.93x the 128-token figure, carried by attention as context
+   grows.
 3. **Gemma 4 26B-A4B as model #2** (v1 item 1), starting with obtaining and
    auditing a checkpoint, then the repacker, loader and forward-pass work that
    section lists, with a correctness gate against llama.cpp before any speed
-   work.
+   work. **Waiting on the author's choice of checkpoint** (Open decisions):
+   a first survey (v1 item 1) found that each candidate needs one new kernel,
+   and which one depends on the file.
 
 **A second drive stays deferred**: the author has no faster NVMe available, so
 the cheapest experiment in the project waits for one (or for a contributor's
@@ -368,17 +379,47 @@ figures are not on the same footing:
   map and strides the way the Qwen3 pin was audited. Until then it is a
   plausible number and not a published one.
 
-What it brings that v0 does not implement: sliding-window KV rings, a
-per-layer attention-type mix, logit softcap, a `(1 + w)` RMSNorm variant,
-query scaling folded differently from Qwen3, and possibly a second quant
-scheme. Some of that is already anticipated in the design rather than
-implemented. `crates/core/src/kv/mod.rs` documents bounded ring buffers for
+**A first survey (2026-10-12), not yet an audit.** Read from Google's
+`config.json`, the transformers implementation and the header tables of seven
+GGUFs fetched remotely (no tensor data), so it is planning evidence, not a
+published figure. 30 layers, hidden 2,816, 128 experts at top-8 with an expert
+intermediate of 704, vocabulary 262,144. llama.cpp names the architecture
+`gemma4` (support since b8637). Google publishes an official
+quantization-aware-trained **Q4_0** GGUF (14.44 GB, not gated) in which every
+expert tensor is Q4_0: one expert is then 3,345,408 B, so the worst case is
+**8 x 30 x 3,345,408 B = 803 MB per token**, against Qwen3's 1,097 MB. That
+derivation becomes this file's figure once a local audit of the chosen file
+confirms the strides. The same survey corrects this section in two places:
+
+- **The norm is plain `x * w`**, not `(1 + w)` (llama.cpp's converter adds no
+  +1 for Gemma 4), and attention scaling is 1.0 rather than a folded query
+  scale.
+- **The "shared expert" is an always-on dense MLP** (intermediate 2,112)
+  running beside the routed experts, so it belongs with the common weights
+  and the closed `ProjectionName` enum does not block it.
+
+What it adds instead: gate and up stored fused in one expert tensor, GELU-tanh
+gating, global layers (every sixth) with head dim 512, two KV heads, keys used
+as values and partial RoPE, a 1,024-token window on the other 25, a router with
+its own norm and scale, per-expert and per-layer output scalars, and a final
+logit softcap of 30. And a down-projection row of 704 is not a whole number of
+256-wide k-quant blocks, so no "Q4_K_M" file uses k-quants there: llama.cpp
+falls back to Q5_0, Q5_1 or Q8_0. **Whichever checkpoint is chosen needs one
+new kernel**: Q4_0 for Google's QAT file, Q5_0 for bartowski's Q4_K_M (17.04
+GB), Q5_1 for unsloth's. The choice is open, below.
+
+What it brings that v0 does not implement, as first written: sliding-window
+KV rings, a per-layer attention-type mix, logit softcap, and a second quant
+scheme. (A `(1 + w)` RMSNorm and a differently folded query scale were on
+this list too; the survey above found neither.) Some of that is already
+anticipated in the design rather than implemented. `crates/core/src/kv/mod.rs` documents bounded ring buffers for
 Gemma 4's 25 sliding-window layers, which keep the KV cache flat as context
 grows, and states that v0 implements the linear variant only. One format
 constraint to design around: `ProjectionName`
 (`crates/core/src/format/layout.rs`) is a closed `Gate | Up | Down` enum, so
 an expert blob has no slot for a shared-expert slab today, even though
-`shared_expert` is already expressible in the manifest.
+`shared_expert` is already expressible in the manifest. If the survey is
+right, Gemma 4 does not need that slot: its shared expert is a dense MLP.
 
 ### 2. A GPU backend behind the existing kernel trait, Vulkan or CUDA
 
@@ -529,10 +570,11 @@ Recorded so they stop being re-derived.
   walks five rungs and this is one more column of what it already records.
   Until it is settled, no prefill-time claim about a large context belongs in
   a published number.
-- **Steady-state decode.** Every published decode figure is a 63-token window
-  starting from a cache the prefill sweep emptied. A longer `--max-new` on the
-  same paired prompt is what turns that into a steady-state number, and it is
-  one more arm on a sweep that already runs.
+- **Steady-state decode. Measured (EXP-034).** The cache fills within a few
+  tokens and its hit rate does not climb over longer windows; decode over 512
+  new tokens is 0.93x the 128-token figure, by attention's growth with
+  context. A 4K prompt with 128 new tokens peaks 12 MiB over `ramvamp plan`'s
+  projection and 76 MiB under the cap, which is noted and not chased.
 - **A second drive. Deferred** (2026-10-12): no faster drive is available to the
   author. Turns the published band into a curve and tests the
   project's central claim, that the design scales with the device.
@@ -572,7 +614,9 @@ rather than default to measuring more.
 | The tok/s floor | **settled**: stated per drive, not as one number |
 | Shipping surface | **settled**: `ramvamp-server`. Building a terminal UI reimplements something that already exists in many good versions and is outside what this project contributes; the contribution is the streaming runtime, and a server is the universal interface to it |
 | The `attn_q` + `attn_v` fusion | **settled**: dropped, its bucket did not separate at either rung. The expert-phase fusion stays |
+| Gate 5's pass criterion | **settled** (2026-10-12, before the run): the final and every running perplexity within 1% of llama.cpp b10217's. The reference's +/-0.16588 is its corpus sampling error, not an engine tolerance. Passed (EXP-035) |
 | Reopen progressive miss execution | **open** |
+| Gemma 4's checkpoint, and with it the new kernel (v1 item 1) | **open**. Recommended: Google's QAT Q4_0 (official, smallest per token, one kernel, trained for the format). The alternatives are bartowski's Q4_K_M (Q5_0 kernel) and unsloth's UD-Q4_K_M (Q5_1). See the survey in v1 item 1 |
 | The memory contract: 3 GB with 11 slots, or 4 GB with up to 19 | **settled** (2026-10-11): 4 GB, 19 slots. Measured clean and paired (EXP-033): decode 1.26x at ctx 512 and 1.12x at 4K, prefill and output unchanged, 4,008 MiB peak at 4K against `ramvamp plan`'s 4,007. `--cache-bytes 1440M` keeps the 3 GB setup |
 | A GPU backend (v1 item 2) | **not now** (2026-10-10): no quotable ratio, because the CPU pool would not hold steady even at locked clocks (EXP-026). Reopen conditions are in the v1 section |
 | Hold the common weights resident by default | **settled** (2026-10-11): yes. Fits 3 GB at 4K context with 109 MiB spare, matches `ramvamp plan` to 2 MiB, and no resident run has had to read a page back (EXP-031). `--common-memory mapped` is the opt-out, and the hard rules say so |
