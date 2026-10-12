@@ -40,7 +40,7 @@
     "license": "https://opensource.org/licenses/MIT",
     "url": "https://y0sif.github.io/ramvamp/",
     "downloadUrl": "https://github.com/y0sif/ramvamp/releases",
-    "softwareVersion": "0.1.0",
+    "softwareVersion": "0.1.1",
     "author": {
       "@type": "Person",
       "name": "y0sif",
@@ -482,8 +482,8 @@
           <p>Expert reads go through io_uring with O_DIRECT, batched per layer. That bypasses the page cache, so expert traffic costs the memory budget nothing. Demand paging is the alternative, and <a href="https://github.com/drumih/turbo-fieldfare">TurboFieldfare</a> measured mmap 3.54x slower per cold expert read.</p>
         </div>
         <div class="feature">
-          <h3>Common weights are mmap'd</h3>
-          <p>Embeddings, attention, routers, norms and the lm_head are about 1,023 MiB, touched on every token, and the page cache keeps them resident.</p>
+          <h3>Common weights are read in once</h3>
+          <p>Embeddings, attention, routers, norms and the lm_head are about 1,023 MiB, touched on every token, so they are read into anonymous memory at load, where a swap-off cgroup cannot reclaim them.</p>
         </div>
         <div class="feature">
           <h3>A small LFU cache</h3>

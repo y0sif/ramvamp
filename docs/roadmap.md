@@ -153,7 +153,7 @@ experiment in the project.
 | Tool calling | **done**. Streaming and buffered, parsed from Qwen's native `<tool_call>` tokens; both paths share one parser and one id minter. The renderer is byte-identical to 20 committed transformers fixtures. Verified against OpenCode driving real tool calls |
 | Configurable context and profiles | **done**. `--context`, `RAMVAMP_CONTEXT`, a JSON profile file, `--no-config`, and a `plan` subcommand that resolves the dials and projects the memory footprint without loading the model. A configuration that cannot fit is refused before allocation instead of OOM-killed part way through prefill |
 | Usable by an agent client | **done**. OpenCode drives the server with working tool calls on a 32K-context profile. That profile does **not** fit in 3 GB: it projects roughly 5,649 MiB, about 5.5 GiB, which is what profiles exist to express. The 3 GB contract is a property of the 4K default, not of the runtime |
-| Distribution: install script and landing page | **in tree, not yet live**. `install.sh` resolves the latest release, refuses anything that is not Linux x86_64, installs both binaries, and prints the 17.35 GiB model install rather than starting it. `site/index.html` is the one-page site, and `.github/workflows/sync-installer.yml` mirrors both onto `gh-pages`. **Pages still has to be switched on by hand once** (Settings > Pages > deploy from `gh-pages`, root), and until then `https://y0sif.github.io/ramvamp/install.sh` is a 404 and the README's one-liner does not work |
+| Distribution: install script and landing page | **done, live**. `install.sh` resolves the latest release, refuses anything that is not Linux x86_64, installs both binaries, and prints the 17.35 GiB model install rather than starting it. `site/index.html` is the one-page site, and `.github/workflows/sync-installer.yml` mirrors both onto `gh-pages`, which GitHub Pages serves, so `https://y0sif.github.io/ramvamp/install.sh` and the README's one-liner work |
 | Gate 5: perplexity | **done** (EXP-035): WikiText-2 PPL 6.3598 against llama.cpp's 6.3810 on the same GGUF, -0.33%, inside the author's 1% bar at every one of 40 windows, token streams identical |
 
 Four claims above have no numbered experiment behind them, which is worth
@@ -211,9 +211,8 @@ done and one set aside:
    Qwen3 pin. See v1 item 1 for the reasoning and what would reopen it.
 
 **Next is not decided.** Every v0 gate is closed. The candidates already on
-record are below ("Then, in no fixed order", the open decision on progressive
-miss execution, and switching GitHub Pages on so the install one-liner works);
-which one comes next is the author's call.
+record are below ("Then, in no fixed order", and the open decision on
+progressive miss execution); which one comes next is the author's call.
 
 **A second drive stays deferred**: the author has no faster NVMe available, so
 the cheapest experiment in the project waits for one (or for a contributor's
