@@ -133,15 +133,17 @@ environment variables: [docs/configuration.md](docs/configuration.md).
 1. **Install repacks, it does not convert.** The GGUF is streamed into the `.rvmp` layout: a
    `common.bin` for what every token needs, one file per layer holding 128 fixed-stride,
    page-aligned expert blobs. Nothing is requantized and no shard is materialized in heap memory.
-2. **Common weights are mmap'd.** Embeddings, attention, routers, norms and the lm_head are
-   about 1,023 MiB, touched every token, and the page cache keeps them resident.
+2. **Common weights are read in once.** Embeddings, attention, routers, norms and the lm_head
+   are about 1,023 MiB, touched every token, so they are read into anonymous memory at load,
+   where a swap-off cgroup cannot reclaim them (EXP-031). `--common-memory mapped` maps them
+   instead.
 3. **Experts are read explicitly, never demand-paged.** Per layer the router picks 8 of 128.
    Hits in that layer's LFU cache dispatch to the compute pool immediately; the misses go to
    io_uring as one batch of O_DIRECT reads, so they bypass the page cache and cost the memory
    budget nothing, and the hit compute hides their latency.
-4. **The cache is small on purpose.** At the default 1,440 MiB budget that is **11 slots per layer
+4. **The cache is small on purpose.** At the default 2,485 MiB budget that is **19 slots per layer
    out of 128 experts**. Worst case is **1,097 MB of expert weights per decode token**, and the
-   cache absorbs 53.0% to 59.3% of requests across five measured context rungs (EXP-023).
+   cache absorbs 67.1% of requests at ctx 512 and 68.3% at ctx 3,961 (EXP-033).
 
 Explicit reads rather than mmap demand paging is a measured choice, and so is having no speculative
 cross-layer expert prefetch; [docs/landscape.md](docs/landscape.md) carries both measurements.
