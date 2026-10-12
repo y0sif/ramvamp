@@ -372,24 +372,27 @@ figures are not on the same footing:
   1,290,240 B, so a layer's per-expert stride is 3,059,712 B on the 24 layers
   with a Q6_K down projection and 2,654,208 B on the other 24. At top-8 that
   is `8 x (24 x 3,059,712 + 24 x 2,654,208)` = 1,097,072,640 B.
-- **Gemma 4 26B-A4B: ~816 MB per token is an ESTIMATE.** No derivation for it
-  is recorded anywhere in this project, and Gemma 4's expert count, top-k,
-  expert intermediate size and quantization are not recorded either. It
-  becomes a fact the moment someone audits a real checkpoint's per-tensor type
-  map and strides the way the Qwen3 pin was audited. Until then it is a
-  plausible number and not a published one.
+- **Gemma 4 26B-A4B: 803 MB per token, audited on the chosen checkpoint
+  (EXP-036).** Google's QAT Q4_0 GGUF stores every expert as Q4_0, and one
+  expert is 3,345,408 B on all 30 layers (2,230,272 B of fused gate and up,
+  1,115,136 B of down), so the worst case is `8 x 30 x 3,345,408` =
+  802,897,920 B, 0.73x Qwen3's. (The ~816 MB this line used to carry had no
+  derivation and is withdrawn.) The weights outside the experts are larger,
+  1.469 GiB against 0.999.
 
-**A first survey (2026-10-12), not yet an audit.** Read from Google's
-`config.json`, the transformers implementation and the header tables of seven
-GGUFs fetched remotely (no tensor data), so it is planning evidence, not a
-published figure. 30 layers, hidden 2,816, 128 experts at top-8 with an expert
+**A first survey (2026-10-12), since audited for the chosen file.** Read
+from Google's `config.json`, the transformers implementation and the header
+tables of seven GGUFs fetched remotely (no tensor data). The type map,
+strides and metadata of the chosen file were then audited from its own
+header (EXP-036); the architecture details below that a header cannot show
+(norm form, scaling, gating) are still the survey's, from the reference
+implementation. 30 layers, hidden 2,816, 128 experts at top-8 with an expert
 intermediate of 704, vocabulary 262,144. llama.cpp names the architecture
 `gemma4` (support since b8637). Google publishes an official
 quantization-aware-trained **Q4_0** GGUF (14.44 GB, not gated) in which every
 expert tensor is Q4_0: one expert is then 3,345,408 B, so the worst case is
 **8 x 30 x 3,345,408 B = 803 MB per token**, against Qwen3's 1,097 MB. That
-derivation becomes this file's figure once a local audit of the chosen file
-confirms the strides. The same survey corrects this section in two places:
+derivation is now audited on the chosen file (EXP-036). The same survey corrects this section in two places:
 
 - **The norm is plain `x * w`**, not `(1 + w)` (llama.cpp's converter adds no
   +1 for Gemma 4), and attention scaling is 1.0 rather than a folded query
