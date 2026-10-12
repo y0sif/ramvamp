@@ -20,9 +20,9 @@ machine with an NVMe SSD, no GPU and no 32 GB of RAM, by never loading the full 
 memory. The always-needed common weights (about 1 GiB) are read into memory once; the routed experts, which are most
 of the model, live on disk in a page-aligned packed format and are fetched with io_uring and
 O_DIRECT only when the router asks for them, through a small per-layer LFU cache.
-Qwen3-30B-A3B is the v0 model; Gemma 4 26B-A4B is the intended second model and is **roadmap,
-not present tense**, since the repacker accepts `qwen3moe` architecture GGUFs and refuses
-anything else by name.
+Qwen3-30B-A3B is the only model. A second one has to be faster or better than it on this
+runtime: Gemma 4 26B-A4B was costed against that bar and set aside (`docs/roadmap.md`, v1 item
+1), and the repacker accepts `qwen3moe` architecture GGUFs and refuses anything else by name.
 
 ## At a glance
 

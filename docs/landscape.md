@@ -21,8 +21,10 @@ ramvamp earns its existence because:
 
 1. It brings measured, not theoretical, SSD expert streaming to Linux on
    commodity x86 hardware, with no GPU required.
-2. It is class-generic over fine-grained MoE models (Qwen3-30B-A3B first,
-   Gemma 4 26B-A4B second) rather than pinned to one checkpoint.
+2. Its format is class-generic over fine-grained MoE models rather than
+   pinned to one checkpoint. Qwen3-30B-A3B is the only model so far; Gemma 4
+   26B-A4B was costed as the second and set aside because it would not be
+   clearly faster or better here (`docs/roadmap.md`, v1 item 1).
 3. Rust with io_uring and O_DIRECT is a better substrate for the core trick,
    explicit parallel reads, than the macOS pread path that inspired it.
 

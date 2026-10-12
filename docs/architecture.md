@@ -275,8 +275,9 @@ For Qwen3 (48 layers) the budget is **1,438.6 MiB of expert pool, which is
 11 slots/layer**. The dial was 10 in the original design, revised up to 12 by
 EXP-005 as the largest pool that fits `memory.max=3G`, and back to 11 by
 EXP-012, which measured the tenant this table used to omit entirely. Gemma 4
-(30 layers) gets proportionally more slots under the same byte budget; the
-exact count depends on its blob stride and has not been computed.
+(30 layers, set aside) would cost 95.7 MiB per slot against Qwen3's 130.8
+(EXP-036), but its common weights are 470 MiB larger, which takes most of
+that back.
 
 | Tenant | Qwen3 v0 | Notes |
 | --- | ---: | --- |
@@ -1840,9 +1841,10 @@ Two things that used to be listed here as caps are not caps:
   reference-faithful by recorded decision, so untrusted content reaches the
   model only through the sanitizing entry point.
 
-Gemma 4 26B-A4B is model #2 and brings: shared-expert overlap, SWA KV rings,
-per-layer attention-type mix, logit softcap, and (if we adopt their quant
-source) a second quant scheme decision.
+Gemma 4 26B-A4B was planned as model #2. It was audited and costed on
+2026-10-12 (EXP-036) and set aside by the author, because it would not be
+clearly faster or better than the Qwen3 pin on this runtime; the reasoning
+and what would reopen it are in `docs/roadmap.md`, v1 item 1.
 
 ## Post-v0 direction (recorded 2026-08-01, not commitments)
 
@@ -1853,7 +1855,8 @@ source) a second quant scheme decision.
   handling) for quality-over-latency users.
 - Anthropic Messages API schema as a second endpoint (Claude Code path;
   until then, a translation proxy works).
-- Gemma 4 26B-A4B as model #2; Vulkan backend behind the kernel trait.
+- Gemma 4 26B-A4B as model #2 (set aside 2026-10-12); Vulkan backend
+  behind the kernel trait (not now, 2026-10-10).
 
 ## Recorded decisions from phase-5 measurement (2026-08-03)
 

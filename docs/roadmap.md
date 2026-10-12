@@ -193,9 +193,10 @@ Prefill keeps only the last row's logits, so scoring needed a new path:
 time inside the scratch the chunk already holds. No `[rows][vocab]` buffer
 exists and the footprint does not change.
 
-## Now: phase 11, Gemma 4, Gate 5 and steady-state decode
+## Done: phase 11, Gate 5 and steady-state decode (2026-10-12)
 
-Decided by the author on 2026-10-12, after phase 10 below. Three items:
+Decided by the author on 2026-10-12, after phase 10 below. Three items, two
+done and one set aside:
 
 1. **Done (EXP-035): Gate 5, perplexity.** PASS: 6.3598 against llama.cpp's
    6.3810, -0.33%, within the author's 1% bar at every window (above).
@@ -204,12 +205,15 @@ Decided by the author on 2026-10-12, after phase 10 below. Three items:
    were not measuring a colder cache than a long reply sees. Decode over 512
    new tokens is 0.93x the 128-token figure, carried by attention as context
    grows.
-3. **Gemma 4 26B-A4B as model #2** (v1 item 1), starting with obtaining and
-   auditing a checkpoint, then the repacker, loader and forward-pass work that
-   section lists, with a correctness gate against llama.cpp before any speed
-   work. **Checkpoint chosen by the author on 2026-10-12: Google's QAT Q4_0
-   GGUF**, which makes Q4_0 the one new kernel (Open decisions). Next: obtain
-   it and audit it locally, which turns the survey in v1 item 1 into figures.
+3. **Set aside (the author, 2026-10-12): Gemma 4 26B-A4B as model #2.** The
+   chosen checkpoint was audited (EXP-036) and costed, and it does not clear
+   the bar the author set for a second model: be faster or better than the
+   Qwen3 pin. See v1 item 1 for the reasoning and what would reopen it.
+
+**Next is not decided.** Every v0 gate is closed. The candidates already on
+record are below ("Then, in no fixed order", the open decision on progressive
+miss execution, and switching GitHub Pages on so the install one-liner works);
+which one comes next is the author's call.
 
 **A second drive stays deferred**: the author has no faster NVMe available, so
 the cheapest experiment in the project waits for one (or for a contributor's
@@ -356,7 +360,43 @@ against `main` as above, and each lands as its own PR.
 
 These are commitments to sequence, not to dates.
 
-### 1. Gemma 4 26B-A4B as model #2
+### 1. Gemma 4 26B-A4B as model #2: not now (2026-10-12)
+
+**Set aside by the author on 2026-10-12.** The bar for a second model is that
+it runs faster or answers better than the Qwen3 pin on this runtime; supporting
+a model for its own sake is not a goal. Gemma 4 does not clearly clear it, on
+three counts:
+
+- **Speed: about the same.** These are **estimates** from EXP-036's audit and
+  EXP-034's measured Qwen3 split, not measurements. Expert reads are 0.73x
+  per token, but the weights outside the experts are 1.469 GiB against 0.999,
+  which costs about five expert slots under the 4 GB cap, and a token touches
+  about 2.3 GB of weights against 2.0 (a dense MLP on every layer and a
+  262,144-row logit projection). That nets out at roughly **1.1x decode at ctx
+  512, 1.2x at 4K** (sliding-window attention caps 25 of 30 layers at 1,024
+  positions) and **0.9x prefill**. The largest unknown, Gemma's live hit rate,
+  can only be measured by running it.
+- **Quality: unproven where ramvamp is used.** Google's published scores are
+  thinking-mode figures, and against Qwen3-30B-A3B-Thinking-2507's they are
+  ahead (vendor-reported, different harnesses): MMLU-Pro 82.6 against 80.9,
+  GPQA Diamond 82.3 against 73.4. At 2 to 3 tok/s a thinking trace costs
+  minutes per answer, ramvamp ships the non-thinking Instruct pin, and no
+  non-thinking Gemma 4 scores are published.
+- **Cost: a second model definition.** The streaming design carries over
+  unchanged (expert files, io_uring, the slot cache, the sweep), but the
+  model around it does not: a Q4_0 kernel, a repacker that reads `gemma4`
+  metadata and a fused gate-up tensor, two attention variants (head dim 512 is
+  above the attention kernel's SIMD limit of 256, keys double as values), a KV
+  ring for the sliding layers, a dense MLP and four extra norms per layer,
+  GELU gating, a tokenizer and chat template that want a BOS, and a
+  correctness gate against llama.cpp.
+
+**What would reopen it:** a measured reason to expect it to be faster or
+better than the pin, such as non-thinking quality numbers that beat Qwen3's,
+or a live hit-rate measurement that moves the speed estimate. The audit, the
+survey and a 576 MB partial download of the chosen file (resumable with
+`curl -C -`) are kept. What follows is the case as it was written, with the
+survey's corrections.
 
 Structurally cheaper than the v0 pin. It has 30 layers against 48, and it has
 a **shared expert**: unconditional per-layer compute that reads can be
@@ -372,24 +412,27 @@ figures are not on the same footing:
   1,290,240 B, so a layer's per-expert stride is 3,059,712 B on the 24 layers
   with a Q6_K down projection and 2,654,208 B on the other 24. At top-8 that
   is `8 x (24 x 3,059,712 + 24 x 2,654,208)` = 1,097,072,640 B.
-- **Gemma 4 26B-A4B: ~816 MB per token is an ESTIMATE.** No derivation for it
-  is recorded anywhere in this project, and Gemma 4's expert count, top-k,
-  expert intermediate size and quantization are not recorded either. It
-  becomes a fact the moment someone audits a real checkpoint's per-tensor type
-  map and strides the way the Qwen3 pin was audited. Until then it is a
-  plausible number and not a published one.
+- **Gemma 4 26B-A4B: 803 MB per token, audited on the chosen checkpoint
+  (EXP-036).** Google's QAT Q4_0 GGUF stores every expert as Q4_0, and one
+  expert is 3,345,408 B on all 30 layers (2,230,272 B of fused gate and up,
+  1,115,136 B of down), so the worst case is `8 x 30 x 3,345,408` =
+  802,897,920 B, 0.73x Qwen3's. (The ~816 MB this line used to carry had no
+  derivation and is withdrawn.) The weights outside the experts are larger,
+  1.469 GiB against 0.999.
 
-**A first survey (2026-10-12), not yet an audit.** Read from Google's
-`config.json`, the transformers implementation and the header tables of seven
-GGUFs fetched remotely (no tensor data), so it is planning evidence, not a
-published figure. 30 layers, hidden 2,816, 128 experts at top-8 with an expert
+**A first survey (2026-10-12), since audited for the chosen file.** Read
+from Google's `config.json`, the transformers implementation and the header
+tables of seven GGUFs fetched remotely (no tensor data). The type map,
+strides and metadata of the chosen file were then audited from its own
+header (EXP-036); the architecture details below that a header cannot show
+(norm form, scaling, gating) are still the survey's, from the reference
+implementation. 30 layers, hidden 2,816, 128 experts at top-8 with an expert
 intermediate of 704, vocabulary 262,144. llama.cpp names the architecture
 `gemma4` (support since b8637). Google publishes an official
 quantization-aware-trained **Q4_0** GGUF (14.44 GB, not gated) in which every
 expert tensor is Q4_0: one expert is then 3,345,408 B, so the worst case is
 **8 x 30 x 3,345,408 B = 803 MB per token**, against Qwen3's 1,097 MB. That
-derivation becomes this file's figure once a local audit of the chosen file
-confirms the strides. The same survey corrects this section in two places:
+derivation is now audited on the chosen file (EXP-036). The same survey corrects this section in two places:
 
 - **The norm is plain `x * w`**, not `(1 + w)` (llama.cpp's converter adds no
   +1 for Gemma 4), and attention scaling is 1.0 rather than a folded query
@@ -504,10 +547,11 @@ model-agnostic**, and that is verified in the code rather than asserted:
    unconditionally. QK-RMSNorm is a Qwen3 feature, and a checkpoint without
    those tensors fails to load.
 
-**Gemma 4 is the forcing function that proves this rather than a separate
-task.** Doing item 1 honestly means generalizing the metadata table, adding a
-second attention variant, and giving the shared expert somewhere to live. What
-is left after that is a much smaller job than it looks like today.
+**Gemma 4 was to be the forcing function that proves this,** by generalizing
+the metadata table, adding a second attention variant and giving the shared
+expert somewhere to live. With Gemma set aside (v1 item 1), this item has no
+forcing model; the next MoE that clears the faster-or-better bar would be
+it.
 
 ### 4. Architectures beyond linux x86_64
 
@@ -617,7 +661,8 @@ rather than default to measuring more.
 | The `attn_q` + `attn_v` fusion | **settled**: dropped, its bucket did not separate at either rung. The expert-phase fusion stays |
 | Gate 5's pass criterion | **settled** (2026-10-12, before the run): the final and every running perplexity within 1% of llama.cpp b10217's. The reference's +/-0.16588 is its corpus sampling error, not an engine tolerance. Passed (EXP-035) |
 | Reopen progressive miss execution | **open** |
-| Gemma 4's checkpoint, and with it the new kernel (v1 item 1) | **settled** (2026-10-12): Google's official QAT Q4_0 GGUF (`google/gemma-4-26B-A4B-it-qat-q4_0-gguf`), so the new kernel is Q4_0. Chosen over bartowski's Q4_K_M (Q5_0 kernel) and unsloth's UD-Q4_K_M (Q5_1): official, smallest per token, one kernel, trained for the format. See the survey in v1 item 1 |
+| Support Gemma 4 26B-A4B (v1 item 1) | **not now** (2026-10-12): a second model has to be faster or better than the Qwen3 pin, and Gemma 4's estimated gain is about 1.1-1.2x decode and 0.9x prefill, with its quality edge published only in thinking mode, for the cost of a second model definition. Reopen conditions are in v1 item 1 |
+| Gemma 4's checkpoint, if it is ever reopened | **settled** (2026-10-12): Google's official QAT Q4_0 GGUF (`google/gemma-4-26B-A4B-it-qat-q4_0-gguf`), so the new kernel would be Q4_0. Chosen over bartowski's Q4_K_M (Q5_0 kernel) and unsloth's UD-Q4_K_M (Q5_1): official, smallest per token, one kernel, trained for the format |
 | The memory contract: 3 GB with 11 slots, or 4 GB with up to 19 | **settled** (2026-10-11): 4 GB, 19 slots. Measured clean and paired (EXP-033): decode 1.26x at ctx 512 and 1.12x at 4K, prefill and output unchanged, 4,008 MiB peak at 4K against `ramvamp plan`'s 4,007. `--cache-bytes 1440M` keeps the 3 GB setup |
 | A GPU backend (v1 item 2) | **not now** (2026-10-10): no quotable ratio, because the CPU pool would not hold steady even at locked clocks (EXP-026). Reopen conditions are in the v1 section |
 | Hold the common weights resident by default | **settled** (2026-10-11): yes. Fits 3 GB at 4K context with 109 MiB spare, matches `ramvamp plan` to 2 MiB, and no resident run has had to read a page back (EXP-031). `--common-memory mapped` is the opt-out, and the hard rules say so |
