@@ -163,7 +163,7 @@ pinned tenant by tenant to the architecture document's memory table by a test,
 and it inherits that table's caveats, including a provisional anonymous-memory
 row that overpredicted the one measured 4K point by 31.7 MiB.
 
-### Gate 5 is a good task and it is unclaimed
+### Gate 5 is phase 11's first item
 
 The llama.cpp side is banked: **PPL 6.3810 +/- 0.16588** (EXP-004). The
 reference is `llama-perplexity` from llama.cpp b10217, run on the WikiText-2
@@ -182,7 +182,30 @@ one llama.cpp command away. The other gates are the pattern to follow,
 including their shared exit-code convention: `scripts/bitident.py`,
 `scripts/kl_vs_reference.py` and `scripts/greedy_regression.py`.
 
-## Now: the CPU path on a machine in use
+## Now: phase 11, Gemma 4, Gate 5 and steady-state decode
+
+Decided by the author on 2026-10-12, after phase 10 below. Three items:
+
+1. **Gate 5, perplexity** (above): the ramvamp side of the WikiText-2 run, matched
+   to `llama-perplexity` b10217's protocol, scored chunk by chunk against the
+   banked log. Needs every scored position's log-probability, which prefill does
+   not produce today (it keeps the last row's logits only); scoring by row block
+   inside the sweep's tail avoids a `[rows][vocab]` buffer. The pass criterion
+   is not yet set and is the author's.
+2. **Steady-state decode, cold** ("Then, in no fixed order" below): longer
+   `--max-new` windows at the 4 GB default, so the published decode figure stops
+   describing only a cache the prefill sweep has just emptied.
+3. **Gemma 4 26B-A4B as model #2** (v1 item 1), starting with obtaining and
+   auditing a checkpoint, then the repacker, loader and forward-pass work that
+   section lists, with a correctness gate against llama.cpp before any speed
+   work.
+
+**A second drive stays deferred**: the author has no faster NVMe available, so
+the cheapest experiment in the project waits for one (or for a contributor's
+report). The working notes for this phase are in the local handoff,
+`docs/handoff-phase11.md`.
+
+## Done: phase 10, the CPU path on a machine in use (2026-10-10 to 2026-10-12)
 
 Decided by the author on 2026-10-10, with the GPU backend set aside: the next
 work makes the CPU path behave on a machine that is also being used for
@@ -510,7 +533,8 @@ Recorded so they stop being re-derived.
   starting from a cache the prefill sweep emptied. A longer `--max-new` on the
   same paired prompt is what turns that into a steady-state number, and it is
   one more arm on a sweep that already runs.
-- **A second drive.** Turns the published band into a curve and tests the
+- **A second drive. Deferred** (2026-10-12): no faster drive is available to the
+  author. Turns the published band into a curve and tests the
   project's central claim, that the design scales with the device.
 
 **Reach**
