@@ -2360,16 +2360,7 @@ fn score_rows(
 
     let head = model.lm_head();
     let vocab = head.out_dim;
-    let mut block = score.block.min(s.staged.len() / vocab.max(1));
-    if block == 0 {
-        return Err(ForwardError::PrefillScratch {
-            needed: (vocab * size_of::<f32>()) as u64,
-            available: std::mem::size_of_val(s.staged) as u64,
-        });
-    }
-    if block >= SCORE_TILE {
-        block -= block % SCORE_TILE;
-    }
+    let block = score_block(score.block, s.staged.len(), vocab)?;
     let mut r = lo;
     while r < hi {
         let count = block.min(hi - r);
@@ -2397,6 +2388,32 @@ fn score_rows(
         r += count;
     }
     Ok(())
+}
+
+/// Rows one `lm_head` block holds: `requested`, capped by what a `staged`
+/// plane of `staged` f32 holds at `vocab` logits a row, then rounded down to
+/// whole [`SCORE_TILE`]s when it holds at least one.
+///
+/// At the v0 dims a 512-row chunk's plane holds 55 rows, so the block is 52.
+///
+/// # Errors
+///
+/// [`ForwardError::PrefillScratch`] when the plane cannot hold one row of
+/// logits. At the v0 dims that is a prefill chunk under 10 rows, which a
+/// plain prefill would accept: scoring needs the wider chunk.
+fn score_block(requested: usize, staged: usize, vocab: usize) -> Result<usize, ForwardError> {
+    let block = requested.min(staged / vocab.max(1));
+    if block == 0 {
+        return Err(ForwardError::PrefillScratch {
+            needed: (vocab * size_of::<f32>()) as u64,
+            available: (staged * size_of::<f32>()) as u64,
+        });
+    }
+    Ok(if block >= SCORE_TILE {
+        block - block % SCORE_TILE
+    } else {
+        block
+    })
 }
 
 /// `ln p(target)` under `logits`, computed the way `llama-perplexity`
@@ -3251,6 +3268,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A scored prefill that continues a cached prefix scores the same bits
+    /// as one that started from empty: chunk offsets are counted from the
+    /// prompt's first token, not from the start of the cache.
+    #[test]
+    fn scored_prefill_continues_a_cache() {
+        let (_fx, model) = load_fixture("prefill-scored-continue");
+        let vocab = crate::io::testutil::VOCAB as u32;
+        let ids: Vec<u32> = (0..12u32).map(|i| (i * 7 + 3) % vocab).collect();
+        let want = prefix_scores(&model, || state_with(&model, 64, sweep_config(512)), &ids);
+        for config in [token_major_config(), sweep_config(3), sweep_config(512)] {
+            let mut st = state_with(&model, 64, config);
+            prefill_prompt(&model, &mut st, &ids[..4], None).unwrap();
+            let (got, _) = scored(&model, &mut st, &ids[4..], 1, 3);
+            assert_eq!(got, want[5..], "{config:?}");
+            assert_eq!(st.seq_len().unwrap(), ids.len());
+        }
+    }
+
+    /// The block size: capped by the plane, whole tiles when it can be,
+    /// refused when not even one row of logits fits. The fixtures never reach
+    /// the cap (their vocabularies are tiny), so it is pinned here at the v0
+    /// dims, where it is what sets the block.
+    #[test]
+    fn score_block_is_capped_by_the_staged_plane() {
+        let vocab = 151_936;
+        // v0: a 512-row chunk's `staged` is 512 * 8 * 2,048 f32, 55 rows.
+        let staged = 512 * 8 * 2_048;
+        assert_eq!(score_block(MAX_SCORE_BLOCK, staged, vocab).unwrap(), 52);
+        assert_eq!(score_block(MAX_SCORE_BLOCK, 7 * vocab, vocab).unwrap(), 4);
+        assert_eq!(score_block(MAX_SCORE_BLOCK, 3 * vocab, vocab).unwrap(), 3);
+        assert_eq!(score_block(5, staged, vocab).unwrap(), 4);
+        assert_eq!(score_block(3, staged, vocab).unwrap(), 3);
+        // Nine rows' chunk at v0: 9 * 8 * 2,048 f32 is under one vocab row.
+        assert!(matches!(
+            score_block(MAX_SCORE_BLOCK, 9 * 8 * 2_048, vocab),
+            Err(ForwardError::PrefillScratch { .. })
+        ));
     }
 
     /// The side-by-side column reduction is the contiguous one, bit for bit,

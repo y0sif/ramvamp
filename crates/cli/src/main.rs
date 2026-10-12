@@ -2570,6 +2570,7 @@ fn run_perplexity(args: PerplexityArgs) -> anyhow::Result<()> {
             "file_bytes": text.len(),
             "first_scored": first,
             "ids": &ids[..n_windows * window],
+            "model": model_dir.display().to_string(),
             "nll": nll,
             "per_window": records,
             "ppl": ppl,

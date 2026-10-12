@@ -28,11 +28,13 @@ The protocol, read from b10217's `tools/perplexity/perplexity.cpp` and
     `--batch 2048` packs four windows per decode (n_seq = 4), which does not
     change any window's arithmetic.
 
-Before comparing, the token streams are checked: llama-tokenize (b10217, the
-same `common_tokenize` call on the same text) must produce exactly the ids
-ramvamp scored, or the windows are not the same windows and the comparison
-means nothing. A mismatch fails the gate, as a tokenizer mismatch fails
-gate 3.
+Before comparing, the token streams are checked: llama-tokenize (b10217) on
+the same text, with `--no-parse-special` so that it makes llama-perplexity's
+`common_tokenize` call exactly (special-token text left as text), must
+produce exactly the ids ramvamp scored, or the windows are not the same
+windows and the comparison means nothing. A mismatch fails the gate, as a
+tokenizer mismatch fails gate 3. It runs first, so a missing tool stops the
+gate before the long run rather than after it.
 
 The pass criterion, set by the author on 2026-10-12 before the ramvamp side
 had ever run:
@@ -134,7 +136,8 @@ def llama_ids(args, text: str) -> list[int]:
     with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(text)
     result = run(
-        [args.llama_tokenize, "-m", args.gguf, "-f", path, "--ids", "--log-disable"],
+        [args.llama_tokenize, "-m", args.gguf, "-f", path, "--ids", "--no-parse-special",
+         "--log-disable"],
         "llama-tokenize",
         timeout=600,
     )
@@ -199,6 +202,7 @@ def main() -> int:
     chunks, n_ctx = ref["chunks"], ref["n_ctx"]
     per_window = n_ctx - 1 - n_ctx // 2
 
+    lids = llama_ids(args, scored_text)
     rv = ramvamp_scores(args, chunks, n_ctx)
     if (rv["window"], rv["windows"], rv["first_scored"], rv["scored_per_window"]) != (
         n_ctx, chunks, n_ctx // 2, per_window
@@ -209,7 +213,6 @@ def main() -> int:
 
     problems: list[str] = []
 
-    lids = llama_ids(args, scored_text)
     used = chunks * n_ctx
     tokens_match = lids[:used] == rv["ids"]
     if not tokens_match:
@@ -242,8 +245,11 @@ def main() -> int:
     rv_nll = [w["nll"] / w["count"] for w in rv["per_window"]]
     diffs = [b - a for a, b in zip(ref_nll, rv_nll)]
     mean_diff = sum(diffs) / len(diffs)
-    sd = math.sqrt(sum((d - mean_diff) ** 2 for d in diffs) / (len(diffs) - 1))
-    se = sd / math.sqrt(len(diffs))
+    if len(diffs) > 1:
+        sd = math.sqrt(sum((d - mean_diff) ** 2 for d in diffs) / (len(diffs) - 1))
+        se = sd / math.sqrt(len(diffs))
+    else:
+        sd = se = float("nan")
 
     verdict = "PASS" if not problems else "FAIL"
     print(f"{'window':>6}  {'llama.cpp':>9}  {'ramvamp':>9}  {'rel':>8}")
@@ -267,7 +273,10 @@ def main() -> int:
         "corpus": {"path": args.corpus, "md5": md5, "bytes": len(raw)},
         "tolerance": TOLERANCE,
         "ramvamp": {"ppl": rv["ppl"], "ppl_error": rv["ppl_error"],
-                    "prefill_mode": rv.get("prefill_mode"), "seconds": rv.get("seconds")},
+                    "prefill_mode": rv.get("prefill_mode"), "seconds": rv.get("seconds"),
+                    "binary": None if args.reuse else args.ramvamp,
+                    "model": rv.get("model", None if args.reuse else args.rvmp),
+                    "reused_json": args.reuse},
         "final_rel": final_rel,
         "worst_running_rel": worst[0],
         "worst_running_window": worst[1],
