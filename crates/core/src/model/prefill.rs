@@ -57,6 +57,7 @@
 //!     sweep the layer once; per expert, compute its routed rows in one batch
 //!     reduce each row's staging in top-k order
 //! final norm + lm_head for the LAST row only
+//!     (plus, when scoring, the scored rows a block at a time)
 //! ```
 //!
 //! Appending the whole chunk's K/V before attending is the point: it is one
@@ -1647,6 +1648,120 @@ pub fn prefill_prompt_with_progress<'s>(
     on_route: Option<PrefillRouteSink<'_>>,
     on_progress: Option<PrefillProgressSink<'_>>,
 ) -> Result<&'s [f32], ForwardError> {
+    prefill(model, state, tokens, on_route, on_progress, None)
+}
+
+/// [`prefill_prompt`], also scoring every prompt position from `first` on
+/// against the token that follows it.
+///
+/// `out[j]` receives `ln p(tokens[first + j + 1] | tokens[..=first + j])`,
+/// so `out.len()` must be `tokens.len() - 1 - first`. This is what perplexity
+/// needs: one log-probability per scored position, where a plain prefill
+/// keeps the last position's logits only. The log-softmax is computed the way
+/// llama.cpp's `llama-perplexity` computes it; see [`log_prob`].
+///
+/// Under [`PrefillMode::Sweep`] no `[rows][vocab]` buffer is ever built: the
+/// scored rows go through `lm_head` a block at a time inside the scratch the
+/// chunk already holds (see [`score_rows`]). Under
+/// [`PrefillMode::TokenMajor`] each scored token's own logits are reduced as
+/// they are produced. The two agree bit for bit, as plain prefill does.
+///
+/// The KV cache and the returned last-token logits are exactly what
+/// [`prefill_prompt`] would have left.
+///
+/// # Errors
+///
+/// [`ForwardError::ScoreRange`] when `first` and `out.len()` do not describe
+/// at least one position `first..tokens.len() - 1`;
+/// [`ForwardError::Model`] wrapping
+/// [`ModelError::TokenOutOfRange`](super::ModelError::TokenOutOfRange) for a
+/// token outside the vocabulary, checked before anything runs because a
+/// target can sit in a chunk that has not been embedded yet; otherwise
+/// exactly [`prefill_prompt`]'s.
+pub fn prefill_prompt_scored<'s>(
+    model: &Model,
+    state: &'s mut ForwardState,
+    tokens: &[u32],
+    first: usize,
+    out: &mut [f64],
+) -> Result<&'s [f32], ForwardError> {
+    prefill_scored_in_blocks(model, state, tokens, first, out, MAX_SCORE_BLOCK)
+}
+
+/// [`prefill_prompt_scored`] with the `lm_head` block capped at `block`
+/// rows, so the tests can make a few rows span several blocks.
+fn prefill_scored_in_blocks<'s>(
+    model: &Model,
+    state: &'s mut ForwardState,
+    tokens: &[u32],
+    first: usize,
+    out: &mut [f64],
+    block: usize,
+) -> Result<&'s [f32], ForwardError> {
+    let scored = tokens
+        .len()
+        .checked_sub(1)
+        .and_then(|last| last.checked_sub(first))
+        .filter(|&count| count > 0);
+    if scored != Some(out.len()) {
+        return Err(ForwardError::ScoreRange {
+            first,
+            prompt: tokens.len(),
+            out: out.len(),
+        });
+    }
+    let vocab = model.arch().vocab;
+    if let Some(&token) = tokens.iter().find(|&&t| t >= vocab) {
+        return Err(super::ModelError::TokenOutOfRange { token, vocab }.into());
+    }
+    let mut score = Score {
+        tokens,
+        first,
+        out,
+        block: block.clamp(1, MAX_SCORE_BLOCK),
+    };
+    prefill(model, state, tokens, None, None, Some(&mut score))
+}
+
+/// Most rows one scoring block holds. It bounds the per-row accumulators of
+/// [`block_log_probs`], which live on the stack. At the v0 dims the `staged`
+/// plane holds 55 rows of logits, so the block there is 52, the largest
+/// multiple of the batched GEMV's four-row tile that fits.
+const MAX_SCORE_BLOCK: usize = 64;
+
+/// The batched GEMV's activation tile. A block is rounded down to a multiple
+/// of it when it holds at least one, so every block but the last runs whole
+/// tiles. Only a speed matter: the kernel is bit-identical at any width.
+const SCORE_TILE: usize = 4;
+
+/// What [`prefill_prompt_scored`] asks of one pass.
+struct Score<'a> {
+    /// The whole prompt, because a row's target can be in the next chunk.
+    tokens: &'a [u32],
+    /// The first prompt index scored.
+    first: usize,
+    /// One slot per scored index, `out[i - first]` for index `i`.
+    out: &'a mut [f64],
+    /// Most rows one `lm_head` block may hold.
+    block: usize,
+}
+
+impl Score<'_> {
+    /// Whether prompt index `i` is scored.
+    fn wants(&self, i: usize) -> bool {
+        i >= self.first && i + 1 < self.tokens.len()
+    }
+}
+
+/// Both prefill entry points, with or without scoring.
+fn prefill<'s>(
+    model: &Model,
+    state: &'s mut ForwardState,
+    tokens: &[u32],
+    on_route: Option<PrefillRouteSink<'_>>,
+    on_progress: Option<PrefillProgressSink<'_>>,
+    score: Option<&mut Score<'_>>,
+) -> Result<&'s [f32], ForwardError> {
     if tokens.is_empty() {
         return Err(ForwardError::EmptyPrefill);
     }
@@ -1657,8 +1772,10 @@ pub fn prefill_prompt_with_progress<'s>(
     state.arm_prefill_timing(mode, tokens.len());
     let started = Instant::now();
     let outcome = match mode {
-        PrefillMode::TokenMajor => prefill_token_major(model, state, tokens, on_route, on_progress),
-        PrefillMode::Sweep => prefill_sweep(model, state, tokens, on_route, on_progress),
+        PrefillMode::TokenMajor => {
+            prefill_token_major(model, state, tokens, on_route, on_progress, score)
+        }
+        PrefillMode::Sweep => prefill_sweep(model, state, tokens, on_route, on_progress, score),
     };
     state.close_prefill_timing(started.elapsed());
     outcome?;
@@ -1672,11 +1789,14 @@ fn prefill_token_major(
     tokens: &[u32],
     mut on_route: Option<PrefillRouteSink<'_>>,
     mut on_progress: Option<PrefillProgressSink<'_>>,
+    mut score: Option<&mut Score<'_>>,
 ) -> Result<(), ForwardError> {
     let start = state.seq_len()?;
     let last = tokens.len() - 1;
     for (i, &id) in tokens.iter().enumerate() {
         let position = start + i;
+        let scored = score.as_deref().is_some_and(|score| score.wants(i));
+        let want_logits = i == last || scored;
         match on_route.as_deref_mut() {
             Some(sink) => {
                 let mut per_layer = |layer: u32, topk: &[(u32, f32)]| sink(position, layer, topk);
@@ -1685,13 +1805,16 @@ fn prefill_token_major(
                     state,
                     id,
                     position,
-                    i == last,
+                    want_logits,
                     Some(&mut per_layer),
                 )?;
             }
             None => {
-                super::forward_token(model, state, id, position, i == last)?;
+                super::forward_token(model, state, id, position, want_logits)?;
             }
+        }
+        if scored && let Some(score) = score.as_deref_mut() {
+            score.out[i - score.first] = log_prob(state.logits(), tokens[i + 1])?;
         }
         // Once the token is committed, never before: a progress report is a
         // claim about work that has already happened. This path has no
@@ -1711,6 +1834,7 @@ fn prefill_sweep(
     tokens: &[u32],
     mut on_route: Option<PrefillRouteSink<'_>>,
     mut on_progress: Option<PrefillProgressSink<'_>>,
+    mut score: Option<&mut Score<'_>>,
 ) -> Result<(), ForwardError> {
     let arch = model.arch();
     state.check_arch(arch)?;
@@ -1786,6 +1910,7 @@ fn prefill_sweep(
             position,
             tail.is_empty(),
             &mut on_route,
+            score.as_deref_mut().map(|score| (score, position - start)),
             &mut clock,
         )?;
         position += n;
@@ -1806,7 +1931,8 @@ fn prefill_sweep(
 /// One chunk of `tokens.len()` positions starting at absolute `start`.
 ///
 /// `rows` is the width the scratch was carved for, which is `>= tokens.len()`;
-/// a short final chunk simply uses the leading rows of every buffer.
+/// a short final chunk simply uses the leading rows of every buffer. `score`
+/// carries a scoring request and the prompt index of this chunk's first row.
 #[allow(clippy::too_many_arguments)]
 fn run_chunk(
     model: &Model,
@@ -1819,6 +1945,7 @@ fn run_chunk(
     start: usize,
     want_logits: bool,
     on_route: &mut Option<PrefillRouteSink<'_>>,
+    score: Option<(&mut Score<'_>, usize)>,
     clock: &mut PhaseClock<'_>,
 ) -> Result<(), ForwardError> {
     let n = tokens.len();
@@ -2136,8 +2263,16 @@ fn run_chunk(
         clock.charge(Phase::Elementwise);
     }
 
-    // 3. The tail, for the last row only: a `[rows][vocab]` logit buffer would
-    //    be 296.75 MiB at the v0 dims and nothing wants the other rows.
+    // 3. The tail. Rows a scored prefill asked for go through `lm_head` a
+    //    block at a time; a `[rows][vocab]` logit buffer would be 296.75 MiB
+    //    at the v0 dims. The last row's logits follow either way. Scoring
+    //    writes the same `normed` and `acts_hidden` bits for that row that
+    //    the last-row step does, so the order between the two moves nothing.
+    if let Some((score, offset)) = score {
+        score_rows(
+            model, dims, rows, session, state.pool, score, offset, n, clock,
+        )?;
+    }
     if want_logits {
         let (s, _) = carve(session.scratch(), dims, rows)?;
         let last = n - 1;
@@ -2158,6 +2293,211 @@ fn run_chunk(
             state.logits,
         )?;
         clock.charge(Phase::Projections);
+    }
+    Ok(())
+}
+
+/// Score this chunk's share of the rows [`prefill_prompt_scored`] asked for.
+///
+/// Row `r` is prompt index `offset + r`, scored when [`Score::wants`] it,
+/// against `tokens[offset + r + 1]`. Those rows get the final RMSNorm and the
+/// Q8_K quantization the last-row tail gives its row; then `lm_head` runs
+/// batched over up to `block` of them at a time into the `staged` plane, as
+/// `[vocab][block]`, and [`block_log_probs`] reduces each column to its
+/// target's log-probability.
+///
+/// `staged` is free here: the last layer's reduction has consumed it, and the
+/// next chunk's first sweep rewrites it before reading it. At the v0 dims it
+/// holds 55 rows of logits, so a block is 52 rows (30.1 MiB) and scoring adds
+/// no byte to the prefill's footprint.
+///
+/// The batched GEMV is bit-identical per element to the single-row one the
+/// last-row tail uses, so a scored row's logits are the bits a prefill that
+/// ended at that row would have produced.
+#[allow(clippy::too_many_arguments)]
+fn score_rows(
+    model: &Model,
+    dims: &PrefillDims,
+    rows: usize,
+    session: &mut PrefillSession<'_>,
+    pool: &mut ComputePool,
+    score: &mut Score<'_>,
+    offset: usize,
+    n: usize,
+    clock: &mut PhaseClock<'_>,
+) -> Result<(), ForwardError> {
+    // The scored indices are one range, `first..tokens.len() - 1`, so the
+    // scored rows of this chunk are one range too.
+    let lo = score.first.saturating_sub(offset).min(n);
+    let hi = (score.tokens.len() - 1).saturating_sub(offset).min(n);
+    if lo >= hi {
+        return Ok(());
+    }
+    let (hidden, hidden_q8k) = (dims.hidden, dims.hidden_q8k);
+    let eps = model.arch().rms_eps as f32;
+    let final_norm = model.final_norm();
+    let (s, _) = carve(session.scratch(), dims, rows)?;
+    {
+        let residual = &*s.residual;
+        let normed = Rows::new(&mut *s.normed, hidden, hi)?;
+        let acts = Rows::new(&mut *s.acts_hidden, hidden_q8k, hi)?;
+        for_each_row(pool, hi - lo, |j| {
+            let r = lo + j;
+            // SAFETY: `for_each_row` hands `j`, and so row `r`, to this body
+            // once.
+            let (normed, acts) = unsafe { (normed.row(r), acts.row(r)) };
+            rmsnorm(
+                &residual[r * hidden..(r + 1) * hidden],
+                final_norm,
+                eps,
+                normed,
+            )?;
+            quantize_row_q8_k(normed, acts)?;
+            Ok(())
+        })?;
+    }
+    clock.charge(Phase::Elementwise);
+
+    let head = model.lm_head();
+    let vocab = head.out_dim;
+    let mut block = score.block.min(s.staged.len() / vocab.max(1));
+    if block == 0 {
+        return Err(ForwardError::PrefillScratch {
+            needed: (vocab * size_of::<f32>()) as u64,
+            available: std::mem::size_of_val(s.staged) as u64,
+        });
+    }
+    if block >= SCORE_TILE {
+        block -= block % SCORE_TILE;
+    }
+    let mut r = lo;
+    while r < hi {
+        let count = block.min(hi - r);
+        let logits = &mut s.staged[..vocab * count];
+        pool_batched_q8_k(
+            pool,
+            head.format,
+            head.bytes,
+            head.in_dim,
+            vocab,
+            &s.acts_hidden[r * hidden_q8k..(r + count) * hidden_q8k],
+            count,
+            logits,
+        )?;
+        clock.charge(Phase::Projections);
+        let at = offset + r;
+        let slots = at - score.first..at - score.first + count;
+        block_log_probs(
+            logits,
+            count,
+            &score.tokens[at + 1..at + 1 + count],
+            &mut score.out[slots],
+        )?;
+        clock.charge(Phase::Elementwise);
+        r += count;
+    }
+    Ok(())
+}
+
+/// `ln p(target)` under `logits`, computed the way `llama-perplexity`
+/// computes it (llama.cpp b10217, `tools/perplexity/perplexity.cpp`,
+/// `log_softmax`): the max in f32, each `exp(logit - max)` in f32 and summed
+/// into an f64, then `(logits[target] - max)` in f32 less `ln(sum)` in f64.
+///
+/// Gate 5 is scored against that tool, so this follows it rather than
+/// [`softmax`]. The max uses its `max < l` comparison as well, which skips a
+/// NaN instead of propagating it; a NaN logit still reaches the sum and
+/// makes the result NaN.
+///
+/// # Errors
+///
+/// [`KernelError::LengthMismatch`] when `target` is not inside `logits`.
+fn log_prob(logits: &[f32], target: u32) -> Result<f64, ForwardError> {
+    let t = target as usize;
+    let Some(&picked) = logits.get(t) else {
+        return Err(KernelError::LengthMismatch {
+            what: "log_prob: target vs vocab",
+            left: t,
+            right: logits.len(),
+        }
+        .into());
+    };
+    let mut max = logits[0];
+    for &l in &logits[1..] {
+        if max < l {
+            max = l;
+        }
+    }
+    let mut sum = 0.0f64;
+    for &l in logits {
+        sum += f64::from((l - max).exp());
+    }
+    Ok(f64::from(picked - max) - sum.ln())
+}
+
+/// [`log_prob`] for every column of a `[vocab][n]` block: column `c`
+/// against `targets[c]`, into `out[c]`.
+///
+/// The columns are reduced side by side in one pass down the vocabulary, so
+/// the block is read in order rather than at a stride of `n`. Each column's
+/// max and sum still see its logits in vocabulary order, so `out[c]` is
+/// bit-identical to [`log_prob`] over column `c` laid out on its own.
+///
+/// # Errors
+///
+/// [`KernelError::LengthMismatch`] when `n` is zero or above
+/// [`MAX_SCORE_BLOCK`], when `block` is not a whole number of `n`-wide rows,
+/// when `targets` or `out` is not `n` long, or when a target is outside the
+/// vocabulary.
+fn block_log_probs(
+    block: &[f32],
+    n: usize,
+    targets: &[u32],
+    out: &mut [f64],
+) -> Result<(), ForwardError> {
+    if n == 0
+        || n > MAX_SCORE_BLOCK
+        || block.is_empty()
+        || !block.len().is_multiple_of(n)
+        || targets.len() != n
+        || out.len() != n
+    {
+        return Err(KernelError::LengthMismatch {
+            what: "block_log_probs: block, targets and out vs n",
+            left: block.len(),
+            right: n,
+        }
+        .into());
+    }
+    let vocab = block.len() / n;
+    let mut max = [0.0f32; MAX_SCORE_BLOCK];
+    let max = &mut max[..n];
+    max.copy_from_slice(&block[..n]);
+    for row in block.chunks_exact(n).skip(1) {
+        for (m, &l) in max.iter_mut().zip(row) {
+            if *m < l {
+                *m = l;
+            }
+        }
+    }
+    let mut sum = [0.0f64; MAX_SCORE_BLOCK];
+    let sum = &mut sum[..n];
+    for row in block.chunks_exact(n) {
+        for ((s, &l), &m) in sum.iter_mut().zip(row).zip(max.iter()) {
+            *s += f64::from((l - m).exp());
+        }
+    }
+    for (c, (&target, slot)) in targets.iter().zip(out.iter_mut()).enumerate() {
+        let t = target as usize;
+        if t >= vocab {
+            return Err(KernelError::LengthMismatch {
+                what: "block_log_probs: target vs vocab",
+                left: t,
+                right: vocab,
+            }
+            .into());
+        }
+        *slot = f64::from(block[t * n + c] - max[c]) - sum[c].ln();
     }
     Ok(())
 }
@@ -2791,6 +3131,219 @@ mod tests {
         let eight = wide_run(&model, dials, &prompt[..8]);
         assert_ne!(wide_run(&model, dials, &prompt), eight);
         assert!(eight.iter().any(|&bits| bits != eight[0]));
+    }
+
+    // ---- scored prefill (gate 5) -----------------------------------------
+
+    /// Score `ids` from `first` on `state` with `lm_head` blocks of at most
+    /// `block` rows. Returns the scores' bits and the last logits' bits.
+    fn scored(
+        model: &Model,
+        state: &mut ForwardState,
+        ids: &[u32],
+        first: usize,
+        block: usize,
+    ) -> (Vec<u64>, Vec<u32>) {
+        let mut out = vec![0.0f64; ids.len() - 1 - first];
+        let logits = prefill_scored_in_blocks(model, state, ids, first, &mut out, block).unwrap();
+        let logits = logit_bits(logits);
+        assert!(
+            out.iter().all(|v| v.is_finite() && *v <= 0.0),
+            "not log-probabilities: {out:?}"
+        );
+        (out.iter().map(|v| v.to_bits()).collect(), logits)
+    }
+
+    /// Each prefix of `ids` prefilled on its own, its last logits reduced by
+    /// [`log_prob`] against the token after it: what every scored position
+    /// must reproduce.
+    fn prefix_scores(
+        model: &Model,
+        mut fresh: impl FnMut() -> ForwardState,
+        ids: &[u32],
+    ) -> Vec<u64> {
+        (0..ids.len() - 1)
+            .map(|i| {
+                let mut st = fresh();
+                let logits = prefill_prompt(model, &mut st, &ids[..=i], None).unwrap();
+                log_prob(logits, ids[i + 1]).unwrap().to_bits()
+            })
+            .collect()
+    }
+
+    /// **Gate 5's load-bearing test.** Every scored position must get the
+    /// bits a prefill that *ended* at that position gives its next token. The
+    /// last-row tail is the path gates 1 to 4 already cover, so a scored row
+    /// that matches it bit for bit inherits their coverage.
+    ///
+    /// Across both prefill modes, chunk widths that split the scored rows over
+    /// several chunks, and `lm_head` blocks that split one chunk's rows over
+    /// several blocks, including blocks that are not whole tiles. The scored
+    /// prefill must also leave the plain prefill's last logits and KV length.
+    #[test]
+    fn scored_rows_match_a_prefill_that_ends_there() {
+        let (_fx, model) = load_fixture("prefill-scored");
+        let vocab = crate::io::testutil::VOCAB as u32;
+        let ids: Vec<u32> = (0..12u32).map(|i| (i * 7 + 3) % vocab).collect();
+        let want = prefix_scores(&model, || state_with(&model, 64, sweep_config(512)), &ids);
+        let last = run(&model, sweep_config(512), &ids);
+        assert!(
+            want.iter().any(|&bits| bits != want[0]),
+            "every position scored the same, so agreement would prove nothing"
+        );
+
+        let configs = [
+            token_major_config(),
+            sweep_config(1),
+            sweep_config(3),
+            sweep_config(4),
+            sweep_config(5),
+            sweep_config(512),
+        ];
+        for &first in &[0usize, 1, 5, 10] {
+            for config in configs {
+                for &block in &[1usize, 3, 4, 5, MAX_SCORE_BLOCK] {
+                    let mut st = state_with(&model, 64, config);
+                    let (got, logits) = scored(&model, &mut st, &ids, first, block);
+                    assert_eq!(
+                        got,
+                        want[first..],
+                        "first {first}, {config:?}, block {block}"
+                    );
+                    assert_eq!(
+                        logits, last,
+                        "last logits moved: first {first}, {config:?}, block {block}"
+                    );
+                    assert_eq!(st.seq_len().unwrap(), ids.len());
+                }
+            }
+        }
+    }
+
+    /// The same on [`wide`], where a row is two Q8_K blocks and the sweep
+    /// runs several experts per window.
+    #[test]
+    fn wide_scored_rows_match_a_prefill_that_ends_there() {
+        let (_fx, model) = load_wide("prefill-wide-scored");
+        let vocab = wide::VOCAB as u32;
+        let ids: Vec<u32> = (0..9u32).map(|i| (i * 11 + 3) % vocab).collect();
+        let token_major = wide_dials(PrefillMode::TokenMajor, 1, 1, 1);
+        let want = prefix_scores(&model, || wide_state(&model, 64, token_major), &ids);
+
+        for &first in &[0usize, 4] {
+            for &(chunk, experts_per_window, windows_in_flight) in
+                &[(2usize, 4u32, 2u32), (3, 8, 3), (512, 4, 1)]
+            {
+                let dials = wide_dials(
+                    PrefillMode::Sweep,
+                    chunk,
+                    experts_per_window,
+                    windows_in_flight,
+                );
+                for &block in &[1usize, 4, 5, MAX_SCORE_BLOCK] {
+                    let mut st = wide_state(&model, 64, dials);
+                    let (got, _) = scored(&model, &mut st, &ids, first, block);
+                    assert_eq!(
+                        got,
+                        want[first..],
+                        "first {first}, {dials:?}, block {block}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The side-by-side column reduction is the contiguous one, bit for bit,
+    /// at every block width up to the cap.
+    #[test]
+    fn block_log_probs_match_log_prob_per_column() {
+        let vocab = 37;
+        for n in [1usize, 2, 4, 5, MAX_SCORE_BLOCK] {
+            let block: Vec<f32> = (0..vocab * n)
+                .map(|i| (((i * 7919) % 1013) as f32 - 506.0) / 37.0)
+                .collect();
+            let targets: Vec<u32> = (0..n).map(|c| ((c * 13 + 5) % vocab) as u32).collect();
+            let mut out = vec![0.0; n];
+            block_log_probs(&block, n, &targets, &mut out).unwrap();
+            for c in 0..n {
+                let column: Vec<f32> = (0..vocab).map(|v| block[v * n + c]).collect();
+                assert_eq!(
+                    out[c].to_bits(),
+                    log_prob(&column, targets[c]).unwrap().to_bits(),
+                    "n {n}, column {c}"
+                );
+            }
+        }
+        let mut out = [0.0; 2];
+        assert!(block_log_probs(&[0.0; 6], 2, &[0, 3], &mut out).is_err());
+        assert!(block_log_probs(&[0.0; 5], 2, &[0, 1], &mut out).is_err());
+        assert!(block_log_probs(&[0.0; 6], 2, &[0], &mut out).is_err());
+    }
+
+    /// [`log_prob`] is a log-softmax: within float error of a plain f64 one,
+    /// and its probabilities sum to one.
+    #[test]
+    fn log_prob_is_a_log_softmax() {
+        let logits: Vec<f32> = (0..300)
+            .map(|i| ((i * 31 % 97) as f32 - 48.0) / 5.0)
+            .collect();
+        let max = logits
+            .iter()
+            .fold(f64::NEG_INFINITY, |m, &l| m.max(f64::from(l)));
+        let lse = max
+            + logits
+                .iter()
+                .map(|&l| (f64::from(l) - max).exp())
+                .sum::<f64>()
+                .ln();
+        let mut total = 0.0;
+        for (t, &l) in logits.iter().enumerate() {
+            let got = log_prob(&logits, t as u32).unwrap();
+            assert!(
+                (got - (f64::from(l) - lse)).abs() < 1e-5,
+                "token {t}: {got}"
+            );
+            total += got.exp();
+        }
+        assert!((total - 1.0).abs() < 1e-5, "{total}");
+        assert!(log_prob(&logits, 300).is_err());
+    }
+
+    /// A range that cannot be scored is refused before anything runs, and so
+    /// is a token outside the vocabulary, even one that is only a target.
+    #[test]
+    fn scored_prefill_refuses_what_it_cannot_score() {
+        let (_fx, model) = load_fixture("prefill-scored-refusals");
+        let ids = [1u32, 2, 3, 4];
+        let mut st = state_with(&model, 64, sweep_config(512));
+        for (prompt, first, slots) in [
+            (&ids[..], 0usize, 2usize),
+            (&ids[..], 0, 4),
+            (&ids[..], 2, 0),
+            (&ids[..], 3, 0),
+            (&ids[..], 4, 0),
+            (&ids[..1], 0, 0),
+            (&ids[..0], 0, 0),
+        ] {
+            let mut out = vec![0.0; slots];
+            let err = prefill_prompt_scored(&model, &mut st, prompt, first, &mut out).unwrap_err();
+            assert!(
+                matches!(err, ForwardError::ScoreRange { .. }),
+                "{} tokens, first {first}, {slots} slots: {err}",
+                prompt.len()
+            );
+        }
+        let bad = [1u32, 2, crate::io::testutil::VOCAB as u32];
+        let mut out = [0.0; 2];
+        let err = prefill_prompt_scored(&model, &mut st, &bad, 0, &mut out).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ForwardError::Model(crate::model::ModelError::TokenOutOfRange { .. })
+            ),
+            "{err}"
+        );
+        assert_eq!(st.seq_len().unwrap(), 0, "a refused request ran anyway");
     }
 
     /// The wide fixture's KV cache agrees too, at a dial pair the narrow

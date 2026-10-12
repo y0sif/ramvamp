@@ -56,7 +56,7 @@ use ramvamp_core::generate::{
 use ramvamp_core::io::{CommonMemory, StreamStats, resident_ceiling};
 use ramvamp_core::model::{
     ForwardError, ForwardState, LoadOptions, Model, PrefillMode, PrefillTiming, StreamPhase,
-    prefill_prompt,
+    prefill_prompt, prefill_prompt_scored,
 };
 use ramvamp_core::threads::Placement;
 use ramvamp_core::tokenizer::{ChatMessage, Role, RvmpTokenizer};
@@ -459,6 +459,11 @@ enum Command {
     /// llama.cpp logit-comparison hook).
     Logits(LogitsArgs),
 
+    /// Perplexity over a text file by `llama-perplexity`'s protocol: the
+    /// file tokenized once, cut into windows, each window's second half
+    /// scored from an empty KV cache (validation gate 5).
+    Perplexity(PerplexityArgs),
+
     /// Resolve the runtime dials and print them with their projected memory
     /// footprint, without loading the model. Answers "will this fit here"
     /// in well under a second.
@@ -725,6 +730,45 @@ struct LogitsArgs {
     runtime: RuntimeArgs,
 }
 
+#[derive(Args)]
+struct PerplexityArgs {
+    /// Installed model directory (the .rvmp dir).
+    #[arg(long, value_name = "DIR")]
+    model: PathBuf,
+
+    /// Text to score, read as UTF-8 and tokenized whole, once. Gate 5 uses
+    /// WikiText-2's raw test split, `wiki.test.raw`.
+    #[arg(long, value_name = "FILE")]
+    file: PathBuf,
+
+    /// Tokens per window (`llama-perplexity -c`). Each window starts from an
+    /// empty KV cache and scores its second half.
+    #[arg(long, default_value_t = 512, value_name = "TOKENS")]
+    window: usize,
+
+    /// Windows to score from the start of the file (`llama-perplexity
+    /// --chunks`). Unset: every whole window the file holds.
+    #[arg(long, value_name = "N")]
+    chunks: Option<usize>,
+
+    /// Write each window's scores and the token ids scored, as JSON. This
+    /// is what `scripts/perplexity_gate.py` reads.
+    #[arg(long, value_name = "FILE")]
+    json: Option<PathBuf>,
+
+    #[command(flatten)]
+    profile: ProfileArgs,
+
+    #[command(flatten)]
+    context: ContextArgs,
+
+    #[command(flatten)]
+    prefill: PrefillArgs,
+
+    #[command(flatten)]
+    runtime: RuntimeArgs,
+}
+
 /// `plan`: the dials, where each one came from, and what they would cost.
 ///
 /// A subcommand rather than a flag on `generate`, for two reasons. `generate`
@@ -777,7 +821,11 @@ fn main() -> anyhow::Result<()> {
     // memory, which only a swap-off cgroup fully protects. See `scope`.
     if matches!(
         command,
-        Command::Generate(_) | Command::Chat(_) | Command::Serve(_) | Command::Logits(_)
+        Command::Generate(_)
+            | Command::Chat(_)
+            | Command::Serve(_)
+            | Command::Logits(_)
+            | Command::Perplexity(_)
     ) {
         scope::ensure_swap_off();
     }
@@ -787,6 +835,7 @@ fn main() -> anyhow::Result<()> {
         Command::Chat(args) => run_chat(*args),
         Command::Serve(args) => run_serve(*args),
         Command::Logits(args) => run_logits(args),
+        Command::Perplexity(args) => run_perplexity(args),
         Command::Plan(args) => run_plan(args),
     }
 }
@@ -2403,6 +2452,140 @@ fn run_logits(args: LogitsArgs) -> anyhow::Result<()> {
     // stderr; the JSON above is what `scripts/bitident.py` compares.
     report_stream_stats(&state);
     report_prefill_timing(&state, &PhaseStats::take(&state));
+    Ok(())
+}
+
+/// Perplexity over a text file, by `llama-perplexity`'s protocol (llama.cpp
+/// b10217, `tools/perplexity/perplexity.cpp`), for validation gate 5.
+///
+/// The file is tokenized once, whole, less one trailing newline as llama's
+/// `-f` reads it, and cut into consecutive windows of `--window` tokens; a
+/// partial window at the end is dropped. Each window runs
+/// from an empty KV cache, and its positions `window / 2 .. window - 1` are
+/// scored against the token after each, so a window scores `window - 1 -
+/// window / 2` tokens. No BOS token is involved: the Qwen3 GGUF sets
+/// `tokenizer.ggml.add_bos_token = false`, so llama.cpp neither prepends one
+/// nor overwrites a window's first token with one, and this tokenizer never
+/// adds one. Running and final perplexity print in llama's own format, so the
+/// two logs can be compared chunk by chunk.
+fn run_perplexity(args: PerplexityArgs) -> anyhow::Result<()> {
+    let model_dir = args.model.as_path();
+    let tokenizer = load_tokenizer(model_dir)?;
+    let dials = resolve_dials(&args.profile, args.context, args.prefill, &args.runtime)?;
+    let context = checked_context(&dials, model_dir)?;
+    let window = args.window;
+    if window < 3 {
+        bail!("--window {window} scores nothing: a window needs at least 3 tokens");
+    }
+    if window > context {
+        bail!("--window {window} exceeds the context cap of {context}");
+    }
+    let text = std::fs::read_to_string(&args.file)
+        .with_context(|| format!("reading {}", args.file.display()))?;
+    // llama.cpp's shared `-f` handler drops one trailing newline before
+    // `llama-perplexity` sees the text, so the same text is scored here. Its
+    // escape processing is not repeated: gate 5's corpus has no backslash,
+    // and `scripts/perplexity_gate.py` refuses one that does.
+    let ids = tokenizer.encode(text.strip_suffix('\n').unwrap_or(&text))?;
+    // llama-perplexity's own floor, kept so the two refuse the same inputs.
+    if ids.len() < 2 * window {
+        bail!(
+            "{} tokenizes to {} tokens; windows of {window} need at least {}",
+            args.file.display(),
+            ids.len(),
+            2 * window
+        );
+    }
+    let available = ids.len() / window;
+    let n_windows = args.chunks.map_or(available, |n| n.min(available));
+    if n_windows == 0 {
+        bail!("--chunks 0 scores nothing");
+    }
+    let first = window / 2;
+    let per_window = window - 1 - first;
+
+    let model = Model::load(model_dir, args.runtime.load_options())
+        .with_context(|| format!("loading model from {}", model_dir.display()))?;
+    let mut state = ForwardState::with_config(&model, context, dials.runtime_config())?;
+    dials.apply_prefill(&mut state)?;
+    state.set_stream_phase(StreamPhase::Prefill);
+    let mode = state.prefill_config().mode;
+
+    println!(
+        "perplexity: {} tokens, {n_windows} of {available} windows of {window}, \
+         scoring positions {first}..{} of each",
+        ids.len(),
+        window - 1
+    );
+    let started = Instant::now();
+    let mut scores = vec![0.0f64; per_window];
+    let (mut nll, mut nll2, mut count) = (0.0f64, 0.0f64, 0usize);
+    let mut records = Vec::with_capacity(n_windows);
+    for k in 0..n_windows {
+        let tokens = &ids[k * window..(k + 1) * window];
+        state.reset();
+        let window_started = Instant::now();
+        prefill_prompt_scored(&model, &mut state, tokens, first, &mut scores)?;
+        let seconds = window_started.elapsed().as_secs_f64();
+        let (mut window_nll, mut window_nll2) = (0.0f64, 0.0f64);
+        for &logprob in &scores {
+            window_nll -= logprob;
+            window_nll2 += logprob * logprob;
+        }
+        nll += window_nll;
+        nll2 += window_nll2;
+        count += per_window;
+        let running = (nll / count as f64).exp();
+        print!("[{}]{running:.4},", k + 1);
+        std::io::stdout().flush()?;
+        eprintln!("window {}/{n_windows}: {seconds:.1} s", k + 1);
+        // Alphabetical, like every literal here: see `run_logits`.
+        records.push(serde_json::json!({
+            "count": per_window,
+            "min_logprob": scores.iter().copied().fold(f64::INFINITY, f64::min),
+            "nll": window_nll,
+            "nll2": window_nll2,
+            "running_ppl": running,
+            "seconds": seconds,
+            "window": k + 1,
+        }));
+    }
+    println!();
+
+    // llama-perplexity's estimate and its error, term for term.
+    let mean = nll / count as f64;
+    let ppl = mean.exp();
+    let variance = nll2 / count as f64 - mean * mean;
+    let error = if variance > 0.0 && count > 1 {
+        (variance / (count - 1) as f64).sqrt() * ppl
+    } else {
+        f64::NAN
+    };
+    println!("Final estimate: PPL = {ppl:.4} +/- {error:.5}");
+
+    if let Some(path) = &args.json {
+        let out = serde_json::json!({
+            "count": count,
+            "file": args.file.display().to_string(),
+            "file_bytes": text.len(),
+            "first_scored": first,
+            "ids": &ids[..n_windows * window],
+            "nll": nll,
+            "per_window": records,
+            "ppl": ppl,
+            "ppl_error": error,
+            "prefill_mode": format!("{mode:?}"),
+            "scored_per_window": per_window,
+            "seconds": started.elapsed().as_secs_f64(),
+            "tokens": ids.len(),
+            "window": window,
+            "windows": n_windows,
+            "windows_available": available,
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&out)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    report_stream_stats(&state);
     Ok(())
 }
 

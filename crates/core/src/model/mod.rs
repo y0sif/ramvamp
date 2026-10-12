@@ -75,6 +75,6 @@ pub use forward::{
 };
 pub use prefill::{
     DEFAULT_PREFILL_CHUNK, PrefillConfig, PrefillMode, PrefillProgressSink, PrefillRouteSink,
-    PrefillTiming, prefill_prompt, prefill_prompt_with_progress,
+    PrefillTiming, prefill_prompt, prefill_prompt_scored, prefill_prompt_with_progress,
 };
 pub use weights::{F32Tensor, LayerWeights, Model, QuantTensor};
