@@ -1527,7 +1527,20 @@ Same GGUF bytes on both sides. Gates, in order:
    per-chunk log sit under `models/llamacpp-ref/`, which is **not in the
    repository**: `.gitignore` excludes `/models/`, so a fresh clone
    regenerates the reference by re-running that command at b10217 on the
-   same GGUF. Phase 7 implements the ramvamp side.
+   same GGUF.
+
+   PASSED in phase 11 (EXP-035) against a criterion the author set before
+   the run: the final perplexity and the running value after every window
+   within 1% of llama.cpp's. `ramvamp perplexity` applies
+   `llama-perplexity`'s protocol as read from b10217's source (the file less
+   one trailing newline, tokenized once, no BOS, positions 256..510 of each
+   512-token window scored from an empty KV cache), and
+   `scripts/perplexity_gate.py` checks the token stream against
+   `llama-tokenize` before gating. PPL **6.3598** against 6.3810, -0.332%;
+   worst running gap -0.689% at window 3; token streams identical over all
+   20,480 ids scored. Prefill scores the rows through `lm_head` a block at a
+   time inside the scratch it already holds, so no `[rows][vocab]` buffer
+   exists.
 
 ## Performance model (rebuilt 2026-08-03 from measured inputs)
 

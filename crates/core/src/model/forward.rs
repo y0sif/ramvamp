@@ -402,6 +402,22 @@ pub enum ForwardError {
         /// Rows the chunk actually holds.
         rows: usize,
     },
+
+    /// A scored prefill was asked for positions the prompt cannot score.
+    /// Position `p` is scored against token `p + 1`, so scoring from `first`
+    /// covers `first..prompt - 1` and needs exactly `prompt - 1 - first`
+    /// output slots, at least one.
+    #[error(
+        "prefill: scoring from position {first} of a {prompt}-token prompt cannot fill {out} slots"
+    )]
+    ScoreRange {
+        /// The first prompt position asked for.
+        first: usize,
+        /// Tokens in the prompt.
+        prompt: usize,
+        /// Slots in the output buffer handed in.
+        out: usize,
+    },
 }
 
 impl From<FootprintError> for ForwardError {
