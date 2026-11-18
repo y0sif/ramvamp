@@ -1,13 +1,11 @@
 name: Benchmark report
-description: Report ramvamp's throughput on your drive. This is the most useful thing you can send.
+description: Report ramvamp's throughput on your drive.
 title: "[bench] "
 labels: ["benchmark"]
 body:
   - type: markdown
     attributes:
       value: |
-        **This is the contribution the project wants most.**
-
         Every published throughput number for ramvamp comes from a single
         machine with a single DRAM-less QLC NVMe drive. The central claim is
         that decode is I/O-bound and therefore scales with the device, and

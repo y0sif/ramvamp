@@ -1656,7 +1656,7 @@ mod tests {
     }
 
     /// Every byte off the socket is untrusted, and the body is read into
-    /// memory to be parsed. Inside a 3 GB cgroup an uncapped read is an OOM.
+    /// memory to be parsed. Inside a 4 GB cgroup an uncapped read is an OOM.
     #[test]
     fn an_oversized_body_is_refused_by_its_declared_length() {
         const BODY: &str = "0123456789abcdef0123456789abcdef";

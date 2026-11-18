@@ -25,7 +25,7 @@ weights, which is what fine-grained MoE gives. Sizes are at 4-bit.
 | --- | --- | --- | --- |
 | Dense 26B | none | n/a | about 13 GB: every weight, every token |
 | Coarse MoE (Mixtral 8x7B) | 8, top-2 | about 90 MB | about 5.6 GB |
-| Fine-grained MoE (Qwen3-30B-A3B, Gemma 4 26B-A4B) | 128, top-8 | 2.5 to 3.2 MiB | 0.8 to 1.1 GB (EXP-015, EXP-036), and ramvamp's cache serves 67 to 68% of requests (EXP-033) |
+| Fine-grained MoE (Qwen3-30B-A3B, Gemma 4 26B-A4B) | 128, top-8 | 2.5 to 3.2 MiB | 0.8 to 1.1 GB (EXP-015, EXP-036) |
 
 ## Measurements the design borrows
 

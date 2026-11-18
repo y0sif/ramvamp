@@ -70,8 +70,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No `apt-get` step: the tree has no C dependencies, and `ureq` uses
-      # rustls rather than OpenSSL.
+      # No `apt-get` step: the C and C++ in the tree (ring, onig_sys, esaxx-rs)
+      # builds with the runner's own compiler and links no system library.
 
       - uses: dtolnay/rust-toolchain@stable
 

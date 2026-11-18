@@ -11,9 +11,9 @@ body:
         your idea is one of the open decisions, saying so and arguing a side
         is more useful than a fresh proposal.
 
-        `docs/experiments.md` records the designs that were measured and
-        rejected (the Rejected verdicts). A proposal that already knows about
-        that measurement is much easier to act on.
+        `docs/comparison.md` records the designs measurements ruled out: mmap
+        demand paging, cross-layer prefetch and per-expert overlap. A proposal
+        that already knows those measurements is much easier to act on.
 
   - type: dropdown
     id: component

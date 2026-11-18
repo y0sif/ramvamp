@@ -53,10 +53,8 @@ A PR that breaks one is rejected on that ground, whatever it gains.
 
 ## Performance changes
 
-A performance PR reports a baseline, a result and a verdict, measured by the
-[method in docs/benchmarks.md](docs/benchmarks.md#method), with both arms run
-back to back in one session. Warm-cache runs are diagnostics, and negative
-results count.
+A performance PR reports its result against a baseline, both measured by the
+[method in docs/benchmarks.md](docs/benchmarks.md#method).
 
 ## Benchmark reports from other drives
 
@@ -92,9 +90,6 @@ merged.
 
 Out of scope:
 
-- **Anything that breaks the bounded-memory design.** Loading a checkpoint
-  into RAM makes it a different project. So does a buffer whose size follows
-  the model rather than the budget.
 - **A dependency added without a stated reason.** Say what it does, what it
   replaces, and how many crates it pulls in.
 

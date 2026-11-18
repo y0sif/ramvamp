@@ -30,7 +30,7 @@ Q4_K_M with the default expert cache, on a DRAM-less QLC NVMe drive:
 | | measured |
 | --- | --- |
 | Speed | decode **2.78 to 2.81 tok/s** and prefill **about 25 tok/s** at ctx 512; decode 1.96 tok/s at ctx 3,961 |
-| Peak memory | **3,690 to 4,008 MiB** of cgroup `memory.peak`, page cache included: about 4.4x below the model's 17.35 GiB |
+| Peak memory | **3,690 to 4,020 MiB** of cgroup `memory.peak`, page cache included: about 4.4x below the model's 17.35 GiB |
 | Fidelity | mean full-vocab KL **1.04e-2** against llama.cpp, top-1 agreement 8/8, perplexity 6.36 against its 6.38 |
 
 `--cache-bytes 1440M` fits a 3 GiB cap at about 2.2 tok/s decode. Full tables and the method:
@@ -90,9 +90,8 @@ rate, and needs a terminal on stdout. Without it, `chat` is plain text and works
 
 `ramvamp serve` is an OpenAI-compatible HTTP server on 127.0.0.1, with no `--host` flag. It serves
 `/v1/chat/completions` (streaming and buffered), `/v1/models` and `/health`, one request at a time,
-and reuses the KV cache across requests that share a prefix. It refuses `n` above 1, `stop` and a
-forced `tool_choice` with a `400`, and ignores fields it does not implement. Endpoints, fields and
-refusals: [docs/server.md](docs/server.md).
+and reuses the KV cache across requests that share a prefix. It answers a `400` to a value it cannot
+honour and ignores fields it does not implement: [docs/server.md](docs/server.md).
 
 ```bash
 ramvamp serve --model ~/models/qwen3-30b-a3b.rvmp --port 8080
@@ -113,21 +112,19 @@ Each token needs about 1 GiB of common weights plus 8 of the 128 experts in each
 3. **Experts are read explicitly, never demand-paged.** Cache hits compute at once while the misses
    go to io_uring as one batch of O_DIRECT reads per layer, which bypass the page cache.
 4. **The cache is small.** `--cache-bytes` defaults to 2485M, which holds 19 of each layer's 128
-   experts and served 67 to 68% of expert requests in the published runs.
+   experts and serves about two thirds of expert requests.
 
 Design: [docs/architecture.md](docs/architecture.md). Why not mmap or cross-layer prefetch:
 [docs/comparison.md](docs/comparison.md).
 
 ## Documentation
 
-Three pages cover using ramvamp; the rest cover its numbers, design, comparisons and plan.
-
 - [docs/install.md](docs/install.md): requirements, install paths, building from source, uninstalling
 - [docs/configuration.md](docs/configuration.md): flags, environment variables and profile keys, with defaults
 - [docs/server.md](docs/server.md): HTTP endpoints, honoured request fields and refusals
 - [docs/benchmarks.md](docs/benchmarks.md): every published number, its conditions, the reference machine
 - [docs/architecture.md](docs/architecture.md): packed format, streaming, cache, kernels and validation
-- [docs/comparison.md](docs/comparison.md): ramvamp against llama.cpp and TurboFieldfare
+- [docs/comparison.md](docs/comparison.md): how five related projects handle experts, and the measurements the design borrows
 - [docs/experiments.md](docs/experiments.md): one line per experiment
 - [docs/roadmap.md](docs/roadmap.md): the plan
 

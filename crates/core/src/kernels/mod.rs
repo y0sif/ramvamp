@@ -26,11 +26,11 @@
 //! - No online, streaming or flash-style rescaled softmax. The causal limit is
 //!   a length: masked positions are absent from the sum, not zero-weighted.
 //!
-//! The one scoped exception is the k-quant dot in [`quants::avx2`]: its float
-//! accumulation order differs from the scalar reference by design and is
-//! tested within a tolerance. Every path built on it (row ranges, fused rows,
-//! batched tiles) is still bit-identical to the single call it replaces. Each
-//! file's own docs state its piece of the argument.
+//! The AVX2 dots in [`quants::avx2`] are the one scoped exception: their
+//! float accumulation order differs from the scalar reference by design and
+//! is tested within a tolerance. Every path built on them (row ranges, fused
+//! rows, batched tiles) is still bit-identical to the single call it
+//! replaces. Each file's own docs state its piece of the argument.
 
 pub mod attention;
 pub mod backend;

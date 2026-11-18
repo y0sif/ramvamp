@@ -25,7 +25,7 @@ Longer replies decode a little slower because attention grows with context,
 not because the cache is colder (EXP-034). At ctx 512 decode is 2.80, 2.79 and
 2.61 tok/s over 128, 256 and 512 new tokens, with the hit rate flat at 67.1%
 to 67.7%. At ctx 3,961 with 128 new tokens decode is 2.04 to 2.06 tok/s and
-`memory.peak` reaches **4,016 to 4,020 MiB**, the highest clean peak recorded.
+`memory.peak` reaches **4,016 to 4,020 MiB** (EXP-034).
 
 `--cache-bytes 1440M` selects 11 slots per layer, the earlier 3 GB
 configuration. Paired with 19 slots in one session (EXP-033), 11 slots decodes
@@ -87,12 +87,12 @@ day later (EXP-025), so every ratio here is paired within one session.
 
 `scripts/cold_bench.py` sets up every condition above and verifies it. After
 `cargo build --release` and `ramvamp-repack install --output models/qwen3.rvmp`
-(the default pin, so the weights match), run decode, then prefill at a fixed
-context from a prompt file with one new token:
+(the default pin, so the weights match), run a 512-token prompt cut from any
+long text; each run reports both prefill and decode:
 
 ```bash
-scripts/cold_bench.py --rvmp models/qwen3.rvmp --max-new 64 --repeats 5 --json scratch/cold-decode.json
-scripts/cold_bench.py --rvmp models/qwen3.rvmp --prompt-file <prompt.txt> --max-new 1 --repeats 5 --json scratch/cold-prefill.json
+scripts/make_ctx_prompt.py --targets 512 --source <long-text.txt> --out scratch/ctx512.txt
+scripts/cold_bench.py --rvmp models/qwen3.rvmp --prompt-file scratch/ctx512.txt --max-new 128 --repeats 5 --json scratch/cold-512.json
 ```
 
 It needs Linux 6.5+, cgroup v2 and `systemd-run --user`, and it refuses to

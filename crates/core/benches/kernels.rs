@@ -8,7 +8,7 @@
 //! the counts down as one timed unit grows into the seconds, and print the
 //! `runs`/`warmup` they actually used per rung. Numbers from here are
 //! diagnostics per the experiment-log rules — published end-to-end numbers
-//! come from cold runs inside the 3 GB cgroup, not from this harness.
+//! come from cold runs inside the 4 GB cgroup, not from this harness.
 //!
 //! Run with `cargo bench -p ramvamp-core`.
 

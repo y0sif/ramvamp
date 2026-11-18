@@ -7,18 +7,8 @@ architectures.
 
 ## Build and check
 
-Run these before every push. They are CI's `check` job, in its order.
+Run [the gate in CONTRIBUTING.md](CONTRIBUTING.md#the-gate) before every push.
 
-```sh
-./scripts/check-docs.sh                       # docs rules, see Docs below
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings     # warnings are errors
-cargo test
-cargo build --release
-```
-
-- The rest of the CI gate, the `pread` fallback and MSRV legs, is in
-  [CONTRIBUTING.md](CONTRIBUTING.md#the-gate). Run it after touching `crates/core/src/io`.
 - The MSRV is `rust-version` in the root `Cargo.toml`. Change it and the CI job together.
 - The tokenizer test fixtures are vendored in `crates/core/src/tokenizer/fixtures/`.
 
@@ -63,10 +53,8 @@ cargo build --release
   may be only 2-byte aligned.
 - `generate` and `logits` keep their exact stdout and stderr shape: the validation and
   benchmark scripts in `scripts/` parse it.
-- Every performance change gets a row in [docs/experiments.md](docs/experiments.md): baseline,
-  result, verdict, negative results included. Published numbers come from cold runs inside a
-  `memory.max=4G` cgroup with `memory.swap.max=0` (zram counts as swap), by the method in
-  [docs/benchmarks.md](docs/benchmarks.md#method). Warm-cache runs are diagnostics.
+- Every performance change gets a row in [docs/experiments.md](docs/experiments.md), measured by
+  the [method in docs/benchmarks.md](docs/benchmarks.md#method).
 
 ## Conventions
 
@@ -106,9 +94,9 @@ cargo publish -p ramvamp
   section.
 - No fix history (issue or PR numbers, "since #N") on any docs page. The README, CONTRIBUTING,
   SECURITY, `docs/install.md`, `docs/configuration.md` and `docs/server.md` also carry no EXP
-  ids, phase or round names, or test provenance; EXP ids belong in architecture, benchmarks,
-  comparison, experiments and roadmap. Help strings follow the same rule, and neither they
-  nor the user docs name scripts. Review enforces these last two; the script does not.
+  ids, phase or round names, "the author", or test provenance; EXP ids belong in architecture,
+  benchmarks, comparison, experiments and roadmap. Help strings follow the same rule, which
+  review enforces, not the script.
 - `scripts/check-docs.sh` enforces the rest: markdown only at its allowlisted paths (a new
   `docs/` page is added there and to `.gitignore`), `CLAUDE.md` holding only `@AGENTS.md`, no
   personal paths, emails or session links in any file, no em or en dashes in markdown, and the

@@ -887,8 +887,8 @@ fn accumulate(total: &mut usize, count: usize, unit: usize) -> Result<(), Forwar
 /// total                                 = 81,720,324 B   77.93 MiB
 /// ```
 ///
-/// against a ~1,438 MiB slab whose sweep ring costs a further ~46.7 MiB at the
-/// default dials. The 3 GiB contract is not touched: these bytes are the slot
+/// against the default 2,485 MiB slab, whose sweep ring costs a further
+/// ~46.7 MiB. The memory contract is not touched: these bytes are the slot
 /// pool's, already resident, borrowed for the length of the prefill. That is
 /// why the sharded attention scratch lives here and not on the heap — a
 /// prefill costs no *additional* bytes, whatever the headroom happens to be.

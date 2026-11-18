@@ -7,10 +7,10 @@
 //! every data file. It is written last and atomically promoted, so its
 //! presence marks a complete install.
 //!
-//! The structs here are the schema. Every key is required: each struct is
-//! `deny_unknown_fields` and none carries a serde default, so a manifest that
-//! omits a key or invents one is rejected rather than loaded with a hole in
-//! it. `common_tensors` is the only way anything locates a tensor in
+//! The structs here are the schema. Each struct is `deny_unknown_fields`, so
+//! a manifest that invents a key is rejected. Every key is required except
+//! `arch.sliding_window`, an `Option` that loads as `None` (full attention)
+//! when absent. `common_tensors` is the only way anything locates a tensor in
 //! `common.bin`: name to `{offset, len, dtype}`, offsets
 //! [`COMMON_TENSOR_ALIGN`]-byte aligned, validated in bounds and
 //! non-overlapping.
@@ -100,7 +100,7 @@ pub struct ArchInfo {
     pub tie_embeddings: bool,
     /// Model has a shared (always-active) expert.
     pub shared_expert: bool,
-    /// Sliding-window size, or `None` for full attention on all layers.
+    /// Sliding-window size; `None` or a missing key means full attention.
     pub sliding_window: Option<u32>,
 }
 

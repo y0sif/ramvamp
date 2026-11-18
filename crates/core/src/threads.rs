@@ -657,8 +657,8 @@ impl Topology {
     /// Preferred CPU for an io_uring reactor thread: an E-core with an L3.
     ///
     /// A latent hook. There is no reactor thread (the ring runs inline on the
-    /// decode thread, see `io::stream`), and nothing reads it but the tests
-    /// and this type's `Display`.
+    /// decode thread, see `io::stream`), and nothing reads it but the tests,
+    /// this type's `Display` and the topology log line in `detect_at`.
     #[must_use]
     pub fn reactor_cpu(&self) -> Option<usize> {
         self.reactor

@@ -6,7 +6,7 @@ itself is in the [README](../README.md#install).
 
 ## Requirements
 
-- **Linux on x86_64.** Expert reads use io_uring (kernel 5.1 or newer) and
+- **Linux on x86_64.** Expert reads use io_uring (kernel 5.6 or newer) and
   O_DIRECT, both Linux interfaces.
 - **An NVMe SSD with 17.35 GiB free.** The repacker streams the download into
   place and keeps no second copy. Other storage works far more slowly, because
@@ -30,7 +30,7 @@ version it replaced.
 | Linux on x86_64 | **refuses**, installs nothing |
 | `curl` and `tar` on PATH | **refuses** |
 | download is a real tarball holding both binaries | **refuses** |
-| kernel 5.1 or newer | warns: io_uring falls back to `pread` |
+| kernel 5.6 or newer | warns: on 5.1 to 5.5 every expert read fails |
 | AVX2 and F16C | warns: scalar kernels, much slower |
 | an NVMe device exists | warns: the drive sets the speed |
 | binary runs and its version matches the tag | warns |

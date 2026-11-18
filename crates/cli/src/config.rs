@@ -1479,7 +1479,7 @@ mod tests {
         assert!(lines[10].starts_with("available: 16,384 MiB"), "{lines:#?}");
         assert!(lines[11].starts_with("verdict:   fits"), "{lines:#?}");
 
-        // The same configuration under the published 3 GiB cgroup.
+        // The same configuration under a 3 GiB cgroup.
         let lines = plan_lines(&dials, Path::new("/m.rvmp"), &projected, Some(3 << 30));
         assert_eq!(lines[10], "available: 3,072 MiB");
         assert_eq!(lines[11], "verdict:   does not fit, 1,041 MiB over");

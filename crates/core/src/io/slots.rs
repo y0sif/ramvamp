@@ -130,19 +130,18 @@ pub const SLOT_ALIGN: usize = 4096;
 
 /// Largest slab [`SlotPool::new`] will attempt, in bytes (4 GiB).
 ///
-/// The expert-cache dial is a byte budget rather than a slot count: 1438 MiB
-/// at the time of writing, which is 11 slots/layer over 48 layers at the
-/// installed Qwen3-30B-A3B strides. This cap sits about 2.8x above that, so
-/// every pool that could fit the 3 GB budget is still expressible, while a
-/// corrupt or hostile layout is not.
+/// The expert-cache dial is a byte budget rather than a slot count: 2,485 MiB
+/// by default, which is 19 slots/layer over 48 layers at the installed
+/// Qwen3-30B-A3B strides. Every pool that could fit the 4 GiB contract is
+/// expressible under this cap, while a corrupt or hostile layout is not.
 ///
 /// It is *not* the constraint that decides the top of EXP-005's sweep, and
 /// this cap being generous enough for 24 slots/layer does not mean the
 /// project can build one. 24 slots/layer is 3,291,217,920 B, over the
-/// 3,221,225,472 B of the `memory.max=3G` cgroup published numbers come from,
-/// so `check_resident_budget` refuses it there — before the mmap'd common
-/// core and the KV cache have taken their share. Under that cgroup the last
-/// expressible sweep point is **23 slots/layer**, at 3,154,083,840 B.
+/// 3,221,225,472 B of the `memory.max=3G` cgroup of that sweep (the contract
+/// before EXP-033), so `check_resident_budget` refuses it there, before the
+/// common core and the KV cache have taken their share. Under that cgroup the
+/// last expressible sweep point is **23 slots/layer**, at 3,154,083,840 B.
 ///
 /// A cap alone would not be worth much. Under default Linux overcommit a
 /// multi-GiB `alloc` succeeds and returns non-null, so
@@ -1082,9 +1081,8 @@ impl fmt::Display for Footprint {
     }
 }
 
-/// `bytes` as whole mebibytes, rounded to nearest, grouped with `,` — the way
-/// `docs/architecture.md` writes every figure in the memory contract
-/// (`1,023.34 MiB`, `3,072 MiB`).
+/// `bytes` as whole mebibytes, rounded to nearest, grouped with `,`
+/// (`2,485`).
 pub(crate) fn mib(bytes: u128) -> String {
     let whole = (bytes + MIB / 2) / MIB;
     let digits = whole.to_string();
@@ -1111,7 +1109,7 @@ pub fn resident_ceiling() -> Option<u64> {
 /// will not say.
 ///
 /// The tightest of `MemTotal` and every cgroup v2 `memory.max` on this
-/// process's path — published numbers come from a `memory.max=3G` cgroup, so
+/// process's path; published numbers come from a `memory.max=4G` cgroup, so
 /// the cgroup limit is the one that actually binds. cgroup v1 is not
 /// consulted; a host old enough to lack v2 falls back to `MemTotal`, which is
 /// still enough to catch a corrupt layout.
@@ -1193,7 +1191,7 @@ fn parse_mem_total(contents: &str) -> Option<u64> {
 /// O_DIRECT reads with page faults disabled (`fs/btrfs/direct-io.c:1107`):
 /// when it cannot fault the destination it does not fail, it silently
 /// completes the transfer through the *buffered* path — the read returns the
-/// full byte count with no error, and the page cache grows inside our 3 GB
+/// full byte count with no error, and the page cache grows inside our 4 GB
 /// cgroup, which is the one thing the whole design exists to avoid. Freshly
 /// allocated pages are untouched, so without this the very first read into
 /// every slot takes that path.
@@ -1366,7 +1364,7 @@ mod tests {
         // without allocating any of it: 24 layers of each stride.
         let per_slot_per_model = 24 * (3_059_712usize + 2_654_208);
         assert_eq!(per_slot_per_model, 137_134_080);
-        // 1438 MiB, the current default, is 11 slots/layer.
+        // 1438 MiB, the 3 GiB configuration's budget, is 11 slots/layer.
         assert_eq!(11 * per_slot_per_model / (1024 * 1024), 1438);
         // The next slot up costs 131 MiB more, and every configuration that
         // could fit the 3 GB budget stays under the policy cap.
@@ -1834,13 +1832,14 @@ mod tests {
     }
 
     /// [`MAX_POOL_BYTES`] is not the constraint that decides how many slots
-    /// this project can actually build. Published numbers come from a
-    /// `memory.max=3G` cgroup, which is tighter than the 4 GiB policy cap for
-    /// every slot count above 23 — so quoting the cap as evidence that the
-    /// whole EXP-005 sweep is reachable is wrong at the top of the sweep.
+    /// this project can actually build. Published numbers came from a
+    /// `memory.max=3G` cgroup before EXP-033, which is tighter than the 4 GiB
+    /// policy cap for every slot count above 23, so quoting the cap as
+    /// evidence that the whole EXP-005 sweep is reachable is wrong at the top
+    /// of the sweep.
     #[test]
     fn the_benchmark_cgroup_binds_before_the_policy_cap() {
-        // The 3 GB benchmark cgroup, exactly as `memory.max` spells it.
+        // The pre-EXP-033 benchmark cgroup, exactly as `memory.max` spells it.
         const CGROUP_3G: u64 = 3 << 30;
         assert_eq!(CGROUP_3G, 3_221_225_472);
         // 24 layers of each real stride, one slot per layer.
@@ -1874,7 +1873,8 @@ mod tests {
     // The projected footprint
     // -----------------------------------------------------------------------
 
-    /// The 3 GB benchmark cgroup every published number comes from.
+    /// The 3 GiB cap of the contract before EXP-033, which `--cache-bytes
+    /// 1440M` still fits.
     const CGROUP_3G: u64 = 3 << 30;
     /// The 4 GiB contract (EXP-033), as `memory.max` spells it.
     const CGROUP_4G: u64 = 4 << 30;

@@ -77,9 +77,9 @@ done
 
 info "Platform:" "Linux x86_64"
 
-# io_uring landed in kernel 5.1. Losing it costs speed, not correctness: the
-# streamer falls back to pread, and the ~4 GB memory contract rides on O_DIRECT
-# rather than on io_uring, so the budget survives the fallback.
+# Expert reads use io_uring's read opcode, which needs kernel 5.6. On 5.1 to 5.5
+# the ring is created but every expert read fails; only a kernel with no
+# io_uring at all, before 5.1, gets the pread path.
 KERNEL="$(uname -r)"
 kmajor="${KERNEL%%.*}"
 krest="${KERNEL#*.}"
@@ -87,12 +87,12 @@ kminor="${krest%%.*}"
 kminor="${kminor%%[!0-9]*}"
 
 if [[ "$kmajor" =~ ^[0-9]+$ ]] && [[ "$kminor" =~ ^[0-9]+$ ]] &&
-   { [ "$kmajor" -gt 5 ] || { [ "$kmajor" -eq 5 ] && [ "$kminor" -ge 1 ]; }; }; then
-    info "Kernel:" "$KERNEL (io_uring available)"
+   { [ "$kmajor" -gt 5 ] || { [ "$kmajor" -eq 5 ] && [ "$kminor" -ge 6 ]; }; }; then
+    info "Kernel:" "$KERNEL (io_uring reads supported)"
 else
-    warn "Kernel $KERNEL is older than 5.1, which is where io_uring landed."
-    echo "  ramvamp will fall back to pread: correct, but slower than any"
-    echo "  figure in the README. The load banner will tell you which mode you got."
+    warn "Kernel $KERNEL is older than 5.6, which ramvamp's io_uring reads need."
+    echo "  On 5.1 to 5.5 every expert read fails, so a model cannot run there."
+    echo "  Upgrade the kernel first."
 fi
 
 # AVX2 and F16C are detected at runtime and there is a scalar fallback, so this

@@ -18,7 +18,7 @@ Every v0 component is done and every validation gate passes.
 | --- | --- |
 | Packed `.rvmp` format, streaming installer | **done**: a 17.35 GiB install with resume and verify, never holding a full tensor in memory |
 | Tokenizer and vendored ChatML | **done**: token-exact against transformers on committed fixtures |
-| CPU kernels | **done**: AVX2, FMA and F16C fast paths with a scalar fallback, 3.2 to 5.1x a row over scalar (EXP-001) |
+| CPU kernels | **done**: AVX2, FMA and F16C fast paths with a scalar fallback ([architecture.md](architecture.md#compute)) |
 | Forward pass, KV cache, generation | **done** (EXP-003, EXP-004) |
 | Expert streaming and cache | **done**: io_uring and O_DIRECT reads, ghost-LFU cache, 19 slots per layer by default (EXP-005 to EXP-014, EXP-033) |
 | Sequential-sweep prefill | **done**: the default path, bit-identical to the per-token one (EXP-016) |
@@ -28,7 +28,7 @@ Every v0 component is done and every validation gate passes.
 | Decode throughput | **published per drive** in [benchmarks.md](benchmarks.md) |
 | HTTP server | **done**: loopback OpenAI-compatible `/v1/chat/completions` (streaming and buffered), `/v1/models` and `/health`, one request at a time, KV cache reused across requests ([server.md](server.md)) |
 | Tool calling | **done**: parsed from Qwen's native `<tool_call>` tokens, streaming and buffered, so agent clients work |
-| Context and profiles | **done**: `--context`, profiles, and `ramvamp plan`, which refuses a configuration that cannot fit before allocating; a 32K context at the default cache projects about 6,695 MiB ([configuration.md](configuration.md)) |
+| Context and profiles | **done**: `--context`, profiles, and `ramvamp plan`, which refuses a configuration that cannot fit before allocating ([configuration.md](configuration.md)) |
 | Distribution | **done**: `install.sh` for Linux x86_64 and the landing page |
 
 ## Next

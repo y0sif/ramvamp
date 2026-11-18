@@ -62,7 +62,7 @@
         "name": "How does a 30B model fit in 4 GB of RAM?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Only 8 of 128 experts per layer are needed for a given token, so the common weights are read into memory once at about 1,023 MiB and the experts stay on disk, read on demand through a per-layer cache. Measured peak memory (cgroup memory.peak) is 3,690 to 4,008 MiB inside a 4,096 MiB ceiling."
+          "text": "Only 8 of 128 experts per layer are needed for a given token, so the common weights are read into memory once at about 1,023 MiB and the experts stay on disk, read on demand through a per-layer cache. Measured peak memory (cgroup memory.peak) is 3,690 to 4,020 MiB inside a 4,096 MiB ceiling."
         }
       },
       {
@@ -453,7 +453,7 @@
             </tr>
             <tr>
               <td>Peak memory</td>
-              <td class="num">3,690 to 4,008 MiB</td>
+              <td class="num">3,690 to 4,020 MiB</td>
               <td>cgroup memory.peak, of a 4,096 MiB ceiling, context 512 to 3,961</td>
             </tr>
             <tr>
@@ -470,8 +470,7 @@
         </table>
       </div>
       <p class="caption">
-        Decode is I/O-bound: it reads up to about 1.1 GB of expert weights per token, so the
-        number belongs to the drive as much as to the code. No figure is published here without naming the drive it came from. Full
+        Decode is I/O-bound: it reads up to about 1.1 GB of expert weights per token. Full
         table and conditions:
         <a href="https://github.com/y0sif/ramvamp/blob/main/docs/benchmarks.md">docs/benchmarks.md</a>.
       </p>
@@ -495,7 +494,7 @@
         </div>
         <div class="feature">
           <h3>A small LFU cache</h3>
-          <p>Nineteen slots per layer out of 128 experts at the default budget, absorbing 67 to 68 percent of requests. Hits dispatch immediately and hide the latency of the misses behind compute.</p>
+          <p>Nineteen slots per layer out of 128 experts at the default budget, absorbing about two thirds of requests. Hits dispatch immediately and hide the latency of the misses behind compute.</p>
         </div>
         <div class="feature">
           <h3>Install repacks, it does not convert</h3>
@@ -507,7 +506,7 @@
         </div>
         <div class="feature">
           <h3>An OpenAI-compatible server</h3>
-          <p><code>ramvamp serve</code> speaks <code>/v1/chat/completions</code> on loopback with streaming SSE, tool calls, and KV prefix reuse across requests. It refuses <code>n</code> above 1, <code>stop</code> and a forced <code>tool_choice</code> with a 400, and ignores fields it does not implement.</p>
+          <p><code>ramvamp serve</code> speaks <code>/v1/chat/completions</code> on loopback with streaming SSE, tool calls, and KV prefix reuse across requests. It answers a 400 to a value it cannot honour and ignores fields it does not implement (<a href="https://github.com/y0sif/ramvamp/blob/main/docs/server.md#refusals">the list</a>).</p>
         </div>
         <div class="feature">
           <h3>A context dial you can price</h3>
@@ -528,8 +527,8 @@
             </tr>
           </thead>
           <tbody>
-            <tr><td>OS</td><td>Linux, x86_64. Nothing else, on purpose: io_uring and AVX2 are the design</td></tr>
-            <tr><td>Kernel</td><td>5.1 or newer for io_uring. Older kernels fall back to pread, which works and is slower</td></tr>
+            <tr><td>OS</td><td>Linux, x86_64</td></tr>
+            <tr><td>Kernel</td><td>5.6 or newer, for io_uring reads. On 5.1 to 5.5 every expert read fails</td></tr>
             <tr><td>CPU</td><td>Any x86_64. AVX2, FMA and F16C are detected at runtime, with a scalar fallback</td></tr>
             <tr><td>RAM</td><td>About 4 GB for the default 4,096-token context, or 3 GB with a smaller expert cache (<code>--cache-bytes 1440M</code>). Larger contexts cost more and <code>plan</code> will tell you how much</td></tr>
             <tr><td>Disk</td><td>17.35 GiB free on an NVMe SSD. It runs on slower storage, well below these figures</td></tr>
@@ -547,7 +546,7 @@
 
       <div class="faq-item">
         <h3>How does a 30B model fit in 4 GB of RAM?</h3>
-        <p>Only 8 of 128 experts per layer are needed for a given token, so the common weights are read into memory once at about 1,023 MiB and the experts stay on disk, read on demand through a per-layer cache. Measured peak memory (cgroup <code>memory.peak</code>) is 3,690 to 4,008 MiB inside a 4,096 MiB ceiling.</p>
+        <p>Only 8 of 128 experts per layer are needed for a given token, so the common weights are read into memory once at about 1,023 MiB and the experts stay on disk, read on demand through a per-layer cache. Measured peak memory (cgroup <code>memory.peak</code>) is 3,690 to 4,020 MiB inside a 4,096 MiB ceiling.</p>
       </div>
 
       <div class="faq-item">
@@ -590,7 +589,7 @@
             <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/install.md">install.md</a></td><td>Requirements, every repacker subcommand, building from source, and uninstalling</td></tr>
             <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/benchmarks.md">benchmarks.md</a></td><td>Every published number, with its conditions and its drive</td></tr>
             <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/architecture.md">architecture.md</a></td><td>The packed format, the streamer, the cache, the kernels</td></tr>
-            <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/comparison.md">comparison.md</a></td><td>ramvamp against llama.cpp and TurboFieldfare, and why explicit reads beat mmap</td></tr>
+            <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/comparison.md">comparison.md</a></td><td>How five related projects handle experts, and why explicit reads beat mmap</td></tr>
             <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/server.md">server.md</a></td><td>The OpenAI-compatible surface, its routes and its refusals</td></tr>
             <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/configuration.md">configuration.md</a></td><td>Profiles, the context dial, and the precedence chain</td></tr>
             <tr><td><a href="https://github.com/y0sif/ramvamp/blob/main/docs/roadmap.md">roadmap.md</a></td><td>The plan of record: what is done and what is open</td></tr>

@@ -74,15 +74,15 @@ A blob is one expert's gate, up and down slabs (884,736 B per Q4_K slab,
 3,059,712 B (2.92 MiB) on Q6_K-down layers and 2,654,208 B (2.53 MiB) on the
 rest, with no padding.
 
-`manifest.json` is written last and promoted atomically. `common_tensors` is
-the only index into `common.bin` (offsets 64-byte aligned, checked in bounds
-and non-overlapping), and every manifest struct rejects unknown or missing
-keys; `crates/core/src/format/manifest.rs` is the schema. At load the
-manifest is schema-validated and `common.bin` and `layout.json` are hashed
-against it, while each layer file is only size-checked unless
-`--verify-layer-hashes` is set, because hashing 16.35 GiB through the page
-cache would defeat O_DIRECT. `ramvamp-repack verify-install` is the thorough
-check.
+`manifest.json` is written last and promoted atomically; its schema,
+`crates/core/src/format/manifest.rs`, rejects unknown keys and requires every
+key but the optional `arch.sliding_window`. `common_tensors` is the only index
+into `common.bin` (offsets 64-byte aligned, checked in bounds and
+non-overlapping). At load the manifest is schema-validated and `common.bin`
+and `layout.json` are hashed against it, while each layer file is only
+size-checked unless `--verify-layer-hashes` is set, because hashing 16.35 GiB
+through the page cache would defeat O_DIRECT. `ramvamp-repack verify-install`
+is the thorough check.
 
 ## Memory contract
 
@@ -96,17 +96,17 @@ expert slots per layer and a 4,096-token context the runtime projects
 | Expert slot pool | 2,484.84 MiB | 19 slots x 48 layers at the real strides, 130.78 MiB a slot across all layers; one allocation, every page faulted at construction |
 | KV cache FP16 | 384 MiB at 4K | 96 KiB a token; allocated at full capacity, faulted lazily |
 | Runtime anonymous memory | 115.1 MiB | activations, scratch, tokenizer, stacks, allocator arenas; sampled once (EXP-012), provisional, a floor rather than a ceiling |
-| Total | 4,007.3 MiB | what `ramvamp plan` projects; peaks measured at ctx 3,961 land within 13 MiB of it (EXP-033, EXP-034) |
+| Total | 4,007.3 MiB | what `ramvamp plan` projects; peaks measured at ctx 3,961 land 1 to 13 MiB above it (EXP-033, EXP-034) |
 
 The expert cache is a byte budget, `--cache-bytes` (default 2,485 MiB),
 divided by the summed per-layer strides to give slots per layer;
 `--cache-bytes 1440M` gives 11 slots and fits a 3 GiB cap (EXP-031). Resident
 common weights cannot be evicted by machine-wide memory pressure from a
-swap-off cgroup (EXP-031). `ramvamp plan`
-prints the projection without loading the model, and the runtime refuses a
-configuration that does not fit before it allocates, naming every term.
-Prefill adds no tenant: its 46.7 MiB ring and 77.9 MiB chunk scratch are
-carved from the slot pool, which prefill leaves idle.
+swap-off cgroup (EXP-031). `ramvamp plan` prints the projection without
+loading the model, and the runtime refuses a configuration that does not fit
+before it allocates, naming every term. Prefill adds no tenant: its 46.7 MiB
+ring and 77.9 MiB chunk scratch are carved from the slot pool, which prefill
+leaves idle.
 
 ## Expert streaming and cache
 
@@ -115,10 +115,10 @@ per-layer slot cache, and they are never demand-paged through mmap.
 TurboFieldfare measured mmap 3.54x slower per cold expert read and about 8x
 slower in its full streaming simulation ([comparison.md](comparison.md)).
 
-- **Reads.** Plain io_uring reads, interrupt-driven, no SQPOLL or IOPOLL
-  (they burn a core the GEMVs need); ring setup steps down a flag ladder on
-  `EINVAL` for older kernels. Without io_uring the streamer falls back to
-  synchronous positioned reads through the same O_DIRECT handle.
+- **Reads.** Plain interrupt-driven io_uring reads: SQPOLL would burn a core
+  the GEMVs need, and btrfs refuses IOPOLL with `EOPNOTSUPP`. Ring setup steps
+  down a flag ladder on `EINVAL` for older kernels; without io_uring, reads
+  fall back to synchronous `pread` through the same O_DIRECT handle.
 - **Nothing is registered.** Registered buffers would pin the whole pool
   against an 8 MiB `RLIMIT_MEMLOCK` to save about 70 us a read (EXP-008).
 - **Queue depth.** The ring has 8 entries, equal to top-k, and a layer step
@@ -126,10 +126,11 @@ slower in its full streaming simulation ([comparison.md](comparison.md)).
   cannot add bytes in flight. Eight blobs are at most 24.5 MB, inside the
   range where the drive holds its peak (EXP-019).
 - **O_DIRECT is a memory requirement.** The same 1.4 GiB of reads peaked the
-  cgroup at 1,092.2 MiB buffered against 5.0 MiB direct (EXP-009). A
-  filesystem can silently serve O_DIRECT through the page cache, so a startup
-  probe checks with `mincore` that it did not; on failure the runtime warns
-  and runs buffered, outside the contract.
+  cgroup at 1,092.2 MiB buffered against 5.0 MiB direct (EXP-009). A startup
+  `mincore` probe checks that the filesystem did not silently serve O_DIRECT
+  through the page cache. On failure reads run buffered, outside the contract;
+  the load banner names the read mode, and the warning is hidden at the
+  default log level.
 - **Cache policy.** Per layer, LFU over per-expert counters indexed by expert
   id that survive eviction (ghost history); without it, per-slot LFU loses
   to LRU, and a global pool across layers would add only 0.53 points
@@ -159,12 +160,12 @@ overlapped with the miss reads, then the miss experts.
    top-k 20 from the checkpoint; greedy for validation).
 
 Steps 4 and 5 are deliberately coarse: per-expert execution as reads land
-measured slower, with divergent output, upstream ([comparison.md](comparison.md)),
-and reopening it is an open decision ([roadmap.md](roadmap.md)).
-Here the reduction is fixed-order, so the result is bit-exact whatever order
-experts finish in. Each expert phase issues one pool job for every gate and up
-together and one for every down; merging `attn_q` with `attn_v` too did not
-separate and was dropped (EXP-025).
+measured slower, with divergent output, upstream
+([comparison.md](comparison.md)), and reopening it is an open decision
+([roadmap.md](roadmap.md)). Here the reduction is fixed-order, so the result
+is bit-exact whatever order experts finish in. Each expert phase issues one
+pool job for every gate and up together and one for every down; merging
+`attn_q` with `attn_v` too did not separate and was dropped (EXP-025).
 
 Hit compute is the only work hiding the miss reads, so `expert io` measures
 what it did not cover: a residual, not the drive's busy time. The fused
@@ -211,11 +212,13 @@ reference machine, with the submitting thread working as one of them.
   because a query-head split measured worse (EXP-020).
 - **Kernels.** AVX2+FMA dots for Q4_K, Q5_K, Q6_K and Q8_0, 3.2 to 5.1x a row
   over scalar (EXP-001), and AVX2+F16C attention, each probed at runtime with
-  a scalar fallback; candle's Rust AVX2 k-quant ports were a reference.
+  a scalar fallback; the AVX2 bodies follow ggml's x86 recipes.
 - **Numerics.** Identical math must give identical bits: vector lanes only on
   already-independent axes, no split dot within a row, no FMA where the scalar
-  reference rounds twice, and no rescaled softmax. Packed offsets may be only
-  2-byte aligned, so kernels use unaligned loads and test shifted views.
+  reference rounds twice, and no rescaled softmax. The AVX2 quantized dots are
+  the exception (eight lanes summed at the end, one FMA per block), tested
+  within a tolerance. Packed offsets may be only 2-byte aligned, so kernels
+  use unaligned loads and test shifted views.
 
 ## Validation protocol vs llama.cpp
 
@@ -249,9 +252,9 @@ Three CLI subcommands serve the gates:
 ## Performance model
 
 Decode is I/O-bound on the reference drive: a token needs up to 1,097 MB of
-experts, the cache serves about two thirds of the requests, and the rest come
-from a DRAM-less QLC drive that sustains about 1.6 GB/s at decode's read
-geometry (EXP-024).
+experts, the cache serves about two thirds of the requests (EXP-033), and the
+rest come from a DRAM-less QLC drive that sustains about 1.6 GB/s at decode's
+read geometry (EXP-024).
 
 - **Volume.** `8 x (24 x 3,059,712 + 24 x 2,654,208)` = 1,097,072,640 B a
   token, exact.
@@ -260,11 +263,8 @@ geometry (EXP-024).
   19 slots it is still the largest term, about 204 to 212 ms a token (EXP-034).
 - **No I/O-only ceiling.** `expert io` is a residual, a lower bound on drive
   time, so inverting it overstates what decode can reach.
-- **Sessions.** Decode ratios are drawn only inside one session
-  ([benchmarks.md](benchmarks.md#method)).
 - **Prefill** is not I/O-bound: expert io was 2.5% of a cold 4K prefill and
-  expert compute 42.1% (EXP-021). How much a faster drive moves decode is
-  unmeasured.
+  expert compute 42.1% (EXP-021).
 
 ## v0 scope caps
 

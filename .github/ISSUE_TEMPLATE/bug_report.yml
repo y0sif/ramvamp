@@ -60,7 +60,7 @@ body:
     attributes:
       label: ramvamp version
       description: Release tag, or `git rev-parse --short HEAD` for a build from source.
-      placeholder: "v0.1.0, or 96d31a9"
+      placeholder: "v0.1.1, or 96d31a9"
     validations:
       required: true
 

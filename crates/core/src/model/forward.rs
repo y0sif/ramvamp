@@ -4175,10 +4175,9 @@ mod tests {
     /// dial to move, so it has to name every tenant, the context it sized the
     /// KV cache for, the total, and the ceiling.
     ///
-    /// The numbers are the real ones: the audited `common.bin`, the shipped
-    /// 11-slot pool, a 16K context, EXP-012's anonymous row, and the 3 GB
-    /// benchmark cgroup — the exact configuration a user gets the moment
-    /// context becomes a dial and they reach for a bigger one.
+    /// The numbers are the real ones: the audited `common.bin`, the 11-slot
+    /// pool of `--cache-bytes 1440M`, a 16K context, EXP-012's anonymous row,
+    /// and a 3 GB cgroup.
     #[test]
     fn an_impossible_configuration_names_every_term_and_the_ceiling() {
         let footprint = Footprint {

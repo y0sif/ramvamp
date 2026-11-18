@@ -95,7 +95,7 @@ const POLL: Duration = Duration::from_millis(40);
 /// The default for a spawned thread is 2 MiB, and the forward pass has only
 /// ever run on the main thread's 8 MiB. Matching it means moving the model to
 /// a worker cannot be what overflows a stack. It is address space, not
-/// residency, so it does not come out of the 3 GB budget.
+/// residency, so it does not come out of the 4 GB budget.
 const WORKER_STACK: usize = 8 * 1024 * 1024;
 
 const GREETING: &str = "\

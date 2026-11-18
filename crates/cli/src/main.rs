@@ -125,7 +125,7 @@ struct RuntimeArgs {
     /// Qwen3-30B-A3B, which fits the 4 GB memory contract at a 4K context,
     /// and 1440M buys 11, which fits 3 GB; a model with a different layer
     /// count or expert size gets a different number of slots out of the same
-    /// budget. Unset: 2485M, or the profile's `cache_bytes`.
+    /// budget. Unset: the profile's `cache_bytes`, else 2485M.
     //
     // `Option` rather than a clap `default_value`, for the reason
     // [`ContextArgs`] spells out: a default here is indistinguishable from the
@@ -141,10 +141,10 @@ struct RuntimeArgs {
     )]
     cache_bytes: Option<u64>,
 
-    /// Compute threads, counting the decode thread itself. Unset: one per
-    /// physical performance core on a hybrid CPU and one per CPU the process
-    /// may use on any other, or the profile's `threads`. Where they run is
-    /// `--placement`.
+    /// Compute threads, counting the decode thread itself. Unset: the
+    /// profile's `threads`, else one per physical performance core on a
+    /// hybrid CPU and one per CPU the process may use on any other. Where they
+    /// run is `--placement`.
     //
     // Range-checked here rather than clamped later: `ComputePool` clamps to
     // `1..=MAX_SHARDS`, so without the check `--threads 0` would run a
@@ -162,7 +162,7 @@ struct RuntimeArgs {
     /// can move one off a core something else is using; `per-core` pins one
     /// thread to each performance core, a few percent faster on an otherwise
     /// idle machine and much slower on a busy one; `off` sets no affinity.
-    /// Unset: shared, or `RAMVAMP_PLACEMENT`, or the profile's `placement`.
+    /// Unset: `RAMVAMP_PLACEMENT`, else the profile's `placement`, else shared.
     #[arg(long, value_name = "MODE", value_parser = parse_placement)]
     placement: Option<Placement>,
 
@@ -231,8 +231,8 @@ struct ContextArgs {
     /// resident memory in proportion, so it is the dial that trades
     /// conversation length against the byte budget. Refused above what the
     /// model was trained for (the manifest's `arch.context_length`), since
-    /// positions past that generate garbage rather than failing. Unset: 4096,
-    /// or `RAMVAMP_CONTEXT`, or the profile's `context`.
+    /// positions past that generate garbage rather than failing. Unset:
+    /// `RAMVAMP_CONTEXT`, else the profile's `context`, else 4096.
     #[arg(
         long,
         value_name = "TOKENS",
@@ -316,8 +316,8 @@ struct PrefillArgs {
     /// Prefill path. `sweep` is the chunked layer-major pass: one sweep over
     /// each layer's expert file per chunk of positions, bypassing the expert
     /// cache. `token-major` runs one forward pass per prompt token through
-    /// that cache instead and produces the same logits. Unset: `sweep`, or
-    /// `RAMVAMP_PREFILL`, or the profile's `prefill`.
+    /// that cache instead and produces the same logits. Unset:
+    /// `RAMVAMP_PREFILL`, else the profile's `prefill`, else `sweep`.
     #[arg(long, value_name = "MODE", value_parser = parse_prefill_mode)]
     prefill: Option<PrefillMode>,
 
@@ -325,8 +325,8 @@ struct PrefillArgs {
     /// reads fewer expert bytes, one pass over the expert set per chunk, and
     /// needs staging memory that grows with it; a chunk too wide for the
     /// expert cache to host is narrowed. Ignored by `--prefill token-major`.
-    /// Unset: 512, or `RAMVAMP_PREFILL_CHUNK`, or the profile's
-    /// `prefill_chunk`.
+    /// Unset: `RAMVAMP_PREFILL_CHUNK`, else the profile's `prefill_chunk`,
+    /// else 512.
     #[arg(
         long,
         value_name = "N",

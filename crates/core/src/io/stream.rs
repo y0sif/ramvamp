@@ -1662,7 +1662,7 @@ impl ExpertStream {
     /// What [`ExpertStream::sweep_layer`] cannot do. A layer-major prefill
     /// writes each expert's output into an `[n_rows][top_k][hidden]` staging
     /// buffer *while* it consumes the sweep, and both have to come out of the
-    /// pool or prefill costs bytes the 3 GB budget does not have. A
+    /// pool or prefill costs bytes the 4 GB budget does not have. A
     /// `LayerSweep` parks this stream's `&mut` for its whole life, so a driver
     /// holding one cannot hold a scratch span too;
     /// [`PrefillSession::split`](super::PrefillSession::split) hands out both

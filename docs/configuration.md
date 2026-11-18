@@ -91,14 +91,14 @@ produce fluent nonsense rather than an error.
 Every command takes `--model <DIR>`, the installed model, plus its own flags.
 A `--messages-file` is a JSON array of `{"role": ..., "content": ...}` turns.
 
-| command | flags |
+| command | what it does, then its flags |
 | --- | --- |
-| `generate` | `--prompt <TEXT>` (raw, no chat template) or `--messages-file <FILE>` (rendered through the template), one required; `--trace-experts <FILE>` writes each position's routed expert ids to a binary trace |
+| `generate` | Streams one completion to stdout. `--prompt <TEXT>` (raw, no chat template) or `--messages-file <FILE>` (rendered through the template), one required; `--trace-experts <FILE>` writes each position's routed expert ids to a binary trace |
 | `chat` | `--system <TEXT>`, the first turn; `--messages-file <FILE>`, a conversation to start from, which `/reset` returns to; `--tui`, the status panel |
 | `generate`, `chat`, `serve` | `--max-new <N>` (128, or 512 for `serve`), `--greedy`, `--temperature`, `--top-k`, `--top-p`, `--seed`. Sampling defaults come from the model: temperature 0.7, top-p 0.8, top-k 20 for the pinned one |
-| `logits` | `--prompt <TEXT>`, required; `--top <N>` (20), how many top tokens to print as JSON; `--trace-experts <FILE>` |
-| `perplexity` | `--file <FILE>`, required, the text to score; `--window <TOKENS>` (512); `--chunks <N>` (every whole window); `--json <FILE>`, the per-window scores |
-| `tokenize` | `--prompt <TEXT>` or `--messages-file <FILE>`, one required. It takes none of the dials above |
+| `logits` | Prints the top next-token logits for a raw prompt as JSON. `--prompt <TEXT>`, required; `--top <N>` (20), how many to print; `--trace-experts <FILE>` |
+| `perplexity` | Scores a text file's perplexity the way `llama-perplexity` does. `--file <FILE>`, required; `--window <TOKENS>` (512); `--chunks <N>` (every whole window); `--json <FILE>`, the per-window scores |
+| `tokenize` | Encodes a prompt or conversation, prints its token ids and checks that they decode back. `--prompt <TEXT>` or `--messages-file <FILE>`, one required. It takes none of the dials above |
 
 `serve`'s own flags are in [server.md](server.md#flags), and
 `ramvamp <command> --help` lists everything.
@@ -125,8 +125,8 @@ set `RUST_LOG=warn`, or run `plan`, whose source column then does not say
 Model commands run with swap turned off for their own process, so nothing
 else on the machine can push the common weights out to swap. `generate`,
 `chat`, `serve`, `logits` and `perplexity` re-launch themselves once inside a
-systemd user scope with `MemorySwapMax=0`. No root is needed, and the terminal,
-signals and exit status stay the command's own. The scope sets no memory cap.
+systemd user scope with `MemorySwapMax=0`. No root is needed, and the scope
+sets no memory cap.
 
 It is skipped when swap is already off for the process, when
 `systemd-run --user --scope` does not work (no systemd user session), or when
