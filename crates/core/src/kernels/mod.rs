@@ -18,8 +18,8 @@
 //! and any thread count matches any other. The rules that keep it:
 //!
 //! - Vector lanes and thread shards run only along axes that are already
-//!   independent: output rows ([`gemv`]); kv heads, the GQA group and the
-//!   elementwise head dimension ([`attention`]). A reduction chain is never
+//!   independent: output rows ([`gemv`]); prefill's query rows, kv heads,
+//!   the GQA group and the elementwise head dimension ([`attention`]). A reduction chain is never
 //!   split, so a dot is never split within a row.
 //! - No FMA where the scalar reference does a separate multiply and add (two
 //!   roundings); `_mm256_fmadd_ps` and `f32::mul_add` would make it one.

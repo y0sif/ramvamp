@@ -25,7 +25,7 @@ read up to about 1.1 GB of expert weights from the SSD. On a machine with the RA
 
 Speed and memory are measured cold, with the page cache dropped first, inside a 4 GiB `memory.max`
 cgroup with `memory.swap.max=0`, so neither free RAM nor swap can hold the model. Qwen3-30B-A3B
-Q4_K_M at the default settings, on a DRAM-less QLC NVMe drive:
+Q4_K_M with the default expert cache, on a DRAM-less QLC NVMe drive:
 
 | | measured |
 | --- | --- |
@@ -45,8 +45,8 @@ The installer supports Linux x86_64 only. It puts `ramvamp` and `ramvamp-repack`
 curl -sSL https://y0sif.github.io/ramvamp/install.sh | bash
 ```
 
-Re-run it to upgrade, and set `RAMVAMP_VERSION=v0.1.1` to pin a release. It stops before the
-model, a 17.35 GiB download that belongs on an NVMe SSD:
+Re-run it to upgrade. To pin a release, end the command with `| RAMVAMP_VERSION=v0.1.1 bash`.
+It stops before the model, a 17.35 GiB download that belongs on an NVMe SSD:
 
 ```bash
 ramvamp-repack install --output ~/models/qwen3-30b-a3b.rvmp
@@ -77,6 +77,7 @@ Building needs Rust 1.88 or newer and a C and C++ compiler. The steps are in
 ## Chat in the terminal
 
 `ramvamp chat` is a multi-turn chat: Ctrl-D or `/exit` leaves, and Ctrl-C stops the reply.
+`/reset` forgets the conversation, `/save <path>` writes it as JSON, and `/help` lists the rest.
 
 ```bash
 ramvamp chat --model ~/models/qwen3-30b-a3b.rvmp --tui
@@ -89,8 +90,9 @@ rate, and needs a terminal on stdout. Without it, `chat` is plain text and works
 
 `ramvamp serve` is an OpenAI-compatible HTTP server on 127.0.0.1, with no `--host` flag. It serves
 `/v1/chat/completions` (streaming and buffered), `/v1/models` and `/health`, one request at a time,
-reuses the KV cache across requests that share a prefix, and answers a request field it cannot
-honour with a `400`. Endpoints and refusals: [docs/server.md](docs/server.md).
+and reuses the KV cache across requests that share a prefix. It refuses `n` above 1, `stop` and a
+forced `tool_choice` with a `400`, and ignores fields it does not implement. Endpoints, fields and
+refusals: [docs/server.md](docs/server.md).
 
 ```bash
 ramvamp serve --model ~/models/qwen3-30b-a3b.rvmp --port 8080
@@ -110,18 +112,18 @@ Each token needs about 1 GiB of common weights plus 8 of the 128 experts in each
    into anonymous memory at load. `--common-memory mapped` maps them instead.
 3. **Experts are read explicitly, never demand-paged.** Cache hits compute at once while the misses
    go to io_uring as one batch of O_DIRECT reads per layer, which bypass the page cache.
-4. **The cache is small.** The default 2,485 MiB budget holds 19 of each layer's 128 experts and
-   serves 67 to 68% of expert requests.
+4. **The cache is small.** `--cache-bytes` defaults to 2485M, which holds 19 of each layer's 128
+   experts and served 67 to 68% of expert requests in the published runs.
 
 Design: [docs/architecture.md](docs/architecture.md). Why not mmap or cross-layer prefetch:
 [docs/comparison.md](docs/comparison.md).
 
 ## Documentation
 
-The `docs/` directory holds one page per topic.
+Three pages cover using ramvamp; the rest cover its numbers, design, comparisons and plan.
 
 - [docs/install.md](docs/install.md): requirements, install paths, building from source, uninstalling
-- [docs/configuration.md](docs/configuration.md): every flag, environment variable and profile key
+- [docs/configuration.md](docs/configuration.md): flags, environment variables and profile keys, with defaults
 - [docs/server.md](docs/server.md): HTTP endpoints, honoured request fields and refusals
 - [docs/benchmarks.md](docs/benchmarks.md): every published number, its conditions, the reference machine
 - [docs/architecture.md](docs/architecture.md): packed format, streaming, cache, kernels and validation

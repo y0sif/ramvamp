@@ -2,10 +2,10 @@
 """Cold, cgroup-confined benchmark with *verified* measurement hygiene.
 
 `docs/experiments.md` rule: published numbers come from cold runs
-inside a `memory.max=3G` cgroup with `memory.swap.max=0`. Every part of
-that sentence is easy to believe and hard to actually get, so this
-harness verifies each one instead of assuming it, and prints a hygiene
-verdict that is separate from the performance numbers. A fast number from
+inside the contract's `memory.max` cgroup (`--memory-max`, default 4G) with
+`memory.swap.max=0`. Every part of that sentence is easy to believe and hard
+to actually get, so this harness verifies each one instead of assuming it,
+and prints a hygiene verdict that is separate from the performance numbers. A fast number from
 a DIRTY run is not a result.
 
 What it checks, and why each check exists:
@@ -13,8 +13,8 @@ What it checks, and why each check exists:
 1. No `ramvamp` process may be running when we start.
    `posix_fadvise(POSIX_FADV_DONTNEED)` returns 0 and evicts *nothing* if
    any process still has the file mmap'd, and the runtime mmaps
-   `common.bin`. A leftover process silently turns every "cold" run into
-   a warm one.
+   `common.bin` under `--common-memory mapped`. A leftover process silently
+   turns every "cold" run into a warm one.
 
 2. Eviction is verified with `mincore`, never trusted from the fadvise
    return code. We mmap each file, count resident pages before and after,
@@ -23,7 +23,7 @@ What it checks, and why each check exists:
    model directory is never written to.
 
 3. The run happens inside a transient systemd *service*, not a scope:
-   `systemd-run --user --wait -q -p MemoryMax=3G -p MemorySwapMax=0
+   `systemd-run --user --wait -q -p MemoryMax=4G -p MemorySwapMax=0
    -p MemoryAccounting=yes`. `--scope` tears the cgroup down before the
    counters can be read, and `--wait` cannot be combined with
    `--remain-after-exit`, so the counters are read from *inside* the

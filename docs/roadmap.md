@@ -21,11 +21,11 @@ Every v0 component is done and every validation gate passes.
 | CPU kernels | **done**: AVX2, FMA and F16C fast paths with a scalar fallback, 3.2 to 5.1x a row over scalar (EXP-001) |
 | Forward pass, KV cache, generation | **done** (EXP-003, EXP-004) |
 | Expert streaming and cache | **done**: io_uring and O_DIRECT reads, ghost-LFU cache, 19 slots per layer by default (EXP-005 to EXP-014, EXP-033) |
-| Sequential-sweep prefill | **done**: about 25 tok/s at ctx 512, 18.23 at ctx 3,961 (EXP-033) |
-| Memory contract | **done**: 4 GiB, peak 3,690 to 4,008 MiB (EXP-033); `--cache-bytes 1440M` fits a 3 GiB cap (EXP-031) |
-| Validation gates 1 to 4 | **done**: expert bytes exact, kernels against scalar, mean KL 1.04e-2 with top-1 8/8 (EXP-004), greedy 16 tokens identical on 3/3 prompts (EXP-003) |
-| Gate 5: perplexity | **done**: WikiText-2 PPL 6.3598 against llama.cpp's 6.3810, -0.33%, within 1% at every window (EXP-035) |
-| Decode throughput | **published per drive**: 2.78 to 2.81 tok/s at ctx 512 and 1.96 at ctx 3,961 on the reference drive (EXP-033) |
+| Sequential-sweep prefill | **done**: the default path, bit-identical to the per-token one (EXP-016) |
+| Memory contract | **done**: 4 GiB with swap off (EXP-033); `--cache-bytes 1440M` fits a 3 GiB cap (EXP-031) |
+| Validation gates 1 to 4 | **done**: expert bytes exact, kernels against scalar, full-vocab KL and greedy tokens against llama.cpp (EXP-003, EXP-004) |
+| Gate 5: perplexity | **done**: WikiText-2 perplexity within 1% of llama.cpp at every window (EXP-035) |
+| Decode throughput | **published per drive** in [benchmarks.md](benchmarks.md) |
 | HTTP server | **done**: loopback OpenAI-compatible `/v1/chat/completions` (streaming and buffered), `/v1/models` and `/health`, one request at a time, KV cache reused across requests ([server.md](server.md)) |
 | Tool calling | **done**: parsed from Qwen's native `<tool_call>` tokens, streaming and buffered, so agent clients work |
 | Context and profiles | **done**: `--context`, profiles, and `ramvamp plan`, which refuses a configuration that cannot fit before allocating; a 32K context at the default cache projects about 6,695 MiB ([configuration.md](configuration.md)) |
@@ -39,7 +39,8 @@ contributor's report (the method is in [benchmarks.md](benchmarks.md#method)).
 
 ## v1
 
-These are commitments to sequence, not to dates.
+v1 has four items; the first two are set aside until their reopen condition
+holds.
 
 ### 1. Gemma 4 26B-A4B as model #2: not now
 
@@ -91,9 +92,6 @@ from the manifest at runtime. Three things are pinned to Qwen3:
    types: gate and up Q4_K, down Q4_K or Q6_K.
 3. The loader requires Qwen3's QK-norm tensors (`attn_q_norm`, `attn_k_norm`).
 
-With Gemma 4 set aside, the next MoE that clears the faster-or-better bar is
-the model that would force these open.
-
 ### 4. Architectures beyond Linux x86_64
 
 The fast kernels are AVX2, FMA and F16C, and the streamer assumes io_uring.
@@ -118,7 +116,7 @@ Recorded so they stop being re-derived; in no fixed order.
 
 ## Open decisions
 
-Each open decision is settled before work on it starts.
+One design decision is open.
 
 | Decision | Status |
 | --- | --- |

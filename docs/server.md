@@ -52,10 +52,10 @@ Any other path or method is a `404`. A query string is ignored when routing.
 | `stream_options.include_usage` | add a final usage chunk to a stream |
 | `temperature`, `top_p`, `top_k`, `seed` | override the server's defaults. `temperature` 0 or below is greedy. Without `seed`, each request gets the server's seed plus the request number |
 | `max_completion_tokens`, `max_tokens` | reply cap; `max_completion_tokens` wins when both are sent |
-| `tools`, `tool_choice` | tool calls, in streamed and buffered replies alike. `tool_choice` may be `auto`, `none` or absent |
+| `tools`, `tool_choice` | tool calls, in streamed and buffered replies alike. `tool_choice` may be `auto` or absent. `none` is accepted but changes nothing: the tools stay in the prompt and the model may still call one |
 
-Other fields, such as `logprobs` and `presence_penalty`, are accepted and
-ignored.
+Every other field, such as `response_format`, `logprobs` or
+`presence_penalty`, is accepted and ignored.
 
 ## How requests are served
 
@@ -65,6 +65,7 @@ ignored.
   repeated system prompt is not prefilled again.
 - **Use `"stream": true` for long replies.** Only a stream gets keep-alive
   comments, and a buffered client may time out before its reply is complete.
+- **No CORS headers.** A web page from another origin cannot read a reply.
 
 Decode and prefill speeds are in [benchmarks.md](benchmarks.md). This is a
 local endpoint for low-volume chat and completion, not an agentic coding
@@ -72,9 +73,7 @@ backend, where one turn is thousands of output tokens.
 
 ## Refusals
 
-Each refusal carries an OpenAI-shaped error body with the `code` below. The
-400s cover fields the server cannot honour as asked, where accepting them would
-mean a wrong answer.
+Each refusal carries an OpenAI-shaped error body with the `code` below.
 
 | status | `code` | cause |
 | --- | --- | --- |

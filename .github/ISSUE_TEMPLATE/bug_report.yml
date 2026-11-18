@@ -6,12 +6,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        Most ramvamp bugs are storage bugs wearing a runtime costume. The
-        fields below are the ones that decide whether a report is
-        reproducible, so please fill them in even when they look irrelevant:
-        the same binary on the same weights behaves differently on a
-        different filesystem, and the I/O mode alone changes the memory
-        contract.
+        The fields below decide whether a report can be reproduced, so please
+        fill them in even when they look irrelevant. The same binary on the
+        same weights behaves differently on another filesystem, and the I/O
+        mode alone changes how much memory it uses.
 
   - type: dropdown
     id: component

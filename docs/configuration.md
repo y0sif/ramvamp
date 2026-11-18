@@ -86,20 +86,32 @@ memory. A prompt plus the tokens reserved for its reply must fit inside it, and
 a value above the model's trained length is refused, because positions past it
 produce fluent nonsense rather than an error.
 
-`generate`, `chat` and `serve` also take `--max-new` (128, or 512 for `serve`),
-`--greedy`, `--temperature`, `--top-k`, `--top-p` and `--seed`. Sampling
-defaults come from the model; for the pinned one, temperature 0.7, top-p 0.8,
-top-k 20. `serve`'s own flags are in [server.md](server.md#flags), and
+## Command flags
+
+Every command takes `--model <DIR>`, the installed model, plus its own flags.
+A `--messages-file` is a JSON array of `{"role": ..., "content": ...}` turns.
+
+| command | flags |
+| --- | --- |
+| `generate` | `--prompt <TEXT>` (raw, no chat template) or `--messages-file <FILE>` (rendered through the template), one required; `--trace-experts <FILE>` writes each position's routed expert ids to a binary trace |
+| `chat` | `--system <TEXT>`, the first turn; `--messages-file <FILE>`, a conversation to start from, which `/reset` returns to; `--tui`, the status panel |
+| `generate`, `chat`, `serve` | `--max-new <N>` (128, or 512 for `serve`), `--greedy`, `--temperature`, `--top-k`, `--top-p`, `--seed`. Sampling defaults come from the model: temperature 0.7, top-p 0.8, top-k 20 for the pinned one |
+| `logits` | `--prompt <TEXT>`, required; `--top <N>` (20), how many top tokens to print as JSON; `--trace-experts <FILE>` |
+| `perplexity` | `--file <FILE>`, required, the text to score; `--window <TOKENS>` (512); `--chunks <N>` (every whole window); `--json <FILE>`, the per-window scores |
+| `tokenize` | `--prompt <TEXT>` or `--messages-file <FILE>`, one required. It takes none of the dials above |
+
+`serve`'s own flags are in [server.md](server.md#flags), and
 `ramvamp <command> --help` lists everything.
 
 ## Environment variables
 
 | variable | effect |
 | --- | --- |
-| `RAMVAMP_CONTEXT`, `RAMVAMP_PLACEMENT`, `RAMVAMP_PREFILL`, `RAMVAMP_PREFILL_CHUNK` | the dials in the table above |
+| `RAMVAMP_CONTEXT`, `RAMVAMP_PLACEMENT`, `RAMVAMP_PREFILL`, `RAMVAMP_PREFILL_CHUNK` | the dials in [Every dial](#every-dial) |
 | `RAMVAMP_NO_SCOPE` | set to any value: run without the [swap-off scope](#the-swap-off-scope) |
 | `RAMVAMP_ASCII` | any value but `0`: ASCII glyphs in `chat --tui`. `TERM=dumb` or a non-UTF-8 locale does the same |
 | `RUST_LOG` | log filter. ramvamp logs only errors by default; `RUST_LOG=warn` or `info` shows more. `ramvamp-repack` defaults to `info` |
+| `RAMVAMP_FORCE_SCALAR` | any value: every quantized GEMV runs the scalar reference kernel instead of AVX2. A diagnostic for comparing outputs, much slower |
 
 An unusable value in a dial variable is ignored, so an old shell setting
 cannot stop the binary from starting. `RAMVAMP_CONTEXT` and `RAMVAMP_PLACEMENT`

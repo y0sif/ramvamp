@@ -1240,8 +1240,8 @@ impl ExpertStream {
     /// `cache_bytes / sum(page-aligned stride of every layer)` slots per
     /// layer: on the audited Qwen3-30B-A3B geometry (24 layers at 3,059,712 B
     /// and 24 at 2,654,208 B) the default 2,485 MiB buys exactly 19, and
-    /// 1,438.59 MiB buys 11. The result is clamped to a layer's expert count — slots
-    /// past that can never be filled — and to
+    /// 1,438.59 MiB buys 11. The result is clamped to a layer's expert count
+    /// (slots past that can never be filled) and to
     /// [`MAX_SLOTS`](crate::io::MAX_SLOTS).
     ///
     /// Construction allocates and pre-faults the whole pool (the dominant

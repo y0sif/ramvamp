@@ -3,18 +3,18 @@
 ramvamp runs a 30B MoE model on a Linux machine with no GPU in about 4 GB of
 RAM by reading its routed experts from NVMe with explicit io_uring and
 O_DIRECT reads, and it publishes every speed figure cold, inside a memory cap,
-with the drive it ran on. Other projects stream or offload MoE experts; this
+with the drive it ran on ([benchmarks.md](benchmarks.md)). Other projects stream or offload MoE experts; this
 page says how each differs, from that project's own documentation.
 
 ## Projects
 
 | Project | What it is | How it handles experts | How ramvamp differs |
 | --- | --- | --- | --- |
-| [TurboFieldfare](https://github.com/drumih/turbo-fieldfare) | Swift + Metal runtime for Apple Silicon Macs, one model (Gemma 4 26B-A4B) in about 2 GB of RAM | Bounded parallel `pread` into a 16-slot LFU cache per layer; the resident shared expert runs on the GPU while reads land. Reports 5.5 to 6.8 tok/s decode on an 8 GB M2 MacBook Air | The same technique on Linux x86 with no GPU, through io_uring and O_DIRECT |
-| [llama.cpp](https://github.com/ggml-org/llama.cpp) | C/C++ engine for many models and backends | Loads by memory-mapping the model by default, so a model larger than RAM is demand-paged from disk; `--n-cpu-moe` keeps expert weights on the CPU, in RAM. No merged path streams routed experts from SSD per token; [a pull request](https://github.com/ggml-org/llama.cpp/pull/25294) proposes one | Experts are never demand-paged. ramvamp validates its output against llama.cpp on the same GGUF bytes |
+| [TurboFieldfare](https://github.com/drumih/turbo-fieldfare) | Swift + Metal runtime for Apple Silicon Macs, one model (Gemma 4 26B-A4B) in about 2 GB of RAM | Bounded parallel `pread` into a 16-slot LFU cache per layer; the resident shared expert runs on the GPU while reads land. Reports 5.5 to 6.8 tok/s decode on an 8 GB M2 MacBook Air with expert prefetch on | The same technique on Linux x86 with no GPU, through io_uring and O_DIRECT |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) | C/C++ engine for many models and backends | Loads by memory-mapping the model by default, so a model larger than RAM is demand-paged from disk; `--n-cpu-moe N` keeps the MoE weights of the first N layers on the CPU (`--cpu-moe` keeps all of them). No merged path streams routed experts from SSD per token; [a pull request](https://github.com/ggml-org/llama.cpp/pull/25294) proposes one | Experts are never demand-paged. ramvamp validates its output against llama.cpp on the same GGUF bytes |
 | [MoE-Infinity](https://github.com/EfficientMoE/MoE-Infinity) | Python/PyTorch library for memory-constrained GPUs | An activation-aware cache keeps hot experts on the GPU and offloads the rest to host RAM and SSD, with tracing and prefetching | Needs a CUDA GPU; ramvamp needs none |
 | [MER](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER) | Rust, pre-release by its own description | NVMe, host RAM and GPU VRAM as managed residency tiers; a WGPU/Vulkan GPU path plus CPU and hybrid paths | Built around GPU tiers; ramvamp is a CPU runtime |
-| [AirLLM](https://github.com/lyogavin/airllm) | Python, GPU | Keeps one layer on the GPU at a time and loads layers from disk | Needs a GPU; ramvamp runs on the CPU |
+| [AirLLM](https://github.com/lyogavin/airllm) | Python library for Hugging Face models on small GPUs, with CPU inference since v2.10.1 and Apple silicon through MLX | Splits the model into per-layer files and keeps one layer on the GPU at a time; for Kimi K3, per-expert streaming loads only the experts a token routes to | Its memory figures are GPU VRAM; ramvamp's are a CPU process's whole host memory, page cache included, inside a cgroup cap |
 
 ## Why the technique needs fine-grained MoE
 
@@ -46,14 +46,4 @@ They are TurboFieldfare's numbers on its machine, not ramvamp's.
 
 Streaming has an energy cost. [arXiv:2508.06978](https://arxiv.org/abs/2508.06978)
 estimates that offloading MoE weights to SSD raises per-token decode energy by
-up to about 12x against an HBM baseline. Reads do not wear an SSD, but a laptop
-battery pays for them.
-
-## ramvamp's own numbers
-
-On a DRAM-less QLC NVMe drive, cold, inside a 4 GiB cap with swap off,
-ramvamp decodes at 2.78 to 2.81 tok/s and prefills at about 25 tok/s at ctx
-512, peaking at 3,690 to 4,008 MiB (EXP-033). The model is 17.35 GiB on disk,
-about 4.4x the peak. Output matches llama.cpp: mean full-vocab KL 1.04e-2,
-top-1 8/8 (EXP-004), WikiText-2 perplexity 6.3598 against 6.3810 (EXP-035).
-Conditions and the machine are in [benchmarks.md](benchmarks.md).
+up to about 12x against an HBM baseline.

@@ -3,30 +3,24 @@
 ramvamp: Run 26-30B MoE models in about 4 GB of RAM. No GPU required. A Rust runtime that
 streams experts from NVMe, CPU-first (AVX2 with a scalar fallback) and Linux-first (io_uring
 with O_DIRECT). Qwen3-30B-A3B is the only model that runs; the repacker refuses other
-architectures. It is a Cargo workspace of four crates in `crates/`.
+architectures.
 
 ## Build and check
 
-CI runs these, in this order (`.github/workflows/ci.yml`). Run every one before a push.
+Run these before every push. They are CI's `check` job, in its order.
 
 ```sh
-./scripts/check-docs.sh                                            # docs rules, see Docs below
+./scripts/check-docs.sh                       # docs rules, see Docs below
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings                          # warnings are errors
+cargo clippy --all-targets -- -D warnings     # warnings are errors
 cargo test
 cargo build --release
-cargo build --all-targets --workspace
-cargo build --all-targets -p ramvamp-core --no-default-features    # pread fallback, no io_uring
-cargo test -p ramvamp-core --no-default-features
-cargo +1.88 build --all-targets --workspace                        # MSRV
-cargo +1.88 build --all-targets -p ramvamp-core --no-default-features
 ```
 
-- The `-p ramvamp-core` is load-bearing. At the workspace root `--no-default-features` does
-  not turn `io-uring` off (feature unification), so the pread path is never compiled.
+- The rest of the CI gate, the `pread` fallback and MSRV legs, is in
+  [CONTRIBUTING.md](CONTRIBUTING.md#the-gate). Run it after touching `crates/core/src/io`.
 - The MSRV is `rust-version` in the root `Cargo.toml`. Change it and the CI job together.
-- `cargo test` needs no model and no network. The tokenizer fixtures are vendored in
-  `crates/core/src/tokenizer/fixtures/`. A test that needs a real install does not belong there.
+- The tokenizer test fixtures are vendored in `crates/core/src/tokenizer/fixtures/`.
 
 ## Layout
 
@@ -52,16 +46,19 @@ cargo +1.88 build --all-targets -p ramvamp-core --no-default-features
   of the next layer's experts. Both rules rest on TurboFieldfare's measurements, in
   [docs/comparison.md](docs/comparison.md).
 - No full model, shard or tensor is ever materialized in heap memory, in the runtime or the
-  repacker. The one exception is the resident common core: one anonymous mapping of
-  `common.bin`, read once at load with the page cache dropped behind it, and counted in full by
-  the footprint projection (`CommonMemory` in `crates/core/src/io/mod.rs`; it is the default,
-  `--common-memory mapped` the opt-out).
+  repacker, and no buffer is sized by the model rather than the budget. The one exception is
+  the resident common core: one anonymous mapping of `common.bin`, read once at load with the
+  page cache dropped behind it, and counted in full by the footprint projection (`CommonMemory`
+  in `crates/core/src/io/mod.rs`; it is the default, `--common-memory mapped` the opt-out).
 - The repacker copies quantized bytes unchanged. It never requantizes.
 - Library code returns typed errors (`thiserror`); binaries use `anyhow`. `ramvamp-core` does
   not panic on untrusted input: manifests, layouts, GGUF headers and bytes on disk. Bounds-check
-  every parsed count, length and offset, and size no allocation directly by a parsed value.
-- A change claiming identical math produces identical bits. `scripts/bitident.py` checks the
-  forward pass; the kernel numerics rule is in `crates/core/src/kernels/mod.rs`.
+  every parsed count, length and offset, and size no allocation directly by a parsed value:
+  no `unwrap`, `expect`, or unchecked indexing or arithmetic on anything read from a file.
+- A change claiming identical math produces identical bits: `ramvamp logits` output is
+  byte-identical before and after, for short prompts and one longer than a 512-token prefill
+  chunk (`scripts/bitident.py` checks both). A change that is not neutral says so in its PR. The
+  kernel numerics rule is in `crates/core/src/kernels/mod.rs`.
 - Vectorized kernels document and test the alignment they assume. Packed sub-tensor offsets
   may be only 2-byte aligned.
 - `generate` and `logits` keep their exact stdout and stderr shape: the validation and
@@ -69,7 +66,7 @@ cargo +1.88 build --all-targets -p ramvamp-core --no-default-features
 - Every performance change gets a row in [docs/experiments.md](docs/experiments.md): baseline,
   result, verdict, negative results included. Published numbers come from cold runs inside a
   `memory.max=4G` cgroup with `memory.swap.max=0` (zram counts as swap), by the method in
-  [docs/benchmarks.md](docs/benchmarks.md). Warm-cache runs are diagnostics.
+  [docs/benchmarks.md](docs/benchmarks.md#method). Warm-cache runs are diagnostics.
 
 ## Conventions
 

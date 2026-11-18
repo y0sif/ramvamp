@@ -11,12 +11,11 @@
 //! Design provenance: the streaming architecture follows the measured results
 //! published by TurboFieldfare (<https://github.com/drumih/turbo-fieldfare>),
 //! most importantly: explicit reads beat mmap demand paging (3.54x per cold
-//! expert read, ~8x end to end in their full-token simulator); a per-layer
-//! expert cache roughly halves expert I/O; copying one layer's routing
-//! choices predicted only ~7% of the next layer's experts, so there is no
-//! speculative prefetch; and I/O
-//! overlaps only with compute that is guaranteed to run (cache-hit experts,
-//! shared expert when the model has one).
+//! expert read, ~8x end to end in their full-token simulator); copying one
+//! layer's routing choices predicted only ~7% of the next layer's experts, so
+//! there is no speculative prefetch; and I/O overlaps only with compute that
+//! is guaranteed to run (cache-hit experts, shared expert when the model has
+//! one).
 //!
 //! Two things that follow from our own measurements rather than theirs. The
 //! eviction policy is LFU over frequency counters indexed by expert id whose

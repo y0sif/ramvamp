@@ -1,8 +1,7 @@
 # Contributing to ramvamp
 
 ramvamp streams MoE expert weights from NVMe so that Qwen3-30B-A3B runs on a
-CPU in about 4 GB of RAM. That memory ceiling is the project, and most of the
-rules below exist because a reasonable-looking change would quietly break it.
+CPU in about 4 GB of RAM.
 
 Read [docs/roadmap.md](docs/roadmap.md) for what is planned,
 [docs/architecture.md](docs/architecture.md) before touching the runtime, and
@@ -49,45 +48,15 @@ in it.
 
 ## Hard rules
 
-These are architectural invariants. A PR that breaks one is rejected on that
-ground, whatever it gains.
-
-- **Routed experts are read explicitly, with `pread` or io_uring. Never mmap
-  demand paging.** Demand paging is slower per cold read and takes queue depth
-  out of the runtime's hands ([docs/comparison.md](docs/comparison.md)). The
-  common weights are read once into memory at load (`--common-memory
-  resident`, the default).
-- **No full model, shard or tensor is materialized in heap memory**, in the
-  runtime or the repacker. The repacker streams the GGUF through a bounded
-  window. The one exception is the resident common weights, read once into a
-  single anonymous mapping and counted by the memory projection. No buffer is sized by
-  the model rather than by the budget.
-- **The repacker copies quantized bytes unchanged. It never requantizes.**
-  That is what makes the comparison against llama.cpp on identical weights
-  mean anything.
-- **No speculative cross-layer expert prefetch.** Cross-layer routing is too
-  unpredictable to pay for the read bandwidth decode needs
-  ([docs/comparison.md](docs/comparison.md)).
-- **Library code returns typed errors with `thiserror`; binaries use
-  `anyhow`.** `ramvamp-core` does not panic on untrusted input: manifests,
-  layouts, GGUF headers and bytes on disk. Bounds-check every parsed count,
-  length and offset, and size no allocation directly by a parsed value. In
-  library code that means no `unwrap`, no `expect`, and no unchecked indexing
-  or arithmetic on anything that came out of a file.
-- **Vectorized kernels document and test the alignment they assume.** Packed
-  sub-tensor offsets can be as little as 2-byte aligned.
-- **A change claiming identical math produces identical bits.** Show that
-  `ramvamp logits` prints byte-identical output before and after, for short
-  prompts and for one longer than a 512-token prefill chunk. A KL tolerance
-  sits above float-reordering noise and would miss a stale expert or a
-  reordered reduction. If a change is not neutral, say so in the PR.
+The architectural invariants are listed in [AGENTS.md](AGENTS.md#hard-rules).
+A PR that breaks one is rejected on that ground, whatever it gains.
 
 ## Performance changes
 
 A performance PR reports a baseline, a result and a verdict, measured by the
-method in [docs/benchmarks.md](docs/benchmarks.md), with both arms run back to
-back in one session. Warm-cache runs are diagnostics, and negative results
-count.
+[method in docs/benchmarks.md](docs/benchmarks.md#method), with both arms run
+back to back in one session. Warm-cache runs are diagnostics, and negative
+results count.
 
 ## Benchmark reports from other drives
 
@@ -140,8 +109,8 @@ The description says:
 - how it was tested, including which gate commands you ran and any measurement
 - what the limitations are, and what you did not test
 
-Commits use imperative mood with a `feat:` / `fix:` / `chore:` / `docs:` /
-`perf:` prefix. Branch off `main`, named `feat/...`.
+Commit messages and branch names follow the
+[conventions in AGENTS.md](AGENTS.md#conventions).
 
 ## Licensing
 

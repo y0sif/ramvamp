@@ -6,10 +6,9 @@
 //! destination buffers that io_uring + `O_DIRECT` reads land in and that the
 //! expert GEMVs then read from.
 //!
-//! Two hard requirements. Both follow from the kernel source cited below;
-//! the percentages attached to them come from bring-up runs on btrfs that
-//! are **not recorded in `docs/experiments.md`**, so treat every number here
-//! as provisional until they are.
+//! Two hard requirements. Both follow from the kernel source cited below,
+//! and EXP-007 recorded both on btrfs, from a probe on a busy machine, so no
+//! rate is quoted here.
 //!
 //! - The backing pages must be touched before any O_DIRECT read targets
 //!   them. btrfs runs direct reads with page faults disabled
@@ -18,8 +17,8 @@
 //!   no error, full byte count, and the page cache grows inside our cgroup.
 //! - A slot backing an in-flight read is never handed to a second reader.
 //!   Aliasing two concurrent O_DIRECT reads onto one buffer makes btrfs
-//!   fail checksum verification (provisional: 13-27% spurious EIO, and it
-//!   increments the filesystem's persistent `corruption_errs`). Index
+//!   fail checksum verification (spurious EIO, and it increments the
+//!   filesystem's persistent `corruption_errs`). Index
 //!   arithmetic is not sufficient, because completions arrive out of order.
 //!
 //! # Alignment contract

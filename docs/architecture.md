@@ -48,11 +48,11 @@ range reads.
 - **Experts:** gate and up are Q4_K (144 B per 256 weights); down is Q6_K
   (210 B per 256) on 24 of 48 layers (0-5, 8, 11, 14, 17, 20, 23, 26, 29, 32,
   35, 38, 41-47) and Q4_K on the rest.
-- **Common weights:** `attn_k` Q8_0, `attn_output` Q5_K, `attn_v` Q6_K on the
-  Q6_K-down layers and Q4_K elsewhere, `token_embd` Q4_K, lm_head Q6_K,
-  router and norms F32.
-- **Activations:** Q8_K per 256-block with per-32 `bsums`, mirroring ggml's
-  `vec_dot_q4_K_q8_K`, and Q8_0 for Q8_0 weights.
+- **Common weights:** `attn_q` Q4_K, `attn_k` Q8_0, `attn_output` Q5_K,
+  `attn_v` Q6_K on the Q6_K-down layers and Q4_K elsewhere, `token_embd`
+  Q4_K, lm_head Q6_K, router and norms F32.
+- **Activations:** Q8_K per 256-block with `bsums` over each 16-weight group,
+  mirroring ggml's `vec_dot_q4_K_q8_K`, and Q8_0 for Q8_0 weights.
 
 ## The .rvmp installed model
 
@@ -88,7 +88,7 @@ check.
 
 The memory contract is a 4 GiB cgroup cap with swap off: at the default 19
 expert slots per layer and a 4,096-token context the runtime projects
-4,007.3 MiB and measured a 4,008.4 MiB peak, 88 MiB under the cap (EXP-033).
+4,007.3 MiB (EXP-033). Measured peaks are in [benchmarks.md](benchmarks.md).
 
 | Tenant | Qwen3 v0 | Notes |
 | --- | ---: | --- |
@@ -96,13 +96,13 @@ expert slots per layer and a 4,096-token context the runtime projects
 | Expert slot pool | 2,484.84 MiB | 19 slots x 48 layers at the real strides, 130.78 MiB a slot across all layers; one allocation, every page faulted at construction |
 | KV cache FP16 | 384 MiB at 4K | 96 KiB a token; allocated at full capacity, faulted lazily |
 | Runtime anonymous memory | 115.1 MiB | activations, scratch, tokenizer, stacks, allocator arenas; sampled once (EXP-012), provisional, a floor rather than a ceiling |
-| Total | 4,007.3 MiB | measured 4,008.4 MiB at ctx 3,961 (EXP-033); 4,016 to 4,020 MiB on a 128-token reply at that context (EXP-034) |
+| Total | 4,007.3 MiB | what `ramvamp plan` projects; peaks measured at ctx 3,961 land within 13 MiB of it (EXP-033, EXP-034) |
 
 The expert cache is a byte budget, `--cache-bytes` (default 2,485 MiB),
 divided by the summed per-layer strides to give slots per layer;
-`--cache-bytes 1440M` gives 11 slots and fits a 3 GiB cap (2,962.9 MiB at
-ctx 3,961, EXP-031). Resident common weights cannot be evicted by
-machine-wide memory pressure from a swap-off cgroup (EXP-031). `ramvamp plan`
+`--cache-bytes 1440M` gives 11 slots and fits a 3 GiB cap (EXP-031). Resident
+common weights cannot be evicted by machine-wide memory pressure from a
+swap-off cgroup (EXP-031). `ramvamp plan`
 prints the projection without loading the model, and the runtime refuses a
 configuration that does not fit before it allocates, naming every term.
 Prefill adds no tenant: its 46.7 MiB ring and 77.9 MiB chunk scratch are
@@ -113,7 +113,7 @@ carved from the slot pool, which prefill leaves idle.
 Routed experts are read explicitly with io_uring and O_DIRECT into a fixed
 per-layer slot cache, and they are never demand-paged through mmap.
 TurboFieldfare measured mmap 3.54x slower per cold expert read and about 8x
-slower end to end ([comparison.md](comparison.md)).
+slower in its full streaming simulation ([comparison.md](comparison.md)).
 
 - **Reads.** Plain io_uring reads, interrupt-driven, no SQPOLL or IOPOLL
   (they burn a core the GEMVs need); ring setup steps down a flag ladder on
@@ -132,9 +132,9 @@ slower end to end ([comparison.md](comparison.md)).
   and runs buffered, outside the contract.
 - **Cache policy.** Per layer, LFU over per-expert counters indexed by expert
   id that survive eviction (ghost history); without it, per-slot LFU loses
-  to LRU, and a global pool across layers would add only 0.53 points (EXP-005). No online policy tried beats it by more
-  than about 0.4 points (EXP-030). The live hit rate at 19 slots is 67.1% at
-  ctx 512 and 68.3% at 3,961 (EXP-033), flat over longer replies (EXP-034).
+  to LRU, and a global pool across layers would add only 0.53 points
+  (EXP-005). No online policy tried beats it by more than about 0.4 points
+  (EXP-030).
 - **Slot ownership.** A slot owned by a read in flight or queued compute is
   never reassigned, because two in-flight O_DIRECT reads aliased onto one
   buffer make btrfs fail checksums with spurious `EIO` (EXP-007). `EIO` and
@@ -148,7 +148,7 @@ Decode runs each layer as attention and routing, then cache-hit experts
 overlapped with the miss reads, then the miss experts.
 
 1. Attention (QK-norm, RoPE, GQA over the FP16 KV cache) and the router, on
-   resident weights; attention fans out by kv head above 8 cached positions.
+   resident weights; attention fans out by kv head from 8 cached positions.
 2. Top-8 expert ids and renormalized weights.
 3. Cache plan: hits, misses, eviction victims.
 4. Submit every miss to io_uring as one batch, then compute every hit as one
@@ -211,7 +211,7 @@ reference machine, with the submitting thread working as one of them.
   because a query-head split measured worse (EXP-020).
 - **Kernels.** AVX2+FMA dots for Q4_K, Q5_K, Q6_K and Q8_0, 3.2 to 5.1x a row
   over scalar (EXP-001), and AVX2+F16C attention, each probed at runtime with
-  a scalar reference fallback.
+  a scalar fallback; candle's Rust AVX2 k-quant ports were a reference.
 - **Numerics.** Identical math must give identical bits: vector lanes only on
   already-independent axes, no split dot within a row, no FMA where the scalar
   reference rounds twice, and no rescaled softmax. Packed offsets may be only
@@ -221,20 +221,20 @@ reference machine, with the submitting thread working as one of them.
 
 Output is validated against llama.cpp b10217 on the same GGUF bytes through
 five gates, whose reference dumps are regenerated outside the repository.
+Measured results are in [benchmarks.md](benchmarks.md#fidelity).
 
 1. **Tensor.** Repacked expert slab bytes equal the GGUF slice bytes exactly.
 2. **Kernel.** Dots and activation quantizers against the scalar reference
    within documented tolerance, alignment unit-tested (EXP-001, EXP-002).
 3. **Logits.** Full-vocab KL(llama.cpp ‖ ramvamp) on 8 fixed prompts must
    have mean <= 3e-2, every prompt <= 6e-2, top-1 agreement on every prompt
-   and all 8 scored (`scripts/kl_vs_reference.py`). Measured: mean 1.04e-2,
-   worst 2.72e-2, top-1 8/8, noise floor 4.5e-3 to 1.3e-2 (EXP-004).
+   and all 8 scored (`scripts/kl_vs_reference.py`), against an AVX2-to-scalar
+   noise floor of 4.5e-3 to 1.3e-2 (EXP-004).
 4. **Greedy.** First generated tokens match on short prompts, reported, not
    gated: 3/3 prompts matched all 16 tokens (EXP-003).
 5. **Perplexity.** WikiText-2 raw test, 40 windows of 512 from an empty KV
    cache, positions 256 to 510 scored, by `llama-perplexity`'s protocol; the
-   final and every running value within 1%. 6.3598 against 6.3810, -0.33%,
-   token streams identical (EXP-035).
+   final and every running value within 1% (EXP-035).
 
 Three CLI subcommands serve the gates:
 
@@ -260,8 +260,8 @@ geometry (EXP-024).
   19 slots it is still the largest term, about 204 to 212 ms a token (EXP-034).
 - **No I/O-only ceiling.** `expert io` is a residual, a lower bound on drive
   time, so inverting it overstates what decode can reach.
-- **Sessions.** A byte-identical binary re-read 3.1% and 8.9% slower a day
-  later (EXP-025), so decode ratios are drawn only inside one session.
+- **Sessions.** Decode ratios are drawn only inside one session
+  ([benchmarks.md](benchmarks.md#method)).
 - **Prefill** is not I/O-bound: expert io was 2.5% of a cold 4K prefill and
   expert compute 42.1% (EXP-021). How much a faster drive moves decode is
   unmeasured.

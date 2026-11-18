@@ -28,7 +28,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # AGENTS.md lists these commands as the gate; change the two together.
+      # CONTRIBUTING.md#the-gate lists these commands; change the two together.
       - name: Check formatting
         run: cargo fmt --check
 

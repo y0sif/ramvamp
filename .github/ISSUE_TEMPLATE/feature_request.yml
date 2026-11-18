@@ -7,12 +7,13 @@ body:
     attributes:
       value: |
         Before you write this up, `docs/roadmap.md` is the plan of record: it
-        says what ships, what is next, and which decisions are still open. If your idea is one of the open decisions, saying so and
-        arguing a side is more useful than a fresh proposal.
+        says what ships, what is next, and which decisions are still open. If
+        your idea is one of the open decisions, saying so and arguing a side
+        is more useful than a fresh proposal.
 
-        `docs/comparison.md` records why several tempting designs were
-        rejected, usually with a measurement attached. A proposal that
-        already knows about that measurement is much easier to act on.
+        `docs/experiments.md` records the designs that were measured and
+        rejected (the Rejected verdicts). A proposal that already knows about
+        that measurement is much easier to act on.
 
   - type: dropdown
     id: component

@@ -19,7 +19,7 @@ the machine in ordinary use, every run hygiene-clean (EXP-033).
 | Prefill, ctx 3,961 | **18.23 tok/s** (one scored run) |
 | Expert cache hit rate | 67.1% at ctx 512, 68.3% at ctx 3,961 |
 | `memory.peak` | **3,690 to 3,697 MiB** at ctx 512, **4,008.4 MiB** at ctx 3,961, of 4,096 |
-| Model on disk | 17.35 GiB, about **4.4x** the 4,008 MiB peak |
+| Model on disk | 17.35 GiB (EXP-018), about **4.4x** the 4,008 MiB peak |
 
 Longer replies decode a little slower because attention grows with context,
 not because the cache is colder (EXP-034). At ctx 512 decode is 2.80, 2.79 and
@@ -51,9 +51,8 @@ v0 shipped at a 3 GB contract: `memory.max=3G`, swap off, 11 slots per layer,
 cold. Decode measured 1.46 to 2.19 tok/s over ctx 64 to 3,961 (EXP-023) and
 1.43 to 2.16 over the same rungs on a later build (EXP-025); prefill 11.25 tok/s
 at ctx 512 (EXP-023); `memory.peak` 2,497.0 to 2,929.3 MiB of 3,072 (EXP-025,
-EXP-023). The two decode ladders are two sessions, not one curve: the
-byte-identical EXP-023 binary re-read 1.85 against 1.91 tok/s at ctx 512 and
-1.33 against 1.46 at 3,961 a day later (EXP-025).
+EXP-023). The two decode ladders are two sessions, not one curve
+([Method](#method)).
 
 ## Method
 
@@ -61,44 +60,60 @@ A figure on this page is published only if its run meets every condition
 below; any other run is a diagnostic. The numbered rules behind them are in
 [experiments.md](experiments.md#measurement-rules).
 
-- **Cold.** Every model file is evicted before the run, and the harness proves
-  the eviction with `mincore` rather than assuming it.
+- **Cold.** Every model file is evicted with `posix_fadvise` before the run,
+  the harness proves the eviction with `mincore`, and non-zero block-layer
+  `read_bytes` is the positive control.
 - **In-cgroup.** The run is capped at the contract's `memory.max` (4G now, 3G
   before EXP-033) with `memory.swap.max=0`, because zram counts as swap and a
   run that swaps measures reclaim, not decode.
 - **Page cache counted.** `memory.peak` is the cgroup's highest memory usage,
   and cgroup v2 charges page cache as well as anonymous memory to it, so file
   pages the run reads are inside the figure, not hidden in free RAM.
-- **Hygiene PASS.** No more than 1 MiB of reclaimed pages read back, every
-  `memory.events` counter zero, swap peak zero, both processes exited 0.
+- **Hygiene PASS.** The inner wrapper resolved its own cgroup, `memory.max`
+  equals the request, no more than 1 MiB of pressure-reclaimed pages was read
+  back (huge-page compaction excepted), every `memory.events` counter and the
+  swap peak are zero, and both processes exited 0. An unreadable counter fails.
 - **A release build** (`cargo build --release`), run as the user that owns the
   install. Otherwise the startup probe cannot prove O_DIRECT and falls back to
   buffered reads, which changes both memory and throughput.
 
-Decode is I/O-bound, so throughput is stated per drive. Expert reads were
-44.4% of a cold decode token at ctx 512 and 33.2% at 3,961 at 11 slots
-(EXP-023), and that bucket is a lower bound on drive time. A decode figure also
-describes its session (EXP-025), so every ratio here is paired within one
-session. A faster drive should do better; by how much is unmeasured.
+Decode is I/O-bound ([architecture.md](architecture.md#performance-model)), so
+throughput is stated per drive; how much a faster drive gains is unmeasured. A
+decode figure also describes its session: the byte-identical EXP-023 binary
+re-read 1.85 against 1.91 tok/s at ctx 512 and 1.33 against 1.46 at 3,961 a
+day later (EXP-025), so every ratio here is paired within one session.
 
 ### Reproduce a run
 
 `scripts/cold_bench.py` sets up every condition above and verifies it. After
 `cargo build --release` and `ramvamp-repack install --output models/qwen3.rvmp`
-(the default pin, so the weights match), run:
+(the default pin, so the weights match), run decode, then prefill at a fixed
+context from a prompt file with one new token:
 
 ```bash
 scripts/cold_bench.py --rvmp models/qwen3.rvmp --max-new 64 --repeats 5 --json scratch/cold-decode.json
+scripts/cold_bench.py --rvmp models/qwen3.rvmp --prompt-file <prompt.txt> --max-new 1 --repeats 5 --json scratch/cold-prefill.json
 ```
 
-It needs Linux 6.5+, cgroup v2 and `systemd-run --user`. Exit 0 means every
-run was clean, 1 that one was dirty (report it anyway), 2 that nothing could be
-measured. Send the summary JSON, `ramvamp generate --greedy` output and the
-drive, filesystem, kernel, CPU and RAM through the benchmark report issue form.
+It needs Linux 6.5+, cgroup v2 and `systemd-run --user`, and it refuses to
+start while any `ramvamp` process is alive, because `posix_fadvise` cannot
+evict a file another process has mapped. A build running alongside invalidates
+the run. Exit 0 means every run was clean, 1 that one was dirty (report it
+anyway), 2 that nothing could be measured. A reply that loops or truncates is
+not a valid speed result, so check the text with a greedy run:
+
+```bash
+target/release/ramvamp generate --model models/qwen3.rvmp --prompt "The capital of France is" --max-new 64 --greedy
+```
+
+Send the summary JSON, that output and the drive, filesystem, kernel, CPU and
+RAM through the benchmark report issue form.
 
 ## Reference machine
 
-Every number on this page was measured on this one machine.
+Every throughput and memory figure on this page was measured on this machine;
+the llama.cpp reference outputs behind the fidelity rows were captured
+elsewhere (EXP-004).
 
 | | |
 | --- | --- |

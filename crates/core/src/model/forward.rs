@@ -1183,8 +1183,8 @@ impl ForwardState {
     /// memory system.
     ///
     /// `router` is pooled by expert like the other sites, so its `wait` is
-    /// measured too. Its two clock reads bracket the fan-out alone, not the
-    /// softmax and top-k scan that follow it.
+    /// measured too. Its opening and closing clock reads bracket the fan-out
+    /// alone, not the softmax and top-k scan that follow it.
     ///
     /// The four buckets are disjoint spans strictly inside the two coarse
     /// phases above, so their sum can never exceed
@@ -2662,9 +2662,10 @@ pub fn forward_token_traced<'s>(
         //
         // The matvec is split across the pool by expert: each logit is one
         // whole serial `dot_f32`, whichever thread computes it, so no bit
-        // moves. Its two clock reads bracket the fan-out alone, not the
-        // softmax and top-k scan the coarse `Router` region also covers, which
-        // is why the two instruments do not sum to each other here.
+        // moves. Its opening and closing clock reads bracket the fan-out
+        // alone, not the softmax and top-k scan the coarse `Router` region
+        // also covers, which is why the two instruments do not sum to each
+        // other here.
         let opened = gemv.open();
         {
             let router = lw.router.data();

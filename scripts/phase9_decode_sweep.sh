@@ -95,10 +95,10 @@
 # per matrix": decode's GEMV work is handed to the pinned compute pool once
 # per expert phase instead of once per matrix. WARM, at ctx 512 over 63
 # tokens, three runs, that moved the pooled GEMV buckets from 14.44 s to
-# 11.42 s — 1.264x. Warm is a diagnostic and AGENTS.md's rule is explicit
-# that published numbers come from cold runs inside a memory.max=3G cgroup,
-# so that ratio is not a result yet. This sweep is where it becomes one, or
-# does not.
+# 11.42 s, 1.264x. Warm is a diagnostic and the measurement rules are
+# explicit that published numbers come from cold runs inside the contract's
+# memory.max cgroup (3G at the time), so that ratio is not a result yet.
+# This sweep is where it becomes one, or does not.
 #
 # EXP-023 is the cold baseline it has to beat, and EXP-023's decode tok/s
 # ladder is (MEASURED, 11 slots, --warmup 1 --repeats 3 --max-new 64):
@@ -149,8 +149,8 @@
 # scripts/phase7_overnight.sh:145-170 pairs REF5 against RAMVAMP so both arms
 # see the same machine state. Same prompt file, same --max-new, same warmup
 # and repeats, nothing between them but their own settle and drain.
-# docs/benchmarks.md#reference-machine is explicit that per-file bandwidth variance
-# exceeds run-to-run variance, so an arm that touches a different file has
+# Per-file bandwidth can differ by more than run-to-run noise within one
+# session (EXP-023, EXP-024), so an arm that touches a different file has
 # moved its own baseline and is no longer a control.
 #
 # That binary is deliberately older than the tracked sources and must not
@@ -1112,9 +1112,9 @@ say ""
 # with the same prompt file, --max-new, warmup and repeats. Nothing separates
 # them but their own settle and drain: the slot checks for both are deferred
 # until after the pair, so that not even a JSON read sits between the two
-# measurements. Per docs/benchmarks.md#reference-machine, per-file bandwidth variance
-# exceeds run-to-run variance, so a control that reads different files is not
-# a control.
+# measurements. Per-file bandwidth can differ by more than run-to-run noise
+# within one session (EXP-023, EXP-024), so a control that reads different
+# files is not a control.
 #
 # --workdir is per step AND per sweep. cold_bench.py writes the child's
 # stderr — which is where the `decode split (forward_token)` block lives — to

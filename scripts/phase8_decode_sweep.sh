@@ -81,8 +81,8 @@
 # scripts/phase7_overnight.sh:145-170 pairs REF5 against RAMVAMP so both arms
 # see the same machine state. Same prompt file, same --max-new, same warmup
 # and repeats, nothing between them but their own settle and drain.
-# docs/benchmarks.md#reference-machine is explicit that per-file bandwidth variance
-# exceeds run-to-run variance, so an arm that touches a different file has
+# Per-file bandwidth can differ by more than run-to-run noise within one
+# session (EXP-023, EXP-024), so an arm that touches a different file has
 # moved its own baseline and is no longer a control.
 #
 # That binary is deliberately older than the tracked sources and must not
@@ -977,9 +977,9 @@ say ""
 # with the same prompt file, --max-new, warmup and repeats. Nothing separates
 # them but their own settle and drain: the slot checks for both are deferred
 # until after the pair, so that not even a JSON read sits between the two
-# measurements. Per docs/benchmarks.md#reference-machine, per-file bandwidth variance
-# exceeds run-to-run variance, so a control that reads different files is not
-# a control.
+# measurements. Per-file bandwidth can differ by more than run-to-run noise
+# within one session (EXP-023, EXP-024), so a control that reads different
+# files is not a control.
 #
 # --workdir is per step AND per sweep. cold_bench.py writes the child's
 # stderr — which is where the `decode split (forward_token)` block lives — to
@@ -1045,14 +1045,14 @@ done
 # WARNING on the 3,961-token arm at 1570M. Two arithmetics disagree about
 # whether 12 slots/layer fits under the 3,072 MiB cap, and they straddle it:
 #
-#   docs/architecture.md's static table  3,091.82 MiB   19.8 MiB OVER
+#   EXP-012's static projection          3,091.82 MiB   19.8 MiB OVER
 #   EXP-021's measured 2,920 MiB at 11
 #     slots, plus 130.8 for the twelfth  3,051    MiB   20.8 MiB UNDER
 #
-# 40 MiB apart on either side of the line, and architecture.md marks its own
-# subtotal column provisional (115.1 of its 1,522.44 MiB of fixed tenants is
-# an estimate). EXP-018 also carries an unexplained 99-105 MiB residual on
-# top of its accounted memory, which is larger than either margin. So this
+# 40 MiB apart on either side of the line, and EXP-012 marks its own
+# 115.1 MiB runtime-anonymous term provisional. EXP-018 also carries an
+# unexplained 99-105 MiB residual on top of its accounted memory, which is
+# larger than either margin. So this
 # arm is genuinely undecided, and running it is how it gets decided.
 #
 # If the cgroup OOM-kills it, that is the finding, not a harness failure:
@@ -1068,7 +1068,7 @@ say "step group 2 — the expert-cache slot dial"
 say "=============================================================="
 say ""
 say "The 3,961-token/1570M arm is undecided by ~20 MiB in both directions:"
-say "architecture.md's static table puts 12 slots/layer 19.8 MiB OVER the"
+say "EXP-012's static projection puts 12 slots/layer 19.8 MiB OVER the"
 say "3,072 MiB cap, EXP-021's measured 2,920 MiB at 11 slots plus 130.8 MiB"
 say "puts it 20.8 MiB UNDER, and EXP-018's unexplained 99-105 MiB residual"
 say "is bigger than either margin. If it is OOM-killed, that is the result."

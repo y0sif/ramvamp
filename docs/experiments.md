@@ -15,7 +15,9 @@ Qwen3-30B-A3B: 48 layers, 128 experts per layer, top-8 routing.
 Verdicts: **Shipped** (the change, or the conclusion it drove, is in the
 runtime), **Rejected** (measured and not adopted), **Superseded** (a later
 entry replaced its number or its premise), **Withdrawn** (its own claim was
-retracted for want of evidence), **Recorded** (measured, nothing changed).
+retracted for want of evidence), **Recorded** (measured, nothing changed),
+**Closed, not now** (measured and set aside until a roadmap reopen condition
+holds), **PASS** (a validation gate met its criterion).
 
 ## Measurement rules
 
@@ -23,28 +25,12 @@ No row below is interpretable without these.
 
 1. A microbenchmark may start an experiment. End-to-end speed and output
    quality decide what ships.
-2. **Publication.** Only cold, in-cgroup, hygiene-PASS numbers are publishable.
-   Everything else is a diagnostic and is labelled one in its row. Correctness
-   measurements are exempt.
-   - *Cold*: every model file evicted with `posix_fadvise(POSIX_FADV_DONTNEED)`,
-     the eviction proven with `mincore`, and non-zero block-layer `read_bytes`
-     as a positive control.
-   - *In-cgroup*: `systemd-run --user` at the contract's `MemoryMax` (`4G` since
-     EXP-033, `3G` for every entry before it) and `MemorySwapMax=0`, with
-     counters read from inside the cgroup before exit; zram counts as swap.
-   - *Hygiene PASS*: the inner wrapper resolved its own cgroup, the pressure
-     reclaimers stole zero pages, every `memory.events` counter is zero,
-     `memory.max` equals the requested limit, swap peak is zero, `read_bytes`
-     is non-zero, and both processes exited 0. An unreadable counter fails.
-   - *khugepaged amendment*: huge-page compaction is subtracted from the
-     reclaim total and reported as a soft note, so an unknown reclaimer still
-     counts as pressure.
-   - *Refault amendment* (EXP-031): pressure reclaim fails a run only when more
-     than 1 MiB of what it took had to be read back
-     (`workingset_refault_file` + `workingset_refault_anon`); less is a soft
-     note, because the machine's own memory pressure reclaims from every
-     cgroup. A run recorded before the refault counters existed keeps the
-     zero-reclaim test.
+2. **Publication.** Only runs that meet every condition in
+   [benchmarks.md](benchmarks.md#method) (cold, in-cgroup, hygiene PASS) are
+   publishable. Everything else is a diagnostic and is labelled one in its
+   row. Correctness measurements are exempt. Before the refault amendment
+   (EXP-031), hygiene failed a run on any pressure reclaim, the zero-reclaim
+   test, which a run recorded before the refault counters existed keeps.
 3. **Comparison.** Every entry records its own baseline. Figures from different
    entries, sessions or machine states are never drawn on one curve. A ratio is
    quotable only when both arms ran back to back, on the same prompt at the
@@ -91,14 +77,14 @@ No row below is interpretable without these.
 | EXP-030 | Whether any online expert-cache policy beats the shipped ghost LFU | Instrument correctness, exempt: `scripts/lfu_sim.py --pin-step` reproduces the live decode hit rate to within 0.01 points (55.74% simulated against 55.735% live at 11 slots). On it: S3-FIFO -0.9 points, LRU-2 -1.2, ARC -2.2, LRU -3.1; the best decaying variants +0.36 to +0.40 out of sample; Belady 62.30%, a 6.6-point gap. One more slot is worth 2.2 to 2.4 points. | Rejected: about 0.4 points is below what a cold decode can resolve. The simulator modes and one committed trace ship |
 | EXP-031 | Staying inside the 3 GB cap while the machine is short of memory | Cold, in-cgroup, mirrored arm order, the machine left as it was. Memory-mapped common weights lost pages to machine-wide reclaim under either cap (once 801 MiB, with decode falling to 1.43 tok/s). `--common-memory resident` reads `common.bin` into anonymous memory: 0 refaults in all 6 runs, same speed, +0.75 s load, +70 MiB peak. At ctx 3,961 resident peaks at 2,962.9 MiB, 109 MiB under 3G and within 2 MiB of `ramvamp plan`; outputs identical. | Shipped: resident is the default, model commands run in their own swap-off cgroup, and rule 2 gains the refault amendment |
 | EXP-032 | The four-row tile for Q6_K, and the first clean cold runs with the machine in use | Kernel: Q6_K `down` 1.46x at 4 rows to 1.51x at 32, bit-identical. Cold, in-cgroup (3G), hygiene PASS on all 12 runs, zero refaults, A B B A at ctx 512, `--max-new 64`: the tile is 1.027x on prefill medians, decode unchanged. The build before the tile gives the first publishable figures after EXP-025: prefill 23.93 to 24.21 tok/s (median 24.10), decode 2.18 to 2.24 (median 2.21), `memory.peak` 2,638 to 2,657 MiB. | Shipped |
-| EXP-033 | What a 4 GB contract buys decode: the slot dial at 11, 15 and 19 | Cold, in-cgroup at `MemoryMax=4G`, hygiene PASS, zero refaults, outputs identical, order 11 15 19 19 15 11, ctx 512, `--max-new 128`, four scored runs per arm. Decode medians 2.215 / 2.52 / 2.795 tok/s at 11 / 15 / 19 slots (2.78 to 2.81 at 19), 1.262x at 19, ranges disjoint; hit rate 53.5% / 61.7% / 67.1%; prefill unchanged (24.48 to 25.27 at 19); `memory.peak` 2,645 / 3,167 / 3,690 to 3,697 MiB. At ctx 3,961, `--max-new 64`, one scored run per arm: decode 1.75 at 11 slots and 1.96 at 19 (1.12x), prefill 18.23 at 19, hit rate 68.3%, `memory.peak` 2,960.8 MiB at 11 and 4,008.4 MiB at 19, 88 MiB under 4 GiB and within 2 MiB of `ramvamp plan`. | Shipped: the contract is 4 GB with 19 slots; `--cache-bytes 1440M` keeps the 3 GB setup |
-| EXP-034 | Steady-state decode: whether the cache warms over a longer reply, at the 4 GB default | Cold, in-cgroup at 4G, hygiene PASS, zero refaults, 19 slots, ctx 512, four scored runs per window. Decode 2.80 / 2.79 / 2.61 tok/s over 128 / 256 / 512 new tokens; the live hit rate is flat at 67.1% / 67.7% / 67.1% because the cache fills within a few tokens. The 512-token window is 0.93x the 128-token one, carried by attention and expert io (about 204 to 212 ms a token) as context grows. At ctx 3,961 with 128 new tokens: decode 2.04 to 2.06 tok/s, hit rate 69.6%, `memory.peak` 4,016 to 4,020 MiB, 12 MiB over `ramvamp plan` and 76 MiB under the cap. | Recorded: the short windows were not measuring a colder cache; no code change |
+| EXP-033 | What a 4 GB contract buys decode: the slot dial at 11, 15 and 19 | Cold, in-cgroup at `MemoryMax=4G`, hygiene PASS, zero refaults, outputs identical, order 11 15 19 19 15 11, ctx 512, `--max-new 128`, four scored runs per arm. Decode medians 2.215 / 2.52 / 2.795 tok/s at 11 / 15 / 19 slots (2.78 to 2.81 at 19), 1.262x at 19, ranges disjoint; hit rate 53.5% / 61.7% / 67.1%; prefill unchanged (24.48 to 25.27 at 19); `memory.peak` 2,645 to 2,658 / 3,166 to 3,167 / 3,690 to 3,697 MiB. At ctx 3,961, `--max-new 64`, one scored run per arm: decode 1.75 at 11 slots and 1.96 at 19 (1.12x), prefill 18.23 at 19, hit rate 68.3%, `memory.peak` 2,960.8 MiB at 11 and 4,008.4 MiB at 19, 88 MiB under 4 GiB and within 2 MiB of `ramvamp plan`. | Shipped: the contract is 4 GB with 19 slots; `--cache-bytes 1440M` keeps the 3 GB setup |
+| EXP-034 | Steady-state decode: whether the cache warms over a longer reply, at the 4 GB default | Cold, in-cgroup at 4G, hygiene PASS, zero refaults, 19 slots, ctx 512, four scored runs per window. Decode 2.80 / 2.79 / 2.61 tok/s over 128 / 256 / 512 new tokens; the live hit rate is flat at 67.1% / 67.7% / 67.1% because the cache fills within a few tokens. The 512-token window is 0.93x the 128-token one because attention grows with context, from about 23 to 33 ms a token; expert io moves from about 204 to 212 ms. At ctx 3,961 with 128 new tokens: decode 2.04 to 2.06 tok/s, hit rate 69.6%, `memory.peak` 4,016 to 4,020 MiB, 12 MiB over `ramvamp plan` and 76 MiB under the cap. | Recorded: the short windows were not measuring a colder cache; no code change |
 | EXP-035 | Gate 5: WikiText-2 perplexity against `llama-perplexity` b10217 on the same GGUF | Correctness, exempt. The protocol read from b10217's source: the file less one trailing newline, tokenized once, no BOS, 40 windows of 512 from an empty KV cache, positions 256 to 510 scored. Token streams identical to `llama-tokenize`. Criterion set before the run: the final and every running PPL within 1%. PPL 6.3598 +/- 0.16504 against 6.3810 +/- 0.16588, -0.33%; worst running gap -0.69% at window 3. | PASS: every v0 gate closed. `ramvamp perplexity` and `scripts/perplexity_gate.py` ship |
 | EXP-036 | Gemma 4 26B-A4B: auditing the chosen checkpoint's header | Audit, no run. Google's QAT Q4_0 GGUF, header read from the file; the parser reproduces Qwen3's 1,097,072,640 B per token exactly. 30 layers, 128 experts at top-8, every expert Q4_0 at 3,345,408 B, so 802,897,920 B per token worst case (0.73x Qwen3's); weights outside the experts 1.469 GiB against 0.999. | Recorded: Q4_0 would be the one new kernel; Gemma 4 is set aside ([roadmap](roadmap.md), v1 item 1) |
 
 ## Corrections and supersessions
 
-The project caught these itself; each row above carries the corrected figure.
+Each row above carries the corrected figure.
 
 - EXP-003's truncated KL was never comparable to a full-vocab target; EXP-004 replaced it.
 - Gate 3's original mean-KL bar of 1e-3 is unachievable against a 4.5e-3 to 1.3e-2 noise floor; it became 3e-2 plus three per-prompt conditions (EXP-004).
@@ -114,4 +100,3 @@ The project caught these itself; each row above carries the corrected figure.
 - The estimated 1.5 to 2x on the QK dot measured 1.00 to 1.07x on the whole kernel (EXP-022).
 - EXP-024's in-file window result moved from 1.104x to 1.161x once its timer and case order were fixed.
 - The per-file bandwidth spread (2.21x in EXP-023) is withdrawn as a property of the drive (EXP-024).
-- Decode is published as two ladders, never one curve: a byte-identical binary re-read 0.969x and 0.911x a day later (EXP-025).

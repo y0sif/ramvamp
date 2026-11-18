@@ -15,8 +15,7 @@ body:
         drive either supports it or refutes it, and both outcomes are worth
         more than another round of tuning on the same hardware.
 
-        Slow results are as valuable as fast ones. A drive where ramvamp
-        performs badly is information, not a complaint, so please send it.
+        Slow results are as useful as fast ones, so please send them too.
 
         [docs/benchmarks.md](https://github.com/y0sif/ramvamp/blob/main/docs/benchmarks.md#reproduce-a-run)
         has the full procedure. The short version: run
@@ -150,10 +149,11 @@ body:
       label: Results
       description: |
         Load time, prefill tokens per second, decode tokens per second, and
-        the cgroup's `memory.peak`, at whichever context lengths you ran. Please report every
-        repeat rather than only the best one: on a DRAM-less part the same
-        binary has read almost 9% apart on consecutive days, so a single run
-        describes its session more than its device.
+        the cgroup's `memory.peak`, at whichever context lengths you ran.
+        Please report every repeat rather than only the best one: on a
+        DRAM-less part the same binary has read almost 9% apart on
+        consecutive days, so a single run describes its session more than its
+        device.
       render: shell
     validations:
       required: true

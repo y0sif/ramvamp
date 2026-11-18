@@ -22,7 +22,8 @@ itself is in the [README](../README.md#install).
 ## What the installer checks
 
 The [installer](../install.sh) refuses a machine it cannot support and warns
-about one that will run slowly. Re-running it upgrades in place.
+about one that will run slowly. Re-running it upgrades in place and reports the
+version it replaced.
 
 | check | on failure |
 | --- | --- |
@@ -34,10 +35,11 @@ about one that will run slowly. Re-running it upgrades in place.
 | an NVMe device exists | warns: the drive sets the speed |
 | binary runs and its version matches the tag | warns |
 | install directory is on `PATH` | warns, and says how to fix it |
+| no other `ramvamp` is already on `PATH` | warns: whichever comes first on `PATH` runs |
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `RAMVAMP_VERSION` | latest release | pin a tag, for example `v0.1.1` |
+| `RAMVAMP_VERSION` | latest release | pin a tag, for example `curl ... \| RAMVAMP_VERSION=v0.1.1 bash` |
 | `RAMVAMP_INSTALL_DIR` | `/usr/local/bin`, or `~/.local/bin` with neither root nor `sudo` | where the two binaries go |
 
 ## Install the model
