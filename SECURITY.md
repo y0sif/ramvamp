@@ -2,8 +2,8 @@
 
 ## Reporting
 
-Use GitHub's [private vulnerability reporting](https://github.com/y0sif/ramvamp/security/advisories/new)
-rather than a public issue. Expect a first reply within a week.
+Open a [GitHub issue](https://github.com/y0sif/ramvamp/issues/new/choose); there is no private
+channel. Expect a first reply within a week.
 
 ## What is worth reporting
 
