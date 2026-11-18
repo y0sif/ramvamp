@@ -5,177 +5,140 @@
 </p>
 
 <p align="center">
-  <strong>Run 26-30B MoE models in about 4 GB of RAM. No GPU required.</strong><br>A Rust runtime that streams experts from NVMe instead of holding them hostage in memory.
+  <strong>Run 26-30B MoE models in about 4 GB of RAM. No GPU required.</strong><br>A Rust runtime that streams experts from NVMe.
 </p>
 
-> **Status: v0, and it runs.** Qwen3-30B-A3B generates coherent text on CPU inside a 4 GB cgroup
-> with a cold page cache, on a machine in ordinary use, validated against llama.cpp on identical
-> weights. The shipping surface
-> is `ramvamp serve`: the OpenAI Chat Completions API on loopback, with streaming SSE, tool
-> calls, and named configuration profiles.
-
 ramvamp is a CPU-first local LLM inference runtime, written in Rust, for fine-grained
-Mixture-of-Experts models. It runs a 30B-parameter quantized model on an ordinary Linux x86_64
-machine with an NVMe SSD, no GPU and no 32 GB of RAM, by never loading the full checkpoint into
-memory. The always-needed common weights (about 1 GiB) are read into memory once; the routed experts, which are most
-of the model, live on disk in a page-aligned packed format and are fetched with io_uring and
-O_DIRECT only when the router asks for them, through a small per-layer LFU cache.
-Qwen3-30B-A3B is the only model. A second one has to be faster or better than it on this
-runtime: Gemma 4 26B-A4B was costed against that bar and set aside (`docs/roadmap.md`, v1 item
-1), and the repacker accepts `qwen3moe` architecture GGUFs and refuses anything else by name.
+Mixture-of-Experts models. It loads about 1 GiB of common weights into memory once and fetches each
+routed expert from NVMe with io_uring and O_DIRECT only when the router picks it. Its output is
+validated against llama.cpp on identical weights, and `ramvamp serve` speaks the OpenAI Chat
+Completions API on loopback.
+
+It runs one model, Qwen3-30B-A3B (Q4_K_M, 17.35 GiB on disk), on Linux x86_64 with an NVMe SSD and
+the CPU alone. The repacker refuses other architectures by name.
+
+The trade is speed for memory. Decode runs at about 2.8 tokens per second, because each token can
+read up to about 1.1 GB of expert weights from the SSD. On a machine with the RAM to hold all
+17.35 GiB, a runtime that keeps the whole model in memory, such as llama.cpp, skips those reads.
 
 ## At a glance
 
-Qwen3-30B-A3B Q4_K_M, cold, inside `memory.max=4G` with `memory.swap.max=0`, the default 19
-expert slots per layer, on the reference machine (Intel Core Ultra 9 185H, CPU only, **Micron
-2400 DRAM-less QLC** NVMe), with the machine in ordinary use and every run hygiene-clean (EXP-033):
+Speed and memory are measured cold, with the page cache dropped first, inside a 4 GiB `memory.max`
+cgroup with `memory.swap.max=0`, so neither free RAM nor swap can hold the model. Qwen3-30B-A3B
+Q4_K_M at the default settings, on a DRAM-less QLC NVMe drive:
 
 | | measured |
 | --- | --- |
-| Decode | **2.78 to 2.81 tok/s** at ctx 512 (`--max-new 128`), **1.96 tok/s** at ctx 3,961, on this DRAM-less QLC drive |
-| Prefill | **about 25 tok/s** at ctx 512 (24.48 to 25.27), 18.2 at ctx 3,961 |
-| Peak RAM | **3,690 to 3,697 MiB** at ctx 512 and **4,008 MiB** at ctx 3,961, of a 4,096 MiB ceiling |
-| Model on disk | 17.35 GiB, a **~6x** memory saving |
-| Fidelity | mean full-vocab KL **1.04e-2** vs llama.cpp, top-1 agreement 8/8 (EXP-004) |
+| Speed | decode **2.78 to 2.81 tok/s** and prefill **about 25 tok/s** at ctx 512; decode 1.96 tok/s at ctx 3,961 |
+| Peak memory | **3,690 to 4,008 MiB** of cgroup `memory.peak`, page cache included: about 4.4x below the model's 17.35 GiB |
+| Fidelity | mean full-vocab KL **1.04e-2** against llama.cpp, top-1 agreement 8/8, perplexity 6.36 against its 6.38 |
 
-**Throughput is stated per drive on purpose**: decode is I/O-bound and this part sustains about
-1.6 GB/s at decode's own read geometry, so no figure appears without its drive. With
-`--cache-bytes 1440M` (11 slots) it fits the earlier 3 GB contract, at 2.2 tok/s decode at ctx 512.
-Full table, conditions, the v0 figures and drive detail: [docs/benchmarks.md](docs/benchmarks.md).
+`--cache-bytes 1440M` fits a 3 GiB cap at about 2.2 tok/s decode. Full tables and the method:
+[docs/benchmarks.md](docs/benchmarks.md).
 
 ## Install
+
+The installer supports Linux x86_64 only. It puts `ramvamp` and `ramvamp-repack` in
+`/usr/local/bin`, or in `~/.local/bin` without root or sudo.
 
 ```bash
 curl -sSL https://y0sif.github.io/ramvamp/install.sh | bash
 ```
 
-Puts `ramvamp` and `ramvamp-repack` in `/usr/local/bin`. Pin a tag with
-`RAMVAMP_VERSION=v0.1.0`, move the destination with `RAMVAMP_INSTALL_DIR`, re-run the same
-line to upgrade. **Linux x86_64 only**, and on anything else it refuses and installs nothing:
-io_uring is a Linux interface, the fast kernels are AVX2 plus F16C, and a binary elsewhere
-would run on fallback paths that no number here describes.
-
-Then install the model. That is a **17.35 GiB download**, so the installer prints this and
-stops rather than starting it for you, and the path wants to be on an NVMe SSD:
+Re-run it to upgrade, and set `RAMVAMP_VERSION=v0.1.1` to pin a release. It stops before the
+model, a 17.35 GiB download that belongs on an NVMe SSD:
 
 ```bash
-# Download and repack the pinned Qwen3-30B-A3B in one streaming pass.
 ramvamp-repack install --output ~/models/qwen3-30b-a3b.rvmp
-
-# Generate. Text streams to stdout; timing and expert stats go to stderr.
-ramvamp generate --model ~/models/qwen3-30b-a3b.rvmp \
-    --prompt "Explain io_uring in two sentences."
 ```
 
 <details>
-<summary><b>Other install methods (prebuilt tarball by hand, from source)</b></summary>
+<summary>Prebuilt tarball, by hand</summary>
 
-**Prebuilt tarball.** What the one-liner does for you. Every tagged release publishes
-`ramvamp-linux-x86_64.tar.gz` on [Releases](https://github.com/y0sif/ramvamp/releases/latest),
-holding both binaries plus the README and both licences.
+Each [release](https://github.com/y0sif/ramvamp/releases/latest) has `ramvamp-linux-x86_64.tar.gz`,
+holding both binaries, this README and both licences:
 
 ```bash
-curl -sSL -o ramvamp.tar.gz \
-  https://github.com/y0sif/ramvamp/releases/latest/download/ramvamp-linux-x86_64.tar.gz
-tar xzf ramvamp.tar.gz
+curl -sSLO https://github.com/y0sif/ramvamp/releases/latest/download/ramvamp-linux-x86_64.tar.gz
+tar xzf ramvamp-linux-x86_64.tar.gz
 sudo install -m755 ramvamp ramvamp-repack /usr/local/bin/
-```
-
-**From source.** Needs Rust 1.88 or newer, which a prebuilt binary does not. Nothing else:
-the tree has no C dependencies.
-
-```bash
-git clone https://github.com/y0sif/ramvamp
-cd ramvamp
-cargo build --release
 ```
 
 </details>
 
-Requirements, the three I/O modes and the repacker's other subcommands:
-[docs/install.md](docs/install.md).
+<details>
+<summary>Build from source</summary>
+
+Building needs Rust 1.88 or newer and a C and C++ compiler. The steps are in
+[docs/install.md](docs/install.md#from-source).
+
+</details>
 
 ## Chat in the terminal
 
-The quickest way to try it, with nothing to wire up:
+`ramvamp chat` is a multi-turn chat: Ctrl-D or `/exit` leaves, and Ctrl-C stops the reply.
 
 ```bash
-ramvamp chat --model ~/models/qwen3-30b-a3b.rvmp
-
-# Same thing with a live status panel: prefill progress, tokens per second,
-# context used, and the expert cache hit rate, updated while it generates.
 ramvamp chat --model ~/models/qwen3-30b-a3b.rvmp --tui
 ```
 
-`--tui` exists because a long prompt is minutes of prefill before the first character
-appears, and silence is indistinguishable from a hang. It needs a terminal on stdout.
-Plain `chat` is the reference behaviour and stays that way.
+`--tui` adds a panel with prefill progress, the token rate, context use and the expert cache hit
+rate, and needs a terminal on stdout. Without it, `chat` is plain text and works redirected.
 
 ## Serve and configure
+
+`ramvamp serve` is an OpenAI-compatible HTTP server on 127.0.0.1, with no `--host` flag. It serves
+`/v1/chat/completions` (streaming and buffered), `/v1/models` and `/health`, one request at a time,
+reuses the KV cache across requests that share a prefix, and answers a request field it cannot
+honour with a `400`. Endpoints and refusals: [docs/server.md](docs/server.md).
 
 ```bash
 ramvamp serve --model ~/models/qwen3-30b-a3b.rvmp --port 8080
 ```
 
-That is `/v1/chat/completions` (streaming SSE and buffered), `/v1/models` and `/health`, on
-`127.0.0.1` with no `--host` flag, on purpose. It serves one request at a time, reuses the KV cache
-across requests by longest common prefix, and refuses fields it cannot honour exactly as typed
-`400`s rather than accepting them quietly. Routes, refusals and positioning: [docs/server.md](docs/server.md).
-
-`--context` (default **4096**) is the dial that trades conversation length against resident
-bytes, and `plan` prices any value of it without loading the model; a 32K profile projects about
-6,695 MiB and needs a bigger budget than 4 GB, which is what named profiles exist to express.
-Profiles, `--profile` / `--config` / `--no-config`, the four-layer precedence chain and the three
-environment variables: [docs/configuration.md](docs/configuration.md).
+`--context` (default 4096) sets the context length, and `ramvamp plan` prints the memory a setting
+needs without loading the model. Profiles, flags, environment variables and their precedence:
+[docs/configuration.md](docs/configuration.md).
 
 ## How it works
 
-1. **Install repacks, it does not convert.** The GGUF is streamed into the `.rvmp` layout: a
-   `common.bin` for what every token needs, one file per layer holding 128 fixed-stride,
-   page-aligned expert blobs. Nothing is requantized and no shard is materialized in heap memory.
-2. **Common weights are read in once.** Embeddings, attention, routers, norms and the lm_head
-   are about 1,023 MiB, touched every token, so they are read into anonymous memory at load,
-   where a swap-off cgroup cannot reclaim them (EXP-031). `--common-memory mapped` maps them
-   instead.
-3. **Experts are read explicitly, never demand-paged.** Per layer the router picks 8 of 128.
-   Hits in that layer's LFU cache dispatch to the compute pool immediately; the misses go to
-   io_uring as one batch of O_DIRECT reads, so they bypass the page cache and cost the memory
-   budget nothing, and the hit compute hides their latency.
-4. **The cache is small on purpose.** At the default 2,485 MiB budget that is **19 slots per layer
-   out of 128 experts**. Worst case is **1,097 MB of expert weights per decode token**, and the
-   cache absorbs 67.1% of requests at ctx 512 and 68.3% at ctx 3,961 (EXP-033).
+Each token needs about 1 GiB of common weights plus 8 of the 128 experts in each of 48 layers.
 
-Explicit reads rather than mmap demand paging is a measured choice, and so is having no speculative
-cross-layer expert prefetch; [docs/landscape.md](docs/landscape.md) carries both measurements.
-[docs/architecture.md](docs/architecture.md) is the design and [docs/roadmap.md](docs/roadmap.md) the plan of record.
+1. **Install repacks, it does not convert.** The GGUF becomes a `common.bin` and one file per layer
+   of 128 page-aligned expert blobs, with quantized bytes copied unchanged.
+2. **Common weights are read in once.** Embeddings, attention, routers, norms and the lm_head go
+   into anonymous memory at load. `--common-memory mapped` maps them instead.
+3. **Experts are read explicitly, never demand-paged.** Cache hits compute at once while the misses
+   go to io_uring as one batch of O_DIRECT reads per layer, which bypass the page cache.
+4. **The cache is small.** The default 2,485 MiB budget holds 19 of each layer's 128 experts and
+   serves 67 to 68% of expert requests.
 
-## Workspace
+Design: [docs/architecture.md](docs/architecture.md). Why not mmap or cross-layer prefetch:
+[docs/comparison.md](docs/comparison.md).
 
-| Crate | Purpose |
-| --- | --- |
-| `ramvamp-core` | Runtime library: packed format, expert streaming, LFU cache, CPU kernels, KV cache, generation |
-| `ramvamp-repack` | Streaming installer: ranged Hugging Face downloads repacked directly into the `.rvmp` layout |
-| `ramvamp-server` | OpenAI-compatible HTTP layer: request validation, SSE framing, tool-call extraction, KV prefix reuse |
-| `ramvamp` | CLI: `serve`, `chat`, `generate`, `plan` |
+## Documentation
 
-## Development
+The `docs/` directory holds one page per topic.
 
-```bash
-cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
-```
+- [docs/install.md](docs/install.md): requirements, install paths, building from source, uninstalling
+- [docs/configuration.md](docs/configuration.md): every flag, environment variable and profile key
+- [docs/server.md](docs/server.md): HTTP endpoints, honoured request fields and refusals
+- [docs/benchmarks.md](docs/benchmarks.md): every published number, its conditions, the reference machine
+- [docs/architecture.md](docs/architecture.md): packed format, streaming, cache, kernels and validation
+- [docs/comparison.md](docs/comparison.md): ramvamp against llama.cpp and TurboFieldfare
+- [docs/experiments.md](docs/experiments.md): one line per experiment
+- [docs/roadmap.md](docs/roadmap.md): the plan
 
-All four must pass before a push. [CONTRIBUTING.md](CONTRIBUTING.md) covers the rest, including
-the measurement rules a performance change has to follow; security issues go through
-[SECURITY.md](SECURITY.md).
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers building, testing and submitting a change, including what
+a performance change must measure. Report security issues through [SECURITY.md](SECURITY.md).
 
 ## Prior art
 
-Inspired by [TurboFieldfare](https://github.com/drumih/turbo-fieldfare), a Swift + Metal runtime
-that proved the physics on Apple Silicon: Gemma 4 26B-A4B in about 2 GB at 5.1 to 6.3 tok/s on an
-8 GB M2 Air. ramvamp exists because that proof is locked to Macs with M-series chips.
+ramvamp is inspired by [TurboFieldfare](https://github.com/drumih/turbo-fieldfare), a Swift and
+Metal runtime that streams MoE experts from SSD on Apple Silicon.
+[docs/comparison.md](docs/comparison.md) compares the two.
 
 ## License
 

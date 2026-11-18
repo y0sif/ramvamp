@@ -11,7 +11,7 @@
 #   ./install.sh
 #
 # Environment:
-#   RAMVAMP_VERSION=v0.1.0   Pin to a specific tag (default: latest release)
+#   RAMVAMP_VERSION=v0.1.1   Pin to a specific tag (default: latest release)
 #   RAMVAMP_INSTALL_DIR=DIR  Where the two binaries go. Default /usr/local/bin,
 #                            falling back to ~/.local/bin when there is neither
 #                            root nor sudo.
@@ -37,7 +37,7 @@ TOTAL=5
 REPO="y0sif/ramvamp"
 ARTIFACT="ramvamp-linux-x86_64.tar.gz"
 
-echo -e "\n${BOLD}ramvamp installer${RESET}: 26-30B MoE models in about 4 GB of RAM\n"
+echo -e "\n${BOLD}ramvamp installer${RESET}: Run 26-30B MoE models in about 4 GB of RAM. No GPU required.\n"
 
 # ── Refuse anything that is not Linux x86_64 ────────────────────────────
 #
@@ -139,7 +139,7 @@ else
 
     if [ -z "$TAG" ] || [ "$TAG" = "latest" ]; then
         error "Could not resolve the latest release tag."
-        echo "  Set RAMVAMP_VERSION=v0.1.0 (or similar) and re-run."
+        echo "  Set RAMVAMP_VERSION=v0.1.1 (or similar) and re-run."
         exit 1
     fi
     info "Latest:" "$TAG"
