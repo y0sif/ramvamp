@@ -1,97 +1,113 @@
 # Benchmarks
 
-Covers every published throughput, memory and fidelity number, the conditions
-each one was measured under, and why they are stated per drive.
+This page holds every published throughput, memory and fidelity number for
+ramvamp, the conditions each was measured under, and the machine it ran on.
+Each figure cites the row in [experiments.md](experiments.md) that produced it.
 
 ## The current runtime, at the 4 GB contract
 
-Intel Core Ultra 9 185H (CPU only, 16 GB RAM, **Micron 2400 DRAM-less QLC**
-NVMe) running Qwen3-30B-A3B Q4_K_M with a cold page cache inside
-`memory.max=4G` and `memory.swap.max=0`, at the default 19 expert slots per
-layer, with the machine in ordinary use (other programs running, swap full) and
-every run hygiene-clean (EXP-033, 2026-10-11):
+On the reference machine, Qwen3-30B-A3B Q4_K_M decodes at 2.78 to 2.81 tok/s
+cold inside a 4 GiB memory cap with swap off. Conditions: cold page cache,
+`memory.max=4G`, `memory.swap.max=0`, the default 19 expert slots per layer,
+the machine in ordinary use, every run hygiene-clean (EXP-033).
 
 | | measured |
 | --- | --- |
-| Decode, ctx 512, `--max-new 128` | **2.78 to 2.81 tok/s** (median 2.795 of four) |
+| Decode, ctx 512, `--max-new 128` | **2.78 to 2.81 tok/s** (median 2.795 of four scored runs) |
 | Decode, ctx 3,961, `--max-new 64` | **1.96 tok/s** (one scored run) |
-| Prefill | **24.48 to 25.27 tok/s** at ctx 512, 18.23 at ctx 3,961 |
+| Prefill, ctx 512 | **24.48 to 25.27 tok/s** |
+| Prefill, ctx 3,961 | **18.23 tok/s** (one scored run) |
 | Expert cache hit rate | 67.1% at ctx 512, 68.3% at ctx 3,961 |
-| Peak RAM | **3,690 to 3,697 MiB** at ctx 512 and **4,008.4 MiB** at ctx 3,961, of a 4,096 MiB ceiling |
+| `memory.peak` | **3,690 to 3,697 MiB** at ctx 512, **4,008.4 MiB** at ctx 3,961, of 4,096 |
+| Model on disk | 17.35 GiB, about **4.4x** the 4,008 MiB peak |
 
-The same runtime at the earlier 3 GB contract (`--cache-bytes 1440M`, 11
-slots), same conditions but `memory.max=3G` (EXP-032): decode **2.18 to 2.24
-tok/s** and prefill **23.93 to 24.21 tok/s** at ctx 512, peak 2,638 to 2,657
-MiB; 2,960.8 MiB at ctx 3,961 (EXP-033). The two contracts' decode figures
-were paired in one session in EXP-033: 19 slots is 1.26x 11 at ctx 512 and
-1.12x at ctx 3,961.
+Longer replies decode a little slower because attention grows with context,
+not because the cache is colder (EXP-034). At ctx 512 decode is 2.80, 2.79 and
+2.61 tok/s over 128, 256 and 512 new tokens, with the hit rate flat at 67.1%
+to 67.7%. At ctx 3,961 with 128 new tokens decode is 2.04 to 2.06 tok/s and
+`memory.peak` reaches **4,016 to 4,020 MiB**, the highest clean peak recorded.
+
+`--cache-bytes 1440M` selects 11 slots per layer, the earlier 3 GB
+configuration. Paired with 19 slots in one session (EXP-033), 11 slots decodes
+2.215 tok/s at ctx 512 (19 slots is 1.26x faster) and 1.75 at ctx 3,961 (1.12x),
+and peaks at 2,960.8 MiB at ctx 3,961, measured inside the 4G cgroup. Inside a
+3G cap it peaks at 2,962.9 MiB at ctx 3,961 (EXP-031); on the build before the
+Q6_K tile, at ctx 512 and `--max-new 64`, it measured prefill 23.93 to 24.21
+tok/s, decode 2.18 to 2.24 and a 2,638 to 2,657 MiB peak (EXP-032).
+
+## Fidelity
+
+ramvamp's output matches llama.cpp b10217 run on the same GGUF bytes.
+Correctness figures are exempt from the cold and cgroup conditions.
+
+| | measured |
+| --- | --- |
+| Full-vocab KL against llama.cpp, 8 prompts | mean **1.04e-2**, worst prompt 2.72e-2, top-1 agreement 8/8 (EXP-004) |
+| WikiText-2 perplexity, 40 windows of 512 | **6.3598** +/- 0.16504 against llama.cpp's 6.3810 +/- 0.16588, -0.33%, token streams identical (EXP-035) |
 
 ## v0, as first published
 
-Intel Core Ultra 9 185H (CPU only, 16 GB RAM, **Micron 2400 DRAM-less QLC**
-NVMe) running Qwen3-30B-A3B Q4_K_M with a cold page cache inside
-`memory.max=3G` and `memory.swap.max=0`, 11 slots per layer:
+v0 shipped at a 3 GB contract: `memory.max=3G`, swap off, 11 slots per layer,
+cold. Decode measured 1.46 to 2.19 tok/s over ctx 64 to 3,961 (EXP-023) and
+1.43 to 2.16 over the same rungs on a later build (EXP-025); prefill 11.25 tok/s
+at ctx 512 (EXP-023); `memory.peak` 2,497.0 to 2,929.3 MiB of 3,072 (EXP-025,
+EXP-023). The two decode ladders are two sessions, not one curve: the
+byte-identical EXP-023 binary re-read 1.85 against 1.91 tok/s at ctx 512 and
+1.33 against 1.46 at 3,961 a day later (EXP-025).
 
-| | measured |
+## Method
+
+A figure on this page is published only if its run meets every condition
+below; any other run is a diagnostic. The numbered rules behind them are in
+[experiments.md](experiments.md#measurement-rules).
+
+- **Cold.** Every model file is evicted before the run, and the harness proves
+  the eviction with `mincore` rather than assuming it.
+- **In-cgroup.** The run is capped at the contract's `memory.max` (4G now, 3G
+  before EXP-033) with `memory.swap.max=0`, because zram counts as swap and a
+  run that swaps measures reclaim, not decode.
+- **Page cache counted.** `memory.peak` is the cgroup's highest memory usage,
+  and cgroup v2 charges page cache as well as anonymous memory to it, so file
+  pages the run reads are inside the figure, not hidden in free RAM.
+- **Hygiene PASS.** No more than 1 MiB of reclaimed pages read back, every
+  `memory.events` counter zero, swap peak zero, both processes exited 0.
+- **A release build** (`cargo build --release`), run as the user that owns the
+  install. Otherwise the startup probe cannot prove O_DIRECT and falls back to
+  buffered reads, which changes both memory and throughput.
+
+Decode is I/O-bound, so throughput is stated per drive. Expert reads were
+44.4% of a cold decode token at ctx 512 and 33.2% at 3,961 at 11 slots
+(EXP-023), and that bucket is a lower bound on drive time. A decode figure also
+describes its session (EXP-025), so every ratio here is paired within one
+session. A faster drive should do better; by how much is unmeasured.
+
+### Reproduce a run
+
+`scripts/cold_bench.py` sets up every condition above and verifies it. After
+`cargo build --release` and `ramvamp-repack install --output models/qwen3.rvmp`
+(the default pin, so the weights match), run:
+
+```bash
+scripts/cold_bench.py --rvmp models/qwen3.rvmp --max-new 64 --repeats 5 --json scratch/cold-decode.json
+```
+
+It needs Linux 6.5+, cgroup v2 and `systemd-run --user`. Exit 0 means every
+run was clean, 1 that one was dirty (report it anyway), 2 that nothing could be
+measured. Send the summary JSON, `ramvamp generate --greedy` output and the
+drive, filesystem, kernel, CPU and RAM through the benchmark report issue form.
+
+## Reference machine
+
+Every number on this page was measured on this one machine.
+
+| | |
 | --- | --- |
-| Decode | **about 2 tok/s**: 1.46 to 2.19 over ctx 64-3,961 (EXP-023), and 1.43 to 2.16 over the same rungs on a later branch (EXP-025) |
-| Prefill | **11.25 tok/s** at ctx 512 (EXP-023) |
-| Peak RAM | **2,497 to 2,929 MiB** of a 3,072 MiB ceiling: 2,497.0 at ctx 64 (EXP-025) and 2,929.3 at ctx 3,961 (EXP-023) |
-| Model on disk | 17.35 GiB, a **~6x** memory saving |
-| Fidelity | mean full-vocab KL **1.04e-2** vs llama.cpp, top-1 agreement 8/8 (EXP-004) |
-
-## The conditions that make those figures valid
-
-Every number above comes from a run that satisfies all of these. A run that
-skips one is a diagnostic, not a published figure.
-
-- **Cold.** The page cache is evicted before the run, and the harness proves
-  the eviction rather than assuming it.
-- **In-cgroup at the contract's `memory.max` (4G now, 3G for v0) with `memory.swap.max=0`.** Swap is off
-  because zram counts as swap, and a run that swaps is measuring reclaim
-  rather than decode.
-- **A release build** (`cargo build --release`). The debug profile is
-  `opt-level = 1` and is not comparable.
-- **Run as the user that owns the install.** The kernel will not report
-  page-cache residency for a file this process neither owns nor may write, so
-  on an install unpacked by root and run by you the startup probe cannot prove
-  O_DIRECT is real and degrades to buffered reads, which changes both the
-  memory figure and the throughput figure.
-
-The full protocol, including the hygiene counters that have to be reported
-next to any number, is in [../CONTRIBUTING.md](../CONTRIBUTING.md).
-
-## Two ladders, not one curve
-
-Those two decode ladders come from different binaries in different sessions,
-and are deliberately not drawn as one curve. The drift is measured rather than
-assumed: the later session also re-ran EXP-023's *byte-identical* binary at two
-rungs and read **1.85 tok/s against 1.91** at ctx 512, and **1.33 against
-1.46** at 3,961. That is 3.1% and 8.9% slower a day later, on the same machine,
-with no code change. On a DRAM-less QLC part a decode figure describes its
-session as well as its device, which is why no single number appears here
-without one.
-
-## Throughput is stated per drive on purpose
-
-Decode is I/O-bound: expert reads are 44.4% of a decode token at ctx 512 and
-33.2% at 3,961, and because that bucket is measured as a residual it is a lower
-bound rather than the drive's busy time.
-
-This reference part is DRAM-less QLC and sustains about **1.6 GB/s** at
-decode's own read geometry: 1.60 to 1.67 GB/s re-measured over the four probe
-files, and 1.565 to 1.694 GB/s with a median of 1.633 across all 48 expert
-files.
-
-A mainstream TLC Gen4 drive should do materially better; by how much is
-unmeasured, and this project does not publish numbers it has not measured. One
-report from a second drive turns a published band into a curve.
-
-## Where the record lives
-
-- [experiments.md](experiments.md) is the experiment record: every EXP id cited
-  above, what it tested, its key evidence and its verdict.
-- [benchmark-machine.md](benchmark-machine.md) is the state of the machine
-  every published number is measured on.
-- [roadmap.md](roadmap.md) is the plan of record and carries the same headline
-  figures alongside what is still open.
+| CPU | Intel Core Ultra 9 185H: 6 P-cores (SMT), 8 E-cores, 2 LP E-cores, 22 threads |
+| ISA | AVX2, F16C, FMA, AVX-VNNI; no AVX-512 |
+| RAM | 16 GB (14.98 GiB `MemTotal`) |
+| Swap | zram, 7.5 GiB; off inside every benchmark cgroup |
+| Storage | Micron 2400 `MTFDKBA1T0QFM-1BD1AABGB`, DRAM-less QLC, PCIe Gen4 x4 |
+| Drive bandwidth | about 1.6 GB/s at decode's read geometry: 1.565 to 1.694 GB/s, median 1.633, over all 48 expert files (EXP-024); 1.54 to 2.37 GB/s across the probe matrix (EXP-019) |
+| Filesystem | btrfs, `compress=zstd:3,ssd,discard=async`, data profile `single` |
+| OS | Arch Linux, cgroup v2 |
+| `RLIMIT_MEMLOCK` | 8 MiB soft and hard (systemd default) |
