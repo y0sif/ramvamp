@@ -83,10 +83,9 @@ In scope:
 - benchmark reports, as above
 - the v1 items in [docs/roadmap.md](docs/roadmap.md)
 
-**Open an issue before starting anything large.** The roadmap has an order,
-and some of its items are open decisions rather than tasks; it marks which. A
-large PR against an item that has not been ordered yet is work that cannot be
-merged.
+**Open an issue before starting anything large.** The roadmap lists open
+decisions separately from planned work. A large PR against an open decision
+cannot be merged until the decision is made.
 
 Out of scope:
 

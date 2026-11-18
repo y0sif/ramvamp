@@ -17,8 +17,8 @@ Completions API on loopback.
 It runs one model, Qwen3-30B-A3B (Q4_K_M, 17.35 GiB on disk), on Linux x86_64 with an NVMe SSD and
 the CPU alone. The repacker refuses other architectures by name.
 
-The trade is speed for memory. Decode runs at about 2.8 tokens per second, because each token can
-read up to about 1.1 GB of expert weights from the SSD. On a machine with the RAM to hold all
+The trade is speed for memory. Decode runs at about 2.8 tokens per second at a 512-token context on a
+DRAM-less QLC SSD, because each token can read up to about 1.1 GB of expert weights from the SSD. On a machine with the RAM to hold all
 17.35 GiB, a runtime that keeps the whole model in memory, such as llama.cpp, skips those reads.
 
 ## At a glance
@@ -90,8 +90,8 @@ rate, and needs a terminal on stdout. Without it, `chat` is plain text and works
 
 `ramvamp serve` is an OpenAI-compatible HTTP server on 127.0.0.1, with no `--host` flag. It serves
 `/v1/chat/completions` (streaming and buffered), `/v1/models` and `/health`, one request at a time,
-and reuses the KV cache across requests that share a prefix. It answers a `400` to a value it cannot
-honour and ignores fields it does not implement: [docs/server.md](docs/server.md).
+and reuses the KV cache across requests that share a prefix. It refuses `n` above 1, a non-empty `stop`
+and a forced `tool_choice` with a `400`, and ignores other fields: [docs/server.md](docs/server.md).
 
 ```bash
 ramvamp serve --model ~/models/qwen3-30b-a3b.rvmp --port 8080

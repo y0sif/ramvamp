@@ -138,8 +138,8 @@ pub const SLOT_ALIGN: usize = 4096;
 /// It is *not* the constraint that decides the top of EXP-005's sweep, and
 /// this cap being generous enough for 24 slots/layer does not mean the
 /// project can build one. 24 slots/layer is 3,291,217,920 B, over the
-/// 3,221,225,472 B of the `memory.max=3G` cgroup of that sweep (the contract
-/// before EXP-033), so `check_resident_budget` refuses it there, before the
+/// 3,221,225,472 B of the 3 GiB `memory.max` cap (the contract before
+/// EXP-033), so `check_resident_budget` refuses it there, before the
 /// common core and the KV cache have taken their share. Under that cgroup the
 /// last expressible sweep point is **23 slots/layer**, at 3,154,083,840 B.
 ///

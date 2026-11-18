@@ -73,9 +73,10 @@ below; any other run is a diagnostic. The numbered rules behind them are in
   equals the request, no more than 1 MiB of pressure-reclaimed pages was read
   back (huge-page compaction excepted), every `memory.events` counter and the
   swap peak are zero, and both processes exited 0. An unreadable counter fails.
-- **A release build** (`cargo build --release`), run as the user that owns the
-  install. Otherwise the startup probe cannot prove O_DIRECT and falls back to
-  buffered reads, which changes both memory and throughput.
+- **A release build** (`cargo build --release`).
+- **Run as the user that owns the install.** Otherwise the startup probe
+  cannot prove O_DIRECT and falls back to buffered reads, which changes both
+  memory and throughput.
 
 Decode is I/O-bound ([architecture.md](architecture.md#performance-model)), so
 throughput is stated per drive; how much a faster drive gains is unmeasured. A
@@ -100,11 +101,8 @@ start while any `ramvamp` process is alive, because `posix_fadvise` cannot
 evict a file another process has mapped. A build running alongside invalidates
 the run. Exit 0 means every run was clean, 1 that one was dirty (report it
 anyway), 2 that nothing could be measured. A reply that loops or truncates is
-not a valid speed result, so check the text with a greedy run:
-
-```bash
-target/release/ramvamp generate --model models/qwen3.rvmp --prompt "The capital of France is" --max-new 64 --greedy
-```
+not a valid speed result: the harness runs greedy and prints the start of each
+reply in its run log, so read it.
 
 Send the summary JSON, that output and the drive, filesystem, kernel, CPU and
 RAM through the benchmark report issue form.

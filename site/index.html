@@ -506,7 +506,7 @@
         </div>
         <div class="feature">
           <h3>An OpenAI-compatible server</h3>
-          <p><code>ramvamp serve</code> speaks <code>/v1/chat/completions</code> on loopback with streaming SSE, tool calls, and KV prefix reuse across requests. It answers a 400 to a value it cannot honour and ignores fields it does not implement (<a href="https://github.com/y0sif/ramvamp/blob/main/docs/server.md#refusals">the list</a>).</p>
+          <p><code>ramvamp serve</code> speaks <code>/v1/chat/completions</code> on loopback with streaming SSE, tool calls, and KV prefix reuse across requests. It refuses <code>n</code> above 1, a non-empty <code>stop</code> and a forced <code>tool_choice</code> with a 400, and ignores other fields (<a href="https://github.com/y0sif/ramvamp/blob/main/docs/server.md#refusals">the list</a>).</p>
         </div>
         <div class="feature">
           <h3>A context dial you can price</h3>
