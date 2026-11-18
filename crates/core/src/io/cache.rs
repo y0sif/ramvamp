@@ -1,8 +1,7 @@
 //! Per-layer expert slot cache.
 //!
-//! Owned by wave-1 lane B. Policy is LFU with recency as tie-breaker and
-//! **frequency counters indexed by expert id, not by slot**, so a count
-//! survives its expert's eviction. That detail is the policy: simulated over
+//! Policy is LFU with recency as tie-breaker and **frequency counters indexed
+//! by expert id, not by slot**, so a count survives its expert's eviction. That detail is the policy: simulated over
 //! real recorded routing traces (EXP-005 replays traces the runtime captured,
 //! but the hit rates are the simulator's, not the runtime's), ghost-history
 //! LFU beats per-slot LFU by +2.2 points and LRU by +2.2 at 10 slots/layer,
@@ -318,8 +317,8 @@ impl CachePlan {
 /// The cold/eviction split is the number that says whether the slot budget
 /// is wrong: cold misses are unavoidable at any cache size, eviction misses
 /// are what more slots would buy. At 10 slots/layer, 87.9% of misses were
-/// eviction misses (EXP-005), and `docs/architecture.md` argues from that
-/// share, so the split has to be honest in both directions. It is only
+/// eviction misses (EXP-005), and the case for buying more slots rests on
+/// that share, so the split has to be honest in both directions. It is only
 /// meaningful if the caller reports completions through
 /// [`LayerCache::mark_ready`]: an expert becomes "fetched" when a read for it
 /// lands, never merely because one was planned. A caller that never marks
@@ -1194,7 +1193,7 @@ mod tests {
     /// A read that failed and was invalidated must not leave its expert
     /// marked as fetched: the retry is a *cold* miss, because the layer never
     /// held those bytes. Counting it as an eviction miss inflates the share
-    /// `docs/architecture.md` uses to argue for buying more slots.
+    /// the case for buying more slots rests on (EXP-005).
     #[test]
     fn a_failed_fill_leaves_the_retry_a_cold_miss() {
         let mut cache = new_cache(1, 8);

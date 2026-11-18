@@ -95,7 +95,7 @@
 # per matrix": decode's GEMV work is handed to the pinned compute pool once
 # per expert phase instead of once per matrix. WARM, at ctx 512 over 63
 # tokens, three runs, that moved the pooled GEMV buckets from 14.44 s to
-# 11.42 s — 1.264x. Warm is a diagnostic and CLAUDE.md's rule is explicit
+# 11.42 s — 1.264x. Warm is a diagnostic and AGENTS.md's rule is explicit
 # that published numbers come from cold runs inside a memory.max=3G cgroup,
 # so that ratio is not a result yet. This sweep is where it becomes one, or
 # does not.
@@ -149,7 +149,7 @@
 # scripts/phase7_overnight.sh:145-170 pairs REF5 against RAMVAMP so both arms
 # see the same machine state. Same prompt file, same --max-new, same warmup
 # and repeats, nothing between them but their own settle and drain.
-# docs/benchmark-machine.md is explicit that per-file bandwidth variance
+# docs/benchmarks.md#reference-machine is explicit that per-file bandwidth variance
 # exceeds run-to-run variance, so an arm that touches a different file has
 # moved its own baseline and is no longer a control.
 #
@@ -1112,7 +1112,7 @@ say ""
 # with the same prompt file, --max-new, warmup and repeats. Nothing separates
 # them but their own settle and drain: the slot checks for both are deferred
 # until after the pair, so that not even a JSON read sits between the two
-# measurements. Per docs/benchmark-machine.md, per-file bandwidth variance
+# measurements. Per docs/benchmarks.md#reference-machine, per-file bandwidth variance
 # exceeds run-to-run variance, so a control that reads different files is not
 # a control.
 #
@@ -1509,7 +1509,7 @@ say ""
 say 'Any "NO SUMMARY" row means that step produced no measurement at all.'
 say "Nothing was substituted for it. Re-run that arm."
 say ""
-say "The paired table is what CLAUDE.md's rule needs to be discharged: the"
+say "The paired table is what AGENTS.md's rule needs to be discharged: the"
 say "fused decode fan-out (70cf304) is a performance change and owes"
 say "docs/experiments.md a baseline, a result and a verdict. The baseline is"
 say "$REF8_EXPECT_SHA"

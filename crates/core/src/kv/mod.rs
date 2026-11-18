@@ -2,11 +2,10 @@
 //!
 //! FP16 K/V storage sized by the model's attention pattern: linear append-only
 //! storage for full-attention layers; bounded ring buffers for sliding-window
-//! layers (needed for Gemma 4's 25 SWA layers, where rings keep the cache
-//! flat as context grows). Under a ~3 GB budget the KV cache is the
-//! third-largest resident tenant after the expert slot pool and the common
-//! weights, so its bounds are part of the memory contract, not an
-//! implementation detail.
+//! layers, where rings keep the cache flat as context grows. Under the
+//! budget of about 4 GB the KV cache is the third-largest resident tenant
+//! after the expert slot pool and the common weights, so its bounds are part
+//! of the memory contract, not an implementation detail.
 //!
 //! v0 implements the linear variant only: [`KvCache`], one pair of
 //! preallocated K and V planes per layer, each `[capacity, n_kv_heads *

@@ -5,11 +5,13 @@
 //!
 //! - The manifest is parsed and validated, `experts/layout.json` and
 //!   `common.bin` are verified against it (sizes always, hashes unless
-//!   [`LoadOptions::skip_hashes`]), and `common.bin` is mapped read-only.
+//!   [`LoadOptions::skip_hashes`]), and `common.bin` is opened read-only
+//!   through [`MappedCommon`], resident by default
+//!   ([`CommonMemory`](crate::io::CommonMemory)).
 //! - Every tensor in the shape table (see [`super::shapes`]) must exist
 //!   with the required dtype and exact byte size; any miss is a typed
 //!   error naming the tensor.
-//! - Big quantized matrices stay in the mmap and are handed out as
+//! - Big quantized matrices stay in that map and are handed out as
 //!   [`QuantTensor`] byte views. Small f32 tensors (norms) are decoded to
 //!   owned `Vec<f32>` at load — copied via `chunks_exact(4)` +
 //!   `from_le_bytes`, never by casting the map. Routers are decoded the

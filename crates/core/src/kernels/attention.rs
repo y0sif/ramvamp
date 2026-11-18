@@ -89,8 +89,8 @@
 //! operands, same order, same roundings
 //! (`restructured_kernel_is_bit_identical_to_head_major_reference`).
 //!
-//! Vectorization: phase 7's wave 2 added an AVX2 + F16C path for both phases
-//! ([`x86`]), dispatched at runtime and **bit-identical** to the scalar
+//! Vectorization: an AVX2 + F16C path for both phases ([`x86`]) is
+//! dispatched at runtime and **bit-identical** to the scalar
 //! reference below, which is what the whole gate rests on. `vcvtph2ps`
 //! widens eight f16 at a time and is exact; the QK dot puts the eight vector
 //! lanes on the **GQA group**, an axis whose accumulators are already

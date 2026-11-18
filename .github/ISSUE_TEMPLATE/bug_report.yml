@@ -46,8 +46,8 @@ body:
       label: Load banner
       description: |
         Paste the whole line ramvamp prints on stderr after loading. It looks
-        like `model loaded in 12.34s (512 prompt tokens); 6 compute shards, 8
-        expert slots/layer from a 1.2 GiB budget, io_uring+O_DIRECT reads`.
+        like `model loaded in 12.34s (512 prompt tokens); 6 compute shards, 19
+        expert slots/layer from a 2.4 GiB budget, io_uring+O_DIRECT reads`.
         The last field is the achieved I/O mode, one of `io_uring+O_DIRECT`,
         `io_uring+buffered` or `pread`, and it is the single most useful line
         in a bug report. It reports what the runtime got, not what it asked
@@ -131,7 +131,7 @@ body:
     attributes:
       label: Memory limit, if any
       description: The value of `memory.max` for the run. Leave blank if the run was unconfined.
-      placeholder: "3G"
+      placeholder: "4G"
 
   - type: input
     id: model

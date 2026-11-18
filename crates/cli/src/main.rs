@@ -108,7 +108,7 @@ const MAX_THREADS: u64 = 256;
 #[command(
     name = "ramvamp",
     version,
-    about = "Run 26-30B fine-grained MoE models in ~3 GB of RAM by streaming experts from NVMe"
+    about = "Run 26-30B MoE models in about 4 GB of RAM. No GPU required."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -141,14 +141,15 @@ struct RuntimeArgs {
     )]
     cache_bytes: Option<u64>,
 
-    /// Compute threads, counting the decode thread itself. Defaults to the
-    /// runtime's own CPU topology detection: one thread per physical
-    /// performance core. Where they run is `--placement`.
-    ///
-    /// Range-checked here rather than clamped later: `ComputePool` clamps to
-    /// `1..=MAX_SHARDS`, so `--threads 0` used to run a correct one-shard
-    /// decode without a word about having ignored the number, and a fat-
-    /// fingered `--threads 99999` used to try to spawn `MAX_SHARDS` of them.
+    /// Compute threads, counting the decode thread itself. Unset: one per
+    /// physical performance core on a hybrid CPU and one per CPU the process
+    /// may use on any other, or the profile's `threads`. Where they run is
+    /// `--placement`.
+    //
+    // Range-checked here rather than clamped later: `ComputePool` clamps to
+    // `1..=MAX_SHARDS`, so without the check `--threads 0` would run a
+    // one-shard decode without a word about ignoring the number, and
+    // `--threads 99999` would try to spawn `MAX_SHARDS` of them.
     #[arg(
         long,
         value_name = "N",
@@ -315,18 +316,17 @@ struct PrefillArgs {
     /// Prefill path. `sweep` is the chunked layer-major pass: one sweep over
     /// each layer's expert file per chunk of positions, bypassing the expert
     /// cache. `token-major` runs one forward pass per prompt token through
-    /// that cache instead — the phase-5 behaviour, kept so the two can be
-    /// A/B'd from the command line. Unset: the runtime default (`sweep`, or
-    /// `RAMVAMP_PREFILL` when it is set).
+    /// that cache instead and produces the same logits. Unset: `sweep`, or
+    /// `RAMVAMP_PREFILL`, or the profile's `prefill`.
     #[arg(long, value_name = "MODE", value_parser = parse_prefill_mode)]
     prefill: Option<PrefillMode>,
 
     /// Prompt positions the sweep carries through the model together. Wider
-    /// is strictly better for I/O — total prefill expert bytes are
-    /// `ceil(prompt / chunk)` passes over the expert set — and costs staging
-    /// that grows linearly, so the runtime clamps a chunk its slot slab
-    /// cannot host. Ignored by `--prefill token-major`. Unset: the runtime
-    /// default (or `RAMVAMP_PREFILL_CHUNK` when it is set).
+    /// reads fewer expert bytes, one pass over the expert set per chunk, and
+    /// needs staging memory that grows with it; a chunk too wide for the
+    /// expert cache to host is narrowed. Ignored by `--prefill token-major`.
+    /// Unset: 512, or `RAMVAMP_PREFILL_CHUNK`, or the profile's
+    /// `prefill_chunk`.
     #[arg(
         long,
         value_name = "N",
@@ -461,7 +461,7 @@ enum Command {
 
     /// Perplexity over a text file by `llama-perplexity`'s protocol: the
     /// file tokenized once, cut into windows, each window's second half
-    /// scored from an empty KV cache (validation gate 5).
+    /// scored from an empty KV cache.
     Perplexity(PerplexityArgs),
 
     /// Resolve the runtime dials and print them with their projected memory
@@ -515,7 +515,7 @@ struct GenerateArgs {
     #[arg(long, default_value_t = 128)]
     max_new: usize,
 
-    /// Deterministic argmax decoding (the validation mode).
+    /// Deterministic argmax decoding.
     #[arg(long)]
     greedy: bool,
 
@@ -536,8 +536,8 @@ struct GenerateArgs {
     seed: Option<u64>,
 
     /// Dump the per-layer routed expert ids for every prefill and
-    /// decode position to a binary trace file (see the TraceWriter
-    /// docs; read by scripts/lfu_sim.py).
+    /// decode position to a binary trace file, for offline expert-cache
+    /// analysis.
     #[arg(long, value_name = "FILE")]
     trace_experts: Option<PathBuf>,
 
@@ -580,7 +580,7 @@ struct ChatArgs {
     #[arg(long, default_value_t = 128)]
     max_new: usize,
 
-    /// Deterministic argmax decoding (the validation mode).
+    /// Deterministic argmax decoding.
     #[arg(long)]
     greedy: bool,
 
@@ -605,8 +605,8 @@ struct ChatArgs {
     /// Draw the terminal harness: the transcript scrolls natively and a
     /// pinned panel shows the prefill bar, the live rate, context use and the
     /// expert-cache hit rate. Needs a terminal on stdout and refuses without
-    /// one. Off by default, so a redirected or scripted `chat` behaves exactly
-    /// as it always has.
+    /// one. Off by default, so a redirected or scripted `chat` prints plain
+    /// text.
     #[arg(long)]
     tui: bool,
 
@@ -635,15 +635,16 @@ struct ServeArgs {
     #[arg(long, value_name = "DIR")]
     model: PathBuf,
 
-    /// TCP port on 127.0.0.1. 0 picks a free one and logs it.
+    /// TCP port on 127.0.0.1. With 0 the OS picks a free port, which is
+    /// shown only with `RUST_LOG=info`.
     #[arg(long, default_value_t = 8080)]
     port: u16,
 
-    /// The id to advertise on /v1/models and echo in every response.
-    /// Defaults to the install directory's name, which is what a model
-    /// picker should show. The `model` field of a request is not validated
-    /// against it: this process serves one install, so refusing a name could
-    /// only refuse a request it is able to answer.
+    /// The id to advertise on /v1/models. Defaults to the install
+    /// directory's name, which is what a model picker should show. A
+    /// request's `model` field is not validated against it, and each response
+    /// echoes the `model` its request sent: this process serves one install,
+    /// so refusing a name could only refuse a request it is able to answer.
     #[arg(long, value_name = "NAME")]
     served_model_name: Option<String>,
 
@@ -653,9 +654,9 @@ struct ServeArgs {
     #[arg(long, default_value_t = 512)]
     max_new: usize,
 
-    /// Deterministic argmax decoding for every request (the validation
-    /// mode). A request that sends its own `temperature` still overrides it,
-    /// since `temperature <= 0` is greedy either way.
+    /// Deterministic argmax decoding for every request. A request that sends
+    /// its own `temperature` still overrides it; `temperature <= 0` is greedy
+    /// either way.
     #[arg(long)]
     greedy: bool,
 
@@ -679,9 +680,9 @@ struct ServeArgs {
     seed: Option<u64>,
 
     /// Seconds a stream may go silent before a keep-alive comment is sent.
-    /// Every client we care about gives up after 300s of no bytes and a 4K
-    /// prompt takes about six minutes to prefill, so this is what keeps a
-    /// long prompt alive. Values above 300 disable the protection.
+    /// Common clients give up after 300 s with no bytes, and a long prompt
+    /// can take minutes to prefill, so this keeps the stream alive. Values
+    /// above 300 disable the protection.
     #[arg(long, value_name = "SECONDS", default_value_t = 10)]
     keepalive_secs: u64,
 
@@ -736,8 +737,7 @@ struct PerplexityArgs {
     #[arg(long, value_name = "DIR")]
     model: PathBuf,
 
-    /// Text to score, read as UTF-8 and tokenized whole, once. Gate 5 uses
-    /// WikiText-2's raw test split, `wiki.test.raw`.
+    /// Text to score, read as UTF-8 and tokenized whole, once.
     #[arg(long, value_name = "FILE")]
     file: PathBuf,
 
@@ -751,8 +751,7 @@ struct PerplexityArgs {
     #[arg(long, value_name = "N")]
     chunks: Option<usize>,
 
-    /// Write each window's scores and the token ids scored, as JSON. This
-    /// is what `scripts/perplexity_gate.py` reads.
+    /// Write each window's scores and the token ids scored, as JSON.
     #[arg(long, value_name = "FILE")]
     json: Option<PathBuf>,
 
@@ -785,7 +784,7 @@ struct PerplexityArgs {
 #[derive(Args)]
 struct PlanArgs {
     /// Installed model directory (the .rvmp dir). Only `manifest.json` and
-    /// `experts/layout.json` are read — a few hundred KiB, not 17 GiB.
+    /// `experts/layout.json` are read: a few hundred KiB, not 17 GiB.
     #[arg(long, value_name = "DIR")]
     model: PathBuf,
 

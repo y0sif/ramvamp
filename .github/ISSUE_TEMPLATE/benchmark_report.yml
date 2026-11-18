@@ -18,7 +18,8 @@ body:
         Slow results are as valuable as fast ones. A drive where ramvamp
         performs badly is information, not a complaint, so please send it.
 
-        `CONTRIBUTING.md` has the full procedure. The short version: run
+        [docs/benchmarks.md](https://github.com/y0sif/ramvamp/blob/main/docs/benchmarks.md#reproduce-a-run)
+        has the full procedure. The short version: run
         cold, run inside the cgroup, and check the generated text before you
         trust the tokens per second.
 
@@ -121,8 +122,8 @@ body:
     id: memory_max
     attributes:
       label: Memory limit
-      description: The `memory.max` for the run. Say so if you raised it above 3G and why.
-      placeholder: "3G"
+      description: The `memory.max` for the run. Say so if you raised it above 4G and why.
+      placeholder: "4G"
 
   - type: textarea
     id: hygiene
@@ -149,7 +150,7 @@ body:
       label: Results
       description: |
         Load time, prefill tokens per second, decode tokens per second, and
-        peak RSS, at whichever context lengths you ran. Please report every
+        the cgroup's `memory.peak`, at whichever context lengths you ran. Please report every
         repeat rather than only the best one: on a DRAM-less part the same
         binary has read almost 9% apart on consecutive days, so a single run
         describes its session more than its device.

@@ -4,8 +4,8 @@
 
 ## Gate
 
-All four must pass before this is pushed. They are the same four in
-`CLAUDE.md`, in the same order.
+All four must pass before this is pushed. They are the first four cargo
+commands of the gate in `AGENTS.md`, in the same order.
 
 - [ ] `cargo fmt --check`
 - [ ] `cargo clippy --all-targets -- -D warnings` with zero warnings
@@ -19,7 +19,7 @@ All four must pass before this is pushed. They are the same four in
       entry for it with a **baseline**, a **result**, and a **verdict**.
 
 If the second box is ticked, the numbers came from a cold run inside a
-`memory.max=3G` cgroup with `memory.swap.max=0`, remembering that zram counts
+`memory.max=4G` cgroup with `memory.swap.max=0`, remembering that zram counts
 as swap. Warm-cache runs are diagnostics and do not settle anything.
 
 Experiment ID and one-line verdict:

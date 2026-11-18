@@ -1,7 +1,7 @@
 //! Compute pool and CPU topology.
 //!
-//! Owned by wave-1 lane D. Six compute shards, one per physical P-core,
-//! joined by a barrier for the duration of a token step. With the default
+//! Six compute shards, one per physical P-core, joined by a barrier for the
+//! duration of a token step. With the default
 //! [`PoolConfig::inline_caller`] those six shards are five spawned worker
 //! threads plus the submitting decode thread, which works too; with
 //! `inline_caller: false` they are six spawned workers.
@@ -17,7 +17,8 @@
 //! thread run on any P-core thread or L3 E-core and leaves the choice to the
 //! scheduler. `PerCore` pins one thread to each P-core with no SMT sibling,
 //! which is v0's layout: a few percent faster on an idle machine, and as slow
-//! as its busiest core on a machine doing anything else (EXP-027).
+//! as its busiest core on a machine doing anything else (EXP-027). `Off` sets
+//! no affinity at all.
 //!
 //! Topology on the reference machine (Core Ultra 9 185H) is not guessable
 //! from core ids: `/sys/devices/cpu_core/cpus` is `0-11` and
@@ -653,7 +654,11 @@ impl Topology {
         &self.compute
     }
 
-    /// Preferred CPU for the io_uring reactor thread.
+    /// Preferred CPU for an io_uring reactor thread: an E-core with an L3.
+    ///
+    /// A latent hook. There is no reactor thread (the ring runs inline on the
+    /// decode thread, see `io::stream`), and nothing reads it but the tests
+    /// and this type's `Display`.
     #[must_use]
     pub fn reactor_cpu(&self) -> Option<usize> {
         self.reactor

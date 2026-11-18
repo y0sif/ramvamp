@@ -54,7 +54,7 @@ physically adjacent to their successor. That difference may be the whole
 disagreement between EXP-008 and EXP-013, and a bandwidth number without the
 extent map next to it is not interpretable.
 
-`docs/benchmark-machine.md` also records that per-file bandwidth variance
+`docs/benchmarks.md#reference-machine` also records that per-file bandwidth variance
 exceeds run-to-run variance (`layer_00` 1,237 MB/s vs `layer_20` 1,812 MB/s).
 This probe therefore runs a **fixed, recorded** file set spanning both stride
 classes and **always reports per file**. Aggregates are printed only with the
@@ -132,7 +132,7 @@ numbers describe buffered I/O, not O_DIRECT.
 **Did the drive report an error?** `btrfs device stats` is sampled before and
 after the whole session and again around each confined run. The reference
 machine's `corruption_errs` baseline is 138,407
-(`docs/benchmark-machine.md`); EXP-007 showed how easily a buffer-aliasing
+(`docs/benchmarks.md#reference-machine`); EXP-007 showed how easily a buffer-aliasing
 bug in a benchmark manufactures an increase. **Any delta is a hard failure,
 not a footnote.** This probe hands every thread its own buffer for exactly
 that reason.
@@ -140,7 +140,7 @@ that reason.
 ## Phase 9: the three things the four-file matrix could not answer
 
 EXP-023 measured a **2.21x** per-file bandwidth spread at decode's K=1 block
-size, and `docs/benchmark-machine.md` concluded "it is not fragmentation" from
+size, and `docs/benchmarks.md#reference-machine` concluded "it is not fragmentation" from
 the fact that the fast and slow files have identical extent *geometry*. Both
 statements have a hole in them, and three modes were added to close them.
 
@@ -273,7 +273,7 @@ BTRFS_COUNTERS = (
 )
 
 # The fixed, recorded file set. layer_00 and layer_20 are the pair
-# docs/benchmark-machine.md names for per-file bandwidth variance (1,237 vs
+# docs/benchmarks.md#reference-machine names for per-file bandwidth variance (1,237 vs
 # 1,812 MB/s; EXP-019 reproduces it and rules out fragmentation as the cause,
 # since the two have identical extent geometry) and both carry the 3,059,712 B
 # stride; layer_06 and layer_21 carry the 2,654,208 B stride. Changing this
@@ -733,7 +733,7 @@ def dispersion_stats(extents: list[dict], gap_bytes: int,
                      units: str = LOGICAL_NOT_LBA) -> dict:
     """Physical dispersion, the axis `filefrag_stats` never measured.
 
-    `docs/benchmark-machine.md` rules fragmentation out as the cause of the
+    `docs/benchmarks.md#reference-machine` rules fragmentation out as the cause of the
     per-file bandwidth spread on the grounds that the slow and fast files have
     identical extent *geometry* — same count, same sizes, zero physically
     adjacent successor pairs. That is true and it does rule geometry out. It
@@ -1109,7 +1109,7 @@ def timed_reads(fd: int, offsets: list[int], block_bytes: int,
     Per-thread buffers, never a shared pool indexed by arithmetic: EXP-007
     established that two in-flight O_DIRECT reads landing in one buffer make
     btrfs verify a checksum over bytes the other read already overwrote, which
-    is where `docs/benchmark-machine.md`'s 138,407 `corruption_errs` came
+    is where `docs/benchmarks.md#reference-machine`'s 138,407 `corruption_errs` came
     from. A benchmark is not allowed to manufacture that again.
 
     Allocation and pre-faulting happen **before** the timer starts, so the

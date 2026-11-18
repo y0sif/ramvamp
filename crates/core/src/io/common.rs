@@ -1,13 +1,13 @@
 //! Read-only mapping of `common.bin`.
 //!
 //! The common core (embeddings, lm_head, attention, routers, norms) is
-//! touched every token. By default it is `mmap`'d read-only and the page
-//! cache keeps it resident, for as long as nothing else needs the memory;
-//! with [`CommonMemory::Resident`] it is read once into anonymous memory
-//! instead, which nothing but swap can take away. Integrity is checked
-//! before the bytes are handed out: the file's size must match the manifest
-//! entry, and unless hashes are skipped its SHA-256 must too (~1 GiB for the
-//! v0 model — a one-time load cost the design accepts).
+//! touched every token. By default ([`CommonMemory::Resident`]) it is read
+//! once into anonymous memory, which nothing but swap can take away; with
+//! [`CommonMemory::Mapped`] it is `mmap`'d read-only and the page cache keeps
+//! it resident for as long as nothing else needs the memory. Integrity is
+//! checked before the bytes are handed out: the file's size must match the
+//! manifest entry, and unless hashes are skipped its SHA-256 must too (~1 GiB
+//! for the v0 model, a one-time load cost the design accepts).
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read};

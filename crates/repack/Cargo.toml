@@ -12,6 +12,8 @@ rust-version.workspace = true
 documentation = "https://docs.rs/ramvamp-repack"
 keywords = ["llm", "moe", "quantization", "gguf", "nvme"]
 categories = ["command-line-utilities", "filesystem", "science"]
+# What ships to crates.io, so nothing else dropped in this directory can.
+include = ["/src/**"]
 
 [[bin]]
 name = "ramvamp-repack"

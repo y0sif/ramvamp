@@ -4,9 +4,9 @@
 //! resident`, EXP-031), which nothing can take away from a process whose
 //! cgroup has swap turned off; with swap on, the kernel could swap them out
 //! when the rest of the machine needs memory instead. So a model command
-//! (`generate`, `chat`, `serve`, `logits`) re-launches itself, once, inside a
-//! transient systemd user scope with `MemorySwapMax=0`. No root is needed: the
-//! user's own systemd manager owns the scope.
+//! (`generate`, `chat`, `serve`, `logits`, `perplexity`) re-launches itself,
+//! once, inside a transient systemd user scope with `MemorySwapMax=0`. No root
+//! is needed: the user's own systemd manager owns the scope.
 //!
 //! It is skipped when it cannot help or is not wanted:
 //!

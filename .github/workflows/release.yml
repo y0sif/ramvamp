@@ -8,7 +8,7 @@ on:
 # This workflow builds and releases the tarball. It does not publish to
 # crates.io: that is done by hand with `cargo publish` after a release is cut,
 # because crates.io has no undo and a version can be yanked but never
-# republished under the same number. See CONTRIBUTING.md for the order.
+# republished under the same number. See AGENTS.md for the order.
 #
 # Scoped per job rather than workflow-wide: only `release` writes anything.
 permissions:

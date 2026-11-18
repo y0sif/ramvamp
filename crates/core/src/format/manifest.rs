@@ -6,6 +6,14 @@
 //! audit, the tensor index into `common.bin`, and the size + SHA-256 of
 //! every data file. It is written last and atomically promoted, so its
 //! presence marks a complete install.
+//!
+//! The structs here are the schema. Every key is required: each struct is
+//! `deny_unknown_fields` and none carries a serde default, so a manifest that
+//! omits a key or invents one is rejected rather than loaded with a hole in
+//! it. `common_tensors` is the only way anything locates a tensor in
+//! `common.bin`: name to `{offset, len, dtype}`, offsets
+//! [`COMMON_TENSOR_ALIGN`]-byte aligned, validated in bounds and
+//! non-overlapping.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
@@ -336,7 +344,7 @@ mod tests {
 
     #[test]
     fn parses_v1_schema_json() {
-        // Key names as frozen in docs/architecture.md plus common_tensors.
+        // Key names as the serde structs above freeze them.
         let json = format!(
             r#"{{
               "rvmp_version": 1,

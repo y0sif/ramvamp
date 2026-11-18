@@ -92,8 +92,8 @@ pub fn rmsnorm_in_place(x: &mut [f32], weight: &[f32], eps: f32) -> Result<(), P
 /// Gemma-variant RMSNorm: `out_i = x_i / sqrt(mean(x^2) + eps) * (1 + w_i)`.
 ///
 /// Gemma checkpoints store the norm weight zero-centered, so the effective
-/// scale is `(1 + w)`. Not needed for the v0 Qwen3 pin; Gemma 4 26B-A4B
-/// (model #2, see `docs/architecture.md`, "v0 scope caps") requires it.
+/// scale is `(1 + w)`. Not needed for the v0 Qwen3 pin; Gemma-family
+/// checkpoints require it.
 ///
 /// # Errors
 ///

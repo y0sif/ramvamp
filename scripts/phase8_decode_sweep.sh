@@ -57,7 +57,7 @@
 # ------------------------------------------- why there is a reference arm --
 #
 # feat/decode changes T_BLOCK from 4 to 8 — four QK dependency chains to
-# eight. CLAUDE.md's hard rule is that every performance change gets an entry
+# eight. AGENTS.md's hard rule is that every performance change gets an entry
 # in docs/experiments.md with a baseline, a result and a verdict, and
 # T_BLOCK has none. Left alone, phase 8 would measure its decode curve on a
 # binary carrying that change and silently attribute T_BLOCK's cost to
@@ -81,7 +81,7 @@
 # scripts/phase7_overnight.sh:145-170 pairs REF5 against RAMVAMP so both arms
 # see the same machine state. Same prompt file, same --max-new, same warmup
 # and repeats, nothing between them but their own settle and drain.
-# docs/benchmark-machine.md is explicit that per-file bandwidth variance
+# docs/benchmarks.md#reference-machine is explicit that per-file bandwidth variance
 # exceeds run-to-run variance, so an arm that touches a different file has
 # moved its own baseline and is no longer a control.
 #
@@ -977,7 +977,7 @@ say ""
 # with the same prompt file, --max-new, warmup and repeats. Nothing separates
 # them but their own settle and drain: the slot checks for both are deferred
 # until after the pair, so that not even a JSON read sits between the two
-# measurements. Per docs/benchmark-machine.md, per-file bandwidth variance
+# measurements. Per docs/benchmarks.md#reference-machine, per-file bandwidth variance
 # exceeds run-to-run variance, so a control that reads different files is not
 # a control.
 #
@@ -1391,7 +1391,7 @@ say ""
 say 'Any "NO SUMMARY" row means that step produced no measurement at all.'
 say "Nothing was substituted for it. Re-run that arm."
 say ""
-say "The T_BLOCK table is what CLAUDE.md's rule needs to be discharged:"
+say "The T_BLOCK table is what AGENTS.md's rule needs to be discharged:"
 say "T_BLOCK 4 -> 8 is a performance change and owes docs/experiments.md a"
 say "baseline, a result and a verdict. The baseline is"
 say "$REF7_EXPECT_SHA"

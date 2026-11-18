@@ -896,10 +896,10 @@ const MIB: u128 = 1 << 20;
 ///
 /// Provisional in the experiment log's sense: EXP-012 sampled peak `anon`
 /// from inside the cgroup on a live decode run whose context length, token
-/// count and page-cache state were not recorded, so it fails rule 2 and
-/// `docs/architecture.md` carries it as a floor for this tenant rather than a
-/// ceiling. It is the one term of [`Footprint`] that is not arithmetic, and
-/// it is why the whole projection is an estimate rather than a bound.
+/// count and page-cache state were not recorded, so it fails rule 2 and is a
+/// floor for this tenant rather than a ceiling. It is the one term of
+/// [`Footprint`] that is not arithmetic, and it is why the whole projection is
+/// an estimate rather than a bound.
 ///
 /// Two known residuals, of opposite sign, neither of which is corrected for
 /// here — see [`Footprint::project`] for why:
@@ -941,9 +941,10 @@ pub enum FootprintError {
 /// is to tell an operator which dial to move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Footprint {
-    /// The mmap'd `common.bin`: embeddings, lm_head, attention, routers,
-    /// norms. Charged to the cgroup as `file`, and resident in practice
-    /// because every token touches it.
+    /// `common.bin`: embeddings, lm_head, attention, routers, norms. Counted
+    /// whole either way: resident by default, so charged to the cgroup as
+    /// `anon`; with `--common-memory mapped`, charged as `file` and resident
+    /// in practice because every token touches it.
     pub common: u64,
     /// The expert slot slab, allocated and pre-faulted whole by
     /// [`SlotPool::new`].

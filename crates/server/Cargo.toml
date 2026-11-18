@@ -12,6 +12,8 @@ rust-version.workspace = true
 documentation = "https://docs.rs/ramvamp-server"
 keywords = ["llm", "inference", "openai", "moe", "server"]
 categories = ["web-programming::http-server", "science", "api-bindings"]
+# What ships to crates.io, so nothing else dropped in this directory can.
+include = ["/src/**"]
 
 [dependencies]
 ramvamp-core = { workspace = true }

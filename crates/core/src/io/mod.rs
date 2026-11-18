@@ -1,11 +1,14 @@
 //! Expert streaming and caching.
 //!
-//! - Common weights: read-only `mmap` (they are touched every token, so the
-//!   page cache keeps them resident).
+//! - Common weights: touched every token, so held whole. By default they are
+//!   read once into anonymous memory ([`CommonMemory::Resident`]);
+//!   [`CommonMemory::Mapped`] memory-maps them read-only instead.
 //! - Routed experts: explicit reads, never demand paging. On Linux with the
 //!   `io-uring` feature (default), misses are fetched with io_uring +
-//!   O_DIRECT into pre-allocated page-aligned slot buffers; the portable
-//!   fallback uses positioned reads (`pread`) on a small thread pool.
+//!   O_DIRECT into pre-allocated page-aligned slot buffers. When the feature
+//!   is off or the ring cannot be created, the fallback is synchronous
+//!   positioned reads (`pread`) on the decode thread, still through the
+//!   O_DIRECT handle when the startup probe verified it.
 //! - Cache: per-layer fixed slot arrays with LFU eviction over frequency
 //!   counters indexed by expert id, sized `n_experts`, whose counts survive
 //!   eviction (ghost history; EXP-005). No cross-layer prefetch: measured
@@ -22,10 +25,9 @@
 //!
 //! # File access layer
 //!
-//! What exists today is the synchronous file-access layer beneath that
-//! design:
+//! Beneath the streamer sits the synchronous file-access layer:
 //!
-//! - [`MappedCommon`]: the read-only map of `common.bin`.
+//! - [`MappedCommon`]: `common.bin`, resident or mapped, read-only.
 //! - [`ExpertReader`]: lazy per-layer file handles + positioned blob reads,
 //!   returning [`ExpertView`]s over the gate/up/down slabs.
 //! - [`LoadOptions`]: the load-time integrity dial.
@@ -109,9 +111,9 @@ pub struct LoadOptions {
 /// [`CommonMemory::Resident`] is the default (EXP-031): on a machine short of
 /// memory, `kswapd` took up to 801 MiB of the mapped weights mid-run and
 /// decode fell to 1.43 tok/s, while resident runs never had to read a page
-/// back, at the same speed, for +0.75 s of load. At 4K context it peaks at
-/// 2,963 MiB, inside the 3 GB contract and within 2 MiB of the footprint
-/// projection, which always assumed the whole file resident.
+/// back, at the same speed, for +0.75 s of load. At the 3 GiB configuration
+/// (`--cache-bytes 1440M`) and 4K context it peaked at 2,963 MiB, within 2 MiB
+/// of the footprint projection, which always counted the whole file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CommonMemory {
     /// Memory-mapped read-only: file-backed pages the kernel may drop under

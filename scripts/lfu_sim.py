@@ -109,8 +109,8 @@ DEFAULT_AGE_PERIOD = 256
 # Window of `lfu-window`, in decode tokens (TurboFieldfare tested 64).
 DEFAULT_WINDOW_TOKENS = 64
 
-# Everything else that has to fit next to the slot pool in the published
-# 3 GB cgroup (`docs/architecture.md`, "Memory budget").
+# Everything else that has to fit next to the slot pool in a 3 GiB cgroup
+# (`docs/architecture.md`, "Memory contract").
 COMMON_WEIGHTS_MIB = 1023.34
 KV_CACHE_MIB = 384.0
 CGROUP_MIB = 3072.0
@@ -1433,7 +1433,7 @@ def print_misses(results: list[dict], slots_list: list[int], policy: str) -> Non
 def print_policy_comparison(results: list[dict], slots_list: list[int], bandwidth: float) -> None:
     """Hit rate and I/O time per policy, both as a delta against LFU.
 
-    The upstream claim this checks (`docs/landscape.md`) is stated in
+    The upstream claim this checks (`docs/comparison.md`) is stated in
     ms/token, so both views are printed on the same traces.
     """
     policies = list(dict.fromkeys(r["policy"] for r in results))

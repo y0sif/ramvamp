@@ -151,8 +151,7 @@ CHAT_CASES = [
         # tokenizer encodes them to the real control ids. Recorded
         # decision — encode_chat is reference-faithful (matching
         # transformers/llama.cpp); sanitization of untrusted content is a
-        # server-side concern, see docs/architecture.md "Post-v0
-        # direction".
+        # server-side concern, see docs/architecture.md "v0 scope caps".
         "special_literals_in_content",
         [
             {

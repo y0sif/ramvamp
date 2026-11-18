@@ -7,7 +7,7 @@
 //! per-layer expert-blob layout, and emits a byte-exact [`CopyOp`] map the
 //! executor can stream. Planning reads only the parsed header — no tensor
 //! data is touched here, and the copy map describes byte-identical moves
-//! only (the repacker never requantizes; see the hard rules in CLAUDE.md).
+//! only (the repacker never requantizes; see the hard rules in AGENTS.md).
 
 use std::collections::BTreeMap;
 use std::ops::Range;

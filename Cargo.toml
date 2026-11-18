@@ -40,7 +40,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 
-# Model I/O (source format is GGUF; parsing is implemented in-repo, see docs/architecture.md)
+# Model I/O (source format is GGUF; parsing is implemented in-repo, see crates/repack/src/gguf/mod.rs)
 memmap2 = "0.9"
 io-uring = "0.7"
 rustix = { version = "1", features = ["thread", "process", "mm"] }

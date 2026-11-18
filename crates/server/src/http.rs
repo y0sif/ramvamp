@@ -6,7 +6,7 @@
 //! security decision, not an oversight: `tiny_http`'s `read_next_line` has
 //! neither a header-size cap nor a read timeout, so a single connection
 //! sending an endless header line grows a `Vec` until the process dies — and
-//! this process is meant to run inside a `memory.max=3G` cgroup next to a 30B
+//! this process is meant to run inside a `memory.max=4G` cgroup next to a 30B
 //! model, where "grows a `Vec`" means the OOM killer takes the model with it.
 //! Loopback is the mitigation. Anyone who wants this reachable from elsewhere
 //! should put a real reverse proxy in front of it, which is also where request
@@ -65,8 +65,8 @@ pub struct ServeConfig {
     /// Every client that matters gives up after 300 s of no bytes — undici's
     /// `bodyTimeout`, the `openai` provider's `headerTimeout`, and
     /// `CLAUDE_CODE_BYTE_STREAM_IDLE_TIMEOUT_MS` all land on the same number —
-    /// and a 4K prompt takes about six minutes to prefill. Ten seconds is
-    /// thirty times under the wall and costs fourteen bytes a tick.
+    /// and a cold 4K prompt takes minutes to prefill. Ten seconds is thirty
+    /// times under the wall and costs fourteen bytes a tick.
     pub keepalive: Duration,
     /// Largest request body this server will buffer, in bytes.
     pub max_body_bytes: usize,
@@ -96,7 +96,7 @@ pub const DEFAULT_CONTEXT: usize = 4096;
 /// A prompt runs about 4 bytes of text per token, so 256 is sixty-four times
 /// the text a completely full window can hold — headroom for JSON escaping,
 /// for the `tools` array, and for the whitespace a pretty-printing client
-/// sends. It is also small against a 3 GB budget at any window that budget can
+/// sends. It is also small against a 4 GB budget at any window that budget can
 /// host: a 32K context allows 8 MiB.
 pub const BODY_BYTES_PER_CONTEXT_TOKEN: usize = 256;
 
