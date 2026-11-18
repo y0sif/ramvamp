@@ -28,10 +28,11 @@ performance regressions.
 
 ## Deployment posture
 
-`ramvamp serve` binds `127.0.0.1` and there is deliberately no flag to change
-that. It has no authentication and no TLS, and the HTTP layer has no
-header-size cap or read timeout, so one connection sending an endless header
-line can exhaust memory next to a 30B model in a 3 GB budget. Put a reverse
-proxy in front of it if it needs to be reachable from anywhere else.
+`ramvamp serve` has no authentication, no TLS, and no header-size cap or read
+timeout: one connection sending an endless header line can grow memory until
+the process is killed. That is why it binds `127.0.0.1` and no flag changes it.
+The body cap grows with `--context` ([server.md](docs/server.md#refusals)).
+A server reachable from elsewhere belongs behind a reverse proxy, which is
+where TLS, authentication and request limits go.
 
 This is not built for production, multi-user, or security-critical use.
