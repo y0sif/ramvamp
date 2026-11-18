@@ -6,6 +6,11 @@
 //! projection slabs sit at 4 KiB-aligned offsets. Stride is uniform within
 //! a layer but may differ across layers: in a Q4_K_M source, layers whose
 //! `down` projection is Q6_K pack a wider blob than pure-Q4_K layers.
+//!
+//! On Qwen3-30B-A3B every slab is already a whole number of pages: a Q4_K
+//! projection slab is 884,736 B (216 pages) and a Q6_K down slab 1,290,240 B
+//! (315), so the strides are 2,654,208 B (648 pages) and 3,059,712 B (747),
+//! and page alignment costs no padding.
 
 use std::collections::BTreeSet;
 

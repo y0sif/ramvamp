@@ -1,13 +1,11 @@
 name: Benchmark report
-description: Report ramvamp's throughput on your drive. This is the most useful thing you can send.
+description: Report ramvamp's throughput on your drive.
 title: "[bench] "
 labels: ["benchmark"]
 body:
   - type: markdown
     attributes:
       value: |
-        **This is the contribution the project wants most.**
-
         Every published throughput number for ramvamp comes from a single
         machine with a single DRAM-less QLC NVMe drive. The central claim is
         that decode is I/O-bound and therefore scales with the device, and
@@ -15,10 +13,10 @@ body:
         drive either supports it or refutes it, and both outcomes are worth
         more than another round of tuning on the same hardware.
 
-        Slow results are as valuable as fast ones. A drive where ramvamp
-        performs badly is information, not a complaint, so please send it.
+        Slow results are as useful as fast ones, so please send them too.
 
-        `CONTRIBUTING.md` has the full procedure. The short version: run
+        [docs/benchmarks.md](https://github.com/y0sif/ramvamp/blob/main/docs/benchmarks.md#reproduce-a-run)
+        has the full procedure. The short version: run
         cold, run inside the cgroup, and check the generated text before you
         trust the tokens per second.
 
@@ -121,8 +119,8 @@ body:
     id: memory_max
     attributes:
       label: Memory limit
-      description: The `memory.max` for the run. Say so if you raised it above 3G and why.
-      placeholder: "3G"
+      description: The `memory.max` for the run. Say so if you raised it above 4G and why.
+      placeholder: "4G"
 
   - type: textarea
     id: hygiene
@@ -149,10 +147,11 @@ body:
       label: Results
       description: |
         Load time, prefill tokens per second, decode tokens per second, and
-        peak RSS, at whichever context lengths you ran. Please report every
-        repeat rather than only the best one: on a DRAM-less part the same
-        binary has read almost 9% apart on consecutive days, so a single run
-        describes its session more than its device.
+        the cgroup's `memory.peak`, at whichever context lengths you ran.
+        Please report every repeat rather than only the best one: on a
+        DRAM-less part the same binary has read almost 9% apart on
+        consecutive days, so a single run describes its session more than its
+        device.
       render: shell
     validations:
       required: true

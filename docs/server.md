@@ -1,71 +1,87 @@
 # The server
 
-Covers `ramvamp serve`: its routes, its concurrency model, what it refuses and
-why, and what it is honestly workable for.
-
-## A first request
+`ramvamp serve` is an OpenAI-compatible Chat Completions server on
+`127.0.0.1`. It serves one request at a time and keeps the KV cache between
+requests. This page covers its flags, endpoints, the request fields it honours
+and what it refuses.
 
 ```bash
+ramvamp serve --model ~/models/qwen3-30b-a3b.rvmp
+
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model": "qwen3-30b-a3b",
+  -d '{"model": "qwen3-30b-a3b.rvmp",
        "messages": [{"role": "user", "content": "Explain io_uring in two sentences."}],
        "stream": true}'
 ```
 
-## Routes
+The port opens only once the model has loaded, so a client gets connection
+refused until it is ready.
+
+## Flags
+
+| flag | default | what it does |
+| --- | --- | --- |
+| `--port <N>` | 8080 | TCP port on `127.0.0.1`. `0` picks a free port, which is logged only with `RUST_LOG=info` |
+| `--served-model-name <NAME>` | the install directory's name | the id `/v1/models` lists |
+| `--max-new <N>` | 512 | reply cap for a request that sends neither `max_completion_tokens` nor `max_tokens`. It is reserved against the context, so a large value shortens what a client can send |
+| `--keepalive-secs <SECONDS>` | 10 | silence before a stream gets an SSE keep-alive comment. Keep it under 300, where common clients give up |
+| `--greedy`, `--temperature`, `--top-k`, `--top-p`, `--seed` | off, then the model's sampling settings | defaults a request can override |
+
+There is no `--host`; [SECURITY.md](../SECURITY.md#deployment-posture) says
+why. The model dials (`--context`, `--cache-bytes`, `--profile` and the rest)
+are in [configuration.md](configuration.md).
+
+## Endpoints
 
 | route | method | what it does |
 | --- | --- | --- |
-| `/v1/chat/completions` | `POST` | Chat Completions, streaming SSE when `"stream": true` and buffered otherwise |
-| `/v1/models` | `GET` | The single served model |
-| `/health` | `GET` | Liveness |
+| `/v1/chat/completions` | `POST` | Chat Completions, streamed as SSE when `"stream": true`, buffered otherwise |
+| `/v1/models` | `GET` | the single served model |
+| `/health` | `GET` | liveness |
 
-## Three things worth knowing before you point a client at it
+Any other path or method is a `404`. A query string is ignored when routing.
 
-- **It binds `127.0.0.1` and there is no `--host` flag, on purpose.** The HTTP
-  layer has no header-size cap, so an endless header line is a memory hazard.
-  Anything that needs to be reachable from elsewhere should sit behind a
-  reverse proxy, which is also where TLS, authentication and request limits
-  belong. There is no auth and no CORS in ramvamp itself.
-- **One request at a time, structurally.** There is no worker pool: one thread
-  accepts and handles inline, and a request arriving mid-generation waits in
-  the accept queue rather than being rejected. At these speeds an immediate 503
-  would just burn a client's retries against a request that holds the model for
-  minutes.
-- **The KV cache is reused across requests** by a longest-common-prefix match
-  against the ids actually fed, so a repeated system prompt is not re-prefilled
-  every turn.
+## Request fields
 
-## Tool calls
-
-Tool calls work in both the streaming and the buffered path. The two share one
-parser and one id minter, and the renderer is byte-identical to 20 transformers
-fixtures.
-
-## What the server refuses, and why it refuses rather than approximates
-
-Each of these is a typed `400` with an OpenAI-shaped error body, chosen over
-accepting the field and quietly not honouring it:
-
-| field | why |
+| field | effect |
 | --- | --- |
-| `n > 1` | One completion per request; there is one KV cache |
-| `stop` | Generation ends on the model's own stop tokens, so a stop sequence would be accepted and never applied |
-| forced `tool_choice` | The vendored chat template branches on `tools` alone and cannot force a named call. `auto`, `none` and omitting it are all fine |
-| non-text content parts | The pinned ChatML template coerces non-string content to `""`, so dropping an `image_url` part would make the model answer a question it was never asked |
+| `messages` | required and non-empty. Roles `system`, `user`, `assistant`, `tool`. Content is a string or an array of `text` parts |
+| `model` | required, echoed back in the reply, not checked against the served id |
+| `stream` | stream the reply as SSE |
+| `stream_options.include_usage` | add a final usage chunk to a stream |
+| `temperature`, `top_p`, `top_k`, `seed` | override the server's defaults. `temperature` 0 or below is greedy. Without `seed`, each request gets the server's seed plus the request number |
+| `max_completion_tokens`, `max_tokens` | reply cap; `max_completion_tokens` wins when both are sent |
+| `tools`, `tool_choice` | tool calls, in streamed and buffered replies alike. `tool_choice` may be `auto` or absent. `none` is accepted but changes nothing: the tools stay in the prompt and the model may still call one |
 
-Prompt plus reserved output over the context cap is a `400` with OpenAI's own
-`context_length_exceeded` code. Unknown and unimplemented fields
-(`logprobs`, `presence_penalty` and friends) are accepted and ignored.
+Every other field, such as `response_format`, `logprobs` or
+`presence_penalty`, is accepted and ignored.
 
-## Position it honestly
+## How requests are served
 
-At about 2 tok/s decode and about 11 tok/s prefill at ctx 512 on the reference
-drive, this is a local 30B endpoint for a machine that could not otherwise run
-one. It is workable for low-volume local chat and completion. It is not an
-agentic coding backend, where a single turn is thousands of output tokens.
+- **One at a time.** A request that arrives mid-generation waits in the accept
+  queue until the current one finishes. It is not rejected.
+- **The KV cache is reused** across requests by longest common prefix, so a
+  repeated system prompt is not prefilled again.
+- **Use `"stream": true` for long replies.** Only a stream gets keep-alive
+  comments, and a buffered client may time out before its reply is complete.
+- **No CORS headers.** A web page from another origin cannot read a reply.
 
-Those figures, and the conditions that make them valid, are in
-[benchmarks.md](benchmarks.md). The context window a client can fill is a dial:
-see [configuration.md](configuration.md).
+Decode and prefill speeds are in [benchmarks.md](benchmarks.md). This is a
+local endpoint for low-volume chat and completion, not an agentic coding
+backend, where one turn is thousands of output tokens.
+
+## Refusals
+
+Each refusal carries an OpenAI-shaped error body with the `code` below.
+
+| status | `code` | cause |
+| --- | --- | --- |
+| 400 | `invalid_json` | the body is not JSON of the expected shape |
+| 400 | `empty_messages` | `messages` is empty |
+| 400 | `unsupported_value` | `n` above 1; a non-empty `stop`, since generation stops on the model's own stop tokens; `tool_choice` other than `auto` or `none`, which the chat template cannot force |
+| 400 | `unsupported_content_part`, `invalid_content_part` | a content part that is not text, which the model would otherwise never see; a `text` part with no `text` |
+| 400 | `invalid_tool_name` | a tool name in `tools` or in an assistant's `tool_calls` outside `^[A-Za-z0-9_-]{1,64}$` |
+| 400 | `context_length_exceeded` | the prompt plus the reply cap is over `--context` |
+| 404 | `not_found` | any other path or method |
+| 413 | `request_too_large` | a body over 256 bytes per token of `--context`, with a 64 KiB floor (1 MiB at the default 4096) |

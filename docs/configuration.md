@@ -1,35 +1,35 @@
 # Configuration
 
-Covers the `--context` dial, named profile files, and the four-layer
-precedence chain that decides which value of a dial actually runs.
+ramvamp is configured with command-line flags, and a named profile saves a set
+of them under one name. With no flags and no profile, every dial takes its
+built-in default, which is the published 4K configuration.
 
-## `--context`, the dial that costs memory
+## Check a configuration with `plan`
 
-`--context` (default **4096**) is the dial that trades conversation length
-against resident bytes. The KV cache is sized at it, and a prompt plus the
-tokens reserved for its reply must fit inside it. It is refused above what the
-model was trained for, because positions past that generate fluent nonsense
-rather than an error.
-
-`plan` will price any value of it for you without loading a single weight:
+`ramvamp plan` prints every dial, where its value came from, and the memory the
+configuration needs, without loading the model. It reads two small metadata
+files and answers in well under a second.
 
 ```bash
-./target/release/ramvamp plan --model ~/models/qwen3-30b-a3b.rvmp --context 32768
+ramvamp plan --model ~/models/qwen3-30b-a3b.rvmp --context 32768
 ```
 
-A 32K profile projects about **6,695 MiB**, about 6.5 GiB, at the default
-19-slot cache, and needs a bigger budget than 4 GB. That is what profiles exist
-to express: the 4 GB contract is a property of the 4K default, not of the
-runtime, and a 3 GB machine runs the same 4K context with `"cache_bytes":
-"1440M"` (11 slots, 2,961 MiB). `plan` exits nonzero when a
-configuration will not fit, naming every term, so a script can ask the question
-without parsing the answer.
+| configuration | projected memory |
+| --- | --- |
+| defaults: `--context 4096`, 19 expert slots per layer | about 4,007 MiB |
+| `--context 32768` | about 6,695 MiB |
+| `--cache-bytes 1440M`, 11 slots per layer | about 2,961 MiB, fits a 3 GiB cap |
+
+The projection is judged against total RAM or the tightest cgroup
+`memory.max`, whichever is smaller. A configuration that does not fit makes
+`plan` exit nonzero, naming every term, so a script can ask without parsing the
+output. A model command refuses the same configuration before allocating its
+caches.
 
 ## Named profiles
 
-A profile is a *name* for a combination of dials, so that a small chat setup
-and a wide-context agent setup are `--profile chat` and `--profile agent`
-rather than four flags each, remembered by hand.
+A profile names a combination of dials, so a small chat setup and a
+wide-context agent setup become `--profile chat` and `--profile agent`.
 
 ```json
 {
@@ -37,56 +37,105 @@ rather than four flags each, remembered by hand.
   "default_profile": "chat",
   "profiles": {
     "chat":  { "context": 4096,  "cache_bytes": "1440M" },
-    "agent": { "context": 16384, "cache_bytes": "1440M" }
+    "agent": { "context": 16384, "cache_bytes": "1440M", "placement": "per-core" }
   }
 }
 ```
 
 The file is read from `--config <PATH>` if given, else
 `$XDG_CONFIG_HOME/ramvamp/config.json`, else `~/.config/ramvamp/config.json`.
+Nothing creates it. `version` is required and must be `1`.
 
 | flag | what it does |
 | --- | --- |
-| `--profile <NAME>` | Select a named profile. Unset: the file's `default_profile`, or the built-in defaults when there is neither. A name the file does not define is an error listing the ones it does |
-| `--config <PATH>` | Read this file instead of the search path. A file named here has to exist; one merely searched for does not |
-| `--no-config` | Ignore any config file and use the built-in defaults |
+| `--profile <NAME>` | Select a profile. Unset: the file's `default_profile`, or the built-in defaults. A name the file does not define is an error listing the ones it does |
+| `--config <PATH>` | Read this file instead of the search path. A file named here must exist |
+| `--no-config` | Ignore any config file. Environment variables and flags still apply |
 
-A missing file is not an error: it means the built-in defaults, which are the
-measured, published 4K configuration. Nothing ships a file, writes one, or
-creates the directory. A file that exists and does not parse *is* an error
-naming the path, and so is an unrecognized key, at the root and inside every
-profile: `"contxt": 16384` would otherwise widen nothing and say nothing.
-
-The five keys a profile may carry are `cache_bytes`, `context`, `prefill`,
-`prefill_chunk` and `threads`, spelled as their flags with `-` written `_`.
-`cache_bytes` goes through the same parser `--cache-bytes` uses, so `"1440M"`
-in the file means exactly what `--cache-bytes 1440M` means.
-
-**`--skip-hashes` and `--verify-layer-hashes` are deliberately not profile
-keys.** They are per-invocation decisions about what to check, not a
-configuration worth naming, and a config file that could turn integrity
-checking off is a config file worth not having.
+A missing file means the built-in defaults. A file that does not parse is an
+error naming the path, and so is an unknown key at the root or in a profile.
+A profile may carry six keys: `cache_bytes`, `context`, `placement`,
+`prefill`, `prefill_chunk` and `threads`. Each is checked exactly as its flag
+is, so `"1440M"` means what `--cache-bytes 1440M` means.
 
 ## Precedence
 
-Lowest to highest: **built-in default, then the profile file, then the
-environment variable, then the explicit flag.**
+Lowest to highest: **built-in default, then the profile, then the environment
+variable, then the flag.** `plan` shows which of the four set each dial.
 
-A file the user edited months ago must not beat a variable they exported in
-this shell, and neither may beat what they typed on this command line.
+## Every dial
 
-| variable | dial |
+These flags are shared by `generate`, `chat`, `serve`, `logits`, `perplexity`
+and `plan`. The integrity flags have no profile key, so a config file cannot
+turn checking off.
+
+| flag | default | profile key | variable | what it sets |
+| --- | --- | --- | --- | --- |
+| `--context <TOKENS>` | 4096 | `context` | `RAMVAMP_CONTEXT` | context window |
+| `--cache-bytes <BYTES>` | `2485M`, 19 slots per layer | `cache_bytes` | none | expert-cache budget; binary suffixes `K`, `M`, `G`, `T`, for example `1440M` or `2.4G` |
+| `--threads <N>` | one per physical performance core on a hybrid CPU, else one per usable CPU | `threads` | none | compute threads, counting the decode thread; 1 to 256 |
+| `--placement <MODE>` | `shared` | `placement` | `RAMVAMP_PLACEMENT` | where threads run: `shared` (any performance core, or any efficiency core with an L3, so the scheduler can dodge a busy one), `per-core` (one pinned per performance core, faster only on an idle machine), `off` (no affinity) |
+| `--prefill <MODE>` | `sweep` | `prefill` | `RAMVAMP_PREFILL` | `sweep` passes over each layer's experts once per chunk of prompt positions; `token-major` runs one forward pass per prompt token through the expert cache |
+| `--prefill-chunk <N>` | 512 | `prefill_chunk` | `RAMVAMP_PREFILL_CHUNK` | prompt positions per sweep; lowered automatically when the cache cannot stage that many |
+| `--common-memory <MODE>` | `resident` | none | none | `resident` reads the common weights into memory once; `mapped` memory-maps them, so the kernel may drop and re-read them |
+| `--skip-hashes` | off | none | none | skip SHA-256 checks at load; size checks still run |
+| `--verify-layer-hashes` | off | none | none | also hash every expert file on first open, a full read of the expert set on each start |
+
+`--context` sizes the KV cache, so it trades conversation length against
+memory. A prompt plus the tokens reserved for its reply must fit inside it, and
+a value above the model's trained length is refused, because positions past it
+produce fluent nonsense rather than an error.
+
+## Command flags
+
+Every command takes `--model <DIR>`, the installed model, plus its own flags.
+A `--messages-file` is a JSON array of `{"role": ..., "content": ...}` turns.
+
+| command | what it does, then its flags |
 | --- | --- |
-| `RAMVAMP_CONTEXT` | `--context` |
-| `RAMVAMP_PREFILL` | `--prefill` (`sweep` or `token-major`) |
-| `RAMVAMP_PREFILL_CHUNK` | `--prefill-chunk` |
+| `generate` | Streams one completion to stdout. `--prompt <TEXT>` (raw, no chat template) or `--messages-file <FILE>` (rendered through the template), one required; `--trace-experts <FILE>` writes each position's routed expert ids to a binary trace |
+| `chat` | `--system <TEXT>`, the first turn; `--messages-file <FILE>`, a conversation to start from, which `/reset` returns to; `--tui`, the status panel |
+| `generate`, `chat`, `serve` | `--max-new <N>` (128, or 512 for `serve`), `--greedy`, `--temperature`, `--top-k`, `--top-p`, `--seed`. Sampling defaults come from the model: temperature 0.7, top-p 0.8, top-k 20 for the pinned one |
+| `logits` | Prints the top next-token logits for a raw prompt as JSON. `--prompt <TEXT>`, required; `--top <N>` (20), how many to print; `--trace-experts <FILE>` |
+| `perplexity` | Scores a text file's perplexity the way `llama-perplexity` does. `--file <FILE>`, required; `--window <TOKENS>` (512); `--chunks <N>` (every whole window); `--json <FILE>`, the per-window scores |
+| `tokenize` | Encodes a prompt or conversation, prints its token ids and checks that they decode back. `--prompt <TEXT>` or `--messages-file <FILE>`, one required. It takes none of the dials above |
 
-An unusable value in any of them is ignored rather than fatal, so a shell
-profile set years ago cannot stop the binary from starting. It is not ignored
-silently: the warning goes to stderr, because a variable that was meant to
-widen the window and did nothing is exactly the failure a user would otherwise
-attribute to the model.
+`serve`'s own flags are in [server.md](server.md#flags), and
+`ramvamp <command> --help` lists everything.
 
-What each configuration costs in throughput and resident bytes is in
-[benchmarks.md](benchmarks.md); the memory contract behind the projection is in
-[architecture.md](architecture.md).
+## Environment variables
+
+| variable | effect |
+| --- | --- |
+| `RAMVAMP_CONTEXT`, `RAMVAMP_PLACEMENT`, `RAMVAMP_PREFILL`, `RAMVAMP_PREFILL_CHUNK` | the dials in [Every dial](#every-dial) |
+| `RAMVAMP_NO_SCOPE` | set to any value: run without the [swap-off scope](#the-swap-off-scope) |
+| `RAMVAMP_ASCII` | any value but `0`: ASCII glyphs in `chat --tui`. `TERM=dumb` or a non-UTF-8 locale does the same |
+| `RUST_LOG` | log filter. ramvamp logs only errors by default; `RUST_LOG=warn` or `info` shows more. `ramvamp-repack` defaults to `info` |
+| `RAMVAMP_FORCE_SCALAR` | any value: every quantized GEMV runs the scalar reference kernel instead of AVX2. A diagnostic for comparing outputs, much slower |
+
+An unusable value in a dial variable is ignored, so an old shell setting
+cannot stop the binary from starting. `RAMVAMP_CONTEXT` and `RAMVAMP_PLACEMENT`
+print a warning to stderr when ignored. `RAMVAMP_PREFILL` and
+`RAMVAMP_PREFILL_CHUNK` warn only in the log, which the default level hides:
+set `RUST_LOG=warn`, or run `plan`, whose source column then does not say
+`env`.
+
+## The swap-off scope
+
+Model commands run with swap turned off for their own process, so nothing
+else on the machine can push the common weights out to swap. `generate`,
+`chat`, `serve`, `logits` and `perplexity` re-launch themselves once inside a
+systemd user scope with `MemorySwapMax=0`. No root is needed, and the scope
+sets no memory cap.
+
+It is skipped when swap is already off for the process, when
+`systemd-run --user --scope` does not work (no systemd user session), or when
+`RAMVAMP_NO_SCOPE` is set to any value. `plan` and `tokenize` never re-launch.
+
+```bash
+RAMVAMP_NO_SCOPE=1 ramvamp chat --model ~/models/qwen3-30b-a3b.rvmp
+```
+
+Throughput and memory by configuration are in [benchmarks.md](benchmarks.md).
+The memory contract behind the projection is in
+[architecture.md](architecture.md#memory-contract).

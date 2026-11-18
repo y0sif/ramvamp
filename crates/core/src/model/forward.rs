@@ -19,7 +19,7 @@
 //!
 //! # Decode loop shape
 //!
-//! This is the phase-5 shape from `docs/architecture.md` ("Decode loop").
+//! This is the shape `docs/architecture.md` describes under "Decode loop".
 //! Per layer, once routing has produced the renormalized top-k:
 //!
 //! 1. [`ExpertStream::begin_layer`] plans the step against the layer's slot
@@ -1182,8 +1182,9 @@ impl ForwardState {
     /// on a hybrid part while an `own`-heavy one blames the kernel or the
     /// memory system.
     ///
-    /// `router` is **not** pooled — it is a serial `dot_f32` loop on the decode
-    /// thread — so its `wait` is zero by construction, not measured.
+    /// `router` is pooled by expert like the other sites, so its `wait` is
+    /// measured too. Its opening and closing clock reads bracket the fan-out
+    /// alone, not the softmax and top-k scan that follow it.
     ///
     /// The four buckets are disjoint spans strictly inside the two coarse
     /// phases above, so their sum can never exceed
@@ -1343,8 +1344,7 @@ struct GemvBucket {
     /// Set-up, publish and this core's share of the rows.
     own: Duration,
     /// The barrier: stragglers, worker wake latency, and whatever the even row
-    /// split costs on cores of different speeds. Always zero for
-    /// [`GemvSite::Router`], which never fans out.
+    /// split costs on cores of different speeds.
     wait: Duration,
     /// Fan-outs charged, so ms/scatter is derivable without another counter.
     scatters: u64,
@@ -1451,17 +1451,13 @@ thread_local! {
 /// region boundary. Per decoded token at the v0 pin (48 layers, `top_k` 8):
 /// `48 * 4 * 3` = 576 for the projections, at most `48 * 4 * 3` = 576 for the
 /// experts (two fused fan-outs for each non-empty phase, and a layer has one
-/// or two), 3 for `lm_head` and `48 * 2` = 96 for the serial router, so
-/// **1,251 reads a token at worst and 963 when every layer's experts are all
-/// hits or all misses** — derived by counting the sites, not measured. At the
-/// ~27 ns `Instant::now()` measures on this machine's vDSO (the figure
-/// [`forward_token_traced`] already quotes) that is ~34 µs against the ~532 ms
-/// token EXP-023 measured: 0.006% of it, and an order below the run-to-run
-/// noise of anything the split is read against.
-///
-/// It was 4,131 reads before phase 9 fused the expert fan-outs (`48 * 4 * 3`
-/// plus `48 * 8 * 3 * 3`), against a design budget of 4,500. The instrument
-/// did not get cheaper; there are simply far fewer jobs to charge.
+/// or two), 3 for `lm_head` and `48 * 3` = 144 for the router, so **1,299
+/// reads a token at worst and 1,011 when every layer's experts are all hits or
+/// all misses**, derived by counting the sites, not measured. At the ~27 ns
+/// `Instant::now()` measures on this machine's vDSO (the figure
+/// [`forward_token_traced`] already quotes) that is ~35 µs against the ~532 ms
+/// token EXP-023 measured: under 0.01% of it, and an order below the
+/// run-to-run noise of anything the split is read against.
 struct GemvClock<'a> {
     /// `None` when this pass charges nowhere.
     split: Option<&'a mut GemvSplit>,
@@ -2666,9 +2662,10 @@ pub fn forward_token_traced<'s>(
         //
         // The matvec is split across the pool by expert: each logit is one
         // whole serial `dot_f32`, whichever thread computes it, so no bit
-        // moves. Its two clock reads bracket the fan-out alone, not the
-        // softmax and top-k scan the coarse `Router` region also covers, which
-        // is why the two instruments do not sum to each other here.
+        // moves. Its opening and closing clock reads bracket the fan-out
+        // alone, not the softmax and top-k scan the coarse `Router` region
+        // also covers, which is why the two instruments do not sum to each
+        // other here.
         let opened = gemv.open();
         {
             let router = lw.router.data();
@@ -4178,10 +4175,9 @@ mod tests {
     /// dial to move, so it has to name every tenant, the context it sized the
     /// KV cache for, the total, and the ceiling.
     ///
-    /// The numbers are the real ones: the audited `common.bin`, the shipped
-    /// 11-slot pool, a 16K context, EXP-012's anonymous row, and the 3 GB
-    /// benchmark cgroup — the exact configuration a user gets the moment
-    /// context becomes a dial and they reach for a bigger one.
+    /// The numbers are the real ones: the audited `common.bin`, the 11-slot
+    /// pool of `--cache-bytes 1440M`, a 16K context, EXP-012's anonymous row,
+    /// and a 3 GB cgroup.
     #[test]
     fn an_impossible_configuration_names_every_term_and_the_ceiling() {
         let footprint = Footprint {
@@ -4306,7 +4302,7 @@ mod tests {
     // The decode GEMV sub-split
     // -----------------------------------------------------------------------
 
-    /// `(own + wait)` over every bucket, plus the serial router.
+    /// `(own + wait)` over every bucket, the router's included.
     fn gemv_accounted(split: &[(&'static str, Duration, Duration, u64); 4]) -> Duration {
         split
             .iter()
@@ -4330,7 +4326,7 @@ mod tests {
     ///
     /// - **Counts.** Every fan-out is charged exactly once, to the bucket the
     ///   geometry says: `4` projections a layer (`attn_q`, `attn_k`, `attn_v`,
-    ///   `attn_output`), a serial router matvec a layer, one `lm_head` a
+    ///   `attn_output`), one router matvec a layer, one `lm_head` a
     ///   token. A GEMV that slipped out of the sub-split, or one charged
     ///   twice, moves one of these exact numbers.
     ///

@@ -5,9 +5,10 @@
 //! `is_x86_feature_detected!`, which caches after the first probe) and falls
 //! back to the scalar reference in the parent module otherwise. The
 //! `force_scalar` parameter forces the scalar path so tests and benches can
-//! compare both implementations through an identical call shape; there is no
-//! environment-variable switch. On non-x86_64 targets everything compiles to
-//! the scalar path.
+//! compare both implementations through an identical call shape; this layer
+//! reads no environment variable (`RAMVAMP_FORCE_SCALAR` is read by the GEMV
+//! layer above it). On non-x86_64 targets everything compiles to the scalar
+//! path.
 //!
 //! The AVX2 bodies mirror ggml's x86 recipes (`ggml-cpu/arch/x86/quants.c`):
 //! the k-quant 6-bit scale unpack via the `0x3f3f3f3f` / `0x0f0f0f0f` /

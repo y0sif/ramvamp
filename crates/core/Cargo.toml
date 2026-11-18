@@ -12,6 +12,10 @@ rust-version.workspace = true
 documentation = "https://docs.rs/ramvamp-core"
 keywords = ["llm", "inference", "moe", "nvme", "io-uring"]
 categories = ["science", "filesystem", "caching", "os::linux-apis"]
+# What ships to crates.io, so nothing else dropped in this directory can. The
+# benches and the tokenizer fixtures under src/ ship because tests and
+# `[[bench]]` need them.
+include = ["/src/**", "/benches/**"]
 
 [features]
 default = ["io-uring"]

@@ -8,16 +8,36 @@
 # Benchmark and experiment outputs
 /scratch/
 
-# Working notes, kept local on purpose.
-#
-# Handoff docs are written by one session for the next and go stale by design;
-# `docs/roadmap.md` is the plan of record and is public. The raw experiment log
-# is an internal working record: it argues with itself, withdraws numbers, and
-# records reasoning that was later refuted. The public record of what was
-# measured is the curated `docs/experiments.md`, and every entry there traces
-# back to an entry in the raw log.
-/docs/handoff-*.md
-/docs/experiments/
+# Public docs pages only. docs/roadmap.md is the plan of record; docs/experiments.md is the
+# curated record of what was measured, each entry traced to a private raw log.
+/docs/*
+!/docs/architecture.md
+!/docs/benchmarks.md
+!/docs/comparison.md
+!/docs/configuration.md
+!/docs/experiments.md
+!/docs/install.md
+!/docs/roadmap.md
+!/docs/server.md
+
+# Internal: specs and agent tooling
+/specs/
+.claude/
+graphify-out/
+CLAUDE.local.md
+
+# Internal working files, in any directory
+NOTES.md
+PLAN.md
+BENCHMARKS.md
+HANDOFF.md
+MEMORY.md
+next-session*.md
+
+# Internal working folders, at the root only
+/bench/
+/results/
+/memory/
 
 # Environment
 .env

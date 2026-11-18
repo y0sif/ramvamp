@@ -9,9 +9,9 @@
 //! nowhere in the audited pin and is not implemented.
 //!
 //! Weight rows are consumed as raw byte slices (`&[u8]`) straight from the
-//! mmap'd common core or a streamed expert slab: zero-copy, no `#[repr(C)]`
-//! casting. Activation blocks are plain Rust structs produced per token by
-//! the quantizers here; they never touch disk.
+//! common core's read-only map or a streamed expert slab: zero-copy, no
+//! `#[repr(C)]` casting. Activation blocks are plain Rust structs produced
+//! per token by the quantizers here; they never touch disk.
 //!
 //! # Alignment
 //!

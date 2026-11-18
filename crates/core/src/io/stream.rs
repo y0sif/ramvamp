@@ -39,6 +39,16 @@
 //! though: submission and reaping are separate methods over an explicit
 //! in-flight table keyed by `user_data`, which is what a reactor would need.
 //!
+//! # Nothing is registered
+//!
+//! Reads are plain `opcode::Read` on a raw fd: no `register_files`, no
+//! `register_buffers`, no `ReadFixed`. Registering the slot pool would pin all
+//! of it with `FOLL_LONGTERM`, unreclaimable and uncompactable, inside a
+//! budget whose point is to stay small. `RLIMIT_MEMLOCK` is 8 MiB soft and
+//! hard under systemd defaults, so it would only work after the user edits a
+//! unit. And the measured benefit is about 70 µs of CPU per 3 MiB read, ~4.5%
+//! of one core (provisional, EXP-008).
+//!
 //! # What can go wrong, and what happens then
 //!
 //! - **Completions arrive out of order.** Dispatch is on `user_data`, which
@@ -157,14 +167,20 @@ use super::{
 /// "decode waits on all misses, prefer the low end for latency" argument is
 /// context here rather than a second measurement.
 ///
-/// **Two gaps this does not close**, both open work in `docs/architecture.md`.
-/// EXP-019 swept queue depth only at 8 experts per read, so the decode
-/// geometry has no measured queue-depth curve of its own: its QD8 point is
-/// measured, its QD2 and QD4 points are not. And the probe emulated depth with
-/// threaded `preadv`, not io_uring, so it characterises the drive and the
-/// filesystem rather than this submission path. An io_uring confirmation
-/// inside the runtime is still owed, and this constant should not move before
-/// that lands.
+/// **The decode geometry is measured; the submission path is not.** EXP-023
+/// swept queue depth at one blob per read, the size decode issues: the curve
+/// is flat from QD 2 (QD 4 on one file), and decode's own concurrency derives
+/// to 3.26-3.76 misses per layer step, on that plateau. Both sweeps emulated
+/// depth with threaded `preadv`, not io_uring, so they characterise the drive
+/// and the filesystem rather than this submission path. An io_uring
+/// confirmation inside the runtime is still owed, and this constant should
+/// not move before that lands.
+///
+/// A deeper ring could not put more bytes in flight anyway. This equals the
+/// v0 pin's `top_k`, a decode layer submits one read per miss, and
+/// [`ExpertStream::begin_layer`] refuses a step while any earlier read is
+/// outstanding, so every miss a layer can have fits the ring at once (derived
+/// from the code, not measured).
 ///
 /// The ring is also charged against `RLIMIT_MEMLOCK`, which is 8 MiB soft
 /// *and* hard under systemd defaults since kernel 6.14.
@@ -1223,9 +1239,9 @@ impl ExpertStream {
     /// configuration stays meaningful across models. It buys
     /// `cache_bytes / sum(page-aligned stride of every layer)` slots per
     /// layer: on the audited Qwen3-30B-A3B geometry (24 layers at 3,059,712 B
-    /// and 24 at 2,654,208 B) 1,438.59 MiB buys exactly 11, which is the
-    /// shipped dial. The result is clamped to a layer's expert count — slots
-    /// past that can never be filled — and to
+    /// and 24 at 2,654,208 B) the default 2,485 MiB buys exactly 19, and
+    /// 1,438.59 MiB buys 11. The result is clamped to a layer's expert count
+    /// (slots past that can never be filled) and to
     /// [`MAX_SLOTS`](crate::io::MAX_SLOTS).
     ///
     /// Construction allocates and pre-faults the whole pool (the dominant
@@ -1646,7 +1662,7 @@ impl ExpertStream {
     /// What [`ExpertStream::sweep_layer`] cannot do. A layer-major prefill
     /// writes each expert's output into an `[n_rows][top_k][hidden]` staging
     /// buffer *while* it consumes the sweep, and both have to come out of the
-    /// pool or prefill costs bytes the 3 GB budget does not have. A
+    /// pool or prefill costs bytes the 4 GB budget does not have. A
     /// `LayerSweep` parks this stream's `&mut` for its whole life, so a driver
     /// holding one cannot hold a scratch span too;
     /// [`PrefillSession::split`](super::PrefillSession::split) hands out both
@@ -2016,11 +2032,12 @@ impl ExpertStream {
     /// # The damage, at the shipped dials
     ///
     /// The arena is carved from the **head** of the slab, which is where layer
-    /// 0 lives, and it is bigger than one layer's whole slot row: 2 windows of
-    /// 8 experts at the 3,059,712 B stride is 46.7 MiB against layer 0's 11
-    /// slots x 2.92 MiB = 32.1 MiB. So one unreapable window read leaves layer
-    /// 0 with **0** slots and layer 1 with 6 — both under a `top_k` of 8, and
-    /// both dead for the rest of the process.
+    /// 0 lives, and it covers most of layer 0's slot row or more: the sweep
+    /// ring alone is 2 windows of 8 experts at the 3,059,712 B stride, 46.7
+    /// MiB, against layer 0's 19 slots x 2.92 MiB = 55.4 MiB, and a 512-row
+    /// prefill session puts about 78 MiB of scratch in front of the ring. So
+    /// one unreapable window read leaves layer 0 (and, under a full session,
+    /// layer 1) below a `top_k` of 8 and dead for the rest of the process.
     ///
     /// Carving the arena from the *tail* instead does not fix this; it moves
     /// the damage to layer 47. Nothing can fix it while the arena is the pool,

@@ -1,8 +1,7 @@
 //! Per-layer expert slot cache.
 //!
-//! Owned by wave-1 lane B. Policy is LFU with recency as tie-breaker and
-//! **frequency counters indexed by expert id, not by slot**, so a count
-//! survives its expert's eviction. That detail is the policy: simulated over
+//! Policy is LFU with recency as tie-breaker and **frequency counters indexed
+//! by expert id, not by slot**, so a count survives its expert's eviction. That detail is the policy: simulated over
 //! real recorded routing traces (EXP-005 replays traces the runtime captured,
 //! but the hit rates are the simulator's, not the runtime's), ghost-history
 //! LFU beats per-slot LFU by +2.2 points and LRU by +2.2 at 10 slots/layer,
@@ -172,10 +171,8 @@ pub enum CacheError {
     /// holds another expert this same step needs. Evicting one would alias a
     /// buffer under a live O_DIRECT read, so the step fails instead.
     ///
-    /// (What aliasing costs on btrfs — spurious EIO from checksum failure —
-    /// was measured during io bring-up but is not recorded in
-    /// `docs/experiments.md`; treat the figure quoted on
-    /// [`CachePlan::hits`] as provisional.)
+    /// (What aliasing costs on btrfs, spurious EIO from checksum failure, is
+    /// recorded in EXP-007.)
     #[error(
         "layer needs {needed} more slot(s) but only {free} of {n_slots} are free \
          (the rest are filling or in use)"
@@ -268,8 +265,7 @@ impl CachePlan {
     /// A hit may name a slot whose fill is still in flight: `plan` never
     /// issues a second read for an expert that already owns a slot, because
     /// two O_DIRECT reads aliasing one buffer make btrfs report spurious EIO
-    /// (provisional: 13-27% during io bring-up, not recorded in
-    /// `docs/experiments.md`). Callers that plan more than once per
+    /// (EXP-007). Callers that plan more than once per
     /// step must therefore wait for outstanding completions (see
     /// [`LayerCache::is_ready`]) before computing on a hit. Those requests
     /// are counted as [`CacheStats::pending_hits`], not as hits.
@@ -318,8 +314,8 @@ impl CachePlan {
 /// The cold/eviction split is the number that says whether the slot budget
 /// is wrong: cold misses are unavoidable at any cache size, eviction misses
 /// are what more slots would buy. At 10 slots/layer, 87.9% of misses were
-/// eviction misses (EXP-005), and `docs/architecture.md` argues from that
-/// share, so the split has to be honest in both directions. It is only
+/// eviction misses (EXP-005), and the case for buying more slots rests on
+/// that share, so the split has to be honest in both directions. It is only
 /// meaningful if the caller reports completions through
 /// [`LayerCache::mark_ready`]: an expert becomes "fetched" when a read for it
 /// lands, never merely because one was planned. A caller that never marks
@@ -1194,7 +1190,7 @@ mod tests {
     /// A read that failed and was invalidated must not leave its expert
     /// marked as fetched: the retry is a *cold* miss, because the layer never
     /// held those bytes. Counting it as an eviction miss inflates the share
-    /// `docs/architecture.md` uses to argue for buying more slots.
+    /// the case for buying more slots rests on (EXP-005).
     #[test]
     fn a_failed_fill_leaves_the_retry_a_cold_miss() {
         let mut cache = new_cache(1, 8);

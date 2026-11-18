@@ -1,7 +1,7 @@
 //! Named profiles: the config file, and the precedence chain around it.
 //!
-//! The dials named here — `context`, `cache_bytes`, `threads`, `prefill`,
-//! `prefill_chunk` — are the ones that decide whether a run fits in memory and
+//! The dials named here (`context`, `cache_bytes`, `threads`, `placement`,
+//! `prefill`, `prefill_chunk`) are the ones that decide whether a run fits in memory and
 //! how fast it goes. They were already runtime values before this module
 //! existed; what a profile adds is a *name* for a combination of them, so that
 //! a small chat setup and a wide-context agent setup are `--profile chat` and
@@ -40,7 +40,7 @@
 //! config.json`, else `~/.config/ramvamp/config.json`.
 //!
 //! **A missing file is not an error.** It means the built-in defaults, which
-//! are the measured, published 4K/11-slot configuration; nothing here ships a
+//! are the measured, published 4K/19-slot configuration; nothing here ships a
 //! file, writes one, or creates the directory. A file that exists and does not
 //! parse *is* an error naming the path, and so is an unrecognized key:
 //! silently ignoring a configuration the user wrote is the failure this
@@ -150,15 +150,15 @@ pub struct ProfileArgs {
 
     /// Ignore any config file and use the built-in defaults.
     ///
-    /// For measurement. Every published number in `docs/experiments.md` assumes
-    /// a known configuration, and a config file in the operator's home would
-    /// otherwise change what a benchmark measures without appearing anywhere
-    /// in the entry that records it. `scripts/cold_bench.py` passes this so a
-    /// cold run means the same thing on a machine that has profiles as on one
-    /// that does not.
-    ///
     /// Env vars and explicit flags still apply: this removes one layer of the
     /// precedence chain, it does not pin the whole configuration.
+    //
+    // For measurement. Every published number in `docs/experiments.md` assumes
+    // a known configuration, and a config file in the operator's home would
+    // otherwise change what a benchmark measures without appearing anywhere
+    // in the entry that records it. `scripts/cold_bench.py` passes this so a
+    // cold run means the same thing on a machine that has profiles as on one
+    // that does not.
     #[arg(long)]
     pub no_config: bool,
 }
@@ -1479,7 +1479,7 @@ mod tests {
         assert!(lines[10].starts_with("available: 16,384 MiB"), "{lines:#?}");
         assert!(lines[11].starts_with("verdict:   fits"), "{lines:#?}");
 
-        // The same configuration under the published 3 GiB cgroup.
+        // The same configuration under a 3 GiB cgroup.
         let lines = plan_lines(&dials, Path::new("/m.rvmp"), &projected, Some(3 << 30));
         assert_eq!(lines[10], "available: 3,072 MiB");
         assert_eq!(lines[11], "verdict:   does not fit, 1,041 MiB over");

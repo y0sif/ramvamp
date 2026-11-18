@@ -1201,7 +1201,7 @@ fn fit_buffers(
 /// [`SLOT_ALIGN`](crate::io::SLOT_ALIGN)-aligned; the ring starts at the next
 /// 4096 boundary past it, so every window offset stays legal for O_DIRECT. The
 /// ring is sized for the *widest* layer, since one session spans all of them.
-/// At the shipped geometry the slab is ~1,438 MiB against a ~47 MiB ring, so
+/// At the default dials the slab is about 2,485 MiB against a ~47 MiB ring, so
 /// this is an ownership problem and not a space one.
 ///
 /// # The scratch is not zeroed

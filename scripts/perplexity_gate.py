@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Gate 5: WikiText-2 perplexity, ramvamp against llama-perplexity, window by window.
 
-Closes validation gate 5, the last open v0 gate (docs/roadmap.md, "Gate 5:
-perplexity"). The reference side is banked: llama.cpp b10217's
+Runs validation gate 5 (docs/architecture.md, "Validation protocol vs
+llama.cpp"), which EXP-035 closed. The reference side is banked: llama.cpp
+b10217's
 
     llama-perplexity -m <Q4_K_M GGUF> -f wiki.test.raw -c 512 --chunks 40
 

@@ -1,96 +1,85 @@
 # Install
 
-Covers how to get the two binaries, what ramvamp needs from a machine, the
-three I/O modes it can end up in, and every `ramvamp-repack` subcommand beyond
-the one-line install.
+This page covers requirements, the installer, the model install, paths,
+building from source, uninstalling and troubleshooting. The install command
+itself is in the [README](../README.md#install).
 
-## The one-liner
+## Requirements
 
-```bash
-curl -sSL https://y0sif.github.io/ramvamp/install.sh | bash
-```
+- **Linux on x86_64.** Expert reads use io_uring (kernel 5.6 or newer) and
+  O_DIRECT, both Linux interfaces.
+- **An NVMe SSD with 17.35 GiB free.** The repacker streams the download into
+  place and keeps no second copy. Other storage works far more slowly, because
+  decode reads up to about 1.1 GB of expert weights per token.
+- **About 4 GB of free memory** at the default 4K context. `ramvamp plan`
+  prints the figure for any setting; see
+  [configuration.md](configuration.md#check-a-configuration-with-plan).
+- **AVX2, FMA and F16C are optional.** They are detected at runtime, and a
+  scalar fallback runs without them, much more slowly.
+- **A systemd user session is optional.** With one, model commands run with
+  swap off; see [configuration.md](configuration.md#the-swap-off-scope).
 
-It resolves the latest release, downloads `ramvamp-linux-x86_64.tar.gz`, checks
-that the binary it extracted reports the version the tag claims, and installs
-`ramvamp` and `ramvamp-repack`. Then it stops: it prints the model install
-command and does **not** run it, because that is a 17.35 GiB download and it is
-not a script's decision to start.
+## What the installer checks
 
-What it refuses, and what it only warns about:
+The [installer](../install.sh) refuses a machine it cannot support and warns
+about one that will run slowly. Re-running it upgrades in place and reports the
+version it replaced.
 
 | check | on failure |
 | --- | --- |
 | Linux on x86_64 | **refuses**, installs nothing |
 | `curl` and `tar` on PATH | **refuses** |
 | download is a real tarball holding both binaries | **refuses** |
-| kernel 5.1 or newer | warns: io_uring falls back to `pread` |
+| kernel 5.6 or newer | warns: on 5.1 to 5.5 every expert read fails |
 | AVX2 and F16C | warns: scalar kernels, much slower |
-| an NVMe device exists | warns: the drive is the throughput |
+| an NVMe device exists | warns: the drive sets the speed |
 | binary runs and its version matches the tag | warns |
 | install directory is on `PATH` | warns, and says how to fix it |
+| no other `ramvamp` is already on `PATH` | warns: whichever comes first on `PATH` runs |
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `RAMVAMP_VERSION` | latest release | pin a tag, for example `v0.1.0` |
+| `RAMVAMP_VERSION` | latest release | pin a tag, for example `curl ... \| RAMVAMP_VERSION=v0.1.1 bash` |
 | `RAMVAMP_INSTALL_DIR` | `/usr/local/bin`, or `~/.local/bin` with neither root nor `sudo` | where the two binaries go |
 
-Re-running it upgrades in place, and says which version it replaced. If another
-`ramvamp` is already on `PATH` somewhere else, it says that too rather than
-letting the two shadow each other quietly.
+## Install the model
 
-The script is [`install.sh`](../install.sh) at the repository root. The copy
-served from `y0sif.github.io/ramvamp/install.sh` is mirrored from it by
-`.github/workflows/sync-installer.yml`, so the two cannot drift.
-
-Prefer to do it by hand:
+`ramvamp-repack` downloads the GGUF and repacks it in one streaming pass,
+copying the quantized bytes unchanged.
 
 ```bash
-curl -sSL -o ramvamp.tar.gz \
-  https://github.com/y0sif/ramvamp/releases/latest/download/ramvamp-linux-x86_64.tar.gz
-tar xzf ramvamp.tar.gz
-sudo install -m755 ramvamp ramvamp-repack /usr/local/bin/
+# Download and repack. Repo, revision and file default to a pinned commit,
+# which `ramvamp-repack install --help` prints.
+ramvamp-repack install --output ~/models/qwen3-30b-a3b.rvmp
+
+# Optional: full hash verification. Note --input here.
+ramvamp-repack verify-install --input ~/models/qwen3-30b-a3b.rvmp
 ```
 
-## Requirements
+| subcommand | what it does | flags |
+| --- | --- | --- |
+| `inspect` | Parse a GGUF header, build the repack plan, and print a report. No data section is read | Exactly one of `--local <PATH>` or `--remote`; with `--remote`, `--repo`, `--revision` (default `main`, not the pin) and `--file` |
+| `install` | Stream a GGUF source into an installed `.rvmp` directory | `--output <DIR>` (required); `--local <PATH>` for an offline source; `--repo`, `--revision`, `--file` for a different remote; `--window-mib <N>` (default 32, one HTTP range request per window); `--resume`; `--overwrite`; `--skip-verify`; `--skip-tokenizer`; `--tokenizer-dir <PATH>` |
+| `fetch-tokenizer` | Fetch the pinned tokenizer files into a completed install | `--output <DIR>` (required); `--tokenizer-dir <PATH>` to copy from a local directory |
+| `verify-install` | Re-verify an install: manifest, per-file size and hash, layout | `--input <DIR>` (required) |
+| `discard-partial` | Delete the staging directory of an interrupted install | `--output <DIR>` (required) |
 
-- **Linux on x86_64.** io_uring and O_DIRECT are the point of the design.
-- **An NVMe SSD** with about **17.35 GiB free** for the installed model. The
-  installer streams the source GGUF into place: no doubling, no separate copy
-  of the download kept on disk. Other storage works and is far slower, because
-  decode reads up to about 1.1 GB of expert weights per token.
-- **AVX2 and FMA are optional.** They are detected at runtime (F16C too, for
-  attention) and there is a scalar fallback, so it runs without them, just
-  slower.
-- **Rust 1.88 or newer, only to build from source.** A prebuilt binary needs no
-  toolchain at all. Edition 2024 itself needs only 1.85, but `ratatui`, which
-  draws the `chat --tui` panel, needs 1.88, and cargo resolves the floor across
-  the whole workspace.
+`install` fetches the tokenizer after the model. If that step fails, the model
+install stands, and `fetch-tokenizer` adds the tokenizer later.
 
-## The three I/O modes, and the banner that names yours
+## Paths
 
-Two degradations are automatic, and the load banner tells you which of the
-three modes you got: `io_uring+O_DIRECT`, `io_uring+buffered`, or `pread`.
-io_uring falls back to `pread`, and O_DIRECT falls back to buffered reads if
-the filesystem refuses the flag or the startup probe cannot prove it is real.
+| what | where |
+| --- | --- |
+| `ramvamp`, `ramvamp-repack` | `/usr/local/bin`, `~/.local/bin`, or `RAMVAMP_INSTALL_DIR` |
+| the model | the `--output` directory; `<output>.partial` while an install runs |
+| config file | `~/.config/ramvamp/config.json`, only if you create it ([configuration.md](configuration.md#named-profiles)) |
 
-**The ~3 GB memory contract turns on O_DIRECT, not on io_uring.** Buffered
-reads are charged to the page cache and expert traffic is most of the model, so
-`io_uring+buffered` will not hold the budget. `pread` is the slow mode, but it
-still bypasses the page cache when O_DIRECT was verified, so the contract
-survives losing io_uring and does not survive losing O_DIRECT.
+## From source
 
-## Run as the user that owns the install
-
-The kernel will not report page-cache residency for a file this process
-neither owns nor may write, so on an install unpacked by root and run by you,
-the startup probe cannot prove O_DIRECT is real, and it degrades to buffered
-rather than assume.
-
-## Build from source
-
-Only needed for an unreleased commit, a local change, or a machine the prebuilt
-binary will not run on. Needs Rust 1.88 or newer and nothing else: the tree has
-no C dependencies, and `ureq` uses rustls rather than OpenSSL.
+Building needs Rust 1.88 or newer and a C and C++ compiler (`build-essential`
+on Debian or Ubuntu, `base-devel` on Arch), because `ring`, Oniguruma and
+esaxx build native code. OpenSSL is not needed.
 
 ```bash
 git clone https://github.com/y0sif/ramvamp
@@ -98,49 +87,33 @@ cd ramvamp
 cargo build --release
 ```
 
-Two binaries come out of a build: `target/release/ramvamp` and
-`target/release/ramvamp-repack`. Every example below writes them as bare
-commands, which is what they are after an install; from a source tree, prefix
-them with `./target/release/`.
+The binaries land in `target/release/`. Copy them onto your `PATH`, or run them
+as `./target/release/ramvamp`.
 
-## The repacker
+## Uninstall
 
-The repacker copies quantized bytes unchanged. It never requantizes, so
-llama.cpp runs the identical bytes and validation compares arithmetic rather
-than weights.
+Uninstalling is deleting the files in [Paths](#paths).
 
 ```bash
-# Peek at the pinned source first. This parses the GGUF header over HTTP range
-# requests only, so it costs nothing before a 17 GiB download.
-ramvamp-repack inspect --remote
-
-# Download and repack in one streaming pass. --output is the only flag you
-# need: repo, revision and file all default to the pinned Qwen3-30B-A3B source.
-ramvamp-repack install --output ~/models/qwen3-30b-a3b.rvmp
-
-# Optional, and thorough: full hash verification of the install.
-# Note --input here, --output above.
-ramvamp-repack verify-install --input ~/models/qwen3-30b-a3b.rvmp
+sudo rm "$(command -v ramvamp)" "$(command -v ramvamp-repack)"  # drop sudo for ~/.local/bin
+rm -r ~/models/qwen3-30b-a3b.rvmp   # the model
+rm -r ~/.config/ramvamp             # only if you created a config file
 ```
 
-| subcommand | what it does | flags |
-| --- | --- | --- |
-| `inspect` | Parse a GGUF header, build the repack plan, and print a report. No data section is ever read | Exactly one of `--local <PATH>` or `--remote`; with `--remote`, `--repo`, `--revision` and `--file` override the defaults |
-| `install` | Stream a GGUF source into an installed `.rvmp` directory | `--output <DIR>` (required); `--local <PATH>` for an offline source; `--repo`, `--revision`, `--file` for a different remote; `--window-mib <N>` (default 32, one HTTP range request per window); `--resume`; `--overwrite`; `--skip-verify`; `--skip-tokenizer`; `--tokenizer-dir <PATH>` |
-| `fetch-tokenizer` | Fetch the pinned tokenizer files into an existing completed install and record them in its manifest | `--output <DIR>` (required); `--tokenizer-dir <PATH>` to copy from a local directory instead of downloading |
-| `verify-install` | Re-verify an installed directory: manifest, per-file size and hash, layout cross-check | `--input <DIR>` (required) |
-| `discard-partial` | Delete the `.partial` staging directory of an interrupted install | `--output <DIR>` (required) |
+## Troubleshooting
 
-`install` fetches the tokenizer itself once the model is durable. A tokenizer
-failure only prints a warning pointing at `fetch-tokenizer`, because the model
-install has already succeeded by then.
+The load banner on stderr ends with the I/O mode: `io_uring+O_DIRECT`,
+`io_uring+buffered`, or `pread`. io_uring falls back to `pread` when the kernel
+cannot create a ring. O_DIRECT falls back to buffered reads when the filesystem
+refuses it or a startup probe cannot prove it bypasses the page cache.
 
-Do not pass `--repo`, `--revision` or `--file` when reporting a benchmark: the
-defaults are the frozen v0 pin, and a report on different weights is a
-different measurement. See [benchmarks.md](benchmarks.md).
-
-## After installing
-
-`plan` prices a configuration before you run it, and refuses an impossible one
-before anything is allocated. See [configuration.md](configuration.md) for the
-dials it resolves, and [server.md](server.md) for the HTTP surface.
+- **Memory depends on O_DIRECT, not on io_uring.** Buffered reads fill the page
+  cache, so `io_uring+buffered` does not hold about 4 GB. `pread` with O_DIRECT
+  is slower and still bypasses the page cache.
+- **Run as the user that owns the install.** For a file the process neither
+  owns nor may write, the kernel hides page-cache residency, so the probe
+  degrades to buffered.
+- **`RUST_LOG=warn` shows why it degraded.** ramvamp logs only errors by default.
+- **An interrupted install** continues with `install --resume`.
+- **A configuration that does not fit** is refused at startup. Lower `--context`
+  or `--cache-bytes`; see [configuration.md](configuration.md).

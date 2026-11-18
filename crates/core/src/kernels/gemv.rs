@@ -2324,11 +2324,11 @@ mod tests {
     /// The `attn_v` row below is **deliberate over-coverage, not a shipped
     /// shape**. It puts a second quant format in the fused space, which no
     /// decode fusion has done since the `attn_q` + `attn_v` half was dropped
-    /// on 2026-08-08 (see `docs/architecture.md`, "How decode's GEMVs fan
-    /// out"). The mixed-format case is worth holding on to anyway: it is what
-    /// pins `fused_row_parts` to per-part `row_bytes` rather than one stride
-    /// for the whole space, and a future fusion that mixes formats would
-    /// otherwise land with no test behind it.
+    /// on 2026-08-08 (EXP-025 in `docs/experiments.md`). The mixed-format
+    /// case is worth holding on to anyway: it is what pins `fused_row_parts`
+    /// to per-part `row_bytes` rather than one stride for the whole space, and
+    /// a future fusion that mixes formats would otherwise land with no test
+    /// behind it.
     ///
     /// Real formats and in-dims (they fix `row_bytes`, hence the packed
     /// alignment each kernel sees) with the row counts trimmed, for the same

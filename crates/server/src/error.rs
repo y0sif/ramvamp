@@ -205,7 +205,7 @@ pub enum ServerError {
     /// The request body is larger than this server will buffer.
     ///
     /// The body is read into memory to be parsed, and this process is meant
-    /// to run inside a 3 GB cgroup alongside a model: an unbounded read is an
+    /// to run inside a 4 GB cgroup alongside a model: an unbounded read is an
     /// OOM with a `Content-Length` header for a trigger. The cap is generous
     /// against a 4K context and small against the budget.
     #[error("request body is larger than the {limit}-byte limit")]

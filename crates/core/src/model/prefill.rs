@@ -72,9 +72,10 @@
 //! # Memory
 //!
 //! Every batched buffer is carved from the [`PrefillSession`] scratch span,
-//! which is the head of the idle expert-slot slab. Nothing is allocated: the
-//! documented headroom under `memory.max=3G` is ~111 MiB, so a heap buffer
-//! here would be a budget event even though the slab itself is ~1,438 MiB.
+//! which is the head of the idle expert-slot slab. Nothing is allocated: at
+//! the default dials the projection leaves about 88 MiB spare under the 4 GiB
+//! contract, so a heap buffer here would be a budget event even though the
+//! slab itself is about 2,485 MiB.
 //! See [`scratch_bytes`] for the arithmetic and [`Carver`] for the typed
 //! sub-allocator that hands the span out.
 //!
@@ -886,8 +887,8 @@ fn accumulate(total: &mut usize, count: usize, unit: usize) -> Result<(), Forwar
 /// total                                 = 81,720,324 B   77.93 MiB
 /// ```
 ///
-/// against a ~1,438 MiB slab whose sweep ring costs a further ~46.7 MiB at the
-/// default dials. The 3 GiB contract is not touched: these bytes are the slot
+/// against the default 2,485 MiB slab, whose sweep ring costs a further
+/// ~46.7 MiB. The memory contract is not touched: these bytes are the slot
 /// pool's, already resident, borrowed for the length of the prefill. That is
 /// why the sharded attention scratch lives here and not on the heap — a
 /// prefill costs no *additional* bytes, whatever the headroom happens to be.
@@ -3961,7 +3962,7 @@ mod tests {
     }
 
     /// The documented v0 figures, to the byte. A 512-row chunk costs 77.93
-    /// MiB of the ~1,438 MiB slot slab, of which the `[rows][top_k][hidden]`
+    /// MiB of the slot slab, of which the `[rows][top_k][hidden]`
     /// staging that makes the reduction order-independent is 32 MiB and the
     /// six per-shard attention carves are 0.76 MiB.
     #[test]
@@ -3987,8 +3988,9 @@ mod tests {
             scratch_bytes(&dims, 1).unwrap() + 511 * per_row
         );
 
-        // Beside the default sweep ring, against the shipped slab: 125 MiB
-        // of 1,438, so neither dial is anywhere near the constraint.
+        // Beside the default sweep ring, against the smallest documented slab
+        // (11 slots, `--cache-bytes 1440M`): 125 MiB of 1,438, so neither dial
+        // is anywhere near the constraint.
         let shipped = layout_of(&[(3_059_712, 128), (2_654_208, 128)]);
         let ring = ring_bytes(&shipped, 8, 2);
         assert_eq!(ring, 48_955_392);

@@ -7,13 +7,13 @@ body:
     attributes:
       value: |
         Before you write this up, `docs/roadmap.md` is the plan of record: it
-        says what v0 needs, what is already done, and which decisions are
-        still open. If your idea is one of the open decisions, saying so and
-        arguing a side is more useful than a fresh proposal.
+        says what ships, what is next, and which decisions are still open. If
+        your idea is one of the open decisions, saying so and arguing a side
+        is more useful than a fresh proposal.
 
-        `docs/landscape.md` records why several tempting designs were
-        rejected, usually with a measurement attached. A proposal that
-        already knows about that measurement is much easier to act on.
+        `docs/comparison.md` records the designs measurements ruled out: mmap
+        demand paging, cross-layer prefetch and per-expert overlap. A proposal
+        that already knows those measurements is much easier to act on.
 
   - type: dropdown
     id: component
@@ -60,7 +60,7 @@ body:
     attributes:
       label: Does this cost memory or throughput?
       description: |
-        The project's whole claim is a 26-30B model in about 3 GB of RAM.
+        The project's whole claim: run 26-30B MoE models in about 4 GB of RAM.
         Proposals that hold more bytes resident, or that add work to the
         decode path, need to say so up front so the trade is discussed
         instead of discovered.

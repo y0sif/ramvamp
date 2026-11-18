@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Reproducible O_DIRECT bandwidth probe over the *installed* expert files.
 
-`docs/experiments.md` lists re-measuring EXP-008 as the highest-value
-item on the backlog, and EXP-008 cannot be re-run: its harness was never
-committed. This file is that harness, written so the entry it feeds is
+EXP-008 cannot be re-run: its harness was never committed. This file is
+that harness (EXP-019, EXP-024), written so the entry it feeds is
 reproducible, self-describing, and rule-2 compliant.
 
 ## The question
@@ -54,9 +53,9 @@ physically adjacent to their successor. That difference may be the whole
 disagreement between EXP-008 and EXP-013, and a bandwidth number without the
 extent map next to it is not interpretable.
 
-`docs/benchmark-machine.md` also records that per-file bandwidth variance
-exceeds run-to-run variance (`layer_00` 1,237 MB/s vs `layer_20` 1,812 MB/s).
-This probe therefore runs a **fixed, recorded** file set spanning both stride
+The machine log once recorded per-file bandwidth variance above run-to-run
+variance (`layer_00` 1,237 MB/s vs `layer_20` 1,812 MB/s), and EXP-024 later
+withdrew the spread as a stable property of a file. This probe therefore runs a **fixed, recorded** file set spanning both stride
 classes and **always reports per file**. Aggregates are printed only with the
 per-file min and max beside them; an aggregate that hides a 1.46x spread is a
 worse answer than no aggregate.
@@ -131,16 +130,15 @@ numbers describe buffered I/O, not O_DIRECT.
 
 **Did the drive report an error?** `btrfs device stats` is sampled before and
 after the whole session and again around each confined run. The reference
-machine's `corruption_errs` baseline is 138,407
-(`docs/benchmark-machine.md`); EXP-007 showed how easily a buffer-aliasing
-bug in a benchmark manufactures an increase. **Any delta is a hard failure,
+machine's `corruption_errs` baseline is 138,407; EXP-007 showed how easily a
+buffer-aliasing bug in a benchmark manufactures an increase. **Any delta is a hard failure,
 not a footnote.** This probe hands every thread its own buffer for exactly
 that reason.
 
 ## Phase 9: the three things the four-file matrix could not answer
 
 EXP-023 measured a **2.21x** per-file bandwidth spread at decode's K=1 block
-size, and `docs/benchmark-machine.md` concluded "it is not fragmentation" from
+size, and the machine log of the time concluded "it is not fragmentation" from
 the fact that the fast and slow files have identical extent *geometry*. Both
 statements have a hole in them, and three modes were added to close them.
 
@@ -272,10 +270,10 @@ BTRFS_COUNTERS = (
     "generation_errs",
 )
 
-# The fixed, recorded file set. layer_00 and layer_20 are the pair
-# docs/benchmark-machine.md names for per-file bandwidth variance (1,237 vs
-# 1,812 MB/s; EXP-019 reproduces it and rules out fragmentation as the cause,
-# since the two have identical extent geometry) and both carry the 3,059,712 B
+# The fixed, recorded file set. layer_00 and layer_20 are the pair the
+# machine log named for per-file bandwidth variance (1,237 vs 1,812 MB/s;
+# EXP-019 reproduces it and rules out fragmentation as the cause, since the
+# two have identical extent geometry) and both carry the 3,059,712 B
 # stride; layer_06 and layer_21 carry the 2,654,208 B stride. Changing this
 # list changes what the numbers mean, so it is a default rather than a
 # computed choice.
@@ -733,7 +731,7 @@ def dispersion_stats(extents: list[dict], gap_bytes: int,
                      units: str = LOGICAL_NOT_LBA) -> dict:
     """Physical dispersion, the axis `filefrag_stats` never measured.
 
-    `docs/benchmark-machine.md` rules fragmentation out as the cause of the
+    The machine log ruled fragmentation out as the cause of the
     per-file bandwidth spread on the grounds that the slow and fast files have
     identical extent *geometry* — same count, same sizes, zero physically
     adjacent successor pairs. That is true and it does rule geometry out. It
@@ -1109,8 +1107,8 @@ def timed_reads(fd: int, offsets: list[int], block_bytes: int,
     Per-thread buffers, never a shared pool indexed by arithmetic: EXP-007
     established that two in-flight O_DIRECT reads landing in one buffer make
     btrfs verify a checksum over bytes the other read already overwrote, which
-    is where `docs/benchmark-machine.md`'s 138,407 `corruption_errs` came
-    from. A benchmark is not allowed to manufacture that again.
+    is where the reference machine's 138,407 `corruption_errs` came from. A
+    benchmark is not allowed to manufacture that again.
 
     Allocation and pre-faulting happen **before** the timer starts, so the
     reported bandwidth is drive time, not page-fault time. **So does thread
@@ -1701,8 +1699,8 @@ def build_all_files_cases(files: list[dict], k: int, qd: int,
                           patterns: list[str]) -> tuple[list[dict], list[tuple[int, int]]]:
     """One cell — (K, QD) — across **every** layer file.
 
-    `docs/experiments.md` says decode "touches all 48 files every token
-    so it pays that spread on all of them", but the spread it cites was
+    The four-file spread (EXP-023) was read as one decode "touches all 48
+    files every token so it pays that spread on all of them", but it was
     measured on four files. Four is a sample, not the population, and the
     claim is about the population. This is the population: one decode-shaped
     case per file, so per-file bandwidth can be joined against per-file

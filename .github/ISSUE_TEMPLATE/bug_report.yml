@@ -6,12 +6,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        Most ramvamp bugs are storage bugs wearing a runtime costume. The
-        fields below are the ones that decide whether a report is
-        reproducible, so please fill them in even when they look irrelevant:
-        the same binary on the same weights behaves differently on a
-        different filesystem, and the I/O mode alone changes the memory
-        contract.
+        The fields below decide whether a report can be reproduced, so please
+        fill them in even when they look irrelevant. The same binary on the
+        same weights behaves differently on another filesystem, and the I/O
+        mode alone changes how much memory it uses.
 
   - type: dropdown
     id: component
@@ -46,8 +44,8 @@ body:
       label: Load banner
       description: |
         Paste the whole line ramvamp prints on stderr after loading. It looks
-        like `model loaded in 12.34s (512 prompt tokens); 6 compute shards, 8
-        expert slots/layer from a 1.2 GiB budget, io_uring+O_DIRECT reads`.
+        like `model loaded in 12.34s (512 prompt tokens); 6 compute shards, 19
+        expert slots/layer from a 2.4 GiB budget, io_uring+O_DIRECT reads`.
         The last field is the achieved I/O mode, one of `io_uring+O_DIRECT`,
         `io_uring+buffered` or `pread`, and it is the single most useful line
         in a bug report. It reports what the runtime got, not what it asked
@@ -62,7 +60,7 @@ body:
     attributes:
       label: ramvamp version
       description: Release tag, or `git rev-parse --short HEAD` for a build from source.
-      placeholder: "v0.1.0, or 96d31a9"
+      placeholder: "v0.1.1, or 96d31a9"
     validations:
       required: true
 
@@ -131,7 +129,7 @@ body:
     attributes:
       label: Memory limit, if any
       description: The value of `memory.max` for the run. Leave blank if the run was unconfined.
-      placeholder: "3G"
+      placeholder: "4G"
 
   - type: input
     id: model

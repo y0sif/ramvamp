@@ -27,9 +27,12 @@
 //! | `blk.N.ffn_gate_exps` / `ffn_up_exps` | q4_k | moe_intermediate x hidden |
 //! | `blk.N.ffn_down_exps` | q4_k or q6_k | hidden x moe_intermediate |
 //!
-//! `attn_v` is Q6_K on exactly the Q6_K-down layers of the audited file;
-//! the loader accepts either format per layer independently rather than
-//! enforcing that coupling.
+//! In the audited file (bartowski's Q4_K_M at commit
+//! `6c6e8692f43e4ca663f7ece8229a1361090d3a4c`) `ffn_down_exps` is Q6_K on 24
+//! of 48 layers (0-5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 41-47) and
+//! Q4_K on the rest. `attn_v` is Q6_K on exactly those layers; the loader
+//! accepts either format per layer independently rather than enforcing that
+//! coupling.
 
 use crate::format::ArchInfo;
 use crate::io::parse_quant_format;

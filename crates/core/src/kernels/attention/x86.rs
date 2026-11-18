@@ -12,7 +12,7 @@
 //! parent module, on every input, with zero tolerance
 //! (`simd_matches_scalar_bit_for_bit`, and transitively
 //! `restructured_kernel_is_bit_identical_to_head_major_reference`, which pins
-//! both against the pre-wave-1 head-major nest). Three separate arguments,
+//! both against the original head-major nest). Three separate arguments,
 //! one per piece:
 //!
 //! **(a) f16 to f32.** `vcvtph2ps` (`_mm256_cvtph_ps`) implements the same
@@ -79,6 +79,13 @@
 //! end-to-end geometries with `head_dim = 9` in the parent module's
 //! `simd_matches_scalar_bit_for_bit` and
 //! `misaligned_head_slices_match_the_scalar_reference`.
+//!
+//! # Miri cannot see this module
+//!
+//! `is_x86_feature_detected!` is false under Miri, so Miri takes the scalar
+//! path and never executes an `unsafe` block here. Soundness rests on
+//! inspection and on the bit-identity tests proving the results match, not on
+//! tooling.
 
 use std::arch::x86_64::*;
 

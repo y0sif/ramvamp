@@ -12,7 +12,10 @@ folklore.
 Inputs:
 
   * one or more binary traces from `ramvamp generate --trace-experts`
-    (`scripts/traces/` holds a committed one)
+    (`scripts/traces/` holds a committed one: the chat in
+    `qwen3-explain-256.prompt.json`, captured on `c715878` at the then-default
+    11 slots with `--messages-file --max-new 256 --seed 2 --no-config`,
+    EXP-030)
   * `models/qwen3.rvmp/experts/layout.json`, or the committed
     `scripts/traces/qwen3-30b-a3b-strides.json`, for the real per-layer expert
     stride (Qwen3-30B-A3B is not uniform: 24 layers are 3,059,712 B and 24
@@ -109,8 +112,8 @@ DEFAULT_AGE_PERIOD = 256
 # Window of `lfu-window`, in decode tokens (TurboFieldfare tested 64).
 DEFAULT_WINDOW_TOKENS = 64
 
-# Everything else that has to fit next to the slot pool in the published
-# 3 GB cgroup (`docs/architecture.md`, "Memory budget").
+# Everything else that has to fit next to the slot pool in a 3 GiB cgroup
+# (`docs/architecture.md`, "Memory contract").
 COMMON_WEIGHTS_MIB = 1023.34
 KV_CACHE_MIB = 384.0
 CGROUP_MIB = 3072.0
@@ -286,9 +289,9 @@ class LfuCache:
 
     A count exists only while its expert is resident: evicting an expert
     throws its history away and a re-fetched slab starts at 1. This is what
-    a naive reading of `docs/architecture.md` ("LFU eviction with recency
-    tie-break") produces, and it is deliberately NOT what the upstream
-    implementation does - see `GhostLfuCache`.
+    a naive reading of "LFU eviction with recency tie-break" produces, and
+    it is deliberately NOT what the upstream implementation does - see
+    `GhostLfuCache`.
     """
 
     label = "lfu"
@@ -1007,9 +1010,9 @@ def layer_curves(
 ) -> tuple[list[list[int]], int]:
     """Per-layer hit counts for every slot count in `1..=slots_max`.
 
-    Feeds the global-pool question: `docs/architecture.md` lists "global
-    slot pool vs per-layer (hot layers steal slots)" as an open decision,
-    and it can only be answered if each layer's own hit curve is known.
+    Feeds the global-pool question (a global slot pool against per-layer
+    pools; EXP-005 settled it: +0.53 points, rejected), which can only be
+    answered if each layer's own hit curve is known.
     Returns `(hits[layer][slots - 1], accesses_per_layer)`.
     """
     cls = POLICIES[policy]
@@ -1433,8 +1436,10 @@ def print_misses(results: list[dict], slots_list: list[int], policy: str) -> Non
 def print_policy_comparison(results: list[dict], slots_list: list[int], bandwidth: float) -> None:
     """Hit rate and I/O time per policy, both as a delta against LFU.
 
-    The upstream claim this checks (`docs/landscape.md`) is stated in
-    ms/token, so both views are printed on the same traces.
+    The upstream claims this checks are stated in ms/token (TurboFieldfare's
+    docs/OPTIMIZATION_JOURNEY.md: a 16-expert cache cut expert I/O from about
+    166 to 88 ms/token, and LFU over LRU from 72.6 to 64.8), so both views
+    are printed on the same traces.
     """
     policies = list(dict.fromkeys(r["policy"] for r in results))
 
