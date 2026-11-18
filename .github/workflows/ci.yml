@@ -16,9 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No `apt-get` step on purpose. The tree has no C dependencies: the only
-      # network client is `ureq` on rustls, and io_uring is reached through
-      # `io-uring`/`rustix`, which are pure Rust against the kernel ABI.
+      - name: Check docs
+        run: ./scripts/check-docs.sh
+
+      # No `apt-get` step: the C and C++ in the tree (ring, onig_sys, esaxx-rs)
+      # builds with the runner's own compiler and links no system library.
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -26,7 +28,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # This is the gate from CLAUDE.md, in the order it is written there.
+      # AGENTS.md lists these commands as the gate; change the two together.
       - name: Check formatting
         run: cargo fmt --check
 
